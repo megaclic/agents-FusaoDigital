@@ -212,8 +212,32 @@
     "signupFailed": "Signup failed"
   },
   "branding": {
+    "assetsTitle": "Logo and favicon",
+    "brandColor": "Brand color",
+    "brandName": "Brand name",
+    "brandNameHint": "Shown in the browser tab title and the login page footer.",
+    "colorMode": "Color mode",
+    "colorModeAdvanced": "Advanced",
+    "colorModeAdvancedComingSoon": "The advanced per-theme token editor is coming soon.",
+    "colorModeSimple": "Simple",
+    "colorsTitle": "Colors",
+    "darkVariant": "Dark",
+    "faviconLabel": "Favicon",
+    "footerTitle": "Sidebar footer",
+    "hideGithubLink": "Hide GitHub link",
+    "identityTitle": "Identity",
+    "lightVariant": "Light",
+    "logoLabel": "Logo",
+    "remove": "Remove",
+    "save": "Save",
+    "savedError": "Failed to save branding settings.",
+    "savedOk": "Branding settings saved.",
+    "siteUrl": "Website URL",
     "subtitle": "Customize the app's global appearance (name, colors, logo, favicon).",
-    "title": "Branding"
+    "supportEmail": "Support e-mail",
+    "title": "Branding",
+    "upload": "Upload",
+    "uploadError": "Failed to upload the file."
   },
   "channels": {
     "account": "Account {{id}}",
@@ -1874,9 +1898,6 @@
     "update": "update"
   },
   "upgrade": {
-    "branding": {
-      "description": "White-label branding (name, colors, logo, favicon) is a Pro feature. Upgrade to Pro to customize the app identity."
-    },
     "cta": "Upgrade to Pro",
     "dismiss": "Maybe later",
     "multiTenant": {

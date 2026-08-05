@@ -212,8 +212,32 @@
     "signupFailed": "Falha ao cadastrar"
   },
   "branding": {
+    "assetsTitle": "Logo e favicon",
+    "brandColor": "Cor principal",
+    "brandName": "Nome da marca",
+    "brandNameHint": "Aparece no título da aba do navegador e no rodapé da tela de login.",
+    "colorMode": "Modo de cor",
+    "colorModeAdvanced": "Avançado",
+    "colorModeAdvancedComingSoon": "O editor avançado de tokens por tema está chegando em breve.",
+    "colorModeSimple": "Simples",
+    "colorsTitle": "Cores",
+    "darkVariant": "Escuro",
+    "faviconLabel": "Favicon",
+    "footerTitle": "Rodapé do menu",
+    "hideGithubLink": "Ocultar link do GitHub",
+    "identityTitle": "Identidade",
+    "lightVariant": "Claro",
+    "logoLabel": "Logo",
+    "remove": "Remover",
+    "save": "Salvar",
+    "savedError": "Erro ao salvar as configurações de identidade visual.",
+    "savedOk": "Configurações de identidade visual salvas.",
+    "siteUrl": "URL do site",
     "subtitle": "Personalize a aparência global do app (nome, cores, logo, favicon).",
-    "title": "Identidade visual"
+    "supportEmail": "E-mail de suporte",
+    "title": "Identidade visual",
+    "upload": "Enviar",
+    "uploadError": "Erro ao enviar o arquivo."
   },
   "channels": {
     "account": "Conta {{id}}",
@@ -1880,9 +1904,6 @@
     "update": "atualizar"
   },
   "upgrade": {
-    "branding": {
-      "description": "A identidade visual white-label (nome, cores, logo, favicon) é um recurso Pro. Faça upgrade para o Pro para personalizar a identidade do app."
-    },
     "cta": "Fazer upgrade",
     "dismiss": "Agora não",
     "multiTenant": {
