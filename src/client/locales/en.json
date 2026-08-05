@@ -1903,11 +1903,6 @@
     "newVersionAvailable": "Version {{version}} available",
     "update": "update"
   },
-  "upgrade": {
-    "cta": "Upgrade to Pro",
-    "dismiss": "Maybe later",
-    "title": "Pro feature"
-  },
   "vault": {
     "add": "Add secret",
     "addTitle": "Add secret",

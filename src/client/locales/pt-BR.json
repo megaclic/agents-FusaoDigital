@@ -1909,11 +1909,6 @@
     "newVersionAvailable": "Versão {{version}} disponível",
     "update": "atualizar"
   },
-  "upgrade": {
-    "cta": "Fazer upgrade",
-    "dismiss": "Agora não",
-    "title": "Recurso Pro"
-  },
   "vault": {
     "add": "Adicionar segredo",
     "addTitle": "Adicionar segredo",
