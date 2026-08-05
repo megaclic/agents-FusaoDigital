@@ -1728,12 +1728,18 @@
   },
   "tenant": {
     "create": "Criar tenant",
+    "createError": "Erro ao criar tenant",
+    "createSuccess": "Tenant criado com sucesso",
+    "createTitle": "Criar novo tenant",
     "demo": "Demo",
     "label": "Tenant",
     "name": "Nome",
+    "nameLabel": "Nome",
     "none": "Nenhum tenant ainda.",
     "select": "Selecionar tenant",
     "slug": "Slug",
+    "slugHelp": "Apenas letras minúsculas, números e hífens",
+    "slugLabel": "Identificador (slug)",
     "switcher": "Trocar de tenant"
   },
   "testMode": {
@@ -1906,9 +1912,6 @@
   "upgrade": {
     "cta": "Fazer upgrade",
     "dismiss": "Agora não",
-    "multiTenant": {
-      "description": "A edição Free roda com um único tenant. Faça upgrade para o Pro para criar e gerenciar vários tenants."
-    },
     "title": "Recurso Pro"
   },
   "vault": {

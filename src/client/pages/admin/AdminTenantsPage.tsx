@@ -1,14 +1,21 @@
-import { Users } from "lucide-react";
+import { Plus, Users } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, Navigate } from "react-router";
-import { Badge, Card, ProGate, Skeleton } from "@/client/components";
+import { Link, Navigate, useSearchParams } from "react-router";
+import {
+  Badge,
+  Button,
+  Card,
+  Skeleton,
+  useModalController,
+  useToast,
+} from "@/client/components";
+import { CreateTenantModal } from "@/client/components/admin/CreateTenantModal";
 import { useAuth } from "@/client/contexts/AuthContext";
 import { api } from "@/client/lib/api";
 import { formatDate } from "@/client/lib/utils";
 
-// Single-tenant Tenants tab: lists the tenant created at /setup, read-only, with an upgrade gate
-// where multi-tenant management would be. Creating and managing multiple tenants requires Pro.
+// Fleet-wide Tenants tab: lists every tenant and lets a SUPER_ADMIN create new ones.
 type TenantsData = Awaited<
   ReturnType<typeof api.api.admin.tenants.get>
 >["data"];
@@ -19,8 +26,11 @@ const TENANT_SKELETON_KEYS = ["tenant-0", "tenant-1", "tenant-2"];
 export function AdminTenantsPage() {
   const { t } = useTranslation();
   const { user } = useAuth();
+  const { showToast } = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [tenants, setTenants] = useState<TenantRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const createModal = useModalController();
 
   const fetchTenants = useCallback(async () => {
     setLoading(true);
@@ -36,6 +46,22 @@ export function AdminTenantsPage() {
     void fetchTenants();
   }, [fetchTenants]);
 
+  // Deeplink: /admin/tenants?create=1 (from the header TenantSwitcher) opens the create modal once,
+  // then strips the param so a re-render / back-nav doesn't re-open it.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: mount-only trigger; clearing the param makes it a no-op on re-render.
+  useEffect(() => {
+    if (searchParams.get("create") !== "1") return;
+    createModal.open();
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("create");
+        return next;
+      },
+      { replace: true },
+    );
+  }, []);
+
   // The Tenants tab is fleet-level; a tenant admin has no business here.
   if (user && user.role !== "SUPER_ADMIN") {
     return <Navigate to="/admin/users" replace />;
@@ -43,11 +69,22 @@ export function AdminTenantsPage() {
 
   return (
     <div className="space-y-6 pt-2">
+      <CreateTenantModal
+        modal={createModal}
+        onCreated={() => {
+          void fetchTenants();
+          showToast(
+            t("tenant.createSuccess", "Tenant criado com sucesso"),
+            "success",
+          );
+        }}
+      />
+
       <div className="flex items-center justify-end">
-        <ProGate
-          feature="multiTenant"
-          triggerLabel={t("admin.createTenant", "Create tenant")}
-        />
+        <Button size="sm" onClick={() => createModal.open()}>
+          <Plus className="h-4 w-4" aria-hidden="true" />
+          {t("admin.createTenant", "Create tenant")}
+        </Button>
       </div>
 
       <Card>

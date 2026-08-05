@@ -3,8 +3,6 @@ import { Building2, Check, ChevronDown, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
-import { useModalController } from "@/client/components/Modal";
-import { ProGate } from "@/client/components/ProGate";
 import { useConfirmLeave } from "@/client/contexts/NavGuardContext";
 import {
   getActiveTenantId,
@@ -12,7 +10,6 @@ import {
   TENANTS_CHANGED_EVENT,
 } from "@/client/lib/activeTenant";
 import { api } from "@/client/lib/api";
-import { IS_FREE } from "@/client/lib/env";
 import { tenantSwitchTarget } from "@/client/lib/tenantSwitch";
 import { suppressUnloadPrompt } from "@/client/lib/unsavedGuard";
 import { cn } from "@/client/lib/utils";
@@ -31,7 +28,6 @@ export function TenantSwitcher() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const confirmLeave = useConfirmLeave();
-  const upgrade = useModalController();
   const [tenants, setTenants] = useState<Tenant[]>([]);
   const active = getActiveTenantId() ?? "";
 
@@ -61,8 +57,7 @@ export function TenantSwitcher() {
     t("tenant.select", "Select tenant");
 
   return (
-    <>
-      <DropdownMenuPrimitive.Root>
+    <DropdownMenuPrimitive.Root>
         <DropdownMenuPrimitive.Trigger asChild>
           <button
             type="button"
@@ -138,12 +133,7 @@ export function TenantSwitcher() {
             <DropdownMenuPrimitive.Item
               className={cn(itemCls, "text-text-secondary")}
               onSelect={() =>
-                // Free ships the same picker as Pro, but "create" opens the upgrade CTA instead of the
-                // create page. The modal is hosted at the component root (below), OUTSIDE this menu, so
-                // it survives the dropdown closing on select.
-                IS_FREE
-                  ? upgrade.open()
-                  : confirmLeave(() => navigate("/admin/tenants?create=1"))
+                confirmLeave(() => navigate("/admin/tenants?create=1"))
               }
             >
               <Plus className="h-4 w-4 shrink-0" aria-hidden="true" />
@@ -153,9 +143,6 @@ export function TenantSwitcher() {
             </DropdownMenuPrimitive.Item>
           </DropdownMenuPrimitive.Content>
         </DropdownMenuPrimitive.Portal>
-      </DropdownMenuPrimitive.Root>
-      {/* Free-only: hosts the upgrade modal opened by the "create" item above. Renders null in Pro. */}
-      <ProGate feature="multiTenant" controller={upgrade} />
-    </>
+    </DropdownMenuPrimitive.Root>
   );
 }

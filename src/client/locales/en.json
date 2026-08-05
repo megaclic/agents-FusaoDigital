@@ -1722,12 +1722,18 @@
   },
   "tenant": {
     "create": "Create tenant",
+    "createError": "Could not create the tenant",
+    "createSuccess": "Tenant created successfully",
+    "createTitle": "Create new tenant",
     "demo": "Demo",
     "label": "Tenant",
     "name": "Name",
+    "nameLabel": "Name",
     "none": "No tenants yet.",
     "select": "Select tenant",
     "slug": "Slug",
+    "slugHelp": "Lowercase letters, numbers, and hyphens only",
+    "slugLabel": "Identifier (slug)",
     "switcher": "Switch tenant"
   },
   "testMode": {
@@ -1900,9 +1906,6 @@
   "upgrade": {
     "cta": "Upgrade to Pro",
     "dismiss": "Maybe later",
-    "multiTenant": {
-      "description": "The Free edition runs a single tenant. Upgrade to Pro to create and manage multiple tenants."
-    },
     "title": "Pro feature"
   },
   "vault": {
