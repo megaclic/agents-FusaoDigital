@@ -39,6 +39,7 @@ import { toolsController } from "@/api/v1/tools.controller";
 import { v1Controller } from "@/api/v1/v1.controller";
 import { vaultController } from "@/api/v1/vault.controller";
 import { webhooksController } from "@/api/v1/webhooks.controller";
+import { zproController } from "@/api/v1/zpro.controller";
 import config from "@/config";
 
 // DEV docs (Scalar): the x-tenant-id header is the SUPER_ADMIN tenant selector, read only on
@@ -249,6 +250,7 @@ const api = new Elysia()
   .use(mcpMeController)
   .use(mcpAdminController)
   .use(chatwootController)
-  .use(chatwootAdminController);
+  .use(chatwootAdminController)
+  .use(zproController);
 
 export default api;

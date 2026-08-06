@@ -109,6 +109,9 @@ model Tenant {
   chatwootInstances             ChatwootInstance[]
   chatwootAgentBots             ChatwootAgentBot[]
   chatwootWebhookDeliveries     ChatwootWebhookDelivery[]
+  zproInstances                 ZproInstance[]
+  zproWebhookDeliveries         ZproWebhookDelivery[]
+  zproAgentBindings             ZproAgentBinding[]
   inboxes                       Inbox[]
   contacts                      Contact[]
   conversations                 Conversation[]
@@ -495,6 +498,73 @@ model AgentThread {
   @@map("agent_threads")
 }
 
+// ──────────────────────────────────────────────────── zpro mirror ──
+
+// Configuração de uma instância Z-PRO vinculada a um tenant. Equivalente ao ChatwootDeployment +
+// ChatwootInstance fundidos numa tabela só (Z-PRO tem um único bearer token por ApiID, sem
+// separação deployment/account).
+model ZproInstance {
+  id             BigInt    @id @default(autoincrement())
+  tenantId       BigInt    @map("tenant_id")
+  baseUrl        String    @map("base_url") // ex: "https://api.fusaobotcrm.com.br"
+  apiId          String    @map("api_id") // ApiID do Z-PRO
+  bearerToken    String    @map("bearer_token") // encrypted; Bearer token da API Z-PRO
+  whatsappId     Int       @map("whatsapp_id") // whatsapp.id do payload do webhook
+  instanceName   String    @map("instance_name") // whatsapp.name (ex: "TesteSindSeg")
+  // Soft-disconnect igual ao Chatwoot: null = ativo.
+  disconnectedAt DateTime? @map("disconnected_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  tenant            Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  webhookDeliveries ZproWebhookDelivery[]
+  agentBindings     ZproAgentBinding[]
+
+  // Um whatsappId é único por tenant (não pode ter dois canais iguais no mesmo tenant).
+  @@unique([tenantId, whatsappId])
+  @@index([tenantId])
+  @@map("zpro_instances")
+}
+
+// Idempotência de entrega do webhook global do Z-PRO. Equivalente ao ChatwootWebhookDelivery.
+model ZproWebhookDelivery {
+  id             BigInt                @id @default(autoincrement())
+  tenantId       BigInt                @map("tenant_id")
+  zproInstanceId BigInt                @map("zpro_instance_id")
+  messageId      String                @map("message_id") // msg.id do payload
+  event          String // msg.type
+  status         InboundDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  receivedAt     DateTime              @default(now()) @map("received_at")
+  processedAt    DateTime?             @map("processed_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  zproInstance ZproInstance @relation(fields: [zproInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([zproInstanceId, messageId])
+  @@index([tenantId])
+  @@map("zpro_webhook_deliveries")
+}
+
+// Liga um Agent do FusaoDigital a uma instância Z-PRO. Equivalente ao ChatwootAgentBot (sem o
+// agentBotId do Chatwoot, que não existe no Z-PRO).
+model ZproAgentBinding {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  zproInstanceId BigInt   @map("zpro_instance_id")
+  agentId        BigInt   @map("agent_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  zproInstance ZproInstance @relation(fields: [zproInstanceId], references: [id], onDelete: Cascade)
+  agent        Agent        @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, zproInstanceId, agentId])
+  @@index([tenantId])
+  @@map("zpro_agent_bindings")
+}
+
 // ──────────────────────────────────────────────── agent config ──
 
 model Agent {
@@ -519,6 +589,7 @@ model Agent {
   tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   toolSelections AgentToolSelection[]
   chatwootBots   ChatwootAgentBot[]
+  zproBindings   ZproAgentBinding[]
 
   @@index([tenantId])
   @@map("agents")
