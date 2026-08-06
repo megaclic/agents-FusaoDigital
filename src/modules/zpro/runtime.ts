@@ -145,6 +145,13 @@ export async function runZproAgentTurn(
   const { tenantId, zproInstanceId, deliveryRowId, event: ev } = params;
   const base = params.base ?? basePrisma;
 
+  console.error(
+    "[ZPRO-DEBUG] runZproAgentTurn called, tenantId=%s instanceId=%s deliveryId=%s",
+    String(tenantId),
+    String(zproInstanceId),
+    String(deliveryRowId),
+  );
+
   // CAS claim: PENDING → PROCESSING. A re-entry that finds a non-PENDING row (already claimed by
   // a concurrent dispatch, or already terminal) skips — mirrors processChatwootDelivery's tx1.
   const claimed = await runScopedOn(base, sysCtx(tenantId), (db) =>

@@ -98,6 +98,7 @@ export const zproController = new Elysia({
             );
           })
           .catch((err) => {
+            console.error("[ZPRO-DEBUG] dispatch catch:", err);
             logger.error(
               {
                 err,
