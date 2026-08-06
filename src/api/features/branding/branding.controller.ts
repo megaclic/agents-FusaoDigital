@@ -123,6 +123,12 @@ export const brandingController = new Elysia({
             "Support e-mail shown in the sidebar support modal, or null to use the default.",
         }),
       ),
+      repoUrl: t.Optional(
+        t.Union([t.String({ maxLength: 512 }), t.Null()], {
+          description:
+            "Sidebar-footer GitHub link override (absolute http(s) URL), or null to use the default.",
+        }),
+      ),
       hideGithubLink: t.Optional(
         t.Boolean({
           description:

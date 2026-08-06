@@ -37,7 +37,7 @@ import {
 import { generateRouteToken } from "@/modules/webhooks/inbound/route-token";
 import { AGENT_SELECT, type AgentDto, requireTenant, toDto } from "./service";
 
-export const AGENT_EXPORT_KIND = "fazer-ai.agent";
+export const AGENT_EXPORT_KIND = "fusaodigital.agent";
 export const AGENT_EXPORT_VERSION = 1;
 
 const exportedGrantSchema = z.discriminatedUnion("source", [

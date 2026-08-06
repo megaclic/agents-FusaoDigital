@@ -251,7 +251,7 @@ export async function registerClient(params: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         redirect_uris: [params.redirectUri],
-        client_name: params.clientName ?? "fazer.ai agents",
+        client_name: params.clientName ?? "FusaoDigital agents",
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
         token_endpoint_auth_method: "none",

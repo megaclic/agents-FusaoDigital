@@ -47,10 +47,11 @@ function writeCache(config: BrandingData): void {
   }
 }
 
-// The white-label display name when none is configured (the product's own brand).
+// The white-label display name when none is configured. Deliberately generic — an empty database
+// must never leak anyone's brand; the operator sets the real name via Admin > Identidade Visual.
 // Exported so consumers (e.g. the auth-page footer) can tell the default apart
 // from an operator-configured name without re-hardcoding the string.
-export const DEFAULT_BRAND_NAME = "fazer.ai agents";
+export const DEFAULT_BRAND_NAME = "Agents";
 
 interface BrandingContextValue {
   config: BrandingData | null;

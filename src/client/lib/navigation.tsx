@@ -148,29 +148,32 @@ export interface SupportContact {
 // a raw mailto: link, which is unreliable when the user has no mail client).
 // The email itself is i18n-driven so projects can route support to a
 // locale-specific inbox. Set to null to hide the support block entirely.
+// Deliberately no default value exposed here: an empty database must never leak anyone's support
+// inbox. The operator configures the real address via Admin > Identidade Visual; until then the
+// Sidebar renders no support block (see supportEmail resolution in Sidebar.tsx).
 // t('nav.support', 'Support')
-// t('support.email', 'support@fazer.ai')
+// t('support.email', '')
 export const SUPPORT_LINK: SupportContact | null = {
   emailKey: "support.email",
-  defaultEmail: "support@fazer.ai",
+  defaultEmail: "",
   labelKey: "nav.support",
   defaultLabel: "Support",
   icon: LifeBuoy,
 };
 
-// t('nav.website', 'fazer.ai')
+// t('nav.website', '')
 // t('nav.github', 'GitHub')
-// Always the public open-source repo — even in Pro/Full (whose own repo is private): the user can
-// only open the public one. Used for the footer GitHub link AND the "new version" upgrade link, so
-// both point at fazer-ai/agents regardless of edition (never the hub).
-export const AGENTS_REPO_URL = "https://github.com/fazer-ai/agents";
+// Fallback GitHub link when the operator hasn't configured a custom repoUrl in branding (see
+// customRepoUrl in Sidebar.tsx). Also used for the "new version" upgrade link.
+export const AGENTS_REPO_URL =
+  "https://github.com/megaclic/agents-FusaoDigital";
 
 export const SECONDARY_LINKS: FooterLink[] = [
   {
     id: "website",
-    href: "https://fazer.ai",
+    href: "",
     labelKey: "nav.website",
-    defaultLabel: "fazer.ai",
+    defaultLabel: "",
     icon: Globe,
   },
   {
@@ -182,6 +185,6 @@ export const SECONDARY_LINKS: FooterLink[] = [
   },
 ];
 
-// Upgrade destination for Pro-gated features (the hub's agents page). Centralized here, alongside
-// the other external links, so every <ProGate> CTA and any future upsell point at one URL.
-export const UPGRADE_URL = "https://app.fazer.ai/#/agents";
+// Upgrade destination for Pro-gated features. Empty: no upsell hub is wired into this fork (kept
+// as an exported constant so any dormant <ProGate> import doesn't break).
+export const UPGRADE_URL = "";

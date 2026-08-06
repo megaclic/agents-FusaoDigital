@@ -229,6 +229,8 @@
     "lightVariant": "Light",
     "logoLabel": "Logo",
     "remove": "Remove",
+    "repoUrl": "Repository URL (GitHub)",
+    "repoUrlHelp": "Replaces the GitHub link in the sidebar footer. Leave empty to use the default.",
     "save": "Save",
     "savedError": "Failed to save branding settings.",
     "savedOk": "Branding settings saved.",
@@ -1419,7 +1421,7 @@
       "endpoint": "MCP endpoint",
       "installAddToFile": "Add to {{file}}",
       "installClaudePost": "Then run /mcp inside Claude Code to sign in.",
-      "installCodexPost": "Then run codex mcp login fazer-ai to sign in.",
+      "installCodexPost": "Then run codex mcp login fusaodigital to sign in.",
       "installHermesPost": "Then run /reload-mcp in Hermes.",
       "installHint": "Pick your tool and copy the snippet. Sign-in happens in your browser via OAuth, with no token to paste.",
       "installOther": "Other",
@@ -1524,7 +1526,7 @@
     "support": "Support",
     "userMenu": "User menu",
     "webhooks": "Webhooks",
-    "website": "fazer.ai"
+    "website": ""
   },
   "oauth": {
     "consent": {
@@ -1717,7 +1719,7 @@
     "copyEmail": "Copy email",
     "copyFailed": "Failed",
     "description": "Send us an email at:",
-    "email": "support@fazer.ai",
+    "email": "",
     "title": "Contact support"
   },
   "tenant": {

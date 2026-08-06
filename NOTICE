@@ -7,3 +7,8 @@ file in this repository).
 This software may include third-party open-source components, each distributed
 under its own license. Refer to the dependency manifests (package.json and the
 lockfile) and any accompanying license files for details.
+
+Modifications to this work:
+Copyright 2026 megaclic (Samir)
+This fork (FusaoDigital agents) modifies the original work under the terms of
+the Apache License, Version 2.0.

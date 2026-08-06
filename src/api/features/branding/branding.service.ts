@@ -20,6 +20,7 @@ import { sanitizeBranding } from "@/lib/branding";
 // translate('errors.noUpdatableFields', 'No updatable fields provided')
 // translate('errors.invalidSiteUrl', 'Invalid website URL')
 // translate('errors.invalidSupportEmail', 'Invalid support e-mail')
+// translate('errors.invalidRepoUrl', 'Invalid repo URL')
 
 export const SINGLETON_ID = 1;
 
@@ -65,6 +66,9 @@ export interface GlobalBrandingDto {
   // option to drop the GitHub entry. null = use the built-in defaults.
   siteUrl: string | null;
   supportEmail: string | null;
+  // Replaces the GitHub entry's href (still labeled/iconed as GitHub). null = use the built-in
+  // default repo URL.
+  repoUrl: string | null;
   hideGithubLink: boolean;
   // Epoch-ms string of the last write — the client appends it to asset URLs to bust caches
   // (the favicon especially is cached aggressively by browsers). "0" while still at defaults.
@@ -83,6 +87,7 @@ interface BrandingRow {
   faviconLightKey: string | null;
   siteUrl: string | null;
   supportEmail: string | null;
+  repoUrl: string | null;
   hideGithubLink: boolean;
   updatedAt: Date;
 }
@@ -97,6 +102,7 @@ export const DEFAULT_DTO: GlobalBrandingDto = {
   favicon: { dark: false, light: false },
   siteUrl: null,
   supportEmail: null,
+  repoUrl: null,
   hideGithubLink: false,
   version: "0",
 };
@@ -135,6 +141,20 @@ export function sanitizeSiteUrl(value: unknown): string | null {
   }
 }
 
+// null unless the value parses as an absolute http(s) URL within bounds. Same contract as
+// sanitizeSiteUrl: it replaces the GitHub entry's href, so anything else must die here.
+export function sanitizeRepoUrl(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > MAX_SITE_URL_LEN) return null;
+  try {
+    const { protocol } = new URL(trimmed);
+    return protocol === "http:" || protocol === "https:" ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
 export function sanitizeSupportEmail(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
@@ -157,6 +177,7 @@ export function toDto(row: BrandingRow): GlobalBrandingDto {
     },
     siteUrl: sanitizeSiteUrl(row.siteUrl),
     supportEmail: sanitizeSupportEmail(row.supportEmail),
+    repoUrl: sanitizeRepoUrl(row.repoUrl),
     hideGithubLink: row.hideGithubLink === true,
     version: row.updatedAt.getTime().toString(),
   };
@@ -177,6 +198,7 @@ export interface ColorUpdate {
   tokensDark?: Record<string, unknown>;
   siteUrl?: string | null;
   supportEmail?: string | null;
+  repoUrl?: string | null;
   hideGithubLink?: boolean;
 }
 

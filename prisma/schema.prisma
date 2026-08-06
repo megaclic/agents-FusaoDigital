@@ -1,4 +1,4 @@
-// fazer.ai agents — schema base.
+// FusaoDigital agents — schema base.
 //
 // Multi-tenancy: every tenant-scoped table carries `tenant_id` and is protected by
 // Postgres RLS (defined in the migrations, since Prisma does not model RLS). The
@@ -170,6 +170,7 @@ model AppBranding {
   faviconLightKey String?  @map("favicon_light_key")
   siteUrl         String?  @map("site_url")
   supportEmail    String?  @map("support_email")
+  repoUrl         String?  @map("repo_url")
   hideGithubLink  Boolean  @default(false) @map("hide_github_link")
   updatedAt       DateTime @updatedAt @map("updated_at")
 

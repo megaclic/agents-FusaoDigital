@@ -125,7 +125,7 @@ const api = new Elysia()
           title: `${config.packageInfo.name} API`,
           version: config.packageInfo.version,
           description:
-            "REST surface for the fazer.ai agents operator console. Dev-only documentation, auto-generated from the route schemas.",
+            "REST surface for the FusaoDigital agents operator console. Dev-only documentation, auto-generated from the route schemas.",
         },
         // The whole API instance is mounted under /api (app.ts `.group("/api", …)`), so every path
         // in this spec is relative to /api. Without this `servers` entry Scalar would send "Try it"

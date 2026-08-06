@@ -17,8 +17,8 @@ import { useBranding } from "@/client/contexts/BrandingContext";
 import { api } from "@/client/lib/api";
 
 // Branding tab: white-label editor for the GLOBAL identity (name, colors, footer links, logo,
-// favicon). Unlike upstream fazer.ai agents, this fork does NOT gate branding writes behind a Pro
-// edition (see branding.admin.service.ts) — the form below talks directly to
+// favicon). This fork does NOT gate branding writes behind a Pro edition (see
+// branding.admin.service.ts) — the form below talks directly to
 // PATCH /v1/branding + PUT/DELETE /v1/branding/asset/:kind/:variant. `useBranding()` is the same
 // context the Sidebar footer reads from, so calling `refresh()` after a save/upload/remove
 // propagates immediately without a page reload.
@@ -53,6 +53,7 @@ export function AdminBrandingPage() {
   const [brandColor, setBrandColor] = useState(DEFAULT_BRAND_COLOR);
   const [siteUrl, setSiteUrl] = useState("");
   const [supportEmail, setSupportEmail] = useState("");
+  const [repoUrl, setRepoUrl] = useState("");
   const [hideGithubLink, setHideGithubLink] = useState(false);
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState<Record<string, boolean>>({});
@@ -66,6 +67,7 @@ export function AdminBrandingPage() {
     setBrandColor(config.brandColor ?? DEFAULT_BRAND_COLOR);
     setSiteUrl(config.siteUrl ?? "");
     setSupportEmail(config.supportEmail ?? "");
+    setRepoUrl(config.repoUrl ?? "");
     setHideGithubLink(config.hideGithubLink);
   }, [config]);
 
@@ -83,6 +85,7 @@ export function AdminBrandingPage() {
         brandColor: brandColor.trim() ? brandColor.trim() : null,
         siteUrl: siteUrl.trim() ? siteUrl.trim() : null,
         supportEmail: supportEmail.trim() ? supportEmail.trim() : null,
+        repoUrl: repoUrl.trim() ? repoUrl.trim() : null,
         hideGithubLink,
       });
       if (error) {
@@ -99,7 +102,11 @@ export function AdminBrandingPage() {
     }
   }
 
-  async function handleUpload(kind: AssetKind, variant: AssetVariant, file: File) {
+  async function handleUpload(
+    kind: AssetKind,
+    variant: AssetVariant,
+    file: File,
+  ) {
     const key = comboKey(kind, variant);
     setUploading((prev) => ({ ...prev, [key]: true }));
     try {
@@ -107,7 +114,10 @@ export function AdminBrandingPage() {
         .asset({ kind })({ variant })
         .put({ file });
       if (error) {
-        showToast(t("branding.uploadError", "Failed to upload the file."), "error");
+        showToast(
+          t("branding.uploadError", "Failed to upload the file."),
+          "error",
+        );
         return;
       }
       await refresh();
@@ -121,7 +131,10 @@ export function AdminBrandingPage() {
       .asset({ kind })({ variant })
       .delete();
     if (error) {
-      showToast(t("branding.uploadError", "Failed to upload the file."), "error");
+      showToast(
+        t("branding.uploadError", "Failed to upload the file."),
+        "error",
+      );
       return;
     }
     await refresh();
@@ -180,7 +193,10 @@ export function AdminBrandingPage() {
             <FormField label={t("branding.colorMode", "Color mode")} group>
               <FilterPills
                 items={[
-                  { key: "SIMPLE", label: t("branding.colorModeSimple", "Simple") },
+                  {
+                    key: "SIMPLE",
+                    label: t("branding.colorModeSimple", "Simple"),
+                  },
                   {
                     key: "ADVANCED",
                     label: t("branding.colorModeAdvanced", "Advanced"),
@@ -237,6 +253,20 @@ export function AdminBrandingPage() {
                 value={supportEmail}
                 onChange={(e) => setSupportEmail(e.target.value)}
                 placeholder="contato@fusaodigital.com.br"
+              />
+            </FormField>
+            <FormField
+              label={t("branding.repoUrl", "Repository URL (GitHub)")}
+              hint={t(
+                "branding.repoUrlHelp",
+                "Replaces the GitHub link in the sidebar footer. Leave empty to use the default.",
+              )}
+            >
+              <Input
+                type="url"
+                value={repoUrl}
+                onChange={(e) => setRepoUrl(e.target.value)}
+                placeholder="https://github.com/sua-org/seu-repo"
               />
             </FormField>
             <SwitchField

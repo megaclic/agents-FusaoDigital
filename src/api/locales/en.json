@@ -29,6 +29,7 @@
     "invalidColorToken": "Invalid color value",
     "invalidCredentials": "Invalid email or password",
     "invalidPassword": "Incorrect password",
+    "invalidRepoUrl": "Invalid repo URL",
     "invalidSetupToken": "Invalid or missing setup token",
     "invalidSiteUrl": "Invalid website URL",
     "invalidSupportEmail": "Invalid support e-mail",

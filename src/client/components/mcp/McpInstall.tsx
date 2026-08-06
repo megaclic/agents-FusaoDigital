@@ -11,7 +11,7 @@ import { HermesIcon } from "@/client/components/icons/HermesIcon";
 import { cn } from "@/client/lib/utils";
 
 // MCP server id shown in the client config; arbitrary, surfaces as the tool namespace prefix.
-const SERVER_ID = "fazer-ai";
+const SERVER_ID = "fusaodigital";
 
 // Where a snippet goes: a shell command ("terminal") or a literal config-file path.
 type Snippet = { location: string; code: string };
@@ -121,7 +121,7 @@ export function McpInstall({ url }: { url: string }) {
   } else if (selected === "codex") {
     postNote = t(
       "mcp.my.installCodexPost",
-      "Then run codex mcp login fazer-ai to sign in.",
+      "Then run codex mcp login fusaodigital to sign in.",
     );
   } else if (selected === "hermes") {
     postNote = t("mcp.my.installHermesPost", "Then run /reload-mcp in Hermes.");

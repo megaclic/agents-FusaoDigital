@@ -134,8 +134,8 @@ interface SidebarFooterProps {
   onNavigate?: () => void;
 }
 
-// Label for a white-labeled website link: the hostname reads like the default
-// entry ("fazer.ai") instead of dumping the full URL into the sidebar.
+// Label for a white-labeled website link: shows just the hostname instead of
+// dumping the full URL into the sidebar.
 function hostnameOf(url: string): string {
   try {
     return new URL(url).hostname;
@@ -160,6 +160,10 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
       ? branding.siteUrl
       : null;
   const customSupportEmail = branding?.supportEmail?.trim() || null;
+  const customRepoUrl =
+    branding?.repoUrl && isSafeHttpUrl(branding.repoUrl)
+      ? branding.repoUrl
+      : null;
   const hideGithub = branding?.hideGithubLink === true;
 
   const supportEmail = SUPPORT_LINK
@@ -216,11 +220,21 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
     supportItem = wrapLi("__support", trigger, label);
   }
 
-  const secondaryItems = SECONDARY_LINKS.filter(
-    (link) => !(link.id === "github" && hideGithub),
-  ).map((link) => {
+  const secondaryItems = SECONDARY_LINKS.filter((link) => {
+    if (link.id === "github" && hideGithub) return false;
+    // No default website URL is shipped (see navigation.tsx) — hide the entry entirely until the
+    // operator configures one, instead of rendering a dead link.
+    if (link.id === "website" && customSiteUrl === null && !link.href)
+      return false;
+    return true;
+  }).map((link) => {
     const isCustomSite = link.id === "website" && customSiteUrl !== null;
-    const href = isCustomSite ? customSiteUrl : link.href;
+    const isCustomRepo = link.id === "github" && customRepoUrl !== null;
+    const href = isCustomSite
+      ? customSiteUrl
+      : isCustomRepo
+        ? customRepoUrl
+        : link.href;
     const label = isCustomSite
       ? hostnameOf(customSiteUrl)
       : // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments in src/client/lib/navigation.tsx
@@ -285,9 +299,9 @@ function SidebarVersion({ collapsed = false }: { collapsed?: boolean }) {
   // Edition marker: only the paid (Pro/full) edition labels itself; Free stays unlabeled.
   const isPro = !IS_FREE;
   const proLabel = t("edition.pro", "Pro");
-  // The specific release page when the source provides one (Free/GitHub), else the public repo's
-  // releases list. Always fazer-ai/agents — in Pro too (its own repo is private), never the hub.
-  // releaseUrl is hub-authored, so only trust an allowlisted http(s) value; otherwise fall back.
+  // The specific release page when the hub provides one, else this fork's own releases list
+  // (AGENTS_REPO_URL). releaseUrl is hub-authored, so only trust an allowlisted http(s) value;
+  // otherwise fall back — this also covers the hub being disabled by default (empty releaseUrl).
   const upgradeHref =
     update.releaseUrl && isSafeHttpUrl(update.releaseUrl)
       ? update.releaseUrl

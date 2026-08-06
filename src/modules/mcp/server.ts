@@ -280,7 +280,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       // Server-level scope hint (MCP `initialize` result). Clients SHOULD surface this to the model so
       // it understands what this server operates on before calling any tool (see docs/mcp.md).
       instructions:
-        "This server administers a fazer.ai agents workspace (tenant): its AI " +
+        "This server administers a FusaoDigital agents workspace (tenant): its AI " +
         "customer-service agents and their system prompts, behavior settings, granted tools and " +
         "knowledge bases; the Chatwoot channels (instances/inboxes) they answer on; live " +
         "conversations (read, reply, hand off, re-engage); plus integrations, A/B experiments, " +

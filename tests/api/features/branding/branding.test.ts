@@ -90,6 +90,7 @@ describe("toDto footer-link fields (defense in depth on read)", () => {
     faviconLightKey: null,
     siteUrl: null as string | null,
     supportEmail: null as string | null,
+    repoUrl: null as string | null,
     hideGithubLink: false,
     updatedAt: new Date(0),
   };

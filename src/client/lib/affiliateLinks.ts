@@ -1,8 +1,8 @@
-// Affiliate/referral links: signing up through these helps fund fazer.ai, so they render with the
-// "create one through our link to help us out" copy. Keyed by the secret-type `kind` id.
+// Affiliate/referral links: signing up through these helps fund this project, so they render with
+// the "create one through our link to help us out" copy. Keyed by the secret-type `kind` id.
 export const AFFILIATE_LINKS: Record<string, string> = {
-  asaas: "https://www.asaas.com/r/5ec90fd5-677d-40c7-b577-cc1f6de62fec",
-  elevenlabs: "https://try.elevenlabs.io/fazer-ai-agents-cli",
+  // asaas: pendente link de afiliado próprio
+  elevenlabs: "https://try.elevenlabs.io/014fro7o02cc",
 };
 
 // Direct "get your API key" pages for named providers. These are NOT referral links, so they render

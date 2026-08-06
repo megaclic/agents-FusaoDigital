@@ -7,23 +7,24 @@ import {
   ASSET_MAX_BYTES,
   type AssetKind,
   type AssetVariant,
+  assetPath,
   type ColorUpdate,
   EXT_BY_TYPE,
   type GlobalBrandingDto,
-  SINGLETON_ID,
-  assetPath,
   getGlobalBranding,
   keyColumn,
+  SINGLETON_ID,
   sanitizeBrandName,
+  sanitizeRepoUrl,
   sanitizeSiteUrl,
   sanitizeSupportEmail,
 } from "./branding.service";
 
-// Branding mutation implementation for this fork (FusaoDigital agents): unlike upstream fazer.ai
-// agents, white-label editing is NOT gated behind a Pro edition here — SUPER_ADMIN can write
-// colors/name/footer-links/logo/favicon directly. Reads (getGlobalBranding/readBrandingAsset) stay
-// public and live in branding.service. Writes go through the base (non-scoped) prisma client since
-// AppBranding is a GLOBAL singleton row (id = SINGLETON_ID), not tenant data.
+// Branding mutation implementation for this fork (FusaoDigital agents): white-label editing is NOT
+// gated behind a Pro edition here — SUPER_ADMIN can write colors/name/footer-links/logo/favicon
+// directly. Reads (getGlobalBranding/readBrandingAsset) stay public and live in branding.service.
+// Writes go through the base (non-scoped) prisma client since AppBranding is a GLOBAL singleton row
+// (id = SINGLETON_ID), not tenant data.
 
 export async function updateBrandingColors(
   input: ColorUpdate,
@@ -66,8 +67,10 @@ export async function updateBrandingColors(
   // NOTE: tokensLight/tokensDark drop unknown keys/invalid values silently (sanitizeBranding's
   // existing contract, shared with the read-side toDto) rather than throwing — the dedicated
   // ADVANCED-mode editor UI is a follow-up; for now malformed entries are just discarded.
-  if ("tokensLight" in input) data.tokensLight = sanitizeBranding(input.tokensLight);
-  if ("tokensDark" in input) data.tokensDark = sanitizeBranding(input.tokensDark);
+  if ("tokensLight" in input)
+    data.tokensLight = sanitizeBranding(input.tokensLight);
+  if ("tokensDark" in input)
+    data.tokensDark = sanitizeBranding(input.tokensDark);
 
   if ("siteUrl" in input) {
     if (input.siteUrl === null) {
@@ -75,13 +78,21 @@ export async function updateBrandingColors(
     } else {
       const sanitized = sanitizeSiteUrl(input.siteUrl);
       if (sanitized === null) {
-        throw new AppError(
-          "Invalid website URL",
-          400,
-          "errors.invalidSiteUrl",
-        );
+        throw new AppError("Invalid website URL", 400, "errors.invalidSiteUrl");
       }
       data.siteUrl = sanitized;
+    }
+  }
+
+  if ("repoUrl" in input) {
+    if (input.repoUrl === null) {
+      data.repoUrl = null;
+    } else {
+      const sanitized = sanitizeRepoUrl(input.repoUrl);
+      if (sanitized === null) {
+        throw new AppError("Invalid repo URL", 400, "errors.invalidRepoUrl");
+      }
+      data.repoUrl = sanitized;
     }
   }
 

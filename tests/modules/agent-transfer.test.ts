@@ -128,7 +128,7 @@ describe.skipIf(!dbUp)("agent export/import", () => {
 
   test("export references by name and carries no secret value", async () => {
     const exp = await exportAgent(ctx(), agentId, appDb);
-    expect(exp.kind).toBe("fazer-ai.agent");
+    expect(exp.kind).toBe("fusaodigital.agent");
     expect(exp.agent.name).toBe("Vendedora");
     // credentialRef is a NAME, not a secret
     expect(exp.agent.modelConfig.credentialRef).toBe("llm-key");

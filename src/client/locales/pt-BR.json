@@ -229,6 +229,8 @@
     "lightVariant": "Claro",
     "logoLabel": "Logo",
     "remove": "Remover",
+    "repoUrl": "URL do repositório (GitHub)",
+    "repoUrlHelp": "Substitui o link do GitHub no rodapé. Deixe vazio para usar o padrão.",
     "save": "Salvar",
     "savedError": "Erro ao salvar as configurações de identidade visual.",
     "savedOk": "Configurações de identidade visual salvas.",
@@ -1424,7 +1426,7 @@
       "endpoint": "Endpoint MCP",
       "installAddToFile": "Adicione em {{file}}",
       "installClaudePost": "Depois rode /mcp no Claude Code para entrar.",
-      "installCodexPost": "Depois rode codex mcp login fazer-ai para entrar.",
+      "installCodexPost": "Depois rode codex mcp login fusaodigital para entrar.",
       "installHermesPost": "Depois rode /reload-mcp no Hermes.",
       "installHint": "Escolha sua ferramenta e copie o trecho. O login acontece no navegador via OAuth, sem token para colar.",
       "installOther": "Outro",
@@ -1529,7 +1531,7 @@
     "support": "Suporte",
     "userMenu": "Menu do usuário",
     "webhooks": "Webhooks",
-    "website": "fazer.ai"
+    "website": ""
   },
   "oauth": {
     "consent": {
@@ -1723,7 +1725,7 @@
     "copyEmail": "Copiar email",
     "copyFailed": "Falha",
     "description": "Envie um email para:",
-    "email": "suporte@fazer.ai",
+    "email": "",
     "title": "Contatar suporte"
   },
   "tenant": {
