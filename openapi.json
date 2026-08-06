@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "agents API",
-    "description": "REST surface for the fazer.ai agents operator console. Dev-only documentation, auto-generated from the route schemas.",
+    "description": "REST surface for the FusaoDigital agents operator console. Dev-only documentation, auto-generated from the route schemas.",
     "version": "0.0.0"
   },
   "servers": [
@@ -2163,6 +2163,18 @@
                       }
                     ]
                   },
+                  "repoUrl": {
+                    "description": "Sidebar-footer GitHub link override (absolute http(s) URL), or null to use the default.",
+                    "anyOf": [
+                      {
+                        "maxLength": 512,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "hideGithubLink": {
                     "description": "When true, the GitHub entry is removed from the sidebar footer.",
                     "type": "boolean"
@@ -2243,6 +2255,18 @@
                       }
                     ]
                   },
+                  "repoUrl": {
+                    "description": "Sidebar-footer GitHub link override (absolute http(s) URL), or null to use the default.",
+                    "anyOf": [
+                      {
+                        "maxLength": 512,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "hideGithubLink": {
                     "description": "When true, the GitHub entry is removed from the sidebar footer.",
                     "type": "boolean"
@@ -2316,6 +2340,18 @@
                     "anyOf": [
                       {
                         "maxLength": 254,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "repoUrl": {
+                    "description": "Sidebar-footer GitHub link override (absolute http(s) URL), or null to use the default.",
+                    "anyOf": [
+                      {
+                        "maxLength": 512,
                         "type": "string"
                       },
                       {
@@ -27272,6 +27308,935 @@
           }
         },
         "operationId": "postV1ChatwootInboxesByIdReconnect"
+      }
+    },
+    "/v1/zpro/webhook": {
+      "post": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Z-PRO global webhook",
+        "description": "Receptor público do webhook de mensagens do Z-PRO. Sem HMAC — a instância (e o tenant) é resolvida pelo whatsappId do payload. Ack rápido + dispatch assíncrono; idempotência via ZproWebhookDelivery.",
+        "security": [],
+        "operationId": "postV1ZproWebhook"
+      }
+    },
+    "/v1/zpro/instances": {
+      "get": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "List Z-PRO instances",
+        "description": "Lists all Z-PRO instances for the tenant.",
+        "responses": {
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1ZproInstances",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Create Z-PRO instance",
+        "description": "Registers a new Z-PRO instance for the tenant (or revives a matching soft-disconnected one).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "description": "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "description": "Z-PRO ApiID.",
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "description": "Z-PRO API bearer token; encrypted at rest, never returned.",
+                    "type": "string"
+                  },
+                  "whatsappId": {
+                    "description": "whatsapp.id from the Z-PRO webhook payload.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "description": "whatsapp.id from the Z-PRO webhook payload.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "instanceName": {
+                    "minLength": 1,
+                    "description": "Display name for the instance.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseUrl",
+                  "apiId",
+                  "bearerToken",
+                  "whatsappId",
+                  "instanceName"
+                ]
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "description": "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "description": "Z-PRO ApiID.",
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "description": "Z-PRO API bearer token; encrypted at rest, never returned.",
+                    "type": "string"
+                  },
+                  "whatsappId": {
+                    "description": "whatsapp.id from the Z-PRO webhook payload.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "description": "whatsapp.id from the Z-PRO webhook payload.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "instanceName": {
+                    "minLength": 1,
+                    "description": "Display name for the instance.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseUrl",
+                  "apiId",
+                  "bearerToken",
+                  "whatsappId",
+                  "instanceName"
+                ]
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "description": "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "description": "Z-PRO ApiID.",
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "description": "Z-PRO API bearer token; encrypted at rest, never returned.",
+                    "type": "string"
+                  },
+                  "whatsappId": {
+                    "description": "whatsapp.id from the Z-PRO webhook payload.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "description": "whatsapp.id from the Z-PRO webhook payload.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "instanceName": {
+                    "minLength": 1,
+                    "description": "Display name for the instance.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseUrl",
+                  "apiId",
+                  "bearerToken",
+                  "whatsappId",
+                  "instanceName"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — a duplicate or a state conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "postV1ZproInstances",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
+      }
+    },
+    "/v1/zpro/instances/{id}": {
+      "patch": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Update Z-PRO instance",
+        "description": "Updates credentials or name of a Z-PRO instance.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Z-PRO instance id (BigInt string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "instanceName": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "whatsappId": {
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "instanceName": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "whatsappId": {
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "instanceName": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "whatsappId": {
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — a duplicate or a state conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "patchV1ZproInstancesById"
+      },
+      "delete": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Disconnect Z-PRO instance",
+        "description": "Soft-disconnects the instance and clears its agent binding (keeps history).",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Z-PRO instance id (BigInt string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "deleteV1ZproInstancesById"
+      }
+    },
+    "/v1/zpro/instances/{id}/bind": {
+      "post": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Bind agent to Z-PRO instance",
+        "description": "Links or unlinks an agent to a Z-PRO instance.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Z-PRO instance id (BigInt string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agentId": {
+                    "description": "Agent id (BigInt string) to bind, or null to unbind.",
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "agentId"
+                ]
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agentId": {
+                    "description": "Agent id (BigInt string) to bind, or null to unbind.",
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "agentId"
+                ]
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "agentId": {
+                    "description": "Agent id (BigInt string) to bind, or null to unbind.",
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "agentId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — a duplicate or a state conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "postV1ZproInstancesByIdBind"
+      }
+    },
+    "/v1/zpro/webhook-url": {
+      "get": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Z-PRO webhook URL",
+        "description": "Returns the webhook URL to configure in the Z-PRO panel.",
+        "responses": {
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1ZproWebhook-url",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
       }
     }
   }

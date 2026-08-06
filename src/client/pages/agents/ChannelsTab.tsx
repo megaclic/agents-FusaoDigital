@@ -1,4 +1,4 @@
-import { Inbox as InboxIcon, Loader2 } from "lucide-react";
+import { Inbox as InboxIcon, Loader2, MessageSquare } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
@@ -11,6 +11,7 @@ import {
   DataBoundary,
   EmptyState,
   InboxRow,
+  Skeleton,
   Switch,
   useModalController,
   useToast,
@@ -28,6 +29,10 @@ type InboxesData = Awaited<
 type Inbox = NonNullable<InboxesData>["inboxes"][number];
 type AgentsData = Awaited<ReturnType<typeof api.api.v1.agents.get>>["data"];
 type AgentLite = NonNullable<AgentsData>["agents"][number];
+type ZproInstancesData = Awaited<
+  ReturnType<typeof api.api.v1.zpro.instances.get>
+>["data"];
+type ZproInstanceDto = NonNullable<ZproInstancesData>["instances"][number];
 
 // Agent editor "Channels" tab: bind/unbind THIS agent to inboxes from the agent's side. Mirrors the
 // Channels page but with a per-inbox switch instead of an agent picker, and acts IMMEDIATELY (no
@@ -323,7 +328,119 @@ export function ChannelsTab({
         )}
       </DataBoundary>
 
+      <ZproInstancesForAgent agentId={agentId} />
+
       <ConfirmDialog modal={confirm} />
     </div>
+  );
+}
+
+// Z-PRO (WhatsApp) binding: a simpler mirror of the Chatwoot section above — one switch per
+// instance, no picker (an instance answers through at most one agent). Renders nothing when the
+// tenant has no Z-PRO instance at all, so agents that never touch WhatsApp stay uncluttered.
+function ZproInstancesForAgent({ agentId }: { agentId: string }) {
+  const { t } = useTranslation();
+  const { showToast } = useToast();
+  const [instances, setInstances] = useState<ZproInstanceDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const { data } = await api.api.v1.zpro.instances.get();
+      if (data) setInstances([...data.instances]);
+    } catch {
+      // best-effort — the Chatwoot section above already surfaces a load error
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function toggle(instance: ZproInstanceDto) {
+    const isBound = instance.agentBindings.some((b) => b.agentId === agentId);
+    setPending(instance.id);
+    try {
+      const { error: err } = await api.api.v1.zpro
+        .instances({ id: instance.id })
+        .bind.post({ agentId: isBound ? null : agentId });
+      if (err) throw err;
+      setInstances((prev) =>
+        prev.map((i) =>
+          i.id === instance.id
+            ? {
+                ...i,
+                agentBindings: isBound ? [] : [{ agentId, agentName: "" }],
+              }
+            : i,
+        ),
+      );
+      showToast(t("zpro.bound", "Instance updated."), "success");
+    } catch {
+      showToast(t("zpro.bindError", "Could not bind the agent."), "error");
+    } finally {
+      setPending(null);
+    }
+  }
+
+  if (!loading && instances.length === 0) return null;
+
+  return (
+    <section className="flex flex-col gap-3">
+      <h2 className="flex items-center gap-2 font-medium text-text-primary">
+        <MessageSquare className="h-4 w-4 text-accent" aria-hidden="true" />
+        {t("zpro.title", "Z-PRO (WhatsApp)")}
+      </h2>
+      {loading ? (
+        <Card className="flex items-center justify-between gap-4">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-6 w-11" />
+        </Card>
+      ) : (
+        <Card className="p-0">
+          <ul>
+            {instances.map((inst) => {
+              const mine = inst.agentBindings.some(
+                (b) => b.agentId === agentId,
+              );
+              return (
+                <li
+                  key={inst.id}
+                  className="flex items-center justify-between gap-4 border-border border-b px-4 py-3 last:border-b-0"
+                >
+                  <div className="flex min-w-0 flex-col gap-0.5">
+                    <span className="font-medium text-sm text-text-primary">
+                      {inst.instanceName}
+                    </span>
+                    <span className="text-text-muted text-xs">
+                      {inst.baseUrl}
+                    </span>
+                  </div>
+                  {pending === inst.id ? (
+                    <Loader2
+                      className="h-5 w-5 animate-spin text-text-muted"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <Switch
+                      checked={mine}
+                      onCheckedChange={() => void toggle(inst)}
+                      aria-label={t(
+                        "zpro.toggleBinding",
+                        "Answer {{instance}} with this agent",
+                        { instance: inst.instanceName },
+                      )}
+                    />
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </Card>
+      )}
+    </section>
   );
 }

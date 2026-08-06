@@ -41,6 +41,7 @@ import { api } from "@/client/lib/api";
 import { chatwootInboxNewUrl } from "@/client/lib/chatwootLinks";
 import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { ZproSection } from "./ZproSection";
 
 type DeploymentData = Awaited<
   ReturnType<typeof api.api.v1.chatwoot.deployment.get>
@@ -1114,6 +1115,8 @@ export function ChannelsPage() {
             })
           )}
         </section>
+
+        <ZproSection />
       </DataBoundary>
 
       <Modal
