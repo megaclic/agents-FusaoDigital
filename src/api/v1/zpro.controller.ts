@@ -84,18 +84,30 @@ export const zproController = new Elysia({
 
         // Ack fast: the dispatch runs detached. runZproAgentTurn CAS-claims the row itself, so a
         // re-fired duplicate that raced this same check is still safe.
-        void runZproAgentTurn({
+        runZproAgentTurn({
           tenantId: instance.tenantId,
           zproInstanceId: instance.id,
           deliveryRowId: delivery.id,
           event,
-        }).catch((err) => {
-          logger.error(
-            "zpro: async dispatch failed (delivery %s): %s",
-            String(delivery.id),
-            err instanceof Error ? err.message : String(err),
-          );
-        });
+        })
+          .then((outcome) => {
+            logger.info(
+              "zpro:dispatch outcome delivery=%s outcome=%s",
+              String(delivery.id),
+              outcome,
+            );
+          })
+          .catch((err) => {
+            logger.error(
+              {
+                err,
+                errMessage: err instanceof Error ? err.message : String(err),
+                errStack: err instanceof Error ? err.stack : undefined,
+                deliveryId: String(delivery.id),
+              },
+              "zpro:async dispatch failed",
+            );
+          });
       },
       logger,
     );

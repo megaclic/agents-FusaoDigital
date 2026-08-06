@@ -265,7 +265,13 @@ export async function runZproAgentTurn(
     return "replied";
   } catch (err) {
     logger.error(
-      { err, threadId, ticketId: ev.threadId },
+      {
+        err,
+        errMessage: err instanceof Error ? err.message : String(err),
+        errStack: err instanceof Error ? err.stack : undefined,
+        threadId,
+        ticketId: ev.threadId,
+      },
       "zpro:runtime:turn-error",
     );
     await markDelivery("FAILED");
