@@ -27,6 +27,20 @@ function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   return ctx;
 }
 
+// Normalizes to origin only (scheme + host + port) — an operator pasting the FULL Z-PRO API URL
+// (e.g. https://api.fusaobotcrm.com.br/v2/api/external/UUID, copied straight from the Z-PRO panel)
+// would otherwise get that path baked into ZproClient.endpoint(), which already appends
+// /v2/api/external/<apiId> itself; the duplicated path 404s silently. An unparseable value is
+// returned trimmed but unchanged — it isn't a valid absolute URL either way, so ZproClient's own
+// fetch calls will fail loudly on it rather than us guessing at a fix.
+function sanitizeZproBaseUrl(raw: string): string {
+  try {
+    return new URL(raw.trim()).origin;
+  } catch {
+    return raw.trim();
+  }
+}
+
 const INSTANCE_SELECT = {
   id: true,
   baseUrl: true,
@@ -120,7 +134,7 @@ export const zproAdminController = new Elysia({
         }
         const data = {
           tenantId,
-          baseUrl: body.baseUrl.replace(/\/+$/, ""),
+          baseUrl: sanitizeZproBaseUrl(body.baseUrl),
           apiId: body.apiId,
           bearerToken: encryptJson(body.bearerToken),
           whatsappId: body.whatsappId,
@@ -183,7 +197,7 @@ export const zproAdminController = new Elysia({
         }
         const data: Prisma.ZproInstanceUpdateInput = {};
         if (body.baseUrl !== undefined)
-          data.baseUrl = body.baseUrl.replace(/\/+$/, "");
+          data.baseUrl = sanitizeZproBaseUrl(body.baseUrl);
         if (body.apiId !== undefined) data.apiId = body.apiId;
         if (body.bearerToken !== undefined) {
           data.bearerToken = encryptJson(body.bearerToken);

@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   ClipboardCopy,
+  Edit2,
   Loader2,
   MessageSquare,
   Plug,
@@ -43,6 +44,9 @@ type InstancesData = Awaited<
 type InstanceDto = NonNullable<InstancesData>["instances"][number];
 type AgentsData = Awaited<ReturnType<typeof api.api.v1.agents.get>>["data"];
 type AgentLite = NonNullable<AgentsData>["agents"][number];
+type UpdateInstanceBody = Parameters<
+  ReturnType<typeof api.api.v1.zpro.instances>["patch"]
+>[0];
 
 const pickerItemCls =
   "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-text-secondary outline-none transition-colors data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary";
@@ -188,6 +192,17 @@ export function ZproSection() {
   });
   const [saving, setSaving] = useState(false);
 
+  const editModal = useModalController();
+  const [editTarget, setEditTarget] = useState<InstanceDto | null>(null);
+  const [editForm, setEditForm] = useState({
+    baseUrl: "",
+    apiId: "",
+    bearerToken: "",
+    instanceName: "",
+    whatsappId: "",
+  });
+  const [editSaving, setEditSaving] = useState(false);
+
   const confirm = useModalController<ConfirmPayload>();
 
   const load = useCallback(async () => {
@@ -266,6 +281,57 @@ export function ZproSection() {
     }
   }
 
+  function openEdit(instance: InstanceDto) {
+    setEditTarget(instance);
+    setEditForm({
+      baseUrl: instance.baseUrl,
+      apiId: instance.apiId,
+      bearerToken: "", // never pre-filled — the backend never returns the stored token
+      instanceName: instance.instanceName,
+      whatsappId: String(instance.whatsappId),
+    });
+    editModal.open();
+  }
+
+  async function saveEdit() {
+    if (!editTarget) return;
+    setEditSaving(true);
+    try {
+      const patch: UpdateInstanceBody = {};
+      if (editForm.baseUrl !== editTarget.baseUrl)
+        patch.baseUrl = editForm.baseUrl;
+      if (editForm.apiId !== editTarget.apiId) patch.apiId = editForm.apiId;
+      if (editForm.instanceName !== editTarget.instanceName) {
+        patch.instanceName = editForm.instanceName;
+      }
+      if (editForm.whatsappId !== String(editTarget.whatsappId)) {
+        patch.whatsappId = Number(editForm.whatsappId);
+      }
+      if (editForm.bearerToken.trim())
+        patch.bearerToken = editForm.bearerToken.trim();
+
+      if (Object.keys(patch).length === 0) {
+        editModal.close();
+        return;
+      }
+
+      const { error: err } = await api.api.v1.zpro
+        .instances({ id: editTarget.id })
+        .patch(patch);
+      if (err) throw err;
+      showToast(t("zpro.instanceUpdated", "Instance updated."), "success");
+      editModal.close();
+      void load();
+    } catch {
+      showToast(
+        t("zpro.instanceUpdateError", "Could not update the instance."),
+        "error",
+      );
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
   function openDisconnect(instance: InstanceDto) {
     confirm.open({
       title: t("zpro.disconnectTitle", "Disconnect instance"),
@@ -339,6 +405,13 @@ export function ZproSection() {
     form.bearerToken !== "" ||
     form.whatsappId !== "" ||
     form.instanceName !== "";
+  const editDirty =
+    !!editTarget &&
+    (editForm.baseUrl !== editTarget.baseUrl ||
+      editForm.apiId !== editTarget.apiId ||
+      editForm.bearerToken !== "" ||
+      editForm.instanceName !== editTarget.instanceName ||
+      editForm.whatsappId !== String(editTarget.whatsappId));
 
   return (
     <section className="flex flex-col gap-3">
@@ -453,6 +526,16 @@ export function ZproSection() {
                     {isAdmin && (
                       <button
                         type="button"
+                        onClick={() => openEdit(inst)}
+                        aria-label={t("zpro.editInstance", "Edit instance")}
+                        className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
+                      >
+                        <Edit2 className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                    )}
+                    {isAdmin && (
+                      <button
+                        type="button"
                         onClick={() => openDisconnect(inst)}
                         aria-label={t(
                           "zpro.disconnectTitle",
@@ -553,6 +636,83 @@ export function ZproSection() {
                 setForm((f) => ({ ...f, instanceName: e.target.value }))
               }
               placeholder="TesteSindSeg"
+            />
+          </FormField>
+        </div>
+      </Modal>
+
+      <Modal
+        modal={editModal}
+        unsavedChanges={editDirty}
+        title={t("zpro.editInstanceTitle", "Edit Z-PRO instance")}
+        footer={
+          <div className="flex justify-end gap-2">
+            <ModalCancelButton disabled={editSaving} />
+            <Button onClick={saveEdit} loading={editSaving}>
+              {t("common.save", "Save")}
+            </Button>
+          </div>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm text-text-muted">
+            {t(
+              "zpro.editInstanceDesc",
+              "Leave the bearer token field empty to keep the current token.",
+            )}
+          </p>
+          <FormField label={t("zpro.baseUrl", "Z-PRO base URL")} required>
+            <Input
+              value={editForm.baseUrl}
+              onChange={(e) =>
+                setEditForm((f) => ({ ...f, baseUrl: e.target.value }))
+              }
+              placeholder="https://api.fusaobotcrm.com.br"
+            />
+          </FormField>
+          <FormField label={t("zpro.apiId", "ApiID")} required>
+            <Input
+              value={editForm.apiId}
+              onChange={(e) =>
+                setEditForm((f) => ({ ...f, apiId: e.target.value }))
+              }
+            />
+          </FormField>
+          <FormField
+            label={t("zpro.bearerToken", "Bearer token")}
+            description={t(
+              "zpro.editBearerHint",
+              "Only fill this in to replace the current token.",
+            )}
+          >
+            <Input
+              type="password"
+              showPasswordToggle
+              value={editForm.bearerToken}
+              onChange={(e) =>
+                setEditForm((f) => ({ ...f, bearerToken: e.target.value }))
+              }
+              placeholder={t(
+                "zpro.bearerTokenUnchanged",
+                "Leave empty to keep",
+              )}
+            />
+          </FormField>
+          <FormField label={t("zpro.instanceName", "Instance name")} required>
+            <Input
+              value={editForm.instanceName}
+              onChange={(e) =>
+                setEditForm((f) => ({ ...f, instanceName: e.target.value }))
+              }
+            />
+          </FormField>
+          <FormField label={t("zpro.whatsappId", "WhatsApp ID")} required>
+            <Input
+              type="number"
+              value={editForm.whatsappId}
+              onChange={(e) =>
+                setEditForm((f) => ({ ...f, whatsappId: e.target.value }))
+              }
             />
           </FormField>
         </div>
