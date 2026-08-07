@@ -7,17 +7,19 @@
 // Ack rápido (<5s) + dispatch assíncrono, igual ao padrão chatwoot.
 
 import { Elysia } from "elysia";
+import { broadcastZproAgentToggled } from "@/api/features/realtime/realtime.service";
+import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import { doc } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
-import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { asSuperAdminOn, runScopedOn } from "@/lib/tenancy";
+import { ZproClient } from "@/modules/zpro/client";
+import { sysCtx } from "@/modules/zpro/ctx";
+import { deactivateAgent } from "@/modules/zpro/handoff";
+import { mirrorZproMessage } from "@/modules/zpro/mirror";
 import { runZproAgentTurn } from "@/modules/zpro/runtime";
 import type { ZproWebhookPayload } from "@/modules/zpro/types";
 import { handleZproWebhook } from "@/modules/zpro/webhook";
-
-function sysCtx(tenantId: bigint): TenantContext {
-  return { tenantId, userId: null, role: "TENANT_ADMIN" };
-}
 
 export const zproController = new Elysia({
   prefix: "/v1/zpro",
@@ -41,13 +43,59 @@ export const zproController = new Elysia({
     const instance = await asSuperAdminOn(basePrisma, (db) =>
       db.zproInstance.findFirst({
         where: { whatsappId, disconnectedAt: null },
-        select: { id: true, tenantId: true, apiId: true },
+        select: {
+          id: true,
+          tenantId: true,
+          apiId: true,
+          baseUrl: true,
+          bearerToken: true,
+        },
       }),
     );
 
     if (!instance) {
       logger.debug({ whatsappId }, "zpro:webhook: no instance found");
       return { ack: true, outcome: "skipped:no-instance" };
+    }
+
+    // 1. Espelha a mensagem no banco local — TODAS as mensagens, mesmo as que o gate do agente
+    // (normalizeZproWebhook) descarta (fromMe/n8nStatus=false/grupo/botStopped). Fonte de verdade
+    // do inbox do painel (ZproConversationsPage/ZproConversationDetailPage).
+    const mirrored = await mirrorZproMessage(
+      payload,
+      instance.tenantId,
+      instance.id,
+    );
+
+    // 2. Handoff automático: um atendente humano respondeu (fromMe + userId preenchido) enquanto
+    // o agente ainda estava marcado ativo no ticket — desativa. Nunca reativa automaticamente;
+    // reativação é sempre manual via POST /v1/zpro/conversations/:id/toggle-agent.
+    const ticket = payload.ticket;
+    if (mirrored?.isHumanIntervention && ticket?.n8nStatus) {
+      try {
+        const client = new ZproClient(
+          instance.baseUrl,
+          instance.apiId,
+          decryptJson<string>(instance.bearerToken),
+        );
+        await deactivateAgent(client, ticket.id);
+        await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+          db.zproConversation.update({
+            where: { id: mirrored.conversationId },
+            data: { agentActive: false },
+          }),
+        );
+        broadcastZproAgentToggled(instance.tenantId, {
+          conversationId: String(mirrored.conversationId),
+          ticketId: ticket.id,
+          agentActive: false,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, ticketId: ticket.id },
+          "zpro:webhook: auto-handoff deactivation failed",
+        );
+      }
     }
 
     // Usa o apiId da instância persistida (mais seguro que confiar no apiId do payload).

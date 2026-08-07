@@ -47,6 +47,8 @@ import { SettingsAppearancePage } from "@/client/pages/settings/SettingsAppearan
 import { SettingsLayout } from "@/client/pages/settings/SettingsLayout";
 import { SettingsProfilePage } from "@/client/pages/settings/SettingsProfilePage";
 import { WebhooksPage } from "@/client/pages/WebhooksPage";
+import { ZproConversationDetailPage } from "@/client/pages/ZproConversationDetailPage";
+import { ZproConversationsPage } from "@/client/pages/ZproConversationsPage";
 
 export function App() {
   return (
@@ -85,6 +87,22 @@ export function App() {
                                 element={
                                   <ProtectedRoute>
                                     <ConversationDetailPage />
+                                  </ProtectedRoute>
+                                }
+                              />
+                              <Route
+                                path="/zpro/conversations"
+                                element={
+                                  <ProtectedRoute>
+                                    <ZproConversationsPage />
+                                  </ProtectedRoute>
+                                }
+                              />
+                              <Route
+                                path="/zpro/conversations/:id"
+                                element={
+                                  <ProtectedRoute>
+                                    <ZproConversationDetailPage />
                                   </ProtectedRoute>
                                 }
                               />

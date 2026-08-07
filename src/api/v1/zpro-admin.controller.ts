@@ -4,6 +4,10 @@
 // /webhook-url here vs /webhook there, mirrors chatwootController/chatwootAdminController).
 // bearerToken is write-only — never returned in any response.
 
+// translate('errors.zproInstanceNotFound', 'Z-PRO instance not found')
+// translate('errors.zproWhatsappIdInUse', 'whatsappId already in use by another instance')
+// translate('errors.zproInstanceDisconnected', 'This instance is disconnected; reconnect it before assigning an agent')
+
 import { Elysia, t } from "elysia";
 import { Prisma } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";

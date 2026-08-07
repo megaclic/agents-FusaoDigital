@@ -1531,7 +1531,8 @@
     "support": "Suporte",
     "userMenu": "Menu do usuário",
     "webhooks": "Webhooks",
-    "website": ""
+    "website": "",
+    "zproConversations": "Conversas Z-PRO"
   },
   "oauth": {
     "consent": {
@@ -2131,6 +2132,49 @@
     "bindAgent": "Agente que responde",
     "bindError": "Não foi possível vincular o agente.",
     "bound": "Instância atualizada.",
+    "conversations": {
+      "activateAgent": "Ativar agente",
+      "agentActivated": "Agente IA ativado.",
+      "agentDeactivated": "Agente IA desativado.",
+      "assignee": {
+        "ai": "IA",
+        "human": "Humano"
+      },
+      "back": "Voltar para conversas Z-PRO",
+      "deactivateAgent": "Desativar agente",
+      "empty": "Nenhuma conversa Z-PRO ainda.",
+      "error": "Não foi possível carregar as conversas.",
+      "filters": {
+        "agent": "Agente ativo",
+        "all": "Todas",
+        "closed": "Fechadas",
+        "human": "Humano"
+      },
+      "filterStatus": "Filtrar conversas",
+      "loading": "Carregando conversas…",
+      "loadMore": "Carregar mais",
+      "mediaPreview": "[Mensagem de mídia]",
+      "mediaType": {
+        "audioMessage": "Mensagem de áudio",
+        "documentMessage": "Documento",
+        "imageMessage": "Imagem",
+        "pttMessage": "Mensagem de áudio",
+        "stickerMessage": "Figurinha",
+        "videoMessage": "Vídeo"
+      },
+      "messagesError": "Não foi possível carregar as mensagens.",
+      "messagesLoading": "Carregando mensagens…",
+      "metaError": "Não foi possível carregar a conversa.",
+      "noMessages": "Nenhuma mensagem ainda.",
+      "status": {
+        "closed": "Fechada",
+        "open": "Aberta",
+        "pending": "Pendente"
+      },
+      "subtitle": "Conversas de WhatsApp em tempo real espelhadas do Z-PRO, com o status de bot/humano.",
+      "title": "Conversas Z-PRO",
+      "toggleError": "Não foi possível atualizar o agente."
+    },
     "copyWebhookUrl": "Copiar URL do webhook",
     "disconnectAction": "Desconectar",
     "disconnectTitle": "Desconectar instância",

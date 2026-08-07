@@ -5,6 +5,7 @@ import {
   KeyRound,
   LibraryBig,
   LifeBuoy,
+  MessageSquare,
   MessagesSquare,
   RadioTower,
   ScrollText,
@@ -38,6 +39,7 @@ export interface NavItem {
 
 // t('nav.dashboard', 'Dashboard')
 // t('nav.conversations', 'Conversations')
+// t('nav.zproConversations', 'Z-PRO conversations')
 // t('nav.agents', 'Agents')
 // t('nav.resources', 'Components')
 // t('nav.channels', 'Channels')
@@ -59,6 +61,12 @@ export const NAV_ITEMS: NavItem[] = [
     labelKey: "nav.conversations",
     defaultLabel: "Conversations",
     icon: MessagesSquare,
+  },
+  {
+    to: "/zpro/conversations",
+    labelKey: "nav.zproConversations",
+    defaultLabel: "Z-PRO conversations",
+    icon: MessageSquare,
   },
   {
     to: "/agents",

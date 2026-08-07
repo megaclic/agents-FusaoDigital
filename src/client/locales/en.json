@@ -1526,7 +1526,8 @@
     "support": "Support",
     "userMenu": "User menu",
     "webhooks": "Webhooks",
-    "website": ""
+    "website": "",
+    "zproConversations": "Z-PRO conversations"
   },
   "oauth": {
     "consent": {
@@ -2125,6 +2126,49 @@
     "bindAgent": "Answering agent",
     "bindError": "Could not bind the agent.",
     "bound": "Instance updated.",
+    "conversations": {
+      "activateAgent": "Activate agent",
+      "agentActivated": "AI agent activated.",
+      "agentDeactivated": "AI agent deactivated.",
+      "assignee": {
+        "ai": "AI",
+        "human": "Human"
+      },
+      "back": "Back to Z-PRO conversations",
+      "deactivateAgent": "Deactivate agent",
+      "empty": "No Z-PRO conversations yet.",
+      "error": "Could not load conversations.",
+      "filters": {
+        "agent": "AI active",
+        "all": "All",
+        "closed": "Closed",
+        "human": "Human"
+      },
+      "filterStatus": "Filter conversations",
+      "loading": "Loading conversations…",
+      "loadMore": "Load more",
+      "mediaPreview": "[Media message]",
+      "mediaType": {
+        "audioMessage": "Audio message",
+        "documentMessage": "Document",
+        "imageMessage": "Image",
+        "pttMessage": "Audio message",
+        "stickerMessage": "Sticker",
+        "videoMessage": "Video"
+      },
+      "messagesError": "Could not load messages.",
+      "messagesLoading": "Loading messages…",
+      "metaError": "Could not load the conversation.",
+      "noMessages": "No messages yet.",
+      "status": {
+        "closed": "Closed",
+        "open": "Open",
+        "pending": "Pending"
+      },
+      "subtitle": "Live WhatsApp conversations mirrored from Z-PRO, with their bot/human status.",
+      "title": "Z-PRO conversations",
+      "toggleError": "Could not update the agent."
+    },
     "copyWebhookUrl": "Copy webhook URL",
     "disconnectAction": "Disconnect",
     "disconnectTitle": "Disconnect instance",

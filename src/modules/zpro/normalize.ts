@@ -4,60 +4,12 @@
 // Baseado em payloads reais capturados em 06/08/2026.
 
 import { ZPRO_METHOD_MESSAGE } from "./constants";
+import { extractMedia, extractMessageBody } from "./parse";
 import type {
   NormalizedZproEvent,
   ZproMessageType,
-  ZproMsgContent,
   ZproWebhookPayload,
 } from "./types";
-
-interface MediaExtracted {
-  mediaUrl?: string;
-  mediaCaption?: string;
-  mediaMimetype?: string;
-  mediaFileName?: string;
-}
-
-function extractMedia(content: ZproMsgContent | undefined): MediaExtracted {
-  if (!content) return {};
-
-  if (content.audioMessage) {
-    return {
-      mediaUrl: content.audioMessage.url,
-      mediaMimetype: content.audioMessage.mimetype,
-    };
-  }
-  if (content.imageMessage) {
-    return {
-      mediaUrl: content.imageMessage.url,
-      mediaCaption: content.imageMessage.caption,
-      mediaMimetype: content.imageMessage.mimetype,
-    };
-  }
-  if (content.videoMessage) {
-    return {
-      mediaUrl: content.videoMessage.url,
-      mediaCaption: content.videoMessage.caption,
-      mediaMimetype: content.videoMessage.mimetype,
-    };
-  }
-  if (content.documentMessage) {
-    return {
-      mediaUrl: content.documentMessage.url,
-      mediaCaption: content.documentMessage.caption, // texto enviado junto
-      mediaMimetype: content.documentMessage.mimetype,
-      mediaFileName:
-        content.documentMessage.fileName ?? content.documentMessage.title,
-    };
-  }
-  if (content.stickerMessage) {
-    return {
-      mediaUrl: content.stickerMessage.url,
-      mediaMimetype: content.stickerMessage.mimetype,
-    };
-  }
-  return {};
-}
 
 /**
  * Normaliza o payload do webhook Z-PRO.
@@ -101,17 +53,7 @@ export function normalizeZproWebhook(
   const contact = ticket.contact;
   const messageType = (msg.type ?? "conversation") as ZproMessageType;
   const msgContent = msg.data?.message;
-
-  // Texto principal: body para conversation, extendedTextMessage.text para rich text,
-  // ou caption da mídia como fallback, ou string vazia
-  const body =
-    msg.body ??
-    msgContent?.extendedTextMessage?.text ??
-    msgContent?.imageMessage?.caption ??
-    msgContent?.videoMessage?.caption ??
-    msgContent?.documentMessage?.caption ??
-    "";
-
+  const body = extractMessageBody(msg);
   const media = extractMedia(msgContent);
 
   return {

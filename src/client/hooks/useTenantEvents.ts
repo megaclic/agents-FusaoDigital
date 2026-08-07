@@ -59,6 +59,22 @@ export type TenantRealtimeEvent =
       tenantId: string;
       agentId: string;
       updatedAt: string;
+    }
+  | {
+      type: "zpro-message";
+      at: number;
+      tenantId: string;
+      conversationId: string;
+      ticketId: number;
+      senderType: "CLIENT" | "AGENT" | "HUMAN";
+    }
+  | {
+      type: "zpro-agent-toggled";
+      at: number;
+      tenantId: string;
+      conversationId: string;
+      ticketId: number;
+      agentActive: boolean;
     };
 
 export interface ConversationRealtimeEvent {
@@ -91,6 +107,18 @@ export interface AgentConfigRealtimeEvent {
   updatedAt: string;
 }
 
+export interface ZproMessageRealtimeEvent {
+  conversationId: string;
+  ticketId: number;
+  senderType: "CLIENT" | "AGENT" | "HUMAN";
+}
+
+export interface ZproAgentToggledRealtimeEvent {
+  conversationId: string;
+  ticketId: number;
+  agentActive: boolean;
+}
+
 export interface UseTenantEventsOptions {
   enabled?: boolean;
   // Fired for every `conversation` event on the active tenant's channel.
@@ -104,6 +132,11 @@ export interface UseTenantEventsOptions {
   // Fired when an agent's config changed (saved via the editor, the REST API, or the MCP server). The
   // open editor compares `updatedAt` against the version it loaded to warn before overwriting.
   onAgentConfig?: (event: AgentConfigRealtimeEvent) => void;
+  // Fired when a Z-PRO ticket gets a new mirrored message (any sender).
+  onZproMessage?: (event: ZproMessageRealtimeEvent) => void;
+  // Fired when a Z-PRO ticket's agent gate (n8nStatus) changes, automatically (human intervened)
+  // or manually (toggle button in the Z-PRO inbox).
+  onZproAgentToggled?: (event: ZproAgentToggledRealtimeEvent) => void;
 }
 
 export function useTenantEvents(options: UseTenantEventsOptions = {}) {

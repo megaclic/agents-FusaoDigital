@@ -112,6 +112,8 @@ model Tenant {
   zproInstances                 ZproInstance[]
   zproWebhookDeliveries         ZproWebhookDelivery[]
   zproAgentBindings             ZproAgentBinding[]
+  zproConversations             ZproConversation[]
+  zproMessages                  ZproMessage[]
   inboxes                       Inbox[]
   contacts                      Contact[]
   conversations                 Conversation[]
@@ -519,6 +521,7 @@ model ZproInstance {
   tenant            Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   webhookDeliveries ZproWebhookDelivery[]
   agentBindings     ZproAgentBinding[]
+  conversations     ZproConversation[]
 
   // Um whatsappId é único por tenant (não pode ter dois canais iguais no mesmo tenant).
   @@unique([tenantId, whatsappId])
@@ -563,6 +566,68 @@ model ZproAgentBinding {
   @@unique([tenantId, zproInstanceId, agentId])
   @@index([tenantId])
   @@map("zpro_agent_bindings")
+}
+
+// Espelho de um ticket Z-PRO — a fonte de verdade do inbox do painel. Criado na primeira mensagem
+// recebida do ticket, atualizado a cada mensagem seguinte (status, lastMessageAt, agentActive).
+// Equivalente ao par Conversation+Contact do Chatwoot, fundidos numa tabela só (Z-PRO não expõe um
+// contactId estável fora do ticket).
+model ZproConversation {
+  id               BigInt    @id @default(autoincrement())
+  tenantId         BigInt    @map("tenant_id")
+  zproInstanceId   BigInt    @map("zpro_instance_id")
+  ticketId         Int       @map("ticket_id") // ticket.id do Z-PRO
+  ticketProtocol   String?   @map("ticket_protocol") // ticket.protocol
+  status           String    @default("open") // open|pending|closed
+  contactId        Int       @map("contact_id") // ticket.contact.id
+  contactNumber    String    @map("contact_number") // ticket.contact.number
+  contactName      String    @map("contact_name") // ticket.contact.name
+  agentActive      Boolean   @default(false) @map("agent_active") // n8nStatus espelhado
+  humanUserId      Int?      @map("human_user_id") // ticket.userId quando humano ativo
+  lastMessageAt    DateTime? @map("last_message_at")
+  lastMessageBody  String?   @map("last_message_body")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  zproInstance ZproInstance  @relation(fields: [zproInstanceId], references: [id], onDelete: Cascade)
+  messages     ZproMessage[]
+
+  @@unique([zproInstanceId, ticketId])
+  @@index([tenantId])
+  @@index([tenantId, status])
+  @@map("zpro_conversations")
+}
+
+// Cada mensagem de um ticket Z-PRO (cliente, agente IA ou atendente humano).
+model ZproMessage {
+  id             BigInt         @id @default(autoincrement())
+  tenantId       BigInt         @map("tenant_id")
+  conversationId BigInt         @map("conversation_id")
+  messageId      String         @map("message_id") // msg.id do Z-PRO (dedup)
+  senderType     ZproSenderType @map("sender_type") // CLIENT | AGENT | HUMAN
+  body           String         @default("")
+  messageType    String         @map("message_type") // conversation|audioMessage|etc
+  mediaUrl       String?        @map("media_url")
+  mediaCaption   String?        @map("media_caption")
+  mediaFileName  String?        @map("media_file_name")
+  fromMe         Boolean        @map("from_me")
+  timestamp      BigInt // msg.timestamp (unix ms)
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversation ZproConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, messageId])
+  @@index([tenantId])
+  @@index([conversationId, timestamp])
+  @@map("zpro_messages")
+}
+
+enum ZproSenderType {
+  CLIENT
+  AGENT
+  HUMAN
 }
 
 // ──────────────────────────────────────────────── agent config ──

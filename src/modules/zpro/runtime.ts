@@ -33,16 +33,13 @@ import {
   type ModelConfig,
   parseModelConfig,
 } from "@/graph/models";
-import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { runScopedOn } from "@/lib/tenancy";
 import { type FlowContext, withFlowStage } from "@/modules/flowlog/service";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
 import { ZproClient } from "./client";
+import { sysCtx } from "./ctx";
 import { sendTextReply, sendTyping } from "./messages";
 import type { NormalizedZproEvent } from "./types";
-
-function sysCtx(tenantId: bigint): TenantContext {
-  return { tenantId, userId: null, role: "TENANT_ADMIN" };
-}
 
 // Chave canônica do thread do checkpointer para um ticket Z-PRO. Mirrors chatwootThreadId's
 // tenant+instance prefix (application-level tenant fence for the checkpointer), com um segmento

@@ -155,6 +155,33 @@ export interface AgentConfigEvent {
   updatedAt: string;
 }
 
+// NOTE: A Z-PRO ticket got a new mirrored message (any sender: client, AI agent, or human
+// attendant). Fans out on the per-tenant topic so the Z-PRO inbox list/detail update live.
+// METADATA ONLY by construction (no message body/contact PII) — the client refetches/appends via
+// REST, mirroring ConversationEvent's PII discipline. See docs/zpro-mirror (mirror.ts).
+export type ZproSenderTypeValue = "CLIENT" | "AGENT" | "HUMAN";
+
+export interface ZproMessageEvent {
+  type: "zpro-message";
+  at: number;
+  tenantId: string;
+  conversationId: string;
+  ticketId: number;
+  senderType: ZproSenderTypeValue;
+}
+
+// NOTE: A Z-PRO ticket's agent gate (n8nStatus) changed — either automatically (a human attendant
+// intervened while the agent was still active) or manually (the toggle button in the Z-PRO inbox).
+// Fans out on the per-tenant topic.
+export interface ZproAgentToggledEvent {
+  type: "zpro-agent-toggled";
+  at: number;
+  tenantId: string;
+  conversationId: string;
+  ticketId: number;
+  agentActive: boolean;
+}
+
 export type ServerEvent =
   | PresenceTick
   | ChatMessage
@@ -163,7 +190,9 @@ export type ServerEvent =
   | ConversationEvent
   | AgentActivityEvent
   | KnowledgeDocumentEvent
-  | AgentConfigEvent;
+  | AgentConfigEvent
+  | ZproMessageEvent
+  | ZproAgentToggledEvent;
 
 type Publisher = (topic: string, data: string) => unknown;
 let publisher: Publisher = () => {};
@@ -279,6 +308,36 @@ export function broadcastAgentConfigEvent(
 ): void {
   publish(TOPICS.tenant(tenantId), {
     type: "agent-config",
+    at: Date.now(),
+    tenantId: tenantId.toString(),
+    ...data,
+  });
+}
+
+// NOTE: Z-PRO inbox live update — a mirrored message arrived (any sender). Called from
+// mirror.ts's mirrorZproMessage, outside any WS handler, the same background-publish pattern the
+// realtime doc blesses. Metadata only (see ZproMessageEvent).
+export function broadcastZproMessage(
+  tenantId: bigint,
+  data: Omit<ZproMessageEvent, "type" | "at" | "tenantId">,
+): void {
+  publish(TOPICS.tenant(tenantId), {
+    type: "zpro-message",
+    at: Date.now(),
+    tenantId: tenantId.toString(),
+    ...data,
+  });
+}
+
+// NOTE: Z-PRO agent-gate indicator. Called from the webhook's auto-handoff branch (human
+// intervened) and the toggle-agent endpoint (manual) — both outside any WS handler, same
+// background-publish pattern.
+export function broadcastZproAgentToggled(
+  tenantId: bigint,
+  data: Omit<ZproAgentToggledEvent, "type" | "at" | "tenantId">,
+): void {
+  publish(TOPICS.tenant(tenantId), {
+    type: "zpro-agent-toggled",
     at: Date.now(),
     tenantId: tenantId.toString(),
     ...data,
