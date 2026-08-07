@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
@@ -61,52 +61,39 @@ if (appUrl && suUrl) {
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
 
+// NOTE: The read tools (tenant_list/tenant_get) work in EVERY edition, so their fixture tenant is
+// seeded straight through Prisma rather than through tenant_create. Provisioning is the only
+// Pro-side surface here (tenantCreate calls the paired tenants.admin.service, a ProEditionError stub
+// in Free), so only that one case is @full-only — routing the whole fixture through it would have
+// dragged the reads down with it in the Free tree.
 describe.skipIf(!dbUp)("MCP fleet tools (DB)", () => {
-  const slug = `fleet-${process.pid}`;
-  let createdId = 0n;
+  const prefix = `fleet-${process.pid}`;
+  const slug = `${prefix}-seed`;
+  let seededId = 0n;
 
+  beforeAll(async () => {
+    const t = await suDb.tenant.create({ data: { name: "Fleet Co", slug } });
+    seededId = t.id;
+  });
+
+  // Covers both the seeded tenant and the one the Full-only case provisions, so the cleanup needs no
+  // marker of its own.
   afterAll(async () => {
-    if (createdId) {
+    const rows = await suDb.tenant.findMany({
+      where: { slug: { startsWith: prefix } },
+      select: { id: true },
+    });
+    for (const { id } of rows) {
       await suDb.$executeRawUnsafe(
-        `DELETE FROM audit_logs WHERE target = 'tenant:${createdId}'`,
+        `DELETE FROM audit_logs WHERE target = 'tenant:${id}'`,
       );
-      await suDb.$executeRawUnsafe(
-        `DELETE FROM tenants WHERE id = ${createdId}`,
-      );
+      await suDb.$executeRawUnsafe(`DELETE FROM tenants WHERE id = ${id}`);
     }
     await suDb.$disconnect();
     await appDb.$disconnect();
   });
 
-  test("tenant_create dry-run creates nothing; apply provisions + audits", async () => {
-    const p = superAdmin();
-    const dry = await tenantCreate(
-      p,
-      { name: "Fleet Co", slug },
-      { base: appDb },
-    );
-    expect(dry.ok).toBe(true);
-    if (dry.ok) expect(dry.data.dryRun).toBe(true);
-    expect(await suDb.tenant.count({ where: { slug } })).toBe(0);
-
-    const applied = await tenantCreate(
-      p,
-      { name: "Fleet Co", slug, dry_run: false },
-      { base: appDb },
-    );
-    expect(applied.ok).toBe(true);
-    if (applied.ok) {
-      const tenant = applied.data.tenant as { id: string };
-      createdId = BigInt(tenant.id);
-    }
-    expect(await suDb.tenant.count({ where: { slug } })).toBe(1);
-    const audits = await suDb.auditLog.count({
-      where: { action: "mcp.tenant_create", target: `tenant:${createdId}` },
-    });
-    expect(audits).toBe(1);
-  });
-
-  test("tenant_list (cross-tenant) includes the new tenant", async () => {
+  test("tenant_list (cross-tenant) includes the seeded tenant", async () => {
     const r = await tenantList(superAdmin(), { base: appDb });
     expect(r.ok).toBe(true);
     if (r.ok) {
@@ -118,7 +105,7 @@ describe.skipIf(!dbUp)("MCP fleet tools (DB)", () => {
   test("tenant_get returns any tenant by id", async () => {
     const r = await tenantGet(
       superAdmin(),
-      { tenant_id: String(createdId) },
+      { tenant_id: String(seededId) },
       { base: appDb },
     );
     expect(r.ok).toBe(true);

@@ -1,4 +1,5 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { isTurnInFlight } from "@/graph/inflight";
 import { parseThreadId, runAgentNudge } from "@/graph/nudge";
@@ -406,5 +407,18 @@ export async function ensureAllTenantSweeps(
   const tenants = await asSuperAdminOn(base, (db) =>
     db.tenant.findMany({ select: { id: true } }),
   );
-  for (const t of tenants) await ensureTenantSweep(t.id, base);
+  // NOTE: per-tenant, best-effort. The list and the writes are not one transaction, so a tenant
+  // deleted in between makes its enqueue fail on the FK — and a bare loop would abort there, leaving
+  // EVERY tenant after it unswept until the next restart, silently. One tenant's failure must not
+  // cost the rest their self-heal, so it is logged and the loop continues.
+  for (const t of tenants) {
+    try {
+      await ensureTenantSweep(t.id, base);
+    } catch (err) {
+      logger.warn(
+        { tenantId: String(t.id), err },
+        "follow-up sweep re-arm failed for tenant; continuing",
+      );
+    }
+  }
 }

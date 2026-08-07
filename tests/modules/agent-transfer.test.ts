@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
+import config from "@/config";
 import type { TenantContext } from "@/lib/tenancy";
 import {
   type AgentExport,
@@ -295,6 +296,21 @@ describe.skipIf(!dbUp)("agent export/import", () => {
     };
     await expect(importAgent(ctx(), stripped, appDb)).rejects.toThrow(
       /invalid agent export payload/,
+    );
+  });
+
+  test("import REJECTS a system prompt over the cap with the specific error", async () => {
+    const exp = await exportAgent(ctx(), agentId, appDb);
+    const oversized = {
+      ...exp,
+      agent: {
+        ...exp.agent,
+        name: "Vendedora PromptGigante",
+        systemPrompt: "p".repeat(config.agent.promptMaxChars + 1),
+      },
+    };
+    await expect(importAgent(ctx(), oversized, appDb)).rejects.toThrow(
+      /system prompt is too long/,
     );
   });
 

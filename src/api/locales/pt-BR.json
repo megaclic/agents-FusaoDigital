@@ -54,6 +54,7 @@
     "noUpdatableFields": "Nenhum campo atualizável foi informado",
     "passwordChangeUnavailable": "Password change is not available for this account",
     "proEdition": "Este recurso requer a edição Pro",
+    "promptTooLong": "O prompt do sistema é longo demais: {{len}} caracteres (limite {{max}}).",
     "providerModelsFailed": "Não foi possível obter a lista de modelos do provedor.",
     "rateLimitExceeded": "Limite de requisições excedido. Tente novamente mais tarde.",
     "setupAlreadyComplete": "A configuração inicial já foi concluída",

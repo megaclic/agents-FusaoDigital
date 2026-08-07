@@ -16,6 +16,7 @@ import {
   listWebhookSubscriptions,
   updateWebhookSubscription,
 } from "@/modules/webhooks/outbound/subscriptions";
+import { outboundUrl } from "../utils/outbound";
 
 // ── pure unit (no DB) ──
 
@@ -128,12 +129,12 @@ describe.skipIf(!dbUp)("webhook subscription CRUD", () => {
     const sub = await createWebhookSubscription(
       ctxA(),
       {
-        url: "https://example.com/hook",
+        url: outboundUrl("/hook"),
         events: ["conversation.created", "llm.usage"],
       },
       appDb,
     );
-    expect(sub.url).toBe("https://example.com/hook");
+    expect(sub.url).toBe(outboundUrl("/hook"));
     expect(sub.events).toEqual(["conversation.created", "llm.usage"]);
     expect(sub.enabled).toBe(true);
     expect(sub.secretRef).toBeNull();
@@ -158,7 +159,7 @@ describe.skipIf(!dbUp)("webhook subscription CRUD", () => {
   test("rejects an unknown event with a 400", async () => {
     const err = await createWebhookSubscription(
       ctxA(),
-      { url: "https://example.com/hook", events: ["conversion"] },
+      { url: outboundUrl("/hook"), events: ["conversion"] },
       appDb,
     ).catch((e) => e);
     expect(err).toBeInstanceOf(AppError);
@@ -182,7 +183,7 @@ describe.skipIf(!dbUp)("webhook subscription CRUD", () => {
   test("tenant B cannot update or delete tenant A's subscription", async () => {
     const sub = await createWebhookSubscription(
       ctxA(),
-      { url: "https://example.com/fenced", events: ["conversation.created"] },
+      { url: outboundUrl("/fenced"), events: ["conversation.created"] },
       appDb,
     );
     const updErr = await updateWebhookSubscription(

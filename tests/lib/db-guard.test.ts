@@ -26,17 +26,33 @@ const suDb = su as PrismaClient;
 const SAFE_ROLE = `secv4_guard_safe_${process.pid}`;
 let tmp: PrismaClient | undefined;
 
+// NOTE: roles and database grants live in CLUSTER-WIDE catalogs (pg_authid, pg_database), which
+// Postgres does not serialize for concurrent DDL — two suites running at once against the same
+// server hit `XX000: tuple concurrently updated` even though each uses its own pid-suffixed role.
+// The role name keeps them from clashing logically; this advisory lock keeps them from clashing
+// physically, by making each run take its turn through the catalog writes.
+async function withRoleCatalogLock(
+  statements: (db: PrismaClient) => Promise<void>,
+): Promise<void> {
+  await suDb.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(729104553)`;
+    await statements(tx as unknown as PrismaClient);
+  });
+}
+
 describe.skipIf(!dbUp)("assertRuntimeRoleIsNotSuperuser", () => {
   beforeAll(async () => {
     // A throwaway NON-superuser, NON-bypassrls role to prove the safe path. Built from the su URL
     // with the credentials swapped.
-    await suDb.$executeRawUnsafe(`DROP ROLE IF EXISTS ${SAFE_ROLE}`);
-    await suDb.$executeRawUnsafe(
-      `CREATE ROLE ${SAFE_ROLE} LOGIN PASSWORD 'guardpw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`,
-    );
-    await suDb.$executeRawUnsafe(
-      `GRANT CONNECT ON DATABASE "${dbName(suUrl as string)}" TO ${SAFE_ROLE}`,
-    );
+    await withRoleCatalogLock(async (db) => {
+      await db.$executeRawUnsafe(`DROP ROLE IF EXISTS ${SAFE_ROLE}`);
+      await db.$executeRawUnsafe(
+        `CREATE ROLE ${SAFE_ROLE} LOGIN PASSWORD 'guardpw' NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`,
+      );
+      await db.$executeRawUnsafe(
+        `GRANT CONNECT ON DATABASE "${dbName(suUrl as string)}" TO ${SAFE_ROLE}`,
+      );
+    });
     const tmpUrl = (suUrl as string).replace(
       /\/\/[^@]+@/,
       `//${SAFE_ROLE}:guardpw@`,
@@ -49,10 +65,12 @@ describe.skipIf(!dbUp)("assertRuntimeRoleIsNotSuperuser", () => {
 
   afterAll(async () => {
     if (tmp) await tmp.$disconnect();
-    await suDb.$executeRawUnsafe(
-      `REVOKE ALL ON DATABASE "${dbName(suUrl as string)}" FROM ${SAFE_ROLE}`,
-    );
-    await suDb.$executeRawUnsafe(`DROP ROLE IF EXISTS ${SAFE_ROLE}`);
+    await withRoleCatalogLock(async (db) => {
+      await db.$executeRawUnsafe(
+        `REVOKE ALL ON DATABASE "${dbName(suUrl as string)}" FROM ${SAFE_ROLE}`,
+      );
+      await db.$executeRawUnsafe(`DROP ROLE IF EXISTS ${SAFE_ROLE}`);
+    });
     await suDb.$disconnect();
   });
 

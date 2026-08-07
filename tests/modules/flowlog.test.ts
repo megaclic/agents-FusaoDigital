@@ -13,6 +13,7 @@ import {
 import { listExecutionLogs } from "@/modules/flowlog/read";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { withFlowStage } from "@/modules/flowlog/service";
+import { outboundUrl } from "../utils/outbound";
 
 // withFlowStage control flow is pure when no flow context is wired (zero overhead, just runs fn).
 describe("withFlowStage (no context)", () => {
@@ -100,27 +101,27 @@ describe.skipIf(!dbUp)("flowlog", () => {
       {
         name: "Ops",
         type: "discord",
-        url: "https://discord.com/api/webhooks/123/secret-token",
+        url: outboundUrl("/api/webhooks/123/secret-token"),
       },
       appDb,
     );
-    expect(dto.urlMasked).toContain("discord.com");
+    expect(dto.urlMasked).toContain("203.0.113");
     expect(dto.urlMasked).not.toContain("secret-token");
     // Stored value is an encrypted blob, not the URL.
     const raw = await suDb.alertChannel.findUnique({
       where: { id: BigInt(dto.id) },
       select: { url: true },
     });
-    expect(raw?.url).not.toContain("discord.com");
+    expect(raw?.url).not.toContain("203.0.113");
     expect(decryptJson<string>(raw?.url ?? "")).toBe(
-      "https://discord.com/api/webhooks/123/secret-token",
+      outboundUrl("/api/webhooks/123/secret-token"),
     );
   });
 
   test("update + delete + RLS isolation for channels", async () => {
     const a = await createAlertChannel(
       ctx(tenantA),
-      { name: "A", type: "webhook", url: "https://example.com/hook" },
+      { name: "A", type: "webhook", url: outboundUrl("/hook") },
       appDb,
     );
     // Tenant B cannot see or update tenant A's channel (RLS → NotFound).
@@ -150,7 +151,7 @@ describe.skipIf(!dbUp)("flowlog", () => {
       {
         name: "all",
         type: "discord",
-        url: "https://discord.com/api/webhooks/x",
+        url: outboundUrl("/api/webhooks/x"),
       },
       appDb,
     );
@@ -159,7 +160,7 @@ describe.skipIf(!dbUp)("flowlog", () => {
       {
         name: "stt",
         type: "discord",
-        url: "https://discord.com/api/webhooks/y",
+        url: outboundUrl("/api/webhooks/y"),
         stages: ["stt"],
       },
       appDb,

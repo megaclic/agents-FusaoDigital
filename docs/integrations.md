@@ -20,12 +20,30 @@ Endpoint: `POST /api/v1/integrations/inbound/:routeToken` (`integrations.control
 
 Flow (`receiveInbound` → ack; `processInboundDelivery` → detached async):
 
-1. **Resolve tenant by route token.** The token is an opaque 256-bit value; only its SHA-256 hash is stored (`IntegrationInstance.routeTokenHash`, unique), so lookup is a constant-time B-tree probe (no linear scan / timing oracle) and a DB dump yields no usable token. The plaintext is returned **once** at creation (`createIntegrationInstance`) and never logged. Resolution is cross-tenant → `asSuperAdmin`.
+1. **Resolve tenant by route token.** The token is an opaque 256-bit value. Its SHA-256 hash is stored in `IntegrationInstance.routeTokenHash` (unique), so lookup is a constant-time B-tree probe — no linear scan, no timing oracle. Resolution is cross-tenant → `asSuperAdmin`. See "The webhook URL is re-readable" below for why the token itself is *also* stored, encrypted.
 2. **Verify auth AFTER resolving the tenant** (so the secret read is tenant-scoped). Strategies: `NONE` | `STATIC_HEADER` | `HMAC_SHA256` (secret from the vault by `inboundSecretRef`; header names overridable per instance via `config`, because providers dictate their own). Unknown token, disabled instance, and bad auth all return the **same uniform 401** (no oracle for which tokens are live).
 3. **Ack fast (<5s), process async.** A slow/non-2xx ack makes some providers (Chatwoot) auto-escalate `pending→open`. `receiveInbound` does the cheap work (resolve, auth, normalize, persist) and returns; the controller fires `processInboundDelivery` detached.
 4. **Normalize via the integration's pure mapper** (below). `{ ok: false, reason: "unhandled" }` (lifecycle noise we deliberately skip) → ignored, no persistence. `{ ok: false, reason: "invalid" }` (the payload SHOULD have matched and did not — schema drift) → `logger.warn` (catalogType/instance/zod issue paths only, never the body) + a durable `FAILED` delivery with `payload: { reason: "invalid", issues }` and a body-digest dedupeKey, same fail-closed mold as no-mapper; the response carries `outcome: "invalid"` so the provider's delivery log shows the distinction.
 5. **Persist an idempotent `InboundDelivery`** — unique `(tenantId, integrationInstanceId, dedupeKey)`. The stored `payload` is the mapper's **allowlisted** projection (PII-bearing; never the raw external JSON, never echoed in logs/audit). A duplicate returns the existing id.
 6. **Dispatch** (`processInboundDelivery`) under a status CAS (`PENDING→PROCESSING→PROCESSED`, re-entry is a no-op). `conversion` → correlate `externalId`→thread via `IntegrationExternalRef` then record `ConversionEvent` idempotently (`ON CONFLICT DO NOTHING`, so the surrounding tx stays alive); an uncorrelated/duplicate conversion is dropped with a log, never invented. `status_update`/`agent_nudge` are declared **seams** (Fases 3/4), no-op for now.
+
+### The webhook URL is re-readable (and rotatable)
+
+The operator pastes `…/api/v1/integrations/inbound/<routeToken>` into the provider's dashboard (Asaas). That is an **address**, not the authenticator — inbound calls are authenticated by `inboundAuthStrategy` + the vault secret — and an address you cannot look up again is a dead end: configure Asaas from another machine, or simply lose the tab, and the integration is unrecoverable.
+
+So the token is persisted **twice**, each copy serving a different reader:
+
+| Column | Form | Read by |
+| --- | --- | --- |
+| `routeTokenHash` | SHA-256 | the hot inbound path (`resolveInboundRouteByToken`), a unique-index probe |
+| `routeToken` | `encryptJson()` blob in a plain `String` column | the editor, via `GET /v1/integrations/instances/:id` |
+
+Consequences worth knowing:
+
+- **Only the single-instance read returns it.** `GET /instances` leaves `routeToken` null — that screen shows no URL, so shipping N tokens to the browser would be pure exposure. The list/update/delete DTOs never carry it either.
+- **Three states, never two.** The DTO carries `routeTokenStatus`: `present` (readable), `absent` (nothing stored — an instance older than this column, or an outbound-only entry), `unreadable` (a blob the key can no longer decrypt). A decrypt failure degrades instead of throwing — the one place that bends the "throw, don't fall back" rule of the [Encryption](../CLAUDE.md#encryption) section, deliberately: nothing downstream makes a security decision on this value, and throwing would 500 the edit modal of every integration. But it must not collapse into `absent` either, or the editor tells the operator "this predates the feature" when the real cause is the key. Both non-present states recover by rotating; the UI just names the right one. The `logger.warn` on failure is the ops signal.
+- **`GET /instances/:id` sets `Cache-Control: no-store`.** It is the only read that returns the decrypted token and nothing global sets the header (same treatment as `branding.controller.ts`).
+- **`POST /instances/:id/route-token` rotates.** It mints a new token, replaces both columns, and returns the plaintext. **The old URL stops resolving the moment it commits**, so the caller must tell the operator to update the provider — the editor does this with a danger-styled confirm. Rotation covers the two cases the stored copy cannot: a row created before the column existed (`routeToken` null — hash-only, plaintext gone for good) and a leaked URL. Outbound-only catalog entries (Calendar/Drive) have no inbound surface, so rotating one is a 400.
 
 ## Mappers (`src/modules/integrations/mappers.ts`)
 
@@ -52,6 +70,8 @@ One clinic calendar serves MANY WhatsApp contacts, so every event the agent crea
 - **List** filters server-side by `privateExtendedProperty=secv4Contact=<stamp>` AND re-verifies each returned event's stamp client-side (`eventStamp(e) === stamp`). The re-verify is defense in depth; when it drops an event the server fence already should have excluded, it logs `gcal: list re-verify dropped events…` (a non-zero `dropped` count is a signal the fence is leaking). With no contact in scope (playground) the per-contact tools refuse outright.
 - **Update / cancel** re-fetch the event (`?fields=extendedProperties`) and refuse with `FOREIGN_EVENT` unless the stamp matches, so an id-guess can never touch another contact's (or a staff-created) appointment.
 - **Availability** is `freeBusy` (busy windows only, zero details) → another contact's bookings count as busy without leaking anything; it returns EVERY bookable slot in a range capped to 24h.
+
+**Meet room on create (`createMeetLink`, default ON):** `calendar_create_event` asks Google for a `hangoutsMeet` conference and the event projection exposes it as `meetLink` — THE link to hand the customer (`htmlLink` is only the event's calendar page, useless to a lead). Two API traps, pinned by tests: the request must carry `conferenceDataVersion=1` (otherwise `conferenceData` is silently ignored, no error) and `createRequest.requestId` must be unique per event (a reused id returns the SAME room, putting different leads in one meeting). If the response still has the room pending, one cheap re-read fetches the link; an account without Meet keeps the event, just without a conference. Operators using the calendar purely as a busy-block set `createMeetLink: false` in the instance config (toggle in the editor's Calendars tab).
 
 **Legacy/staff events without a stamp are invisible to the agent by design** (the list fence and the re-verify both exclude them; update/cancel refuse them) — not a bug, the cost of fail-closed.
 

@@ -10,6 +10,7 @@ import {
   webhookCreate,
   webhookDelete,
 } from "@/modules/mcp/write-webhooks";
+import { outboundUrl } from "../utils/outbound";
 
 // Webhook/alert/integration write tools: gate is DB-free; dry-run, secret-by-reference, and the
 // DB-only apply paths (create/delete) need a real Postgres. External delivery (webhook_test) is
@@ -30,7 +31,7 @@ function principal(over: Partial<VerifiedToken>): VerifiedToken {
 describe("MCP webhooks/alerts/integrations gate (no DB)", () => {
   test("webhook_create without mcp:write → insufficient_scope", async () => {
     const r = await webhookCreate(principal({ scopes: ["mcp:read"] }), {
-      url: "https://x.example.com",
+      url: outboundUrl(),
       events: ["heartbeat"],
     });
     expect(r.ok).toBe(false);
@@ -39,7 +40,7 @@ describe("MCP webhooks/alerts/integrations gate (no DB)", () => {
 
   test("webhook_create with unknown event → error", async () => {
     const r = await webhookCreate(principal({}), {
-      url: "https://x.example.com",
+      url: outboundUrl(),
       events: ["not.a.real.event"],
     });
     expect(r.ok).toBe(false);
@@ -108,7 +109,7 @@ describe.skipIf(!dbUp)("MCP webhooks/alerts/integrations tools (DB)", () => {
         tenantId: tenantA,
         name: "discord-url",
         kind: "generic",
-        secret: encryptJson("https://discord.com/api/webhooks/123/abcdefTOKEN"),
+        secret: encryptJson(outboundUrl("/api/webhooks/123/abcdefTOKEN")),
       },
     });
   });
@@ -142,7 +143,7 @@ describe.skipIf(!dbUp)("MCP webhooks/alerts/integrations tools (DB)", () => {
     const r = await webhookCreate(
       p,
       {
-        url: "https://example.com/in",
+        url: outboundUrl("/in"),
         events: ["conversation.created"],
         secret_ref: "wh-secret",
         dry_run: false,
@@ -151,7 +152,7 @@ describe.skipIf(!dbUp)("MCP webhooks/alerts/integrations tools (DB)", () => {
     );
     expect(r.ok).toBe(true);
     const row = await suDb.webhookSubscription.findFirst({
-      where: { tenantId: tenantA, url: "https://example.com/in" },
+      where: { tenantId: tenantA, url: outboundUrl("/in") },
     });
     expect(row?.secretRef).toBe(`vault:${secretId}`);
     const audits = await suDb.auditLog.count({
@@ -232,7 +233,7 @@ describe.skipIf(!dbUp)("MCP webhooks/alerts/integrations tools (DB)", () => {
     const own = await webhookCreate(
       principal({ tenantId: tenantA }),
       {
-        url: "https://example.com/fenced",
+        url: outboundUrl("/fenced"),
         events: ["heartbeat"],
         dry_run: false,
       },
@@ -240,7 +241,7 @@ describe.skipIf(!dbUp)("MCP webhooks/alerts/integrations tools (DB)", () => {
     );
     expect(own.ok).toBe(true);
     const row = await suDb.webhookSubscription.findFirst({
-      where: { tenantId: tenantA, url: "https://example.com/fenced" },
+      where: { tenantId: tenantA, url: outboundUrl("/fenced") },
     });
     const r = await webhookDelete(
       principal({ tenantId: tenantB }),

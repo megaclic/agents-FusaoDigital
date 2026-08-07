@@ -128,8 +128,11 @@ async function claimWhere(
   base: PrismaClient,
   now: Date,
   kindFilter: Prisma.Sql,
+  tenantId?: bigint,
 ): Promise<ClaimedJob[]> {
   const lim = Math.min(Math.max(Math.floor(limit), 1), 100);
+  const tenantClause =
+    tenantId != null ? Prisma.sql`AND tenant_id = ${tenantId}` : Prisma.empty;
   return asSuperAdminOn(base, async (db) => {
     const rows = await db.$queryRaw<
       Array<{
@@ -144,6 +147,7 @@ async function claimWhere(
       WHERE id IN (
         SELECT id FROM scheduler_jobs
         WHERE status = 'PENDING' AND run_at <= ${now} AND ${kindFilter}
+          ${tenantClause}
         ORDER BY run_at
         FOR UPDATE SKIP LOCKED
         LIMIT ${lim}
@@ -163,12 +167,18 @@ async function claimWhere(
 // dedicated fast tick to honor the per-agent window, and leaving them here would make a flush wait
 // up to a full scheduler interval. (A stray DEBOUNCE here would still be handled correctly, but the
 // fast worker is the intended drain.)
+// NOTE: `tenantId` is test-only isolation, same as the alert worker's. The claim is cross-tenant by
+// design (single-leader in production), so two suites running at once against the shared test
+// database steal each other's jobs — the LIMIT fills with the other run's rows, or SKIP LOCKED hands
+// them over outright, and the test that enqueued a job simply does not find it back. Leave it unset
+// in production.
 export function claimDueJobs(
   limit: number,
   base: PrismaClient = basePrisma,
   now: Date = new Date(),
+  tenantId?: bigint,
 ): Promise<ClaimedJob[]> {
-  return claimWhere(limit, base, now, Prisma.sql`kind <> 'DEBOUNCE'`);
+  return claimWhere(limit, base, now, Prisma.sql`kind <> 'DEBOUNCE'`, tenantId);
 }
 
 // The fast debounce tick claims ONLY debounce jobs.
@@ -176,8 +186,9 @@ export function claimDueDebounceJobs(
   limit: number,
   base: PrismaClient = basePrisma,
   now: Date = new Date(),
+  tenantId?: bigint,
 ): Promise<ClaimedJob[]> {
-  return claimWhere(limit, base, now, Prisma.sql`kind = 'DEBOUNCE'`);
+  return claimWhere(limit, base, now, Prisma.sql`kind = 'DEBOUNCE'`, tenantId);
 }
 
 // Terminal success.
@@ -246,21 +257,25 @@ export async function failJob(
 }
 
 // Reaper: a CLAIMED row older than `staleMs` is presumed crashed → back to PENDING (attempts++ so
-// poison eventually dies). Cross-tenant, so asSuperAdmin.
+// poison eventually dies). Cross-tenant, so asSuperAdmin. `tenantId` is the same test-only fence as
+// the claim's: without it, a concurrent suite's reap bumps this run's attempts underneath it.
 export async function reapStaleJobs(
   staleMs: number,
   base: PrismaClient = basePrisma,
   now: Date = new Date(),
+  tenantId?: bigint,
 ): Promise<number> {
   const cutoff = new Date(now.getTime() - staleMs);
+  const tenantClause =
+    tenantId != null ? Prisma.sql`AND tenant_id = ${tenantId}` : Prisma.empty;
   return asSuperAdminOn(base, async (db) => {
-    const requeued = await db.$executeRaw`
+    const requeued = await db.$executeRaw(Prisma.sql`
       UPDATE scheduler_jobs
       SET status = CASE WHEN attempts + 1 >= ${MAX_ATTEMPTS} THEN 'DEAD'::"SchedulerJobStatus" ELSE 'PENDING'::"SchedulerJobStatus" END,
           attempts = attempts + 1,
           claimed_at = NULL,
           updated_at = now()
-      WHERE status = 'CLAIMED' AND claimed_at < ${cutoff}`;
+      WHERE status = 'CLAIMED' AND claimed_at < ${cutoff} ${tenantClause}`);
     return requeued;
   });
 }

@@ -54,6 +54,7 @@
     "noUpdatableFields": "No updatable fields provided",
     "passwordChangeUnavailable": "Password change is not available for this account",
     "proEdition": "This feature requires the Pro edition",
+    "promptTooLong": "System prompt is too long: {{len}} characters (limit {{max}}).",
     "providerModelsFailed": "Failed to retrieve model list from provider.",
     "rateLimitExceeded": "Rate limit exceeded. Please try again later.",
     "setupAlreadyComplete": "Initial setup has already been completed",

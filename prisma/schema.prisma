@@ -9,7 +9,9 @@
 //   * Secrets at rest are encryptJson() base64 blobs stored in plain String columns
 //     (never Json, never logged). VaultEntry.secret, ChatwootInstance.*Token, etc.
 //   * Opaque tokens (routeToken, quote access token) are stored as SHA-256 hashes for
-//     constant-time unique-index lookup; the plaintext is shown once at creation.
+//     constant-time unique-index lookup. The quote token is shown once at creation.
+//     IntegrationInstance.routeToken ALSO keeps an encryptJson() copy so the operator can
+//     re-read the inbound webhook URL in the editor (see the model for why).
 //   * `catalogType` is a String validated against the in-code integration registry, not a
 //     DB enum, so new integrations need no enum migration.
 
@@ -381,6 +383,15 @@ model Contact {
   email             String?
   phone             String?
   attributes        Json     @default("{}")
+  // Mirror of the contact's Chatwoot custom attributes (meta.sender.custom_attributes, refreshed on
+  // every webhook event). Read-only projection: the agent WRITES through the Chatwoot API and this
+  // column follows. Feeds the per-agent attribute context injected into the system prompt, so a turn
+  // never has to call Chatwoot to know what is already stored.
+  // customAttributesAt is this bag's SOURCE watermark (the Chatwoot event timestamp it came from),
+  // not a row mtime: the contact upsert runs outside the per-conversation lock and a contact can be
+  // touched by several conversations, so the write is gated on it to keep the snapshot monotonic.
+  customAttributes   Json      @default("{}") @map("custom_attributes")
+  customAttributesAt DateTime? @map("custom_attributes_at")
   // Per-contact audio-reply preference (TTS mode "preference"): true = wants audio, false = wants
   // text, null = unknown (falls back to mirroring what the customer sent). Set by the agent's
   // set_voice_preference native tool. RLS-scoped column — NOT a Chatwoot custom attribute.
@@ -415,6 +426,12 @@ model Conversation {
   // real name instead of "Human #id". NULL when unassigned or assigned to a bot.
   assigneeName           String?   @map("assignee_name")
   threadId               String    @map("thread_id") // tenantId:instanceId:convId
+  // Mirror of the conversation's Chatwoot custom attributes and of the LINKED KANBAN CARD's ones
+  // (conversation.custom_attributes / conversation.kanban_task.custom_attributes on the webhook
+  // payload). Same contract as Contact.customAttributes: refreshed on every event, read by the
+  // attribute-context block. kanbanAttributes stays {} on upstream Chatwoot (no card in the payload).
+  customAttributes       Json      @default("{}") @map("custom_attributes")
+  kanbanAttributes       Json      @default("{}") @map("kanban_attributes")
   lastEventAt            DateTime? @map("last_event_at")
   // Debounce watermark: the Chatwoot message id of the last inbound message already handled
   // (responded to or deliberately skipped). The flush re-fetches and answers only ids beyond it,
@@ -906,8 +923,14 @@ model McpServerConnection {
   @@map("mcp_server_connections")
 }
 
-// NOTE: routeToken is stored as a SHA-256 hash for constant-time unique-index lookup;
-// inbound auth secret lives in the vault by reference. See docs/integrations.md.
+// NOTE: routeTokenHash is the SHA-256 of the route token, for constant-time unique-index lookup on
+// the hot inbound path. `routeToken` is the SAME token as an encryptJson() blob, kept because the
+// operator pastes this URL into the provider's dashboard (Asaas) and legitimately needs to re-read
+// it later — a hash-only design forced a rotation (and a re-paste upstream) just to see it again.
+// It is an ADDRESS, not the authenticator: inbound calls are authenticated by inboundAuthStrategy +
+// the vault secret. Returned only by GET /instances/:id (never by the list), never logged.
+// NULL on rows created before this column existed → the editor offers a rotation instead.
+// The inbound auth secret itself lives in the vault by reference. See docs/integrations.md.
 model IntegrationInstance {
   id                  BigInt              @id @default(autoincrement())
   tenantId            BigInt              @map("tenant_id")
@@ -919,6 +942,7 @@ model IntegrationInstance {
   inboundAuthStrategy InboundAuthStrategy @default(NONE) @map("inbound_auth_strategy")
   inboundSecretRef    String?             @map("inbound_secret_ref")
   routeTokenHash      String?             @unique @map("route_token_hash")
+  routeToken          String?             @map("route_token")
   createdAt           DateTime            @default(now()) @map("created_at")
   updatedAt           DateTime            @updatedAt @map("updated_at")
 

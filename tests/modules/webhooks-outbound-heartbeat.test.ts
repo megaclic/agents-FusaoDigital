@@ -11,6 +11,7 @@ import {
   createWebhookSubscription,
   deleteWebhookSubscription,
 } from "@/modules/webhooks/outbound/subscriptions";
+import { outboundUrl } from "../utils/outbound";
 
 // Heartbeat emitter: the per-tenant HEARTBEAT SchedulerJob is armed lazily by subscription mutations
 // (syncTenantHeartbeat) and self-terminates when no enabled `heartbeat` subscription remains. The
@@ -102,14 +103,14 @@ describe.skipIf(!dbUp)("heartbeat emitter", () => {
 
     await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/hb1", events: ["heartbeat"] },
+      { url: outboundUrl("/hb1"), events: ["heartbeat"] },
       appDb,
     );
     expect(await pendingHeartbeatJobs()).toBe(1);
 
     await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/hb2", events: ["heartbeat"] },
+      { url: outboundUrl("/hb2"), events: ["heartbeat"] },
       appDb,
     );
     // Still exactly one job row (and it is active) despite two subscriptions.
@@ -121,7 +122,7 @@ describe.skipIf(!dbUp)("heartbeat emitter", () => {
     await clearTenantWebhookState();
     await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/other", events: ["conversation.created"] },
+      { url: outboundUrl("/other"), events: ["conversation.created"] },
       appDb,
     );
     expect(await pendingHeartbeatJobs()).toBe(0);
@@ -131,12 +132,12 @@ describe.skipIf(!dbUp)("heartbeat emitter", () => {
     await clearTenantWebhookState();
     await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/hb1", events: ["heartbeat"] },
+      { url: outboundUrl("/hb1"), events: ["heartbeat"] },
       appDb,
     );
     await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/hb2", events: ["heartbeat", "llm.usage"] },
+      { url: outboundUrl("/hb2"), events: ["heartbeat", "llm.usage"] },
       appDb,
     );
 
@@ -158,7 +159,7 @@ describe.skipIf(!dbUp)("heartbeat emitter", () => {
     await clearTenantWebhookState();
     const sub = await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/hb1", events: ["heartbeat"] },
+      { url: outboundUrl("/hb1"), events: ["heartbeat"] },
       appDb,
     );
     expect(await pendingHeartbeatJobs()).toBe(1);
@@ -176,7 +177,7 @@ describe.skipIf(!dbUp)("heartbeat emitter", () => {
     await clearTenantWebhookState();
     await createWebhookSubscription(
       ctx(),
-      { url: "https://example.com/hb1", events: ["heartbeat"] },
+      { url: outboundUrl("/hb1"), events: ["heartbeat"] },
       appDb,
     );
     expect(await pendingHeartbeatJobs()).toBe(1);

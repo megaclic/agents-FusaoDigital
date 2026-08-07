@@ -7,6 +7,7 @@ import {
   signOutbound,
   verifyOutboundSignature,
 } from "@/modules/webhooks/outbound/signing";
+import { outboundUrl } from "../utils/outbound";
 
 describe("outbound webhook signing", () => {
   test("signOutbound is deterministic and prefixed", () => {
@@ -62,7 +63,7 @@ describe.skipIf(!dbUp)("emitOutbound", () => {
     await su.webhookSubscription.create({
       data: {
         tenantId,
-        url: "https://example.com/hook",
+        url: outboundUrl("/hook"),
         events: ["conversation.created", "conversation.status_changed"],
         enabled: true,
       },
@@ -70,7 +71,7 @@ describe.skipIf(!dbUp)("emitOutbound", () => {
     await su.webhookSubscription.create({
       data: {
         tenantId,
-        url: "https://example.com/disabled",
+        url: outboundUrl("/disabled"),
         events: ["conversation.created"],
         enabled: false,
       },

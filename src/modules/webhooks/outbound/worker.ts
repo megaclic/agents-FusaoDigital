@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
@@ -40,6 +40,11 @@ export interface OutboundWorkerOptions {
   fetchImpl?: typeof fetch;
   assertSafe?: (url: string) => Promise<URL>;
   now?: () => number;
+  // NOTE: test-only isolation, mirroring the alert worker's. Scopes the claim + reap to one tenant
+  // so two suites sharing the test database cannot steal each other's deliveries (the claim is
+  // cross-tenant, and SKIP LOCKED hands a row to whoever gets there first). Unset in production =
+  // global claim, which is correct under the single-leader invariant.
+  tenantId?: bigint;
 }
 
 export interface OutboundBatchSummary {
@@ -100,11 +105,16 @@ async function reapStaleSending(
   base: PrismaClient,
   staleMs: number,
   now: () => number,
+  tenantId?: bigint,
 ): Promise<number> {
   const cutoff = new Date(now() - staleMs);
   const { count } = await asSuperAdminOn(base, (db) =>
     db.outboundWebhookDelivery.updateMany({
-      where: { status: "SENDING", updatedAt: { lt: cutoff } },
+      where: {
+        status: "SENDING",
+        updatedAt: { lt: cutoff },
+        ...(tenantId != null ? { tenantId } : {}),
+      },
       data: { status: "PENDING" },
     }),
   );
@@ -117,7 +127,12 @@ async function reapStaleSending(
 async function claimDueDeliveries(
   base: PrismaClient,
   limit: number,
+  tenantId?: bigint,
 ): Promise<ClaimedDelivery[]> {
+  const tenantClause =
+    tenantId != null
+      ? Prisma.sql`AND d2.tenant_id = ${tenantId}`
+      : Prisma.empty;
   return asSuperAdminOn(
     base,
     (db) =>
@@ -131,6 +146,7 @@ async function claimDueDeliveries(
         WHERE d2.status = 'PENDING'
           AND (d2.next_attempt_at IS NULL OR d2.next_attempt_at <= now())
           AND s2.enabled = true
+          ${tenantClause}
         ORDER BY d2.next_attempt_at NULLS FIRST, d2.id
         FOR UPDATE OF d2 SKIP LOCKED
         LIMIT ${limit}
@@ -291,10 +307,12 @@ export async function processOutboundBatch(
     base,
     opts.staleMs ?? STALE_SENDING_MS,
     now,
+    opts.tenantId,
   );
   const claimed = await claimDueDeliveries(
     base,
     opts.claimLimit ?? CLAIM_LIMIT,
+    opts.tenantId,
   );
   const outcomes = await mapWithConcurrency(
     claimed,

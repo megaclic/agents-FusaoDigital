@@ -141,6 +141,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const { fetchImpl } = stubFetch(200);
     const summary = await processOutboundBatch({
       base: appDb,
+      tenantId,
       fetchImpl,
       assertSafe: passthroughSafe,
     });
@@ -157,6 +158,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const { fetchImpl, calls } = stubFetch(200);
     await processOutboundBatch({
       base: appDb,
+      tenantId,
       fetchImpl,
       assertSafe: passthroughSafe,
     });
@@ -185,6 +187,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const { fetchImpl } = stubFetch(500);
     await processOutboundBatch({
       base: appDb,
+      tenantId,
       fetchImpl,
       assertSafe: passthroughSafe,
     });
@@ -204,6 +207,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const { fetchImpl } = stubFetch(503);
     await processOutboundBatch({
       base: appDb,
+      tenantId,
       fetchImpl,
       assertSafe: passthroughSafe,
     });
@@ -217,6 +221,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const { fetchImpl, calls } = stubFetch(200);
     await processOutboundBatch({
       base: appDb,
+      tenantId,
       fetchImpl,
       assertSafe: passthroughSafe,
     });
@@ -242,7 +247,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const id = await seedDelivery({ subscriptionId: blockedSub.id });
     const { fetchImpl, calls } = stubFetch(200);
     // Real SSRF guard (not the passthrough): the metadata/loopback URL must be rejected.
-    await processOutboundBatch({ base: appDb, fetchImpl });
+    await processOutboundBatch({ base: appDb, tenantId, fetchImpl });
     expect(calls.length).toBe(0); // never reached fetch
     const row = await readDelivery(id);
     expect(row.status).toBe("DEAD");
@@ -261,6 +266,7 @@ describe.skipIf(!dbUp)("outbound delivery worker", () => {
     const { fetchImpl } = stubFetch(200);
     const summary = await processOutboundBatch({
       base: appDb,
+      tenantId,
       fetchImpl,
       assertSafe: passthroughSafe,
       staleMs: 60_000,

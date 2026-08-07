@@ -107,6 +107,7 @@ const app = new Elysia({
             getLocaleFromHeader(request.headers.get("accept-language")),
             error.translationKey,
             error.message,
+            error.translationParams,
           )
         : error.message;
       // NOTE: keep set.status in sync — the access log in onAfterResponse reads it,

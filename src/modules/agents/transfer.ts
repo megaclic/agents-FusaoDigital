@@ -35,7 +35,13 @@ import {
   VAULT_REF_PREFIX,
 } from "@/modules/vault/service";
 import { generateRouteToken } from "@/modules/webhooks/inbound/route-token";
-import { AGENT_SELECT, type AgentDto, requireTenant, toDto } from "./service";
+import {
+  AGENT_SELECT,
+  type AgentDto,
+  assertPromptSize,
+  requireTenant,
+  toDto,
+} from "./service";
 
 export const AGENT_EXPORT_KIND = "fusaodigital.agent";
 export const AGENT_EXPORT_VERSION = 1;
@@ -152,7 +158,7 @@ export const agentExportSchema = z.object({
     .optional(),
   agent: z.object({
     name: z.string().min(1).max(200),
-    systemPrompt: z.string().max(50_000),
+    systemPrompt: z.string().max(config.agent.promptMaxChars),
     modelConfig: z.record(z.string(), z.unknown()),
     settings: z.record(z.string(), z.unknown()),
     transferWithSummary: z.boolean(),
@@ -741,6 +747,13 @@ export async function importAgent(
   base: PrismaClient = basePrisma,
 ): Promise<ImportAgentResult> {
   const tenantId = requireTenant(ctx);
+  // NOTE: size check BEFORE the schema parse — past the cap the operator gets the specific
+  // prompt-too-long error, not the generic invalid-payload one.
+  if (raw && typeof raw === "object") {
+    const sp = (raw as { agent?: { systemPrompt?: unknown } }).agent
+      ?.systemPrompt;
+    if (typeof sp === "string") assertPromptSize(sp);
+  }
   const parsed = agentExportSchema.safeParse(raw);
   if (!parsed.success) {
     throw new AppError(

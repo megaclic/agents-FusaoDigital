@@ -51,8 +51,11 @@ describe.skipIf(!dbUp)("scheduler", () => {
       data: { name: "SCH", slug: `sch-${process.pid}` },
     });
     tenantId = t.id;
-    // clear any stray jobs so the cross-tenant claim only sees ours
-    await suDb.$executeRawUnsafe(`DELETE FROM scheduler_jobs`);
+    // NOTE: this used to wipe scheduler_jobs GLOBALLY so the cross-tenant claim would only see this
+    // file's rows. That made the file destructive to anything else on the database — including a
+    // second suite running at the same time, whose jobs vanished mid-test. The claim and the reaper
+    // now take a tenant fence instead (see claimDueJobs), so the isolation no longer needs a
+    // table-wide delete.
   });
 
   afterAll(async () => {
@@ -137,7 +140,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
       runAt: past(),
       base: appDb,
     });
-    const claimed = await claimDueJobs(10, appDb);
+    const claimed = await claimDueJobs(10, appDb, new Date(), tenantId);
     const mine = claimed.find((j) => j.id === id);
     expect(mine).toBeDefined();
     expect((await statusOf(id)).status).toBe("CLAIMED");
@@ -153,7 +156,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
       runAt: past(),
       base: appDb,
     });
-    await claimDueJobs(10, appDb);
+    await claimDueJobs(10, appDb, new Date(), tenantId);
     await rescheduleJob(
       tenantId,
       id,
@@ -175,7 +178,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
       payload: { threadId: "1:2:3" },
       base: appDb,
     });
-    await claimDueJobs(10, appDb);
+    await claimDueJobs(10, appDb, new Date(), tenantId);
     // Reschedule to the past so it can be re-claimed for the second leg of the test.
     await rescheduleJob(
       tenantId,
@@ -192,7 +195,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
     expect(row.payload).toEqual({ threadId: "1:2:3", stepIndex: 1 });
 
     // Omitting the payload on a later reschedule keeps the current one.
-    await claimDueJobs(10, appDb);
+    await claimDueJobs(10, appDb, new Date(), tenantId);
     await rescheduleJob(tenantId, id, past(), undefined, appDb);
     const row2 = await suDb.schedulerJob.findUniqueOrThrow({
       where: { id },
@@ -209,7 +212,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
       runAt: past(),
       base: appDb,
     });
-    await claimDueJobs(10, appDb);
+    await claimDueJobs(10, appDb, new Date(), tenantId);
     await failJob(tenantId, id, 0, "boom", appDb);
     expect((await statusOf(id)).status).toBe("PENDING"); // retry
     // simulate near the cap
@@ -234,7 +237,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
       where: { id },
       data: { status: "CLAIMED", claimedAt: new Date(Date.now() - 600_000) },
     });
-    const reaped = await reapStaleJobs(5 * 60_000, appDb);
+    const reaped = await reapStaleJobs(5 * 60_000, appDb, new Date(), tenantId);
     expect(reaped).toBeGreaterThanOrEqual(1);
     const s = await statusOf(id);
     expect(s.status).toBe("PENDING");
@@ -254,7 +257,9 @@ describe.skipIf(!dbUp)("scheduler", () => {
       runAt: past(),
       base: appDb,
     });
-    const claimed = (await claimDueJobs(10, appDb)).find((j) => j.id === id);
+    const claimed = (await claimDueJobs(10, appDb, new Date(), tenantId)).find(
+      (j) => j.id === id,
+    );
     expect(claimed).toBeDefined();
     await runClaimed(claimed as NonNullable<typeof claimed>, appDb);
     expect(seen).toBe(true);

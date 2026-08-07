@@ -1,4 +1,5 @@
 import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
@@ -78,5 +79,16 @@ export async function ensureAllFlowlogSweeps(
   const tenants = await asSuperAdminOn(base, (db) =>
     db.tenant.findMany({ select: { id: true } }),
   );
-  for (const t of tenants) await ensureFlowlogSweep(t.id, base);
+  // Same best-effort discipline as ensureAllTenantSweeps: one tenant failing (deleted between the
+  // list and the write, transient error) must not deprive every later tenant of its boot re-arm.
+  for (const t of tenants) {
+    try {
+      await ensureFlowlogSweep(t.id, base);
+    } catch (err) {
+      logger.warn(
+        { tenantId: String(t.id), err },
+        "flowlog sweep re-arm failed for tenant; continuing",
+      );
+    }
+  }
 }

@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import { broadcastAgentConfigEvent } from "@/api/features/realtime/realtime.service";
 import basePrisma from "@/api/lib/prisma";
+import config from "@/config";
 import { DEFAULT_MODEL_CONFIG, modelConfigSchema } from "@/graph/model-config";
 import {
   NATIVE_TOOL_NAMES,
@@ -226,12 +227,37 @@ export async function getAgent(
   return toDto(row);
 }
 
+// NOTE: the cap is a deliberate checkpoint (oversized prompts usually hold knowledge-base
+// content and degrade instruction adherence), raised only via AGENT_PROMPT_MAX_CHARS — on
+// purpose, no UI affordance points at the override. Checked BEFORE the schema parse so every
+// transport surfaces this localized error instead of a raw validation failure.
+export class PromptTooLongError extends AppError {
+  constructor(length: number) {
+    const max = config.agent.promptMaxChars;
+    super(
+      `system prompt is too long: ${length} characters (limit ${max})`,
+      400,
+      "errors.promptTooLong",
+      { len: length, max },
+    );
+  }
+}
+
+export function assertPromptSize(systemPrompt: string | undefined): void {
+  if (
+    systemPrompt !== undefined &&
+    systemPrompt.length > config.agent.promptMaxChars
+  ) {
+    throw new PromptTooLongError(systemPrompt.length);
+  }
+}
+
 // Allowlist of editable fields. tenantId/id are never touched; modelConfig/settings must be
 // objects (the runtime's own parser validates their inner shape at load time).
 export const agentUpdateSchema = z
   .object({
     name: z.string().min(1).max(200).optional(),
-    systemPrompt: z.string().max(50_000).optional(),
+    systemPrompt: z.string().max(config.agent.promptMaxChars).optional(),
     enabled: z.boolean().optional(),
     mode: z.enum(AGENT_MODES).optional(),
     transferWithSummary: z.boolean().optional(),
@@ -266,6 +292,7 @@ export async function updateAgent(
   // change made elsewhere (another tab, the REST API, or the MCP server). Omitted ⇒ last-write-wins.
   opts: { expectedUpdatedAt?: Date } = {},
 ): Promise<AgentDto> {
+  assertPromptSize(patch.systemPrompt);
   const data = agentUpdateSchema.parse(patch);
   validateModelConfigForWrite(data.modelConfig);
   const { businessHoursId, followUpHoursId, ...rest } = data;
@@ -396,7 +423,7 @@ export function requireTenant(ctx: TenantContext): bigint {
 export const agentCreateSchema = z
   .object({
     name: z.string().min(1).max(200),
-    systemPrompt: z.string().max(50_000).optional(),
+    systemPrompt: z.string().max(config.agent.promptMaxChars).optional(),
     enabled: z.boolean().optional(),
     mode: z.enum(AGENT_MODES).optional(),
     transferWithSummary: z.boolean().optional(),
@@ -414,6 +441,7 @@ export async function createAgent(
   base: PrismaClient = basePrisma,
 ): Promise<AgentDto> {
   const tenantId = requireTenant(ctx);
+  assertPromptSize(input.systemPrompt);
   const data = agentCreateSchema.parse(input);
   validateModelConfigForWrite(data.modelConfig);
   const bhId =

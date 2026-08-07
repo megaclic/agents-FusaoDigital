@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
+import config from "@/config";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import {
   agentList,
@@ -68,6 +69,15 @@ describe("MCP write gate (no DB)", () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("invalid agent_id");
+  });
+
+  test("system_prompt over the cap → err on the DRY-RUN path too, before any DB access", async () => {
+    const r = await promptSet(principal({}), {
+      agent_id: "1",
+      system_prompt: "p".repeat(config.agent.promptMaxChars + 1),
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("system prompt is too long");
   });
 
   test("credential_create requires mcp:write", async () => {
@@ -483,22 +493,6 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     );
     expect("ref" in res).toBe(true);
     if ("ref" in res) expect(res.ref).toMatch(/^vault:\d+$/);
-  });
-
-  test("tenant_update applies name + audits", async () => {
-    const p = principal({ tenantId: tenantA });
-    const r = await tenantUpdate(
-      p,
-      { name: "WA renamed", dry_run: false },
-      { base: appDb },
-    );
-    expect(r.ok).toBe(true);
-    const row = await suDb.tenant.findUnique({ where: { id: tenantA } });
-    expect(row?.name).toBe("WA renamed");
-    const audits = await suDb.auditLog.count({
-      where: { tenantId: tenantA, action: "mcp.tenant_update" },
-    });
-    expect(audits).toBe(1);
   });
 
   test("agent_list returns the tenant's agents (id, name, enabled)", async () => {

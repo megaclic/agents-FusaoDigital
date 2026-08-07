@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import i18n from "i18next";
+import { createInstance } from "i18next";
 import en from "@/api/locales/en.json";
 import ptBR from "@/api/locales/pt-BR.json";
 
@@ -10,6 +10,11 @@ interface RequestContext {
 }
 
 export const requestContext = new AsyncLocalStorage<RequestContext>();
+
+// NOTE: own instance, NOT the i18next singleton — the client bundle inits the singleton with the
+// CLIENT locales, and any context where both coexist (bun test workers) would clobber the server
+// resources (silently falling back to defaultValue).
+const i18n = createInstance();
 
 i18n.init({
   resources: {
@@ -35,8 +40,14 @@ export function translateWithLocale(
   locale: Locale,
   key: string,
   defaultValue?: string,
+  params?: Record<string, string | number>,
 ): string {
-  return i18n.t(key, { lng: locale, defaultValue: defaultValue ?? key });
+  // NOTE: params spread into the options bag — i18next resolves {{placeholders}} from it.
+  return i18n.t(key, {
+    lng: locale,
+    defaultValue: defaultValue ?? key,
+    ...params,
+  });
 }
 
 export function getLocaleFromHeader(acceptLanguage: string | null): Locale {

@@ -42,6 +42,7 @@ const {
   AGENTS_UPDATE_CHECK_URL,
   HUB_UPDATES_TTL_MS,
   AGENT_MODEL_CONCURRENCY,
+  AGENT_PROMPT_MAX_CHARS,
   DB_POOL_MAX,
 } = process.env;
 
@@ -69,6 +70,11 @@ const parseDomainList = (
 };
 
 const googleClientId = (GOOGLE_CLIENT_ID ?? "").trim();
+
+// NOTE: strict parse — anything but a finite positive integer (Infinity, NaN, 0, negatives,
+// fractions) falls back to the default, so the prompt-size guard can never be disabled by a
+// malformed value.
+const agentPromptMaxChars = Number(AGENT_PROMPT_MAX_CHARS);
 
 const config = {
   packageInfo: {
@@ -145,6 +151,14 @@ const config = {
       AGENT_MODEL_CONCURRENCY && Number(AGENT_MODEL_CONCURRENCY) > 0
         ? Number(AGENT_MODEL_CONCURRENCY)
         : 20,
+    // NOTE: Hard cap (characters) on an agent's system prompt, enforced at the service layer for
+    // every transport (console/REST/MCP) and at import. A deliberate checkpoint, not a technical
+    // ceiling: prompts past tens of KB usually hold knowledge-base content and degrade instruction
+    // adherence. Intentionally surfaced only as a save error — no UI affordance points here.
+    promptMaxChars:
+      Number.isSafeInteger(agentPromptMaxChars) && agentPromptMaxChars > 0
+        ? agentPromptMaxChars
+        : 100_000,
   },
   // NOTE: Outbound webhook delivery worker. Single-replica by construction (a reentrancy
   // guard + interval; see docs/deploy.md "Single replica" for the leader pattern when scaling).

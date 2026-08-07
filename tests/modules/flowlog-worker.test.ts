@@ -4,6 +4,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import type { TenantContext } from "@/lib/tenancy";
 import { processAlertBatch } from "@/modules/flowlog/alert-worker";
 import { createAlertChannel } from "@/modules/flowlog/channels";
+import { outboundUrl } from "../utils/outbound";
 
 // Alert worker: claim → deliver/retry/dead, and the coalesce window. The claim is cross-tenant, so
 // each test asserts ITS OWN delivery row by id (a default-204 fetch makes any co-claimed row a
@@ -82,18 +83,24 @@ describe.skipIf(!dbUp)("alert worker", () => {
       {
         name: "ok",
         type: "discord",
-        url: "https://discord.com/api/webhooks/ok",
+        url: outboundUrl("/api/webhooks/ok"),
       },
       appDb,
     );
     const id = await makeDelivery(BigInt(ch.id));
-    await processAlertBatch({
+    const batch = await processAlertBatch({
       base: appDb,
       tenantId,
       coalesceWindowMs: 0,
       fetchImpl: ok204,
       now: () => Date.now(),
     });
+    // NOTE: assert the CLAIM before the outcome. Every observed flake in this file has been the row
+    // not being picked up at all, and `status is PENDING, expected DELIVERED` does not say whether
+    // the claim missed it or the delivery failed — checking the summary first names the cause.
+    // Lower-bound, not exact: the claim is allowed to sweep up a sibling test's retry row (see the
+    // note at the top of the file), so pinning it to 1 would trade one flake for another.
+    expect(batch.claimed).toBeGreaterThanOrEqual(1);
     const row = await suDb.alertDelivery.findUnique({ where: { id } });
     expect(row?.status).toBe("DELIVERED");
     expect(row?.attempts).toBe(1);
@@ -105,7 +112,7 @@ describe.skipIf(!dbUp)("alert worker", () => {
       {
         name: "retry",
         type: "webhook",
-        url: "https://example.com/retry",
+        url: outboundUrl("/retry"),
       },
       appDb,
     );
@@ -114,13 +121,14 @@ describe.skipIf(!dbUp)("alert worker", () => {
       new Response(null, {
         status: url.includes("/retry") ? 500 : 204,
       })) as unknown as typeof fetch;
-    await processAlertBatch({
+    const batch = await processAlertBatch({
       base: appDb,
       tenantId,
       coalesceWindowMs: 0,
       fetchImpl,
       now: () => Date.now(),
     });
+    expect(batch.claimed).toBeGreaterThanOrEqual(1);
     const row = await suDb.alertDelivery.findUnique({ where: { id } });
     expect(row?.status).toBe("PENDING");
     expect(row?.attempts).toBe(1);
@@ -133,7 +141,7 @@ describe.skipIf(!dbUp)("alert worker", () => {
       {
         name: "dead",
         type: "webhook",
-        url: "https://example.com/blocked",
+        url: outboundUrl("/blocked"),
       },
       appDb,
     );
@@ -142,7 +150,7 @@ describe.skipIf(!dbUp)("alert worker", () => {
       if (url.includes("/blocked")) throw new Error("ssrf blocked");
       return new URL(url);
     };
-    await processAlertBatch({
+    const batch = await processAlertBatch({
       base: appDb,
       tenantId,
       coalesceWindowMs: 0,
@@ -150,6 +158,7 @@ describe.skipIf(!dbUp)("alert worker", () => {
       assertSafe,
       now: () => Date.now(),
     });
+    expect(batch.claimed).toBeGreaterThanOrEqual(1);
     const row = await suDb.alertDelivery.findUnique({ where: { id } });
     expect(row?.status).toBe("DEAD");
   });
@@ -160,7 +169,7 @@ describe.skipIf(!dbUp)("alert worker", () => {
       {
         name: "window",
         type: "discord",
-        url: "https://discord.com/api/webhooks/window",
+        url: outboundUrl("/api/webhooks/window"),
       },
       appDb,
     );

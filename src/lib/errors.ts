@@ -8,11 +8,20 @@ export class AppError extends Error {
   // Without it, the raw `message` reaches the client (fine for protocol/internal errors
   // like OAuth `invalid_grant`, wrong for user-facing flows — set a key there).
   readonly translationKey?: string;
-  constructor(message: string, statusCode: number, translationKey?: string) {
+  // NOTE: interpolation values for translationKey ({{placeholders}} in the locale entry).
+  // `message` must arrive pre-interpolated: it is the log line and the untranslated fallback.
+  readonly translationParams?: Record<string, string | number>;
+  constructor(
+    message: string,
+    statusCode: number,
+    translationKey?: string,
+    translationParams?: Record<string, string | number>,
+  ) {
     super(message);
     this.name = new.target.name;
     this.statusCode = statusCode;
     this.translationKey = translationKey;
+    this.translationParams = translationParams;
   }
 }
 

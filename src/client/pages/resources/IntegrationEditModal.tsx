@@ -12,6 +12,8 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
+  ConfirmDialog,
+  type ConfirmPayload,
   CredentialPicker,
   FormField,
   Input,
@@ -106,6 +108,7 @@ function defaultConfig(catalogType: string): Record<string, unknown> {
         businessHoursId: "",
         slotDurationMinutes: 30,
         slotGranularityMinutes: 15,
+        createMeetLink: true,
         appointmentReminders: {
           enabled: false,
           offsetsHours: [24, 1],
@@ -535,6 +538,16 @@ export function IntegrationEditModal({
   };
   const { showToast } = useToast();
   const tokenModal = useModalController<{ url: string }>();
+  const rotateConfirm = useModalController<ConfirmPayload>();
+  // NOTE: The instance's inbound webhook token, read back on edit so the operator can copy the URL
+  // again. When it is null the STATUS says why: "absent" (nothing was ever stored — an instance
+  // older than this feature) vs "unreadable" (a blob the key can no longer decrypt). Both are fixed
+  // by rotating, but pointing at the wrong cause sends the operator hunting in the wrong place.
+  const [routeToken, setRouteToken] = useState<string | null>(null);
+  const [routeTokenStatus, setRouteTokenStatus] = useState<
+    "present" | "absent" | "unreadable"
+  >("absent");
+  const [rotating, setRotating] = useState(false);
   const [catalog, setCatalog] = useState<CatalogEntry[]>([]);
   const [form, setForm] = useState<Form>(emptyForm());
   const [saving, setSaving] = useState(false);
@@ -667,6 +680,8 @@ export function IntegrationEditModal({
               setCatalog(list);
               return list;
             })();
+        setRouteToken(null);
+        setRouteTokenStatus("absent");
         if (!payloadId) {
           const first = catList[0];
           const ct = first?.catalogType ?? "";
@@ -703,6 +718,8 @@ export function IntegrationEditModal({
           inboundSecretRef: inst.inboundSecretRef ?? "",
         };
         setForm(next);
+        setRouteToken(inst.routeToken);
+        setRouteTokenStatus(inst.routeTokenStatus);
         formBaseline.current = JSON.stringify(next);
         syncSlotModes(next.config);
         // Pre-load the credential's calendars/folders so the picker reflects the saved selection.
@@ -800,6 +817,52 @@ export function IntegrationEditModal({
       void navigator.clipboard?.writeText(url);
       showToast(t("common.copied", "Copied"), "success");
     }
+  }
+
+  const inboundUrl = (token: string) =>
+    `${window.location.origin}/api/v1/integrations/inbound/${token}`;
+
+  function copyInboundUrl() {
+    if (!routeToken) return;
+    void navigator.clipboard?.writeText(inboundUrl(routeToken));
+    showToast(t("common.copied", "Copied"), "success");
+  }
+
+  // NOTE: Rotation is destructive from the provider's point of view — the old URL stops resolving
+  // the moment this commits, so the confirm spells that out instead of a generic "are you sure".
+  function askRotate() {
+    rotateConfirm.open({
+      title: t("integrations.webhook.rotateTitle", "Generate a new URL"),
+      message: t(
+        "integrations.webhook.rotateMessage",
+        "The current URL stops working immediately. You must paste the new one into the provider's panel, or payment notifications stop arriving.",
+      ),
+      danger: true,
+      confirmLabel: t("integrations.webhook.rotateConfirm", "Generate"),
+      onConfirm: async () => {
+        if (!editId) return;
+        setRotating(true);
+        try {
+          const { data, error } = await api.api.v1.integrations
+            .instances({ id: editId })
+            ["route-token"].post();
+          if (error || !data) throw error ?? new Error("no data");
+          setRouteToken(data.routeToken);
+          tokenModal.open({ url: inboundUrl(data.routeToken) });
+        } catch (e) {
+          showToast(
+            t("integrations.webhook.rotateError", "Could not generate."),
+            "error",
+          );
+          // NOTE: Rethrow — ConfirmDialog's contract is that a throwing onConfirm keeps the dialog
+          // open (the caller owns the toast). Swallowing it closes the dialog on failure, which
+          // reads as "done" for an action that did not happen.
+          throw e;
+        } finally {
+          setRotating(false);
+        }
+      },
+    });
   }
 
   const selectedCatalog = catalog.find(
@@ -1418,6 +1481,20 @@ export function IntegrationEditModal({
                         "Spacing is the gap between offered start times: 15 min means 09:00 and 09:15 can both be offered.",
                       )}
                     </p>
+                    <SwitchField
+                      checked={cfg.createMeetLink !== false}
+                      onCheckedChange={(v) => setCfg({ createMeetLink: v })}
+                      label={t(
+                        "integrations.config.createMeetLink",
+                        "Create a Google Meet room for each appointment",
+                      )}
+                    />
+                    <p className="text-text-muted text-xs">
+                      {t(
+                        "integrations.config.createMeetLinkHint",
+                        "The agent then shares the Meet link with the customer. Turn it off if this calendar is only used to block time slots.",
+                      )}
+                    </p>
                   </div>
                 )}
                 {calTab === "reminders" && (
@@ -1653,6 +1730,61 @@ export function IntegrationEditModal({
                     "When a charge is paid, Asaas calls this webhook and the agent is woken on the exact conversation that generated the charge. It then decides whether to message the customer (and may use its tools). You paste the webhook URL into the Asaas panel after saving.",
                   )}
                 </p>
+                {/* The URL only exists once the instance does, so it shows on edit, never create. */}
+                {editId && (
+                  <FormField
+                    label={t("integrations.webhook.url", "Webhook URL")}
+                    group
+                    description={
+                      routeToken
+                        ? t(
+                            "integrations.webhook.urlHint",
+                            "Paste this into the provider's panel.",
+                          )
+                        : routeTokenStatus === "unreadable"
+                          ? t(
+                              "integrations.webhook.urlUnreadable",
+                              "The stored URL can no longer be decrypted, which usually means the encryption key changed. Generate a new one and update it in the provider's panel.",
+                            )
+                          : t(
+                              "integrations.webhook.urlMissing",
+                              "This integration was created before the URL could be shown again, so we no longer have it. Generate a new one and update it in the provider's panel.",
+                            )
+                    }
+                  >
+                    <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                      {routeToken && (
+                        <>
+                          <Input
+                            readOnly
+                            value={inboundUrl(routeToken)}
+                            onFocus={(e) => e.currentTarget.select()}
+                            aria-label={t(
+                              "integrations.webhook.url",
+                              "Webhook URL",
+                            )}
+                            className="font-mono text-xs"
+                          />
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            onClick={copyInboundUrl}
+                          >
+                            {t("common.copy", "Copy")}
+                          </Button>
+                        </>
+                      )}
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        loading={rotating}
+                        onClick={askRotate}
+                      >
+                        {t("integrations.webhook.rotate", "Generate new URL")}
+                      </Button>
+                    </div>
+                  </FormField>
+                )}
                 <SwitchField
                   checked={cfg.notifyOnPayment !== false}
                   onCheckedChange={(v) => setCfg({ notifyOnPayment: v })}
@@ -1726,7 +1858,7 @@ export function IntegrationEditModal({
           <p className="text-sm text-text-secondary">
             {t(
               "integrations.tokenHint",
-              "Copy this URL into the provider's webhook settings. It is shown only once.",
+              "Copy this URL into the provider's webhook settings. You can read it again later by editing this integration.",
             )}
           </p>
           <div className="flex items-center gap-2">
@@ -1740,6 +1872,8 @@ export function IntegrationEditModal({
           </div>
         </div>
       </Modal>
+
+      <ConfirmDialog modal={rotateConfirm} />
     </>
   );
 }

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
+import config from "@/config";
 import { buildNativeTools } from "@/graph/tools/native";
 import type { TenantContext } from "@/lib/tenancy";
 import {
@@ -12,6 +13,7 @@ import {
   getAgentToolSelections,
   listAgents,
   listAgentsPaged,
+  PromptTooLongError,
   replaceAgentToolSelections,
   updateAgent,
 } from "@/modules/agents/service";
@@ -719,5 +721,37 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
         appDb,
       ),
     ).rejects.toThrow();
+  });
+
+  test("create/update reject a system prompt over the cap with the localized error", async () => {
+    const boom = "p".repeat(config.agent.promptMaxChars + 1);
+    try {
+      await createAgent(
+        ctx(tenantC),
+        { name: "TooBig", systemPrompt: boom },
+        appDb,
+      );
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(PromptTooLongError);
+      expect((e as PromptTooLongError).statusCode).toBe(400);
+      expect((e as PromptTooLongError).translationKey).toBe(
+        "errors.promptTooLong",
+      );
+    }
+    const a = await createAgent(ctx(tenantC), { name: "CapProbe" }, appDb);
+    await expect(
+      updateAgent(ctx(tenantC), BigInt(a.id), { systemPrompt: boom }, appDb),
+    ).rejects.toThrow(/system prompt is too long/);
+  });
+
+  test("a system prompt exactly at the cap is accepted", async () => {
+    const max = "p".repeat(config.agent.promptMaxChars);
+    const a = await createAgent(
+      ctx(tenantC),
+      { name: "AtCap", systemPrompt: max },
+      appDb,
+    );
+    expect(a.systemPrompt).toHaveLength(config.agent.promptMaxChars);
   });
 });

@@ -300,15 +300,15 @@ describe.skipIf(!dbUp)("debounce", () => {
       now: past,
     });
 
-    const scheduled = (await claimDueJobs(50, appDb)).filter(
-      (j) => j.tenantId === tenantId,
-    );
+    const scheduled = (
+      await claimDueJobs(50, appDb, new Date(), tenantId)
+    ).filter((j) => j.tenantId === tenantId);
     expect(scheduled.some((j) => j.kind === "WEBHOOK_RETRY")).toBe(true);
     expect(scheduled.some((j) => j.kind === "DEBOUNCE")).toBe(false);
 
-    const debounced = (await claimDueDebounceJobs(50, appDb)).filter(
-      (j) => j.tenantId === tenantId,
-    );
+    const debounced = (
+      await claimDueDebounceJobs(50, appDb, new Date(), tenantId)
+    ).filter((j) => j.tenantId === tenantId);
     expect(debounced.every((j) => j.kind === "DEBOUNCE")).toBe(true);
     expect(debounced.some((j) => j.payload.threadId === threadOf(700))).toBe(
       true,

@@ -1,3 +1,4 @@
+import { ZodError } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import {
   setBrandingAsset,
@@ -25,7 +26,12 @@ import {
   mergeBehaviorSettings,
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
-import { getAgent, listAgents, updateAgent } from "@/modules/agents/service";
+import {
+  assertPromptSize,
+  getAgent,
+  listAgents,
+  updateAgent,
+} from "@/modules/agents/service";
 import { type AuditEntry, recordAudit } from "@/modules/audit/service";
 import {
   createPendingVaultEntry,
@@ -90,6 +96,14 @@ export function truncForAudit(v: unknown): unknown {
     return o;
   }
   return v;
+}
+
+// NOTE: service-layer ZodErrors must surface as a tool result (err), never bubble raw into the
+// MCP SDK's generic exception envelope.
+function zodIssuesMessage(e: ZodError): string {
+  return `validation failed: ${e.issues
+    .map((i) => `${i.path.map(String).join(".") || "value"}: ${i.message}`)
+    .join("; ")}`;
 }
 
 export function ctxOf(principal: VerifiedToken): TenantContext {
@@ -310,6 +324,7 @@ export async function credentialCreate(
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -339,6 +354,9 @@ export async function promptSet(
   }
 
   try {
+    // NOTE: checked here (not only inside updateAgent) so the DRY-RUN path enforces the cap too —
+    // a preview must never claim a diff the apply would reject.
+    assertPromptSize(args.system_prompt);
     const current = await getAgent(ctx, agentId, base);
     const beforeProj = { systemPrompt: current.systemPrompt };
     const afterProj = { systemPrompt: args.system_prompt };
@@ -367,6 +385,7 @@ export async function promptSet(
     return ok({ dryRun: false, applied: true, target, diff });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -391,6 +410,7 @@ export async function agentList(
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -445,6 +465,7 @@ export async function agentSettingsGet(
     return ok({ agentId: agent.id, settings });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -489,9 +510,11 @@ export async function agentSettingsSet(
   if (args.limits !== undefined) patch.limits = args.limits;
   if (args.channelRedirect !== undefined)
     patch.channelRedirect = args.channelRedirect;
+  if (args.attributeContext !== undefined)
+    patch.attributeContext = args.attributeContext;
   if (Object.keys(patch).length === 0) {
     return err(
-      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, channelRedirect and/or grounding)",
+      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, channelRedirect, attributeContext and/or grounding)",
     );
   }
 
@@ -577,6 +600,7 @@ export async function agentSettingsSet(
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -636,6 +660,7 @@ export async function tenantUpdate(
     return ok({ dryRun: false, applied: true, target, diff });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -773,6 +798,7 @@ export async function brandingSet(
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
@@ -895,6 +921,7 @@ export async function brandingAssetSet(
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
+    if (e instanceof ZodError) return err(zodIssuesMessage(e));
     throw e;
   }
 }
