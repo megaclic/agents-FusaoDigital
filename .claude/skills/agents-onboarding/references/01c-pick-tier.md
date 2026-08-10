@@ -48,13 +48,13 @@ Entregou os 5 → vá direto pra **etapa 6** (a mesma pra todos os tiers).
 
 - **`pgvector/pgvector:pg17`**, nunca Postgres puro: o schema roda `CREATE EXTENSION vector`.
 - **Réplica única** do fazer.ai agents: os workers (scheduler/debounce/outbound) assumem um único líder; não escale o
-  serviço `agents` pra >1 (ver o aviso no `templates/docker-compose.prod.yml`).
+  serviço `agents` pra >1 (ver o aviso no `docker-compose.prod.yml`, raiz do repo agents).
 - **DNS antes do ACME**: o cert só emite com o A-record já resolvendo pro IP da VPS. Crie os A-records
   (etapa 1) e confirme a resolução com o poll `until [ "$(dig +short <sub>.<domínio> @1.1.1.1 | tail -1)" =
   "<VPS_IP>" ]; do sleep 15; done` **antes** de anexar o domínio no painel / subir o Caddy.
 - **Quem ocupa 80/443**: se já há um proxy/ingress (Traefik do painel, nginx, um Caddy), o Caddy
-  *bundled* do `templates/docker-compose.portainer.yml` **conflita**:
-  reuse o proxy existente com `templates/docker-compose.prod.yml` (BYO-proxy).
+  *bundled* do `docker-compose.portainer.yml` **conflita**:
+  reuse o proxy existente com `docker-compose.prod.yml` (BYO-proxy). Ambos na raiz do repo agents.
   O 1b já sinaliza quem detém as portas.
 - **Não sobrescreva `command:`** no serviço do fazer.ai agents: o CMD da imagem faz `bootstrap → migrate deploy →
   serve`. Um `command:` próprio quebra o boot.

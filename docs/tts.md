@@ -28,10 +28,11 @@ shouldReplyWithAudio(mode, userSentAudio, contactVoiceReply)
 
 `TtsProvider.synthesize(req) → { audio, mime, fileName }`. Adding a provider = one function + one registry entry; key from the **vault**, provider/voice/model per agent.
 
-| Provider     | Default model        | Endpoint                          | Auth         | Notes              |
-| ------------ | -------------------- | --------------------------------- | ------------ | ------------------ |
-| `openai`     | `tts-1`              | `…/v1/audio/speech`               | `Bearer`     | voice default `alloy` |
-| `elevenlabs` | `eleven_flash_v2_5`  | `…/v1/text-to-speech/{voice_id}`  | `xi-api-key` | voice **required**  |
+| Provider     | Default model         | Endpoint                          | Auth         | Notes              |
+| ------------ | ---------------------- | --------------------------------- | ------------ | ------------------ |
+| `openai`     | `gpt-4o-mini-tts`      | `…/v1/audio/speech`               | `Bearer`     | voice default `alloy` |
+| `elevenlabs` | `eleven_flash_v2_5`    | `…/v1/text-to-speech/{voice_id}`  | `xi-api-key` | voice **required**  |
+| `openrouter` | `hexgrad/kokoro-82m`   | `{baseURL or openrouter.ai}/audio/speech` | `Bearer` | voice default `af_alloy`; **mp3-only** (no Opus/PTT — arrives as a plain file, not a native voice note; Instagram unsupported, falls back to text) |
 
 `prepareSpeechText` is a no-LLM cleanup (strip markdown/links/emoji, collapse whitespace). On top of it, an **opt-in LLM normalization** (`llmNormalizeForSpeech`, `agent.settings.tts.normalize`, off by default) rewrites what a voice engine reads wrong or inconsistently (currency, numbers, percentages, dates, times, phone numbers, ordinals, abbreviations, addresses) into the way it is spoken, IN THE SAME LANGUAGE as the reply. It runs only on the audio path and only on the synth input: the Chatwoot `transcribed_text` keeps the ORIGINAL reply (no rewritten text leaks into the transcript). The runtime builds a **temp-0 model from the agent's own model config** (no extra credential) and injects it via `SynthesizeReplyParams.deps`; it is best-effort, so a slow or failing rewrite (20s timeout) falls back to the raw text and never blocks the reply. We chose the LLM over a regex pass on purpose: deterministic pt-BR rules (number-to-words, date/ordinal/abbreviation tables) are an endless edge-case treadmill (`30°C` vs an ordinal, "no" vs "nº", fractions vs dates) and lock the feature to one locale, while the LLM covers the long tail and any language.
 

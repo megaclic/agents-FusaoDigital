@@ -14,7 +14,7 @@ base de artefatos:
 O padrão de qualquer painel PaaS (Easypanel/Dokploy/CapRover/…) é o mesmo:
 
 - O **proxy do painel** (Traefik/nginx embutido) detém 80/443 e emite Let's Encrypt ao **anexar um domínio**
-  a um serviço. Logo, use o `templates/docker-compose.prod.yml` (BYO-proxy, **sem** o Caddy bundled) e deixe o painel
+  a um serviço. Logo, use o `docker-compose.prod.yml` (do repo agents; BYO-proxy, **sem** o Caddy bundled) e deixe o painel
   rotear + certificar. Um Caddy nosso brigaria pelas portas.
 - O env vem do **`.env` que você controla** (não há magic vars do Coolify): gere com o
   `scripts/gen-onboarding-env.ts` e cole as vars no serviço pelo painel.
@@ -25,12 +25,12 @@ Daqui em diante os passos são os mesmos da VM crua; só muda o "como" você apl
 
 ## TLS na VM crua: duas opções
 
-- **Caddy bundled** (recomendado se a VM tem 80/443 **livres**): use o `templates/docker-compose.portainer.yml` pra
-  agents. Ele já traz um Caddy que emite Let's Encrypt automático a partir de `CADDY_DOMAIN`/`ACME_EMAIL`
-  (gerados no `.env`).
-- **BYO-proxy** (se já há nginx/Caddy/Traefik na 443, ou é um painel): use o `templates/docker-compose.prod.yml` (sem
-  Caddy) e aponte o proxy pra porta publicada do app. O inventário ([1b](01b-brownfield.md)) diz quem ocupa
-  80/443.
+- **Caddy bundled** (recomendado se a VM tem 80/443 **livres**): use o `docker-compose.portainer.yml` (raiz do
+  repo agents) pra agents. Ele já traz um Caddy que emite Let's Encrypt automático a partir de
+  `CADDY_DOMAIN`/`ACME_EMAIL` (gerados no `.env`).
+- **BYO-proxy** (se já há nginx/Caddy/Traefik na 443, ou é um painel): use o `docker-compose.prod.yml` (raiz do
+  repo agents; sem Caddy) e aponte o proxy pra porta publicada do app. O inventário ([1b](01b-brownfield.md))
+  diz quem ocupa 80/443.
 
 ## Passos
 
@@ -38,10 +38,11 @@ Daqui em diante os passos são os mesmos da VM crua; só muda o "como" você apl
 2. **Env:** `bun scripts/gen-onboarding-env.ts --public-url https://agents.<domínio> --acme-email
    voce@<domínio>` gera o `.env` (duas roles, secrets, URLs, `CADDY_DOMAIN`). Chatwoot/Langfuse têm env
    próprio (ver [`03-chatwoot-pro.md`](03-chatwoot-pro.md) e [`05-langfuse.md`](05-langfuse.md)).
-3. **Suba cada stack** (a partir da raiz desta skill, com o `.env` ao lado; num painel, o equivalente é
-   criar cada projeto Compose):
+3. **Suba cada stack** (com o `.env` ao lado de cada compose; num painel, o equivalente é criar cada
+   projeto Compose). **Duas raízes diferentes**: `docker-compose.*.yml` do agents fica na raiz do **repo
+   fazer.ai agents**; `templates/chatwoot/` e `templates/langfuse/` ficam na raiz **desta skill**:
    ```sh
-   docker compose -f templates/docker-compose.portainer.yml up -d       # agents + postgres + Caddy (ou .prod.yml + proxy)
+   docker compose -f docker-compose.portainer.yml up -d           # agents + postgres + Caddy (ou .prod.yml + proxy)
    docker compose -f templates/chatwoot/docker-compose.yml up -d  # Pro vs OSS pelo env (03-chatwoot-pro.md)
    docker compose -f templates/langfuse/docker-compose.yml up -d  # com MinIO (obrigatório)
    ```

@@ -4,23 +4,26 @@ Adapter de deploy **Tier B**. O agente, da máquina do operador, dirige um **Por
 gera os secrets, deploya cada stack a partir de uma string de compose, e sobe um **Caddy bundled** que
 termina TLS com certificado real automático (sem labels Traefik, sem polling do socket). É o companion
 por-plataforma do [contrato (1c)](01c-pick-tier.md); os invariantes (duas roles de DB, pgvector, réplica
-única) valem igual. Para BYO-proxy use `templates/docker-compose.prod.yml`; o Tier B usa o Caddy-bundled
-`templates/docker-compose.portainer.yml`.
+única) valem igual. Para BYO-proxy use `docker-compose.prod.yml`; o Tier B usa o Caddy-bundled
+`docker-compose.portainer.yml`.
 
-## Artefatos (incluídos nesta skill, relativos à raiz dela)
+## Artefatos
 
-| Artefato | Papel |
-| --- | --- |
-| `templates/docker-compose.portainer.yml` | agents + Postgres + **Caddy bundled** (auto-HTTPS). Self-contained (uma string pro Portainer). |
-| `scripts/gen-onboarding-env.ts` | Gera o `.env` (duas roles de DB, JWT/ENCRYPTION, `CADDY_DOMAIN`, `ACME_EMAIL` opcional). |
-| `templates/chatwoot/` | Stack do Chatwoot, Pro (Harbor) ou OSS (público): um compose genérico, edição por env. Ver [`03-chatwoot-pro.md`](03-chatwoot-pro.md). |
-| `templates/langfuse/` | Langfuse opcional (tracing); inclui o MinIO que a ingestion v3 exige. Ver [`05-langfuse.md`](05-langfuse.md). |
-| `scripts/portainer-brownfield.py` | Descoberta brownfield read-only (inventário + decisão por serviço) via a API do Portainer. |
+Este skill roda com CWD na raiz do repo **fazer.ai agents** (onde estão `scripts/gen-onboarding-env.ts`,
+`docker-compose.*.yml` etc.) — não confunda com a raiz da skill (`.claude/skills/agents-onboarding/`).
+
+| Artefato | Raiz | Papel |
+| --- | --- | --- |
+| `docker-compose.portainer.yml` | repo agents | agents + Postgres + **Caddy bundled** (auto-HTTPS). Self-contained (uma string pro Portainer). |
+| `scripts/gen-onboarding-env.ts` | repo agents | Gera o `.env` (duas roles de DB, JWT/ENCRYPTION, `CADDY_DOMAIN`, `ACME_EMAIL` opcional). |
+| `templates/chatwoot/` | esta skill | Stack do Chatwoot, Pro (Harbor) ou OSS (público): um compose genérico, edição por env. Ver [`03-chatwoot-pro.md`](03-chatwoot-pro.md). |
+| `templates/langfuse/` | esta skill | Langfuse opcional (tracing); inclui o MinIO que a ingestion v3 exige. Ver [`05-langfuse.md`](05-langfuse.md). |
+| `scripts/portainer-brownfield.py` | esta skill | Descoberta brownfield read-only (inventário + decisão por serviço) via a API do Portainer. |
 
 ## Por que self-contained + Caddy bundled
 
 A API "deploy from string" do Portainer recebe **um** documento de compose, então o
-`templates/docker-compose.portainer.yml` repete app + postgres e adiciona um serviço `caddy`. O Caddy monta o
+`docker-compose.portainer.yml` repete app + postgres e adiciona um serviço `caddy`. O Caddy monta o
 Caddyfile a partir do env no boot (`CADDY_DOMAIN` → o app; `PORTAINER_DOMAIN` opcional → o painel via
 `host.docker.internal:9443`) e obtém certs via ACME (tls-alpn-01 / http-01).
 
@@ -78,7 +81,7 @@ bun scripts/gen-onboarding-env.ts --public-url https://agents.<domínio> --acme-
 
 curl -sk -X POST "https://localhost:9443/api/stacks/create/standalone/string?endpointId=1" \
   -H "X-API-Key: <api-key>" -H 'Content-Type: application/json' \
-  -d "$(jq -n --arg c "$(cat templates/docker-compose.portainer.yml)" --argjson env "$ENV_JSON" \
+  -d "$(jq -n --arg c "$(cat docker-compose.portainer.yml)" --argjson env "$ENV_JSON" \
         '{Name:"agents", StackFileContent:$c, Env:$env, Registries:[<ghcr-id>]}')"
 ```
 
@@ -116,7 +119,7 @@ PORTAINER_API_KEY=$KEY PORTAINER_ENDPOINT_ID=1 python3 scripts/portainer-brownfi
 ```
 
 Ele lista os stacks, faz fingerprint de cada container por imagem, sinaliza **quem ocupa 80/443** (um
-ingress existente faz o stack Caddy-bundled conflitar → reuse-o ou troque pro `templates/docker-compose.prod.yml`
+ingress existente faz o stack Caddy-bundled conflitar → reuse-o ou troque pro `docker-compose.prod.yml`
 BYO-proxy) e imprime uma matriz de decisão: `agents` saudável → reusa; Chatwoot presente → reusa
 (`chatwoot-pro` Harbor e OSS são ambos válidos); Chatwoot ausente → instala Pro se há assinatura no hub,
 senão OSS; Langfuse ausente → instala só se selecionado.

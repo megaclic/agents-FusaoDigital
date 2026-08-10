@@ -20,7 +20,7 @@ ARG BUN_PUBLIC_CDN_URL=""
 ENV BUN_PUBLIC_CDN_URL=$BUN_PUBLIC_CDN_URL
 
 # @edition-arg
-ARG BUN_PUBLIC_EDITION="free"
+ARG BUN_PUBLIC_EDITION="full"
 ENV BUN_PUBLIC_EDITION=$BUN_PUBLIC_EDITION
 
 # Generate Prisma client. The dummy DATABASE_URL is scoped to this RUN only (NOT an ENV), so it is

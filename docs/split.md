@@ -12,7 +12,7 @@ Instead of dumping one wall of text, optionally break the agent's reply into sev
 
 ## Configuration
 
-Per-agent `agent.settings.split` (`readSplitConfig`): `enabled` (default `false`), `maxChars` (default 600), `typingWpm` (150), `minDelayMs` (800), `maxDelayMs` (8000), `maxChunks` (6). The editor Behavior tab exposes enabled + maxChars + typingWpm + maxDelayMs; min/maxChunks keep defaults. Writable over REST (`PATCH /v1/agents/:id`) + MCP (`agent_settings_get`/`agent_settings_set`, the `split` block) via the settings bag.
+Per-agent `agent.settings.split` (`readSplitConfig`): `enabled` (default `false`), `maxChars` (default 600), `typingWpm` (250), `minDelayMs` (800), `maxDelayMs` (8000), `maxChunks` (6). The editor Behavior tab exposes enabled + maxChars + typingWpm + maxDelayMs; min/maxChunks keep defaults. Writable over REST (`PATCH /v1/agents/:id`) + MCP (`agent_settings_get`/`agent_settings_set`, the `split` block) via the settings bag.
 
 ## Interaction notes
 

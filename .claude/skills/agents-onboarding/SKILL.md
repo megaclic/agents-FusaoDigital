@@ -49,7 +49,7 @@ Abra a referência da etapa **antes** de executá-la (carga sob demanda). O flux
 | 1c | **Selecionar o tier** de deploy + fixar o **contrato** (o que o deploy entrega à espinha) | [`references/01c-pick-tier.md`](references/01c-pick-tier.md) |
 | 2 | **Tier A** · Coolify: reusar/instalar, API Access, **Instance Domain** (`coolify.<root>`) | [`references/02-coolify.md`](references/02-coolify.md) |
 | 3 | Deploy **Chatwoot** (Pro **ou** OSS pelo marcador; Pro: API do Coolify, login Harbor). **`chatwootSource: existing` PULA este passo** e usa o Chatwoot que já existe | [`references/03-chatwoot-pro.md`](references/03-chatwoot-pro.md) |
-| 4 | Deploy **fazer.ai agents** (edição Free/Pro pelo marcador, `templates/docker-compose.coolify.yml`, bootstrap 2-roles + migrate) | [`references/04-agents-image.md`](references/04-agents-image.md) |
+| 4 | Deploy **fazer.ai agents** (edição Free/Pro pelo marcador, `docker-compose.coolify.yml` do repo agents, bootstrap 2-roles + migrate) | [`references/04-agents-image.md`](references/04-agents-image.md) |
 | 5 | Deploy **Langfuse** (+ **MinIO S3 obrigatório**) | [`references/05-langfuse.md`](references/05-langfuse.md) |
 | 6 | fazer.ai agents `/setup` (cria admin SUPER_ADMIN) → conectar **MCP** (OAuth) → **alvo de tenant** (`tenant_list`; passar `tenant` nas tools) | [`references/06-setup-and-mcp.md`](references/06-setup-and-mcp.md) |
 | 8 | **Import do agente** (`agent_import`; padrão **Maria**/Clínica Moreira, vendorado em `samples/agents/maria-clinica-moreira.json`) + embedding por-tenant + reindex/retry da KB | [`references/08-agent-import.md`](references/08-agent-import.md) |

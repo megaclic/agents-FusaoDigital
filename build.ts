@@ -160,7 +160,7 @@ const result = await Bun.build({
     // Distribution edition. Defaults to "full" so the master and any plain `bun run build`
     // yield the Full app; the Free derivation flips the fallback to "free" (# @edition-arg).
     "process.env.BUN_PUBLIC_EDITION": JSON.stringify(
-      process.env.BUN_PUBLIC_EDITION || "free",
+      process.env.BUN_PUBLIC_EDITION || "full",
     ),
   },
   ...cliConfig,

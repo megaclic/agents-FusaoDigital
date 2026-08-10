@@ -29,12 +29,13 @@ STT runs **before** arming/answering so the debounce re-fetch (and the direct pa
 
 The OpenAI `/audio/transcriptions` multipart shape is a de-facto standard, so `openai` and `openai-compatible` (Groq, self-hosted faster-whisper, …) share one adapter (baseURL switch). Gemini (inline base64 → `generateContent`, key in `x-goog-api-key`) and ElevenLabs (`/speech-to-text`, `xi-api-key` + `model_id`) get thin adapters. **Adding a provider = one function + one registry entry**; a future generic/declarative provider slots behind the same `SttProvider` interface without touching callers. `SttError` never captures the response body (PII). Provider is selectable per agent; the API key is a **vault** entry referenced by a stable `vault:<id>` ref (renaming the secret never breaks the agent).
 
-| Provider            | Default model       | Endpoint                                   | Auth             |
-| ------------------- | ------------------- | ------------------------------------------ | ---------------- |
-| `openai`            | `whisper-1`         | `…/v1/audio/transcriptions`                | `Bearer`         |
-| `openai-compatible` | (set yours)         | `{baseURL}/audio/transcriptions`           | `Bearer`         |
-| `gemini`            | `gemini-2.0-flash`  | `…/models/{model}:generateContent`         | `x-goog-api-key` |
-| `elevenlabs`        | `scribe_v1`         | `…/v1/speech-to-text`                       | `xi-api-key`     |
+| Provider            | Default model        | Endpoint                                   | Auth             |
+| ------------------- | --------------------- | ------------------------------------------ | ---------------- |
+| `openai`            | `gpt-4o-transcribe`   | `…/v1/audio/transcriptions`                | `Bearer`         |
+| `openai-compatible` | `whisper-1` (generic; set yours) | `{baseURL}/audio/transcriptions` | `Bearer`         |
+| `gemini`            | `gemini-3.5-flash`    | `…/models/{model}:generateContent`         | `x-goog-api-key` |
+| `elevenlabs`        | `scribe_v2`           | `…/v1/speech-to-text`                       | `xi-api-key`     |
+| `openrouter`        | `openai/whisper-1`    | `{baseURL or openrouter.ai}/audio/transcriptions` (JSON, base64 `input_audio`) | `Bearer` |
 
 ## Inbound rendering (`src/modules/chatwoot/render.ts`)
 

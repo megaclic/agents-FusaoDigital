@@ -96,7 +96,7 @@ Beyond the original handful, the server now projects **the whole tenant** so an 
 ## Rate limit
 
 The transport `/api/v1/mcp` gets its **own looser per-IP bucket** (`mcpTransportRateLimitMiddleware`
-+ `isMcpTransport` in `middlewares/rateLimit.ts`): every JSON-RPC call from one client shares one IP, so the global 100/min bucket would throttle a legitimate client mid-task. The dedicated bucket is **240/min per IP** — a runaway-guard ceiling, not a tight throttle; the real credential gate is the Bearer (re-resolved per request, `jti` denylist for revoke). The OAuth subpaths `/api/v1/mcp/oauth/*` keep the global limit so `/token` brute-force stays bounded. A per-token bucket was considered but would be single-replica (in-memory) for the MVP, so this keys by IP like the rest.
++ `isMcpTransport` in `middlewares/rateLimit.ts`): every JSON-RPC call from one client shares one IP, so the global `RATE_LIMIT_USER_PER_MIN` bucket (default 600/min per IP) would throttle a legitimate client mid-task. The dedicated bucket is `RATE_LIMIT_MCP_PER_MIN` (default **1200/min per IP**) — a runaway-guard ceiling, not a tight throttle; the real credential gate is the Bearer (re-resolved per request, `jti` denylist for revoke). The OAuth subpaths `/api/v1/mcp/oauth/*` keep the global limit so `/token` brute-force stays bounded. A per-token bucket was considered but would be single-replica (in-memory) for the MVP, so this keys by IP like the rest.
 
 ## Dynamic Client Registration (RFC 7591, `oauth/dcr.ts`)
 

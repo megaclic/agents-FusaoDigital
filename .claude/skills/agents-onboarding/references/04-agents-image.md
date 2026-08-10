@@ -14,7 +14,7 @@ Leia `~/.fazer-ai/onboarding.json` → `edition` (`free` | `pro`; ausente = `fre
 
 ## Compose
 
-Use o `templates/docker-compose.coolify.yml` do repo via `scripts/coolify.py create-service` (lê o compose, base64-encoda, POSTa em `/api/v1/services`). Topologia: `agents` (imagem conforme a **edição** acima; o compose default é a Free) + `postgres` (`pgvector/pgvector:pg17`: NÃO postgres puro: o schema precisa de `CREATE EXTENSION vector`). Volume `storage:/app/storage`. Healthcheck `wget -qO- http://localhost:3000/api/health`.
+Use o `docker-compose.coolify.yml` (raiz do repo **fazer.ai agents**, não desta skill) via `scripts/coolify.py create-service --compose-file <path>` (lê o compose, base64-encoda, POSTa em `/api/v1/services`). Topologia: `agents` (imagem conforme a **edição** acima; o compose default é a Free) + `postgres` (`pgvector/pgvector:pg17`: NÃO postgres puro: o schema precisa de `CREATE EXTENSION vector`). Volume `storage:/app/storage`. Healthcheck `wget -qO- http://localhost:3000/api/health`.
 
 ## Magic vars (Coolify gera; NÃO setar à mão)
 
@@ -29,7 +29,7 @@ Use o `templates/docker-compose.coolify.yml` do repo via `scripts/coolify.py cre
 BRANDING_STORAGE_DIR=/app/storage/branding
 QUOTES_STORAGE_DIR=/app/storage/quotes
 ```
-Sem isso caem em `./data/*` (FS efêmero do container) e logo/favicon (+ PDFs de quote) somem no redeploy. Já corrigido no `templates/docker-compose.coolify.yml`; **confira que está lá** (branding é refino manual opcional depois, em `/admin/branding`, mas a persistência precisa já estar no lugar).
+Sem isso caem em `./data/*` (FS efêmero do container) e logo/favicon (+ PDFs de quote) somem no redeploy. Já corrigido no `docker-compose.coolify.yml` (raiz do repo agents); **confira que está lá** (branding é refino manual opcional depois, em `/admin/branding`, mas a persistência precisa já estar no lugar).
 
 ## Boot = CMD da imagem (NÃO sobrescrever `command`)
 

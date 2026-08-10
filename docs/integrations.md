@@ -10,7 +10,7 @@ A catalog entry is data, one of three `kind`s:
 - `MCP` — an external MCP server we **consume** (`McpServerConnection` + `@langchain/mcp-adapters`).
 - `NATIVE` — a source module. Only when justified (Chatwoot; deep-domain integrations).
 
-`IntegrationInstance.catalogType` is a plain `String` validated against this in-code registry (`isKnownCatalogType`), **not** a DB enum — a new integration needs no enum migration. Seeded entries: `GENERIC`, `ASAAS`, `GOOGLE_CALENDAR`. An entry may exist before its mapper ships; until then inbound for it fails closed (durable `FAILED` record + log).
+`IntegrationInstance.catalogType` is a plain `String` validated against this in-code registry (`isKnownCatalogType`), **not** a DB enum — a new integration needs no enum migration. Seeded entries: `ASAAS`, `GOOGLE_CALENDAR`, `GOOGLE_DRIVE` (Calendar/Drive are outbound-only toolpacks; Asaas is the only one with an inbound mapper today). An entry may exist before its mapper ships; until then inbound for it fails closed (durable `FAILED` record + log).
 
 ## Generic inbound receptor (`src/modules/webhooks/inbound/`)
 
@@ -51,7 +51,7 @@ A mapper is a **pure translator**: `(raw: unknown) => MapResult`. No DB, no netw
 
 - **Correlation is by primary key, not LLM.** `externalId` (created at outbound time in `IntegrationExternalRef`) is looked up to recover the thread. An agent-as-mapper was rejected: hallucinated correlation of financial data is a privacy incident, breaks idempotency, taxes the <5s ack, and turns an untrusted external payload → LLM → tools into a prompt-injection vector. The LLM is never in the correlation critical path.
 - **Why code, not a runtime DSL:** inbound processes untrusted external bytes (larger attack surface than outbound); the long tail of providers resists a DSL (inner-platform); and the set of real mapper authors is small and is us. ~15 lines, type-safe, unit-testable, injection-bounded. A future sandboxed `declarativeMapper(config)` can slot in behind the same `InboundMapper` interface if a non-us author ever needs it — not built now.
-- **Registry**, keyed by `catalogType`. Adding an integration = a catalog entry + a mapper + a zod schema + a `registerMapper` line; the core (route-token, auth, ack/async, idempotency, correlation, dispatch) is untouched. `GENERIC` ships now (accepts our normalized shape); Asaas/Calendar mappers ship when those integrations land.
+- **Registry**, keyed by `catalogType`. Adding an integration = a catalog entry + a mapper + a zod schema + a `registerMapper` line; the core (route-token, auth, ack/async, idempotency, correlation, dispatch) is untouched. Asaas is the only inbound integration today (Calendar/Drive are outbound-only); a catalog entry without a mapper fails closed.
 
 ## Known limitations
 
