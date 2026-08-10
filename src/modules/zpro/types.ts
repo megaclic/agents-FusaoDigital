@@ -181,6 +181,16 @@ export interface ZproWhatsapp {
   wabaId?: string;
 }
 
+// ZproInstance já resolvido no banco pelo controller, usado por normalizeZproWebhook como
+// fallback de identidade de canal quando o payload não traz `whatsapp` na raiz (alguns canais do
+// webhook global só mandam `ticket.whatsappId`). channelType fica de fora: a tabela ZproInstance
+// não guarda o tipo de canal (evo/baileys/waba/...), então esse campo cai para `ticket.channel`.
+export interface ResolvedZproInstance {
+  id: number;
+  name: string;
+  channelType?: string;
+}
+
 export interface ZproUser {
   id: number;
   name: string;

@@ -5,7 +5,11 @@
 
 import { ZPRO_IDEMPOTENCY_TTL_MS, ZPRO_METHOD_MESSAGE } from "./constants";
 import { normalizeZproWebhook } from "./normalize";
-import type { NormalizedZproEvent, ZproWebhookPayload } from "./types";
+import type {
+  NormalizedZproEvent,
+  ResolvedZproInstance,
+  ZproWebhookPayload,
+} from "./types";
 
 // Cache em memória para idempotência. Substituir por Redis/Prisma na Fase 2
 // quando o volume justificar ou em cenários multi-instância.
@@ -31,10 +35,13 @@ export interface ZproWebhookResult {
 /**
  * Processa um payload recebido do webhook global do Z-PRO.
  *
- * @param payload   Body JSON do POST
- * @param apiId     ApiID da instância configurada (vem do path da rota ou config)
- * @param dispatch  Função que recebe o evento normalizado e aciona o LangGraph
- * @param log       Logger do projeto (opcional; loga em dev)
+ * @param payload          Body JSON do POST
+ * @param apiId            ApiID da instância configurada (vem do path da rota ou config)
+ * @param dispatch         Função que recebe o evento normalizado e aciona o LangGraph
+ * @param log              Logger do projeto (opcional; loga em dev)
+ * @param resolvedInstance Instância já resolvida no banco pelo controller — repassada para
+ *                         normalizeZproWebhook como fallback quando o payload não traz
+ *                         `whatsapp` na raiz
  */
 export async function handleZproWebhook(
   payload: ZproWebhookPayload,
@@ -44,6 +51,7 @@ export async function handleZproWebhook(
     debug: (obj: unknown, msg: string) => void;
     error: (obj: unknown, msg: string) => void;
   },
+  resolvedInstance?: ResolvedZproInstance,
 ): Promise<ZproWebhookResult> {
   log?.debug({ method: payload.method }, "zpro:webhook:received");
 
@@ -60,7 +68,7 @@ export async function handleZproWebhook(
     return { ok: true, reason: "skipped:duplicate" };
   }
 
-  const event = normalizeZproWebhook(payload, apiId);
+  const event = normalizeZproWebhook(payload, apiId, resolvedInstance);
   if (!event) {
     return { ok: true, reason: "skipped:normalize-gate" };
   }

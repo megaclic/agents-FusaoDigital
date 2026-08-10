@@ -3,7 +3,7 @@
 // do agente, só roda para eventos que passam no gate) e mirror.ts (espelho de TODAS as mensagens,
 // inclusive as que o gate descarta), para não duplicar a mesma lógica de parsing duas vezes.
 
-import type { ZproMsgContent, ZproMsgTop } from "./types";
+import type { ZproMsgContent, ZproMsgTop, ZproWebhookPayload } from "./types";
 
 export interface MediaExtracted {
   mediaUrl?: string;
@@ -66,5 +66,33 @@ export function extractMessageBody(msg: ZproMsgTop): string {
     content?.videoMessage?.caption ??
     content?.documentMessage?.caption ??
     ""
+  );
+}
+
+// Nem todo canal do Z-PRO manda `whatsapp` na raiz do payload (confirmado: o canal "evo" manda;
+// o webhook global atual, para outros canais, só traz `ticket.whatsappId`). Tenta as fontes em
+// ordem de confiabilidade antes de desistir.
+function toWhatsappId(v: unknown): number | null {
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) {
+    return Number(v);
+  }
+  return null;
+}
+
+export function extractWhatsappId(payload: ZproWebhookPayload): number | null {
+  return (
+    toWhatsappId(payload.whatsapp?.id) ?? toWhatsappId(payload.ticket?.whatsappId)
+  );
+}
+
+// Nome de exibição do canal, com a mesma degradação de fontes: `whatsapp` na raiz nem sempre
+// existe, então cai para o `instance`/`instanceId` que o próprio `msg` carrega.
+export function extractInstanceName(payload: ZproWebhookPayload): string {
+  return (
+    payload.whatsapp?.name ??
+    payload.msg?.instance ??
+    payload.msg?.data?.instanceId ??
+    "unknown"
   );
 }

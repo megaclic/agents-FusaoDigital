@@ -17,8 +17,12 @@ import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
 import { deactivateAgent } from "@/modules/zpro/handoff";
 import { mirrorZproMessage } from "@/modules/zpro/mirror";
+import { extractWhatsappId } from "@/modules/zpro/parse";
 import { runZproAgentTurn } from "@/modules/zpro/runtime";
-import type { ZproWebhookPayload } from "@/modules/zpro/types";
+import type {
+  ResolvedZproInstance,
+  ZproWebhookPayload,
+} from "@/modules/zpro/types";
 import { handleZproWebhook } from "@/modules/zpro/webhook";
 
 export const zproController = new Elysia({
@@ -34,7 +38,8 @@ export const zproController = new Elysia({
       return { ack: true, outcome: "invalid-json" };
     }
 
-    const whatsappId = payload.whatsapp?.id;
+    // Nem todo canal manda `whatsapp` na raiz do payload — alguns só trazem `ticket.whatsappId`.
+    const whatsappId = extractWhatsappId(payload);
     if (!whatsappId) {
       return { ack: true, outcome: "skipped:no-whatsapp-id" };
     }
@@ -49,6 +54,7 @@ export const zproController = new Elysia({
           apiId: true,
           baseUrl: true,
           bearerToken: true,
+          instanceName: true,
         },
       }),
     );
@@ -57,6 +63,15 @@ export const zproController = new Elysia({
       logger.debug({ whatsappId }, "zpro:webhook: no instance found");
       return { ack: true, outcome: "skipped:no-instance" };
     }
+
+    // Fallback de identidade de canal para normalizeZproWebhook quando o payload não traz
+    // `whatsapp` na raiz. `id` aqui é o whatsappId (já validado acima), não o BigInt da linha —
+    // NormalizedZproEvent.instanceId é sempre o whatsapp.id. channelType fica de fora: a tabela
+    // ZproInstance não guarda o tipo de canal; normalizeZproWebhook cai para `ticket.channel`.
+    const resolvedInstance: ResolvedZproInstance = {
+      id: whatsappId,
+      name: instance.instanceName,
+    };
 
     // 1. Espelha a mensagem no banco local — TODAS as mensagens, mesmo as que o gate do agente
     // (normalizeZproWebhook) descarta (fromMe/n8nStatus=false/grupo/botStopped). Fonte de verdade
@@ -158,6 +173,7 @@ export const zproController = new Elysia({
           });
       },
       logger,
+      resolvedInstance,
     );
 
     return { ack: true, outcome: result.reason ?? "queued" };
