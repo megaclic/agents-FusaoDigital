@@ -42,6 +42,14 @@ export interface NormalizedChatwootAttachment {
   // message_created; populated once our STT write-back lands (which the fork re-dispatches as a
   // message_updated). Read to make eager STT idempotent and to render the transcription in the UI.
   transcribedText?: string | null;
+  // NOTE: Location attachments (a WhatsApp pin) also ship their coordinates + human-readable place
+  // name in the payload (Attachment#push_event_data → location_metadata: coordinates_lat /
+  // coordinates_long / fallback_title). The columns default to 0.0, so an exact (0,0) means "the
+  // provider sent no coordinates", not a real pin (see firstLocationAttachment). Absent on every
+  // other file_type.
+  latitude?: number | null;
+  longitude?: number | null;
+  fallbackTitle?: string | null;
 }
 
 export interface NormalizedChatwootMessage {
@@ -98,10 +106,14 @@ export interface NormalizedChatwootEvent {
   contactInboxId: number | null;
   inboxId: number | null;
   status: string | null;
-  assigneeType: string | null;
-  assigneeId: number | null;
-  // Display name of the assignee (meta.assignee.name) — only meaningful for a human (User) assignee.
-  assigneeName: string | null;
+  // NOTE: The assignee trio uses `undefined` as "this payload said nothing" (no `meta`), so the
+  // mirror keeps the stored values instead of wiping them — same convention as the attribute bags.
+  // An explicit `null` means meta WAS present with no assignee: a real unassign, and it clears.
+  assigneeType?: string | null;
+  assigneeId?: number | null;
+  // NOTE: Display name of the assignee (meta.assignee.name) — the human's name for a User
+  // assignee, the bot's name for an AgentBot one.
+  assigneeName?: string | null;
   message?: NormalizedChatwootMessage;
   changedAttributes?: unknown;
   // ── mirror metadata (best-effort; absent on payloads that do not carry it) ──

@@ -2,7 +2,7 @@ import { Elysia, t } from "elysia";
 import { authPlugin } from "@/api/lib/auth";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
-import { doc, errors } from "@/api/lib/openapi";
+import { doc, errors, htmlResponse } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
@@ -409,6 +409,17 @@ export const oauthMcpCallbackController = new Elysia({
           "Public popup redirect target for the MCP consent flow; cookie-authenticated in-handler and bound by the signed state, it always returns HTML so the popup can postMessage the result to its opener and self-close.",
         ),
         security: [],
+        responses: {
+          200: htmlResponse(
+            "HTML page that posts the successful result to the opener window and self-closes.",
+          ),
+          400: htmlResponse(
+            "HTML page reporting a failed flow (provider error, missing or expired state, token exchange failure) without leaking internals.",
+          ),
+          401: htmlResponse(
+            "HTML page reporting an unauthenticated caller or a state/user mismatch.",
+          ),
+        },
       },
       query: t.Object({
         code: t.Optional(

@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import { authPlugin } from "@/api/lib/auth";
-import { doc, errors } from "@/api/lib/openapi";
+import { doc, errors, jsonResponse } from "@/api/lib/openapi";
 import {
   clearBrandingAsset,
   setBrandingAsset,
@@ -42,6 +42,11 @@ export const brandingController = new Elysia({
           "Returns the resolved global identity: colors, which asset variants exist, and the cache version. Public so it can load before any auth context.",
         ),
         security: [],
+        responses: {
+          200: jsonResponse(
+            "The resolved global branding: brand name, color mode and tokens, which logo/favicon variants exist, and the cache-busting version.",
+          ),
+        },
       },
     },
   )

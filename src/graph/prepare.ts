@@ -10,6 +10,10 @@ import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
+  buildAppointmentContextSection,
+  loadAppointmentContext,
+} from "@/modules/appointments/context";
+import {
   cancelAppointmentReminders,
   enqueueAppointmentReminders,
 } from "@/modules/appointments/reminders";
@@ -466,6 +470,44 @@ export async function loadAgentConfig(
             sel.nativeToolsAllow.includes("set_custom_attribute"),
         )
       : null;
+  // NOTE: The LIVE appointments booked in THIS conversation, re-read from the reminder scheduler
+  // rows on EVERY turn — including after the last reminder fired (job DONE, start still ahead), the
+  // exact turn where the customer replies to it. loadAgentConfig is shared by the reactive turn, the
+  // nudge and the debounce flush, so the identity reaches all of them. Playground passes
+  // conversationId 0 ⇒ no block. One bounded DB read; never a Google call.
+  let appointmentSection: string | null = null;
+  if (conv && args.conversationId > 0) {
+    const canOperate = sel.integrationSelections.some(
+      (s) =>
+        s.catalogType === "GOOGLE_CALENDAR" &&
+        s.enabledTools.some((t) =>
+          [
+            "calendar_update_event",
+            "calendar_cancel_event",
+            "calendar_confirm_appointment",
+          ].includes(t),
+        ),
+    );
+    try {
+      appointmentSection = buildAppointmentContextSection(
+        await loadAppointmentContext(
+          db,
+          args.tenantId,
+          chatwootThreadId(args.tenantId, args.instanceId, args.conversationId),
+        ),
+        canOperate,
+      );
+    } catch (e) {
+      // NOTE: Optional context fails OPEN — a read error here must not silence the whole turn.
+      logger.warn(
+        "appointment context load failed: %s",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+  const promptSections = [attributeSection, appointmentSection].filter(
+    (s): s is string => s !== null,
+  );
   return {
     agentId: agent.id,
     agentBotId: bot?.chatwootAgentBotId ?? null,
@@ -475,8 +517,8 @@ export async function loadAgentConfig(
     channelType: conv?.inbox?.channelType ?? null,
     contactDbId: conv?.contact?.id ?? null,
     contactInboxId: conv?.contactInboxId ?? null,
-    systemPrompt: attributeSection
-      ? `${systemPrompt}\n\n${attributeSection}`
+    systemPrompt: promptSections.length
+      ? `${systemPrompt}\n\n${promptSections.join("\n\n")}`
       : systemPrompt,
     mc,
     apiKey,
@@ -608,6 +650,8 @@ export async function buildToolset(
         credentialRef: string | null;
         offsetsHours: number[];
         askConfirmationOnLast: boolean;
+        summary: string | null;
+        calendarLabel: string | null;
       }) => {
         try {
           await enqueueAppointmentReminders({
@@ -619,6 +663,8 @@ export async function buildToolset(
             startISO: a.startISO,
             offsetsHours: a.offsetsHours,
             askConfirmationOnLast: a.askConfirmationOnLast,
+            summary: a.summary,
+            calendarLabel: a.calendarLabel,
             base: ctx.base,
           });
         } catch (e) {

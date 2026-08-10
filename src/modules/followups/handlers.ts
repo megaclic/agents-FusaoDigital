@@ -6,7 +6,7 @@ import { parseThreadId, runAgentNudge } from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { isTestSilenced } from "@/modules/agents/test-mode";
-import { hasPendingAppointmentReminder } from "@/modules/appointments/reminders";
+import { hasLiveAppointment } from "@/modules/appointments/reminders";
 import {
   isOpenAt,
   nextOpenAt,
@@ -35,11 +35,22 @@ const SWEEP_INTERVAL_MS = 60_000;
 // nudging mid-turn. Anchored on lastEventAt, which the agent's own reply advances, so once the turn
 // finishes the follow-up naturally measures inactivity from the reply.
 const IN_FLIGHT_BACKOFF_MS = 30_000;
-// Back-off when the conversation has a pending appointment reminder (a future booking) and the agent
-// pauses follow-ups during appointments: hold the sequence and re-check later rather than nudging or
-// dying, so it resumes once the appointment passes / is cancelled. Coarse (1h) because the sweep
-// already filters these out — this only catches a FOLLOWUP that was in flight before the booking.
+// Back-off when the conversation has a LIVE appointment (queued reminder OR one already fired with
+// the start still ahead) and the agent pauses follow-ups during appointments: hold the sequence and
+// re-check later rather than nudging or dying, so it resumes once the appointment passes / is
+// cancelled. Coarse (1h) because the sweep already filters these out — this only catches a FOLLOWUP
+// that was in flight before the booking.
 const APPOINTMENT_BACKOFF_MS = 3_600_000;
+// NOTE: Back-off when the nudge could not run to completion without posting anything: the live-state GET
+// failed (fail-closed) or a pending human-in-the-loop interrupt deferred it. Retry the SAME step —
+// nothing was sent, so the watermark must not advance.
+const NUDGE_RETRY_BACKOFF_MS = 900_000;
+// NOTE: Cap on consecutive same-step retries (payload `nudgeRetries`, reset when the step advances).
+// A conversation whose live GET fails forever (e.g. deleted in Chatwoot) must not stay PENDING
+// indefinitely. On exhaustion the CURRENT EPISODE is abandoned by stamping lastFollowUpAt WITHOUT
+// posting — dead-lettering alone would loop, because the sweep re-enqueues any conversation with
+// no stamp; the stamp keeps it away until the customer speaks again (which starts a new episode).
+const NUDGE_RETRY_LIMIT = 8;
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -92,7 +103,13 @@ async function sweepHandler(
       JOIN agents a ON a.id = i.agent_id
       WHERE c.tenant_id = ${tenantId}
         AND c.status = 'pending'
-        AND c.assignee_type IS NULL
+        -- NOTE: Bot-owned = anything but a human, mirroring shouldBotHandle: NULL (unassigned — Chatwoot
+        -- < 4.16.2, Dialogflow-style hooks) AND 'AgentBot' (the NORMAL state since Chatwoot 4.16.2
+        -- auto-assigns the connected bot at conversation creation). IS DISTINCT FROM because
+        -- NULL <> 'User' evaluates to NULL. A foreign bot's AgentBot is deliberately NOT filtered
+        -- here: the nudge's own ownership gate (assignee bot id vs ours) re-checks before invoking
+        -- the model, so a rare false positive costs one no-op job cycle.
+        AND c.assignee_type IS DISTINCT FROM 'User'
         AND c.inbox_id IS NOT NULL
         AND a.enabled = true
         AND (a.mode <> 'test' OR c.test_activated_at IS NOT NULL)
@@ -102,17 +119,52 @@ async function sweepHandler(
           c.last_follow_up_at IS NULL
           OR c.last_inbound_at > c.last_follow_up_at
         )
-        -- Pause re-engagement while a FUTURE appointment exists (a pending APPOINTMENT_REMINDER),
-        -- unless the agent opted out (followUp.pauseWhileAppointment = false). Mirrors the handler's
-        -- suppression gate so the operator-facing estimate and the worker agree.
+        -- Activation fence: only episodes of silence that BEGAN after follow-up was armed for this
+        -- agent (Agent.followUpArmedAt, stamped on the effective OFF→ON transition and re-stamped
+        -- on promotion to production). Without it, flipping an agent to production with follow-up
+        -- on would blast every eligible conversation in the historical backlog at once.
+        -- NULL = never armed → fail-safe skip.
+        AND a.follow_up_armed_at IS NOT NULL
+        AND c.last_inbound_at >= a.follow_up_armed_at
+        -- NOTE: Pause re-engagement while the conversation has a LIVE future appointment, unless the
+        -- agent opted out (followUp.pauseWhileAppointment = false). SQL mirror of
+        -- projectAppointmentEvents (appointments/context.ts): a non-tombstoned reminder row counts
+        -- while it is still queued (PENDING/CLAIMED) OR its startISO is still ahead — firing marks
+        -- rows DONE, so after the LAST reminder only the future-start arm keeps suppression on
+        -- (issue #39). The cast is guarded (CASE + pg_input_is_valid; deploy mandates pg17):
+        -- startISO can be all-day (YYYY-MM-DD) or model-supplied garbage, and an unguarded cast
+        -- would abort the WHOLE tenant sweep. Offset-less values are pinned to UTC exactly like
+        -- parseStartMs (all-day → UTC midnight; offset-less datetime → 'Z'), so the SQL and JS
+        -- liveness decisions agree regardless of the session/host time zones.
+        -- Invalid/absent start = not-future (fail-safe: only the queued arm suppresses then).
         AND NOT (
           coalesce(a.settings->'followUp'->>'pauseWhileAppointment', 'true') <> 'false'
           AND EXISTS (
-            SELECT 1 FROM scheduler_jobs sj
+            SELECT 1
+            FROM scheduler_jobs sj
+            CROSS JOIN LATERAL (
+              SELECT CASE
+                WHEN sj.payload->>'startISO' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                  THEN sj.payload->>'startISO' || 'T00:00:00Z'
+                WHEN sj.payload->>'startISO' ~ '[Tt ][0-9]{2}:'
+                     AND sj.payload->>'startISO' !~ '([Zz]|[+-][0-9]{2}:?[0-9]{2})$'
+                  THEN sj.payload->>'startISO' || 'Z'
+                ELSE sj.payload->>'startISO'
+              END AS start_iso
+            ) norm
             WHERE sj.tenant_id = c.tenant_id
               AND sj.kind = 'APPOINTMENT_REMINDER'
-              AND sj.status = 'PENDING'
               AND sj.payload->>'threadId' = c.thread_id
+              AND sj.payload->>'cancelledAt' IS NULL
+              AND (
+                sj.status IN ('PENDING', 'CLAIMED')
+                OR CASE
+                  WHEN norm.start_iso IS NOT NULL
+                       AND pg_input_is_valid(norm.start_iso, 'timestamptz')
+                    THEN norm.start_iso::timestamptz > now()
+                  ELSE false
+                END
+              )
           )
         )
         -- Skip a conversation managed by a WhatsApp→chat redirect (channelRedirect): both the WIDGET
@@ -200,6 +252,7 @@ export async function followUpHandler(
         settings: true,
         businessHoursId: true,
         followUpHoursId: true,
+        followUpArmedAt: true,
       },
     });
     if (!agent?.enabled) return null;
@@ -230,16 +283,17 @@ export async function followUpHandler(
           select: { windows: true, timezone: true },
         })
       : null;
-    return { conv, followUpCfg, hours };
+    return { conv, followUpCfg, hours, armedAt: agent.followUpArmedAt };
   });
   if (!ctx) return { outcome: "done" };
 
-  // Appointment-reminder suppression: hold the follow-up while this conversation has a FUTURE
-  // appointment (a pending reminder). Re-check later instead of nudging OR ending the sequence, so it
-  // resumes once the appointment passes / is cancelled. Defense in depth — the inbound that booked the
-  // appointment already cancels any prior FOLLOWUP, and the sweep won't enqueue a new one meanwhile.
+  // Appointment suppression: hold the follow-up while this conversation has a LIVE appointment —
+  // queued reminder OR already-fired one with the start still ahead (issue #39). Re-check later
+  // instead of nudging OR ending the sequence, so it resumes once the appointment passes / is
+  // cancelled. Defense in depth — the inbound that booked the appointment already cancels any prior
+  // FOLLOWUP, and the sweep won't enqueue a new one meanwhile.
   if (ctx.followUpCfg.pauseWhileAppointment) {
-    const blockedByAppointment = await hasPendingAppointmentReminder(
+    const blockedByAppointment = await hasLiveAppointment(
       tenantId,
       threadId,
       base,
@@ -274,6 +328,17 @@ export async function followUpHandler(
     // Step 0 (sequence start) only proceeds for a fresh episode — the sweep's SQL filter already
     // enforces this; re-checking here blocks a stale step-0 job on an already-handled conversation.
     if (!newEpisode) return { outcome: "done" };
+    // NOTE: Activation fence (mirrors the sweep SQL): a sequence only STARTS for an episode that began
+    // after follow-up was armed. Catches a step-0 job enqueued before a re-arm (disable → re-enable)
+    // and any agent never armed (NULL → fail-safe). Later steps are exempt: an in-flight sequence
+    // legitimately outlives a re-arm.
+    if (
+      ctx.armedAt == null ||
+      lastInboundAt == null ||
+      lastInboundAt < ctx.armedAt
+    ) {
+      return { outcome: "done" };
+    }
   } else if (newEpisode) {
     // A later step but the client spoke (or the watermark vanished): the episode is over. The inbound
     // webhook already cancels the PENDING job; a new period of silence restarts at step 0.
@@ -325,7 +390,7 @@ export async function followUpHandler(
   const idleMin = lastEventAt
     ? Math.round((Date.now() - lastEventAt.getTime()) / 60_000)
     : stepDelayMinutes(step);
-  await runAgentNudge({
+  const nudgeOutcome = await runAgentNudge({
     tenantId,
     threadId,
     nudge: {
@@ -344,9 +409,49 @@ export async function followUpHandler(
           : undefined,
       resolve: isLast && step.resolve === true,
     },
+    // NOTE: An inactivity follow-up must verify the LIVE conversation state before posting: the mirror can
+    // be stale forever (a lost resolve webhook has no reconciliation), and following up a resolved
+    // conversation was the community-reported incident this gate exists for.
+    requireLiveBotOwnership: true,
     base,
     deps,
   });
+
+  // NOTE: Live gate: the conversation is no longer bot-owned in Chatwoot (resolved / human took over) —
+  // the episode is moot. No watermark, no next step; the reconciled mirror keeps the sweep away.
+  if (nudgeOutcome === "stale") return { outcome: "done" };
+  // NOTE: Nothing was posted: the live-state GET failed (fail-closed) or a pending human-in-the-loop
+  // interrupt deferred the nudge. Retry the SAME step later instead of stamping a follow-up that
+  // never happened — but bounded (NUDGE_RETRY_LIMIT): on exhaustion, abandon the episode with a
+  // stamp so the sweep stays away until the customer speaks again.
+  if (nudgeOutcome === "live-unavailable" || nudgeOutcome === "deferred") {
+    const priorRetries =
+      typeof job.payload.nudgeRetries === "number" &&
+      Number.isInteger(job.payload.nudgeRetries)
+        ? job.payload.nudgeRetries
+        : 0;
+    if (priorRetries + 1 >= NUDGE_RETRY_LIMIT) {
+      logger.warn(
+        "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
+        stepIndex,
+        priorRetries + 1,
+        nudgeOutcome,
+        threadId,
+      );
+      await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.conversation.update({
+          where: { id: ctx.conv.id },
+          data: { lastFollowUpAt: new Date() },
+        }),
+      );
+      return { outcome: "done" };
+    }
+    return {
+      outcome: "reschedule",
+      runAt: new Date(Date.now() + NUDGE_RETRY_BACKOFF_MS),
+      payload: { ...job.payload, nudgeRetries: priorRetries + 1 },
+    };
+  }
 
   // Watermark: stamp regardless of whether the nudge sent or stayed silent, so the next step's
   // cadence anchors here and the episode-interruption check works.
@@ -356,6 +461,13 @@ export async function followUpHandler(
       data: { lastFollowUpAt: new Date() },
     }),
   );
+
+  // NOTE: The outside-window fallback note ENDS the sequence: with no usable template, every further step
+  // would be equally undeliverable (only a customer reply reopens the 24h window, and that reply
+  // ends the episode anyway). One explained note is the operator's cue — N would be noise. Any
+  // configured resolve on the unreached last step deliberately does NOT run: the conversation stays
+  // visible in the operator's queue instead of being silently closed.
+  if (nudgeOutcome === "noted-window") return { outcome: "done" };
 
   // Advance to the next step on the SAME job row (reschedule carries the new stepIndex), or end.
   const nextIndex = stepIndex + 1;

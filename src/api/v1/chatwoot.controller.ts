@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import logger from "@/api/lib/logger";
-import { doc } from "@/api/lib/openapi";
+import { doc, errorResponse, jsonResponse } from "@/api/lib/openapi";
 import {
   processChatwootDelivery,
   receiveChatwootWebhook,
@@ -64,9 +64,30 @@ export const chatwootController = new Elysia({
     detail: {
       ...doc(
         "Chatwoot bot webhook",
-        "Public Agent Bot webhook receiver; authenticated by the opaque per-instance route token plus the HMAC signature header (verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast and always returns 200 to avoid leaking auth state.",
+        "Public Agent Bot webhook receiver; authenticated by the opaque per-instance route token plus the HMAC signature header (verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast (<5s) and processes asynchronously; an unknown token and a bad signature collapse into the same 401, so a probe cannot tell which routes are live.",
       ),
       security: [],
+      responses: {
+        200: jsonResponse(
+          "Returned once the caller is authenticated; `outcome` says what happened to the event.",
+          t.Object({
+            ack: t.Literal(true),
+            outcome: t.Union(
+              [
+                t.Literal("queued"),
+                t.Literal("duplicate"),
+                t.Literal("ignored"),
+              ],
+              {
+                description:
+                  "queued = accepted for async handling; duplicate = replay of an already-recorded event; ignored = an event shape the receiver does not handle.",
+              },
+            ),
+          }),
+        ),
+        400: errorResponse(400),
+        401: errorResponse(401),
+      },
     },
     params: t.Object({
       routeToken: t.String({

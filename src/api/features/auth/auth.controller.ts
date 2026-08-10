@@ -41,7 +41,7 @@ import {
 import { authPlugin } from "@/api/lib/auth";
 import { translate } from "@/api/lib/i18n";
 import logger from "@/api/lib/logger";
-import { doc, errors } from "@/api/lib/openapi";
+import { doc, errors, jsonResponse } from "@/api/lib/openapi";
 import config from "@/config";
 
 const baseAuthController = new Elysia({
@@ -378,6 +378,11 @@ const baseAuthController = new Elysia({
           "Returns the authenticated user (or null when anonymous) plus auth state flags: setupRequired, setupTokenRequired, signupEnabled, providers, and the default tenant id. Safe to call without a session.",
         ),
         security: [],
+        responses: {
+          200: jsonResponse(
+            "Session and auth state. `user` is null when anonymous; the flags describe setup, signup and provider availability.",
+          ),
+        },
       },
     },
   )
@@ -566,6 +571,12 @@ const baseAuthController = new Elysia({
           "Clears the authentication cookie for the current session.",
         ),
         security: [],
+        responses: {
+          200: jsonResponse(
+            "The auth cookie was cleared.",
+            t.Object({ success: t.Literal(true) }),
+          ),
+        },
       },
     },
   );

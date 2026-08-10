@@ -1,5 +1,11 @@
 import { Elysia } from "elysia";
-import { doc, errors } from "@/api/lib/openapi";
+import {
+  doc,
+  ErrorResponse,
+  errors,
+  jsonResponse,
+  type ResponseDoc,
+} from "@/api/lib/openapi";
 import config from "@/config";
 import { verifyApiKey } from "@/modules/api-keys/verify";
 import {
@@ -20,6 +26,18 @@ function bearer(req: Request): string | null {
   const auth = req.headers.get("authorization") ?? "";
   return auth.startsWith("Bearer ") ? auth.slice(7).trim() : null;
 }
+
+// NOTE: Doc-only 405 shared by the not-offered GET/DELETE stubs below, carrying the `Allow` header
+// the handlers always set.
+const methodNotAllowedResponse: ResponseDoc = {
+  ...jsonResponse(
+    "Always returned: this transport does not offer the method (`Allow: POST`).",
+    ErrorResponse,
+  ),
+  headers: {
+    Allow: { description: "Always `POST`.", schema: { type: "string" } },
+  },
+};
 
 export const mcpController = new Elysia({
   prefix: "/v1/mcp",
@@ -72,6 +90,7 @@ export const mcpController = new Elysia({
           "Always 405 with `Allow: POST`. This transport is stateless and tools-only, so the OPTIONAL server-to-client SSE stream does not exist; the route is declared so a probing client gets an explicit 405 instead of falling through to the SPA 404 guard and reconnecting in a loop.",
         ),
         security: [],
+        responses: { 405: methodNotAllowedResponse },
       },
     },
   )
@@ -89,6 +108,7 @@ export const mcpController = new Elysia({
           "Always 405 with `Allow: POST`. The transport is stateless, so there is no session to tear down; declared for the same reason as the GET above.",
         ),
         security: [],
+        responses: { 405: methodNotAllowedResponse },
       },
     },
   );

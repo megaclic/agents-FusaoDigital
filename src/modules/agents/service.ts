@@ -254,6 +254,20 @@ export function assertPromptSize(systemPrompt: string | undefined): void {
 
 // Allowlist of editable fields. tenantId/id are never touched; modelConfig/settings must be
 // objects (the runtime's own parser validates their inner shape at load time).
+// NOTE: The EFFECTIVE follow-up state: an ENABLED agent with followUp.enabled, in ANY mode — the
+// sweep admits test-mode conversations explicitly activated with /teste, so test-mode agents need
+// the fence armed too. Its OFF→ON transition stamps Agent.followUpArmedAt (the sweep's backlog
+// fence) — see updateAgent/createAgent. Re-arming on every OFF→ON is deliberate: disabling and
+// re-enabling means "from now on". Promotion to production ALSO re-arms (updateAgent): it widens
+// the eligible set from /teste-activated conversations to every pending one, and a watermark from
+// the test period would expose that whole historical backlog to the sweep at once.
+function effectiveFollowUpOn(a: {
+  enabled: boolean;
+  settings: unknown;
+}): boolean {
+  return a.enabled && readFollowUpConfig(a.settings).enabled;
+}
+
 export const agentUpdateSchema = z
   .object({
     name: z.string().min(1).max(200).optional(),
@@ -341,6 +355,34 @@ export async function updateAgent(
     const updateData: Record<string, unknown> = { ...rest };
     if (hasBh) updateData.businessHoursId = bhId;
     if (hasFuh) updateData.followUpHoursId = fuhId;
+    // NOTE: Arm the follow-up backlog fence on the OFF→ON transition of the effective state. The row
+    // lock (FOR UPDATE, held to commit — runScopedOn is one interactive transaction) serializes the
+    // read-compute-write against concurrent saves: without it, a save that read the old ON state
+    // could land last after another save turned follow-up OFF, restoring ON with the STALE watermark
+    // and re-exposing the pre-arm backlog to the sweep. RLS still applies to the raw read.
+    const beforeRows = await db.$queryRaw<
+      Array<{ enabled: boolean; mode: string; settings: unknown }>
+    >`SELECT enabled, mode, settings FROM agents WHERE id = ${id} FOR UPDATE`;
+    const before = beforeRows[0];
+    if (before) {
+      const after = {
+        enabled: rest.enabled !== undefined ? rest.enabled : before.enabled,
+        mode: rest.mode !== undefined ? rest.mode : before.mode,
+        settings: rest.settings !== undefined ? rest.settings : before.settings,
+      };
+      // NOTE: Promotion to production re-arms even with follow-up already effectively ON: the
+      // eligible set widens from /teste-activated conversations to EVERY pending one, and keeping a
+      // watermark from the test period would blast the whole pre-promotion backlog (the community
+      // incident this fence exists to prevent).
+      const promotedToProduction =
+        before.mode !== "production" && after.mode === "production";
+      if (
+        effectiveFollowUpOn(after) &&
+        (!effectiveFollowUpOn(before) || promotedToProduction)
+      ) {
+        updateData.followUpArmedAt = new Date();
+      }
+    }
     // updateMany so a cross-tenant id (invisible under RLS) yields count 0 → NotFound, rather
     // than a P2025 throw. The $extends does not auto-scope updates, but RLS does. With an
     // expectedUpdatedAt precondition (editor optimistic concurrency), it joins the filter: count 0
@@ -473,20 +515,31 @@ export async function createAgent(
         );
       }
     }
+    const createShape = {
+      enabled: data.enabled ?? true,
+      // NOTE: New agents are born in test mode (operator opt-in before going live).
+      mode: data.mode ?? "test",
+      settings: (data.settings ?? {}) as Prisma.InputJsonValue,
+    };
     const row = await db.agent.create({
       data: {
         tenantId,
         name: data.name,
         systemPrompt: data.systemPrompt ?? "",
-        enabled: data.enabled ?? true,
-        // New agents are born in test mode (operator opt-in before going live).
-        mode: data.mode ?? "test",
+        enabled: createShape.enabled,
+        mode: createShape.mode,
         transferWithSummary: data.transferWithSummary ?? true,
         modelConfig: (data.modelConfig ??
           DEFAULT_MODEL_CONFIG) as Prisma.InputJsonValue,
-        settings: (data.settings ?? {}) as Prisma.InputJsonValue,
+        settings: createShape.settings,
         businessHoursId: bhId,
         followUpHoursId: fuhId,
+        // NOTE: Born already effectively follow-up-ON (enabled + followUp.enabled, any mode: the
+        // sweep admits /teste-activated conversations) → armed from creation, so only post-creation
+        // episodes are swept.
+        ...(effectiveFollowUpOn(createShape)
+          ? { followUpArmedAt: new Date() }
+          : {}),
       },
       select: AGENT_SELECT,
     });

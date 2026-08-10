@@ -1,4 +1,8 @@
-import type { NormalizedChatwootEvent } from "./types";
+import type { RenderableLocation } from "./render";
+import type {
+  NormalizedChatwootAttachment,
+  NormalizedChatwootEvent,
+} from "./types";
 
 // Pure normalization of an (untrusted) Chatwoot Agent Bot webhook payload into the fields we
 // act on, tolerant of the two payload shapes. No DB, no network — the receiver verifies HMAC,
@@ -16,6 +20,12 @@ function num(v: unknown): number | null {
 
 function str(v: unknown): string | null {
   return typeof v === "string" ? v : null;
+}
+
+// NOTE: Coordinates arrive as JSON floats (possibly negative) — num() deliberately rejects those
+// (it parses ids). Numbers only: the fork's serializer never sends coordinates as strings.
+function float(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 // NOTE: undefined means "this payload said nothing", so the mirror keeps the stored bag instead of
@@ -55,9 +65,11 @@ export function normalizeChatwootEvent(
         : null,
     inboxId: conv ? num(conv.inbox_id) : null,
     status: conv ? str(conv.status) : null,
-    assigneeType: meta ? str(meta.assignee_type) : null,
-    assigneeId: assignee ? num(assignee.id) : null,
-    assigneeName: assignee ? str(assignee.name) : null,
+    // NOTE: No meta ⇒ undefined ("said nothing", the mirror preserves); meta without an assignee ⇒
+    // explicit null (a real unassign). Mirrors the attrs() sentinel above.
+    assigneeType: meta ? str(meta.assignee_type) : undefined,
+    assigneeId: meta ? (assignee ? num(assignee.id) : null) : undefined,
+    assigneeName: meta ? (assignee ? str(assignee.name) : null) : undefined,
   };
 
   if (isMessage) {
@@ -86,6 +98,11 @@ export function normalizeChatwootEvent(
             // Audio attachments ship `transcribed_text` (empty until our write-back lands); empty
             // string normalizes to null so callers can treat "no transcription" uniformly.
             transcribedText: str(a.transcribed_text) || null,
+            // NOTE: Location attachments ship coordinates + place name (location_metadata);
+            // null-ish on every other file_type.
+            latitude: float(a.coordinates_lat),
+            longitude: float(a.coordinates_long),
+            fallbackTitle: str(a.fallback_title) || null,
           }))
         : undefined,
       inReplyTo: ca ? num(ca.in_reply_to) : null,
@@ -128,6 +145,51 @@ export function normalizeChatwootEvent(
   normalized.channel = conv ? str(conv.channel) : null;
   normalized.lastActivityAt = conv ? num(conv.last_activity_at) : null;
   return normalized;
+}
+
+// NOTE: Minimal parse of a LIVE conversation payload (GET /conversations/:id — the REST show shape;
+// same field positions as the conversation-event payloads: `status` at the top, `meta.assignee_type`,
+// `meta.assignee.{id,name}`, `id` = display_id). Null when the payload does not look like a
+// conversation — a missing `status` is treated as unparseable (the caller must fail closed and retry,
+// never conclude "not bot-owned" from a degraded payload). Feeds the proactive-send live gate: the
+// mirror can be stale forever (a lost resolve webhook has no reconciliation), so anything about to
+// message a customer proactively re-checks this.
+export interface LiveConversationState {
+  status: string;
+  assigneeType: string | null;
+  assigneeId: number | null;
+  assigneeName: string | null;
+  // NOTE: The conversation's last_activity_at (REST show renders it both as `last_activity_at` and
+  // `timestamp`, epoch seconds). Lets the live-probe reconcile compare freshness against the
+  // mirror's monotonic lastEventAt. null when the payload omits both.
+  lastActivityAt: Date | null;
+}
+
+export function parseLiveConversation(
+  raw: unknown,
+): LiveConversationState | null {
+  if (!isRecord(raw)) return null;
+  if (num(raw.id) === null) return null;
+  const status = str(raw.status);
+  if (status === null) return null;
+  const meta = isRecord(raw.meta) ? raw.meta : null;
+  const assignee = meta && isRecord(meta.assignee) ? meta.assignee : null;
+  const assigneeType = meta ? str(meta.assignee_type) : null;
+  const assigneeId = assignee ? num(assignee.id) : null;
+  // NOTE: An "AgentBot" claim without a readable numeric id is unverifiable ownership — with a null
+  // assigneeId, shouldBotHandle would treat a conversation owned by ANOTHER bot as ours. The fork's
+  // jbuilder always renders meta.assignee (agent_bot_slim, with id) alongside assignee_type
+  // "AgentBot", so this only rejects genuinely malformed payloads. Fail closed: the live gate turns
+  // null into "live-unavailable" and retries.
+  if (assigneeType === "AgentBot" && assigneeId === null) return null;
+  const activitySec = num(raw.last_activity_at) ?? num(raw.timestamp);
+  return {
+    status,
+    assigneeType,
+    assigneeId,
+    assigneeName: assignee ? str(assignee.name) : null,
+    lastActivityAt: activitySec !== null ? new Date(activitySec * 1000) : null,
+  };
 }
 
 // Attribution = source of truth. The bot owns a conversation only while NO human is assigned
@@ -226,6 +288,48 @@ export function firstAudioAttachment(e: NormalizedChatwootEvent): {
         id: a.id,
         dataUrl: a.dataUrl,
         transcribedText: a.transcribedText ?? null,
+      };
+    }
+  }
+  return null;
+}
+
+// NOTE: The first USABLE location attachment (a WhatsApp pin): real coordinates and/or a human
+// title, or null. Chatwoot's coordinate columns default to 0.0, so an exact (0,0) — the null
+// island — means the provider sent no coordinates, not a pin in the Gulf of Guinea; such a pin can
+// still carry a usable fallback_title (place name + address). Neither ⇒ null, and the render falls
+// back to the generic attachment marker. Shared by the direct webhook path and the debounce
+// re-fetch (issue #45).
+export function firstLocationAttachment(
+  attachments:
+    | Array<
+        Pick<
+          NormalizedChatwootAttachment,
+          "fileType" | "latitude" | "longitude" | "fallbackTitle"
+        >
+      >
+    | undefined,
+): RenderableLocation | null {
+  for (const a of attachments ?? []) {
+    if (a.fileType !== "location") continue;
+    const lat = a.latitude ?? null;
+    const long = a.longitude ?? null;
+    // NOTE: Out-of-range values (|lat| > 90, |long| > 180) are provider garbage, not coordinates —
+    // they would flow into tool args. Same fail-safe as (0,0): drop the coords, keep the title.
+    const hasCoords =
+      lat !== null &&
+      long !== null &&
+      lat >= -90 &&
+      lat <= 90 &&
+      long >= -180 &&
+      long <= 180 &&
+      !(lat === 0 && long === 0);
+    const title = a.fallbackTitle?.replace(/\s+/g, " ").trim() || null;
+    if (hasCoords || title) {
+      return {
+        latitude: hasCoords ? lat : null,
+        longitude: hasCoords ? long : null,
+        title,
       };
     }
   }

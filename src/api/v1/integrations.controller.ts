@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import logger from "@/api/lib/logger";
-import { doc } from "@/api/lib/openapi";
+import { doc, errorResponse, jsonResponse } from "@/api/lib/openapi";
 import {
   processInboundDelivery,
   receiveInbound,
@@ -50,9 +50,32 @@ export const integrationsController = new Elysia({
     detail: {
       ...doc(
         "Generic inbound webhook",
-        "Public inbound receptor for integrations (n8n-style webhook node); authenticated by the opaque per-instance route token plus the per-instance auth strategy (e.g. HMAC or static header, verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast and always returns 200 to avoid leaking auth state.",
+        "Public inbound receptor for integrations (n8n-style webhook node); authenticated by the opaque per-instance route token plus the per-instance auth strategy (e.g. HMAC or static header, verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast (<5s) and dispatches asynchronously; an unknown token and failed auth collapse into the same 401, so a probe cannot tell which routes are live.",
       ),
       security: [],
+      responses: {
+        200: jsonResponse(
+          "Returned once the caller is authenticated; `outcome` says what happened to the delivery.",
+          t.Object({
+            ack: t.Literal(true),
+            outcome: t.Union(
+              [
+                t.Literal("queued"),
+                t.Literal("duplicate"),
+                t.Literal("ignored"),
+                t.Literal("no-mapper"),
+                t.Literal("invalid"),
+              ],
+              {
+                description:
+                  "queued = accepted for async dispatch; duplicate = replay of an already-recorded delivery; ignored = deliberately-unhandled lifecycle event; no-mapper = the integration has no inbound mapper registered; invalid = the payload failed the mapper schema (recorded for inspection).",
+              },
+            ),
+          }),
+        ),
+        400: errorResponse(400),
+        401: errorResponse(401),
+      },
     },
     params: t.Object({
       routeToken: t.String({

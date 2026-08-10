@@ -5,6 +5,7 @@ import { type AgentNudge, parseThreadId, runAgentNudge } from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { loadAppointmentContext } from "@/modules/appointments/context";
 import {
   type ClaimedJob,
   cancelPendingJobsByPrefix,
@@ -74,6 +75,11 @@ export interface ScheduleAppointmentRemindersArgs {
   startISO: string;
   offsetsHours: number[];
   askConfirmationOnLast: boolean;
+  // Carried into the job payload so the per-turn appointment context (and the reminder turn itself)
+  // can describe the event without a Google call. Snapshotted at (re)arm time — a rename made
+  // directly in Google Calendar goes stale until the next reschedule re-arms.
+  summary?: string | null;
+  calendarLabel?: string | null;
   base?: PrismaClient;
   now?: Date;
 }
@@ -102,6 +108,8 @@ export async function enqueueAppointmentReminders(
         offsetHours: j.offsetHours,
         isLast: j.isLast,
         askConfirmation: args.askConfirmationOnLast,
+        summary: args.summary ?? null,
+        calendarLabel: args.calendarLabel ?? null,
       },
       base: args.base,
     });
@@ -121,46 +129,67 @@ export async function cancelAppointmentReminders(
     reminderPrefix(eventId),
     base,
   );
+  // NOTE: Tombstone EVERY row of this event (fired DONE rows included). Cancelling marks jobs DONE,
+  // which is indistinguishable from "fired" — without the stamp, the per-turn appointment context
+  // would keep presenting a cancelled appointment as live until its start passed. A reschedule
+  // re-arm replaces the payload wholesale (enqueueJob's upsert is authoritative), clearing the stamp
+  // on the offsets that survive. One atomic jsonb merge, never read-modify-write: a concurrent
+  // re-arm's payload is stamped or replaced whole, so a stale snapshot can never clobber it.
+  await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    // LIKE needs its own escaping (Google recurrence ids carry `_`).
+    const likePrefix = `${reminderPrefix(eventId).replace(/[\\%_]/g, "\\$&")}%`;
+    const stamp = JSON.stringify({ cancelledAt: new Date().toISOString() });
+    await db.$executeRaw`
+      UPDATE scheduler_jobs
+         SET payload = payload || ${stamp}::jsonb, updated_at = now()
+       WHERE tenant_id = ${tenantId}
+         AND kind = 'APPOINTMENT_REMINDER'
+         AND dedupe_key LIKE ${likePrefix}`;
+  });
 }
 
-// True when this conversation (by thread) has at least one PENDING appointment reminder — i.e. a known
-// FUTURE appointment. The follow-up sweep + handler use it to pause re-engagement while a booking is
-// live (FollowUpConfig.pauseWhileAppointment): a customer who just booked should not get "still there?"
-// nudges; the reminder owns the conversation until the appointment passes / is cancelled. Tenant-scoped.
-export async function hasPendingAppointmentReminder(
+// True while this conversation (by thread) has at least one LIVE appointment — a queued reminder row
+// (PENDING/CLAIMED) or an already-fired one whose start is still ahead, tombstones excluded: the shared
+// projectAppointmentEvents predicate, via loadAppointmentContext. The follow-up handler uses it to
+// pause re-engagement while a booking is live (FollowUpConfig.pauseWhileAppointment): a customer who
+// just booked should not get "still there?" nudges until the appointment passes / is cancelled.
+// NOTE: Anchoring on PENDING rows alone went blind after the LAST reminder fired (issue #39).
+// Tenant-scoped.
+export async function hasLiveAppointment(
   tenantId: bigint,
   threadId: string,
   base: PrismaClient = basePrisma,
 ): Promise<boolean> {
   return runScopedOn(base, sysCtx(tenantId), async (db) => {
-    const row = await db.schedulerJob.findFirst({
-      where: {
-        kind: "APPOINTMENT_REMINDER",
-        status: "PENDING",
-        payload: { path: ["threadId"], equals: threadId },
-      },
-      select: { id: true },
-    });
-    return row !== null;
+    const events = await loadAppointmentContext(db, tenantId, threadId);
+    return events.length > 0;
   });
 }
 
-// Pure: the system nudge for a reminder. On the last reminder with confirmation enabled, instruct the
-// agent to ask for confirmation and to mark the event via calendar_confirm_appointment.
-export function reminderNudge(
-  isLast: boolean,
-  askConfirmation: boolean,
-  summary: string,
-  startISO: string,
-): AgentNudge {
-  const wantsConfirmation = isLast && askConfirmation;
+export interface ReminderNudgeArgs {
+  isLast: boolean;
+  askConfirmation: boolean;
+  summary: string;
+  startISO: string;
+  eventId: string;
+  calendarId: string;
+}
+
+// Pure: the system nudge for a reminder. The event's identity travels as fenced-data refs (the ids
+// the calendar tools take as arguments — issue #22: without them the agent that answers the reply
+// cannot tell WHICH appointment the reminder was about), and the instructions point at the refs by
+// key. On the last reminder with confirmation enabled, instruct the agent to ask for confirmation
+// and to mark the event via calendar_confirm_appointment.
+export function reminderNudge(a: ReminderNudgeArgs): AgentNudge {
+  const wantsConfirmation = a.isLast && a.askConfirmation;
   return {
     source: "appointment_reminder",
     kind: "reminder",
-    summary: `Upcoming appointment "${summary}" starting at ${startISO}.`,
+    summary: `Upcoming appointment "${a.summary}" starting at ${a.startISO}.`,
+    refs: { event_id: a.eventId, calendar_id: a.calendarId },
     instructions: wantsConfirmation
-      ? "This is the final reminder before the appointment. Remind the customer warmly of the date and time, and ASK them to confirm they will attend. If they confirm, call calendar_confirm_appointment with the event id to mark it confirmed."
-      : "Remind the customer warmly of their upcoming appointment, stating the date and time. Keep it short and natural.",
+      ? "This is the final reminder before the appointment. Remind the customer warmly of the date and time, and ASK them to confirm they will attend. If they confirm, call calendar_confirm_appointment with eventId set to the event_id value from the fenced data line (and calendarId set to the calendar_id value)."
+      : "Remind the customer warmly of their upcoming appointment, stating the date and time. Keep it short and natural. If they ask to reschedule or cancel, use calendar_update_event / calendar_cancel_event with eventId set to the event_id value from the fenced data line (and calendarId set to the calendar_id value).",
   };
 }
 
@@ -251,7 +280,9 @@ export async function appointmentReminderHandler(
 
   // Verify the event before nudging: skip if it was cancelled / deleted / already started (e.g. edited
   // directly in Google). A transient lookup failure (undefined) falls through to nudging anyway.
-  let summary = "your appointment";
+  // Summary preference: live Google value > the snapshot enriched into the payload > generic.
+  let summary =
+    typeof p.summary === "string" && p.summary ? p.summary : "your appointment";
   if (credentialRef) {
     const ev = await fetchEventStatus(
       tenantId,
@@ -271,7 +302,14 @@ export async function appointmentReminderHandler(
   await runAgentNudge({
     tenantId,
     threadId,
-    nudge: reminderNudge(isLast, askConfirmation, summary, startISO),
+    nudge: reminderNudge({
+      isLast,
+      askConfirmation,
+      summary,
+      startISO,
+      eventId,
+      calendarId,
+    }),
     base,
     deps,
   });

@@ -160,8 +160,9 @@ export const mcpConnectionsController = new Elysia({
         "Update MCP connection",
         "Updates a consumed MCP server connection of the tenant.",
       ),
-      params: t.Object({ id: t.String() }),
+      params: idParams,
       body: writeBody,
+      response: errors(400, 401, 403, 404),
     },
   )
   .delete(
@@ -176,7 +177,8 @@ export const mcpConnectionsController = new Elysia({
         "Delete MCP connection",
         "Removes a consumed MCP server connection from the tenant.",
       ),
-      params: t.Object({ id: t.String() }),
+      params: idParams,
+      response: errors(400, 401, 403, 404),
     },
   )
   .post(
@@ -198,6 +200,7 @@ export const mcpConnectionsController = new Elysia({
         "Discover MCP tools",
         "Connects to the MCP server behind the connection and lists the tools and instructions it exposes.",
       ),
-      params: t.Object({ id: t.String() }),
+      params: idParams,
+      response: errors(400, 401, 403, 404),
     },
   );

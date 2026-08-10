@@ -604,6 +604,7 @@ export async function getConversationDetail(
               modelConfig: true,
               businessHoursId: true,
               followUpHoursId: true,
+              followUpArmedAt: true,
             },
           }),
         )
@@ -662,10 +663,20 @@ export async function getConversationDetail(
     // step is "2d". The tooltip uses this to explain the deferral.
     let nextRunAtDeferred = false;
     const firstStep = cfg.steps[0];
-    if (job) {
-      const rawStep = (job.payload as { stepIndex?: unknown } | null)
-        ?.stepIndex;
-      const stepIndex = typeof rawStep === "number" ? rawStep : 0;
+    // NOTE: A PENDING step-0 job enqueued before a re-arm will be DROPPED by the handler's
+    // activation fence — the estimate must not promise it. Later steps stay exempt (an in-flight
+    // sequence legitimately outlives a re-arm), mirroring followUpHandler.
+    const rawStep = (job?.payload as { stepIndex?: unknown } | null)?.stepIndex;
+    const jobStepIndex =
+      typeof rawStep === "number" && Number.isInteger(rawStep) ? rawStep : 0;
+    const fencedStep0Job =
+      job != null &&
+      jobStepIndex === 0 &&
+      (agent?.followUpArmedAt == null ||
+        conv.lastInboundAt == null ||
+        conv.lastInboundAt < agent.followUpArmedAt);
+    if (job && !fencedStep0Job) {
+      const stepIndex = jobStepIndex;
       nextStep = stepIndex + 1;
       // job.runAt is NOT the firing time yet — the sweep enqueues step 0 with runAt=now (and re-arms
       // it on EVERY pass), so a freshly-swept job's runAt sits before the real cadence AND outside the
@@ -700,6 +711,11 @@ export async function getConversationDetail(
       cfg.enabled &&
       firstStep &&
       isNewFollowUpEpisode(conv.lastFollowUpAt, conv.lastInboundAt) &&
+      // NOTE: Activation fence (mirrors the sweep SQL): no estimate for an episode that began before
+      // follow-up was armed — the sweep will never enqueue it, so the indicator must not promise it.
+      agent?.followUpArmedAt != null &&
+      conv.lastInboundAt != null &&
+      conv.lastInboundAt >= agent.followUpArmedAt &&
       conv.lastEventAt &&
       shouldBotHandle({
         status: conv.status,

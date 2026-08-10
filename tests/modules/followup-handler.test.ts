@@ -5,12 +5,15 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
+import { hasLiveAppointment } from "@/modules/appointments/reminders";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import {
   ensureAllTenantSweeps,
   followUpHandler,
+  registerFollowUpHandlers,
 } from "@/modules/followups/handlers";
 import type { ClaimedJob } from "@/modules/scheduler/service";
+import { getJobHandler } from "@/modules/scheduler/worker";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -48,13 +51,20 @@ function fakeModel() {
   return new FakeListChatModel({ responses: [REPLY] });
 }
 
-function stubClient() {
+function stubClient(over: { liveMeta?: Record<string, unknown> } = {}) {
   const sent: Array<[number, string]> = [];
   const notes: Array<[number, string]> = [];
   const labelSets: string[][] = [];
   const resolved: number[] = [];
   let currentLabels: string[] = [];
   const client = {
+    // NOTE: `liveMeta` lets a test make the LIVE state (the requireLiveBotOwnership probe) agree
+    // with the mirrored assignee it seeded — the default `{}` reads as unassigned.
+    getConversation: async (c: number) => ({
+      id: c,
+      status: "pending",
+      meta: over.liveMeta ?? {},
+    }),
     sendMessage: async (c: number, t: string) => {
       sent.push([c, t]);
       return {};
@@ -129,6 +139,7 @@ async function seedConversation(
     lastFollowUpAt?: Date | null;
     status?: string;
     assigneeType?: string | null;
+    assigneeId?: number | null;
   } = {},
 ) {
   // Two minutes ago so the inactivity threshold (1min delay agent) is exceeded.
@@ -148,6 +159,7 @@ async function seedConversation(
       chatwootConversationId: convId,
       status: over.status ?? "pending",
       assigneeType: over.assigneeType ?? null,
+      assigneeId: over.assigneeId ?? null,
       threadId: threadOf(convId),
       lastEventAt,
       lastInboundAt:
@@ -167,6 +179,7 @@ async function seedConversation(
         over.lastFollowUpAt !== undefined ? over.lastFollowUpAt : null,
       status: over.status ?? "pending",
       assigneeType: over.assigneeType ?? null,
+      assigneeId: over.assigneeId ?? null,
     },
   });
 }
@@ -201,6 +214,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
         tenantId,
         name: "Atendente",
         systemPrompt: "Você é prestativa.",
+        followUpArmedAt: new Date(Date.now() - 30 * 86_400_000),
         modelConfig: {
           provider: "openai",
           model: "gpt-4o-mini",
@@ -414,12 +428,14 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
       persistUsage: async () => {},
     });
     expect(result).toEqual({ outcome: "done" }); // no further step
-    // A 1-day cadence means the client has been silent past WhatsApp's 24h window, so the proactive
-    // message is delivered as a private note (no free-form). The deterministic actions still fire.
+    // NOTE: A 1-day cadence means the client has been silent past WhatsApp's 24h window, so the
+    // proactive message is delivered as a private note (noted-window). Labels still fire, but the
+    // auto-resolve is SKIPPED: nothing reached the customer, so resolving would close the
+    // conversation unanswered.
     expect(s.notes.length).toBeGreaterThan(0);
     expect(s.sent).toEqual([]);
     expect(s.labelSets).toContainEqual(["sem-resposta"]);
-    expect(s.resolved).toContain(1007);
+    expect(s.resolved).toEqual([]);
   });
 
   test("(h) last step actions fire EVEN when the agent stays silent", async () => {
@@ -639,5 +655,463 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     // The agent opted out of pausing, so the follow-up fires normally.
     expect(result).toEqual({ outcome: "done" });
     expect(s.sent.length).toBeGreaterThan(0);
+  });
+
+  // NOTE: Chatwoot ≥ 4.16.2 auto-assigns the connected Agent Bot at conversation creation, so
+  // `assignee_type = 'AgentBot'` is the NORMAL bot-owned state — the sweep must treat it exactly
+  // like unassigned (shouldBotHandle's `!== 'User'`), or follow-up never fires in ordinary
+  // operation (issue #27).
+  test("(o) sweep enqueues for a bot-owned conversation (AgentBot) and skips a human-owned one", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [{ delayValue: 1, delayUnit: "minutes", instructions: "" }],
+          },
+        },
+      },
+    });
+    await seedConversation(1020, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await seedConversation(1021, {
+      assigneeType: "User",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    expect(sweep).toBeDefined();
+    await sweep?.(
+      {
+        id: 999n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+      },
+      appDb,
+    );
+    const botJob = await suDb.schedulerJob.findFirst({
+      where: {
+        tenantId,
+        kind: "FOLLOWUP",
+        dedupeKey: `followup:${threadOf(1020)}`,
+      },
+    });
+    const humanJob = await suDb.schedulerJob.findFirst({
+      where: {
+        tenantId,
+        kind: "FOLLOWUP",
+        dedupeKey: `followup:${threadOf(1021)}`,
+      },
+    });
+    expect(botJob).not.toBeNull();
+    expect(humanJob).toBeNull();
+  });
+
+  // NOTE: The permissive sweep makes a conversation owned by a DIFFERENT Agent Bot reachable, so
+  // the nudge's ownership gate must exclude it by id — our bot messages only its own conversations.
+  test("(p) a conversation owned by a FOREIGN Agent Bot is never messaged; our own is", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    // NOTE: Our bot is chatwootAgentBotId 5 (beforeAll); 777 is another bot on the same account.
+    await seedConversation(1030, {
+      assigneeType: "AgentBot",
+      assigneeId: 777,
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const foreign = stubClient({
+      liveMeta: { assignee_type: "AgentBot", assignee: { id: 777 } },
+    });
+    await followUpHandler(jobFor(1030), appDb, {
+      makeModel: fakeModel,
+      makeClient: foreign.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    expect(foreign.sent).toEqual([]);
+
+    await seedConversation(1031, {
+      assigneeType: "AgentBot",
+      assigneeId: 5,
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const ours = stubClient({
+      liveMeta: { assignee_type: "AgentBot", assignee: { id: 5 } },
+    });
+    await followUpHandler(jobFor(1031), appDb, {
+      makeModel: fakeModel,
+      makeClient: ours.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    expect(ours.sent).toEqual([[1031, REPLY]]);
+  });
+
+  // NOTE: Firing a reminder marks its row DONE. Suppression anchored on PENDING rows alone goes
+  // blind after the LAST reminder fires while the appointment is still ahead (issue #39) — both
+  // the handler re-check and the sweep must treat "DONE with a future start" as a live appointment,
+  // tombstoned (cancelled) rows excluded.
+  test("(q) follow-up stays paused after the LAST reminder fired while the appointment is ahead", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1040, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    // NOTE: The last reminder already fired (DONE, runAt in the past) but the appointment is 2h ahead.
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_q:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1040),
+          eventId: "ev_q",
+          startISO: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+        },
+      },
+    });
+    const s = stubClient();
+    const result = await followUpHandler(jobFor(1040), appDb, {
+      makeModel: fakeModel,
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    expect(result.outcome).toBe("reschedule");
+    expect(s.sent).toEqual([]);
+    expect(s.notes).toEqual([]);
+    expect(await lastFollowUpOf(1040)).toBeNull();
+  });
+
+  test("(r) sweep skips conversations with a live appointment: DONE + future start, and CLAIMED", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1041, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_r:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1041),
+          eventId: "ev_r",
+          startISO: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+        },
+      },
+    });
+    // NOTE: The reminder's OWN turn runs with the row CLAIMED — also live, even without a startISO.
+    await seedConversation(1042, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_r2:0",
+        status: "CLAIMED",
+        runAt: new Date(),
+        payload: { threadId: threadOf(1042), eventId: "ev_r2" },
+      },
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 998n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    for (const convId of [1041, 1042]) {
+      expect(
+        await suDb.schedulerJob.findFirst({
+          where: {
+            tenantId,
+            kind: "FOLLOWUP",
+            dedupeKey: `followup:${threadOf(convId)}`,
+          },
+        }),
+      ).toBeNull();
+    }
+  });
+
+  test("(s) sweep resumes once the appointment start has passed (DONE, past start)", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1043, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_s:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 3 * 3_600_000),
+        payload: {
+          threadId: threadOf(1043),
+          eventId: "ev_s",
+          startISO: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+        },
+      },
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 997n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1043)}`,
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  test("(t) sweep resumes for a cancelled appointment (tombstoned rows, start still ahead)", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1044, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    // NOTE: Cancelling marks rows DONE too — the tombstone is what tells them apart from "fired".
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_t:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1044),
+          eventId: "ev_t",
+          startISO: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+          cancelledAt: new Date().toISOString(),
+        },
+      },
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 996n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1044)}`,
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  test("(u) a garbage startISO never aborts the sweep for the tenant", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    // NOTE: Conv A carries model-supplied garbage in startISO; conv B is a plain eligible
+    // conversation. An unguarded ::timestamptz cast would throw on A and kill follow-ups for the
+    // WHOLE tenant.
+    await seedConversation(1045, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_u:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1045),
+          eventId: "ev_u",
+          startISO: "amanhã de manhã",
+        },
+      },
+    });
+    await seedConversation(1046, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 995n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    // NOTE: Garbage = not-future = not suppressed (fail-safe), and the sweep survives for everyone.
+    for (const convId of [1045, 1046]) {
+      expect(
+        await suDb.schedulerJob.findFirst({
+          where: {
+            tenantId,
+            kind: "FOLLOWUP",
+            dedupeKey: `followup:${threadOf(convId)}`,
+          },
+        }),
+      ).not.toBeNull();
+    }
+  });
+
+  test("(w) an offset-less datetime is read as UTC by BOTH sides (sweep and re-check agree)", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1048, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    // NOTE: The model-input fallback can leave startISO WITHOUT an offset; both runtimes must pin it
+    // to UTC (parseStartMs / the SQL normalization) or their decisions diverge across time zones.
+    const offsetLessFutureUtc = new Date(Date.now() + 2 * 3_600_000)
+      .toISOString()
+      .slice(0, 19);
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_w:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1048),
+          eventId: "ev_w",
+          startISO: offsetLessFutureUtc,
+        },
+      },
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 993n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1048)}`,
+        },
+      }),
+    ).toBeNull();
+    expect(await hasLiveAppointment(tenantId, threadOf(1048), appDb)).toBe(
+      true,
+    );
+  });
+
+  test("(v) an all-day (date-only) future start suppresses the sweep", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1047, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_v:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1047),
+          eventId: "ev_v",
+          // NOTE: All-day events carry a bare YYYY-MM-DD (UTC midnight, parseStartMs).
+          startISO: new Date(Date.now() + 3 * 86_400_000)
+            .toISOString()
+            .slice(0, 10),
+        },
+      },
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 994n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1047)}`,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  test("(x) an impossible calendar date never suppresses (no Date.parse roll-over on either side)", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "" },
+    ]);
+    await seedConversation(1049, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    // NOTE: Feb 30 of NEXT year: Date.parse would roll it over to a FUTURE March 2 (suppressing the
+    // follow-up), while pg_input_is_valid rejects it. Both sides must treat it as garbage.
+    const impossibleFuture = `${new Date().getUTCFullYear() + 1}-02-30T00:00:00Z`;
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: "reminder:ev_x:0",
+        status: "DONE",
+        runAt: new Date(Date.now() - 60 * 60_000),
+        payload: {
+          threadId: threadOf(1049),
+          eventId: "ev_x",
+          startISO: impossibleFuture,
+        },
+      },
+    });
+    registerFollowUpHandlers();
+    const sweep = getJobHandler("FOLLOWUP_SWEEP");
+    await sweep?.(
+      { id: 992n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1049)}`,
+        },
+      }),
+    ).not.toBeNull();
+    expect(await hasLiveAppointment(tenantId, threadOf(1049), appDb)).toBe(
+      false,
+    );
   });
 });

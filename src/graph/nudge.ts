@@ -2,10 +2,14 @@ import { HumanMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
-import { shouldBotHandle } from "@/modules/chatwoot/normalize";
+import {
+  parseLiveConversation,
+  shouldBotHandle,
+} from "@/modules/chatwoot/normalize";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import {
   buildTemplatePayload,
@@ -45,6 +49,10 @@ export interface AgentNudge {
   value?: number | null;
   currency?: string | null;
   summary?: string | null;
+  // NOTE: Opaque external references the agent may need as TOOL ARGUMENTS (event id, calendar id,
+  // …). Rendered INSIDE the data fence as extra k=v facts — sanitized like every fenced field, and
+  // never appended to the instructions lane (which is trusted operator/code text).
+  refs?: Record<string, string | null | undefined>;
   instructions?: string;
   // For a follow-up sequence: the 1-based step that fired. Surfaced on the conversation timeline
   // ("Follow-up N enviado") and in the flow log. Undefined for non-sequenced nudges (inbound events).
@@ -55,8 +63,17 @@ export type RunAgentNudgeOutcome =
   | "messaged"
   | "templated"
   | "noted"
+  // NOTE: The outside-24h-window fallback note specifically (no usable template): the intended customer
+  // message was left as an EXPLAINED private note. Distinct from "noted" so the follow-up sequence
+  // can END here — every further step would be equally undeliverable.
+  | "noted-window"
   | "silent"
   | "deferred"
+  // NOTE: Live-state gate (requireLiveBotOwnership): the conversation is NOT bot-owned in Chatwoot right
+  // now (resolved/open/snoozed or a human assigned) — nothing was posted, mirror reconciled.
+  | "stale"
+  // Live-state gate could not verify (GET failed): fail-closed, nothing posted; caller may retry.
+  | "live-unavailable"
   | "no-conversation"
   | "no-agent";
 
@@ -73,6 +90,14 @@ export interface RunAgentNudgeParams {
   threadId: string;
   nudge: AgentNudge;
   postActions?: NudgePostActions;
+  // NOTE: Opt-in live-state gate: before ANY proactive work (model invoke included), fetch the REAL
+  // conversation from Chatwoot and abort ("stale") unless the bot still owns it, reconciling the
+  // mirror with what came back. The mirror alone is not trustworthy for proactive sends: a lost
+  // resolve webhook leaves it pending forever (no reconciliation), and that stale pending is how
+  // follow-ups fired on conversations the operator had already resolved. Inactivity follow-ups set
+  // this; event nudges (payment received etc.) keep the mirror-only gate — for those, a private
+  // note on a human-owned or even resolved conversation is still useful signal.
+  requireLiveBotOwnership?: boolean;
   base?: PrismaClient;
   deps?: RuntimeDeps;
 }
@@ -97,6 +122,14 @@ export function parseThreadId(
 // human turn is actually a proactive nudge (renderNudge always emits it; sanitizeFreeText strips it
 // from untrusted input so it can't be forged) — the playground session rebuild relies on this.
 export const DATA_FENCE = "⟦external-data⟧";
+
+// NOTE: Operator-facing header for the outside-24h-window fallback note (WhatsApp oficial, no approved
+// template configured). Explains WHY the follow-up became a private note and what to configure —
+// without it the yellow note reads as a bug. Same hardcoded pt-BR register as the one-shot
+// test-mode/out-of-hours notices in the webhook gate.
+export const OUTSIDE_WINDOW_NOTE_PREFIX =
+  "⏳ Fora da janela de 24h do WhatsApp: a mensagem abaixo NÃO foi enviada ao cliente. " +
+  "Para reengajar fora da janela, configure um template aprovado (HSM) na aba Comportamento do agente.\n\n";
 
 // Explicit "no follow-up" signal. We ask the model to emit EXACTLY this token when a proactive
 // message isn't warranted, instead of "reply with an empty message" — models routinely NARRATE
@@ -152,6 +185,15 @@ export function renderNudge(
     );
   }
   if (n.summary) facts.push(`summary=${sanitizeFreeText(n.summary, 500)}`);
+  if (n.refs) {
+    for (const [key, value] of Object.entries(n.refs)) {
+      if (value) {
+        facts.push(
+          `${sanitizeFreeText(key, 40)}=${sanitizeFreeText(value, 200)}`,
+        );
+      }
+    }
+  }
   const directive = canMessageCustomer
     ? `An external system event just occurred for this conversation. By default, send a brief, warm, helpful proactive message to the customer about it — keep it short and natural, in the conversation's language. Lean toward reaching out: a timely follow-up is usually welcome. Stay silent ONLY if a message would clearly be unhelpful, premature, duplicated, or annoying; in that rare case reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else.`
     : `A human agent is currently handling this conversation. Do NOT message the customer. If the event is worth flagging, write a short internal note for the human; otherwise reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else.`;
@@ -199,6 +241,8 @@ export async function runAgentNudge(
         inboxId: true,
         status: true,
         assigneeType: true,
+        assigneeId: true,
+        assigneeName: true,
         lastInboundAt: true,
         testActivatedAt: true,
       },
@@ -230,6 +274,8 @@ export async function runAgentNudge(
       cfg,
       status: conv.status,
       assigneeType: conv.assigneeType,
+      assigneeId: conv.assigneeId,
+      assigneeName: conv.assigneeName,
       lastInboundAt: conv.lastInboundAt,
       channelType: inbox.channelType,
       provider: inbox.provider,
@@ -281,12 +327,6 @@ export async function runAgentNudge(
     });
   };
 
-  // Pre-invoke gate: may we message the customer (bot owns it), or only note (human owns it)?
-  const canMessagePre = shouldBotHandle(
-    { assigneeType: loaded.assigneeType, status: loaded.status },
-    { ourAgentBotId: cfg.agentBotId },
-  );
-
   // 2. Client + tools (network, outside the tx). The bot token is the persona's, so the proactive
   // message is attributed to this persona's Agent Bot in Chatwoot.
   const client = await loadChatwootClient(tenantId, instanceId, {
@@ -294,6 +334,142 @@ export async function runAgentNudge(
     makeClient: params.deps?.makeClient,
     botToken: cfg.agentBotToken ?? undefined,
   });
+
+  // NOTE: Live-ownership probe (the opt-in requireLiveBotOwnership path): fetch the REAL
+  // conversation from Chatwoot, reconcile the mirror with what came back (the GET is fresher than
+  // any queued webhook, and fixing the stored status is what stops the sweep from re-enqueuing this
+  // conversation), and report whether the bot still owns it. "unavailable" = cannot VERIFY ⇒ the
+  // caller must not SEND (fail-closed). Used BOTH before any model spend AND again right before
+  // delivery — an operator can resolve/take over during model execution, and a delayed or lost
+  // webhook would leave the mirror bot-owned.
+  const probeLiveOwnership = async (): Promise<
+    "owned" | "not-owned" | "unavailable"
+  > => {
+    let live: ReturnType<typeof parseLiveConversation> = null;
+    try {
+      live = parseLiveConversation(
+        await client.getConversation(conversationId),
+      );
+    } catch (err) {
+      logger.warn(
+        { err, conversationId: String(conversationId) },
+        "agentNudge: live conversation fetch failed — failing closed",
+      );
+    }
+    if (!live) return "unavailable";
+    if (
+      live.status !== loaded.status ||
+      live.assigneeType !== loaded.assigneeType ||
+      live.assigneeId !== loaded.assigneeId ||
+      live.assigneeName !== loaded.assigneeName
+    ) {
+      try {
+        // NOTE: Serialize with mirrorChatwootEvent: same per-conversation withEntityLock, and a
+        // freshness guard — a webhook committed between our GET and this write is NEWER than the
+        // probe snapshot, so the reconcile must not restore stale status/assignee over it. The
+        // stored monotonic lastEventAt vs the live payload's last_activity_at decides; when the
+        // live is fresher it also advances lastEventAt so later frozen retries stay fenced.
+        const liveState = live;
+        await runScopedOn(base, sysCtx(tenantId), (db) =>
+          withEntityLock(
+            db,
+            `${tenantId}:${instanceId}:${conversationId}`,
+            async () => {
+              const where = {
+                tenantId_chatwootInstanceId_chatwootConversationId: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  chatwootConversationId: conversationId,
+                },
+              };
+              const current = await db.conversation.findUnique({
+                where,
+                select: { lastEventAt: true },
+              });
+              if (!current) return;
+              // Second-granular like the mirror's monotonic guard (last_activity_at is epoch
+              // seconds); a strict > on raw ms would false-skip same-second states.
+              const sec = (d: Date) => Math.floor(d.getTime() / 1000);
+              const liveAt = liveState.lastActivityAt;
+              if (
+                liveAt !== null &&
+                current.lastEventAt !== null &&
+                sec(current.lastEventAt) > sec(liveAt)
+              ) {
+                return;
+              }
+              await db.conversation.update({
+                where,
+                data: {
+                  status: liveState.status,
+                  assigneeType: liveState.assigneeType,
+                  assigneeId: liveState.assigneeId,
+                  assigneeName: liveState.assigneeName,
+                  ...(liveAt !== null &&
+                  (current.lastEventAt === null ||
+                    sec(liveAt) > sec(current.lastEventAt))
+                    ? { lastEventAt: liveAt }
+                    : {}),
+                },
+              });
+            },
+          ),
+        );
+        // NOTE: Keep the in-memory snapshot in step so a second probe only re-writes on a NEW divergence.
+        loaded.status = live.status;
+        loaded.assigneeType = live.assigneeType;
+        loaded.assigneeId = live.assigneeId;
+        loaded.assigneeName = live.assigneeName;
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "agentNudge: mirror reconcile failed",
+        );
+      }
+    }
+    const owned = shouldBotHandle(
+      {
+        assigneeType: live.assigneeType,
+        status: live.status,
+        assigneeId: live.assigneeId,
+      },
+      { ourAgentBotId: cfg.agentBotId },
+    );
+    if (!owned) {
+      logger.info(
+        "agentNudge: live state not bot-owned (conv=%s status=%s assignee=%s) — skipping",
+        String(conversationId),
+        live.status,
+        live.assigneeType ?? "none",
+      );
+    }
+    return owned ? "owned" : "not-owned";
+  };
+
+  // NOTE: 2b. Live-state gate (opt-in, BEFORE any model spend): only proceed while the bot still owns the
+  // conversation in Chatwoot. The mirror is not trustworthy for proactive sends — a lost resolve
+  // webhook leaves it pending forever — and this is the fence that stops a follow-up from landing on
+  // a conversation the operator already resolved.
+  if (params.requireLiveBotOwnership) {
+    const pre = await probeLiveOwnership();
+    if (pre === "unavailable") return "live-unavailable";
+    if (pre === "not-owned") return "stale";
+  }
+
+  // Pre-invoke gate: may we message the customer (bot owns it), or only note (human owns it)?
+  // When the live gate ran, it already proved bot ownership with FRESH data (and reconciled the
+  // mirror), so the mirror-based check is subsumed.
+  const canMessagePre = params.requireLiveBotOwnership
+    ? true
+    : shouldBotHandle(
+        {
+          assigneeType: loaded.assigneeType,
+          status: loaded.status,
+          assigneeId: loaded.assigneeId,
+        },
+        { ourAgentBotId: cfg.agentBotId },
+      );
+
   const tools = await buildToolset(
     cfg,
     {
@@ -354,12 +530,20 @@ export async function runAgentNudge(
     ? ""
     : replyRaw.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
 
-  // 5. Re-check the live gate (a human may have taken over). Needed for BOTH the customer message AND
-  // the deterministic post-actions.
-  const canMessagePost = await runScopedOn(
-    base,
-    sysCtx(tenantId),
-    async (db) => {
+  // 5. Re-check ownership at post time (a human may have taken over during model execution). Needed
+  // for BOTH the customer message AND the deterministic post-actions. The live-gated path re-probes
+  // Chatwoot itself — the pre-invoke GET only covers the window BEFORE the model ran, and a resolve
+  // during execution with a delayed/lost webhook would leave the mirror bot-owned; nothing has been
+  // posted yet, so failing closed here is free. Event nudges keep the mirror read (for them a
+  // human-owned conversation downgrades to a private note rather than aborting).
+  let canMessagePost: boolean;
+  if (params.requireLiveBotOwnership) {
+    const post = await probeLiveOwnership();
+    if (post === "unavailable") return "live-unavailable";
+    if (post === "not-owned") return "stale";
+    canMessagePost = true;
+  } else {
+    canMessagePost = await runScopedOn(base, sysCtx(tenantId), async (db) => {
       const conv = await db.conversation.findUnique({
         where: {
           tenantId_chatwootInstanceId_chatwootConversationId: {
@@ -368,23 +552,31 @@ export async function runAgentNudge(
             chatwootConversationId: conversationId,
           },
         },
-        select: { assigneeType: true, status: true },
+        select: { assigneeType: true, status: true, assigneeId: true },
       });
       return shouldBotHandle(
         {
           assigneeType: conv?.assigneeType ?? null,
+          assigneeId: conv?.assigneeId ?? null,
           status: conv?.status ?? null,
         },
         { ourAgentBotId: cfg.agentBotId },
       );
-    },
-  );
+    });
+  }
 
   // Deterministic post-actions applied by the SYSTEM whenever the step fires and the bot still owns
   // the conversation — even when the agent stayed silent. Best-effort: a failure here must NOT fail
   // the job (any customer message already went out → retrying would double-post), so each action is
   // wrapped + logged. MUST run AFTER any customer message: a message reopens a resolved conversation.
-  const applyPostActions = async (): Promise<void> => {
+  // allowResolve=false skips ONLY the resolve action (labels still apply): the noted-window branch
+  // never reached the customer AND ends the sequence, so auto-resolving there would close the
+  // conversation on the back of a message nobody received.
+  const applyPostActions = async ({
+    allowResolve = true,
+  }: {
+    allowResolve?: boolean;
+  } = {}): Promise<void> => {
     const actions = params.postActions;
     if (!actions || !canMessagePost) return;
     const labels = actions.assignLabels?.filter((l) => l.trim());
@@ -400,7 +592,7 @@ export async function runAgentNudge(
         );
       }
     }
-    if (actions.resolve) {
+    if (allowResolve && actions.resolve) {
       try {
         await client.toggleStatus(conversationId, "resolved");
       } catch (err) {
@@ -459,16 +651,21 @@ export async function runAgentNudge(
         return "templated";
       }
     }
-    // Outside the window with no usable template → leave the intended message as an internal note.
-    await client.sendPrivateNote(conversationId, reply);
+    // Outside the window with no usable template → leave the intended message as an internal note,
+    // EXPLAINED (pt-BR, same register as the test-mode/out-of-hours notices): an unexplained yellow
+    // note reads as a bug to the operator (community post "Followup indo como conversa privada").
+    await client.sendPrivateNote(
+      conversationId,
+      `${OUTSIDE_WINDOW_NOTE_PREFIX}${reply}`,
+    );
     logger.info(
       "agentNudge noted (outside 24h window, no template): conv=%s source=%s",
       String(conversationId),
       params.nudge.source,
     );
-    markFollowUp("noted");
-    await applyPostActions();
-    return "noted";
+    markFollowUp("noted-window");
+    await applyPostActions({ allowResolve: false });
+    return "noted-window";
   }
   await client.sendPrivateNote(conversationId, reply);
   logger.info(
