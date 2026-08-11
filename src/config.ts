@@ -107,9 +107,16 @@ const config = {
   // a derived-but-distinct value so the separation holds even if MCP_JWT_SECRET is unset.
   mcpJwtSecret:
     MCP_JWT_SECRET || `${JWT_SECRET || "change-me-in-production"}:mcp`,
-  // NOTE: Dynamic Client Registration is OFF by default (an open /register is a privilege-
-  // escalation surface). Enable only when you need programmatic MCP client onboarding.
-  mcpDcrEnabled: MCP_DCR_ENABLED === "true",
+  // NOTE: Dynamic Client Registration is ON by default: every MCP client we support self-registers
+  // and NONE has a fallback — with `registration_endpoint` absent from the metadata, Codex aborts
+  // with "Dynamic client registration not supported" and Claude Code with "Incompatible auth
+  // server", both before any login screen. Pre-registering a client does not rescue them either
+  // (Codex's loopback callback uses a random port, and /authorize matches redirect_uri exactly), so
+  // a closed default means the MCP transport is simply unreachable. Set MCP_DCR_ENABLED=false to
+  // close it: /register 404s and the metadata stops advertising it. A self-registered client is
+  // still shown as "unverified" on the consent screen, /register is rate-limited, and the effective
+  // grant stays role-gated at /authorize.
+  mcpDcrEnabled: MCP_DCR_ENABLED !== "false",
   encryptionKey: ENCRYPTION_KEY || "change-me-in-production",
   corsOrigin: CORS_ORIGIN || "localhost:3000",
   databaseUrl: DATABASE_URL,

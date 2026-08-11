@@ -1,5 +1,5 @@
-// Dynamic Client Registration (RFC 7591) helpers. DCR is CLOSED by default (MCP_DCR_ENABLED);
-// when an operator opens it, a redirect_uri must still pass a strict allowlist: an EXACT https URL
+// NOTE: Dynamic Client Registration (RFC 7591) helpers. DCR is OPEN by default (close it with
+// MCP_DCR_ENABLED=false); a redirect_uri must still pass a strict allowlist: an EXACT https URL
 // (no wildcard, no fragment), or an http loopback for native/dev clients (RFC 8252). /authorize
 // later matches the registered URI exactly, so a permissive value here would be an open-redirect
 // vector.

@@ -5,10 +5,12 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
   buildQuoteResolver,
+  maxIncomingId,
   parseChatwootMessages,
 } from "@/modules/chatwoot/messages";
 import {
@@ -367,6 +369,12 @@ export async function runLoadedTurn(
     const inGuard = await runGuardrail("input", turnText);
     if (inGuard) {
       if (inGuard.reply !== null) {
+        // NOTE: The guardrail reply is a post like any other, so it claims the trigger through the
+        // same gate: without this, two concurrent deliveries that both trip the guardrail each post
+        // their template, and a stale one posts over newer customer input.
+        if (params.shouldPost && !(await params.shouldPost())) {
+          return "superseded";
+        }
         await client.sendMessage(conversationId, inGuard.reply);
         deliveredBalloons = 1;
         return "posted";
@@ -601,6 +609,9 @@ export async function runAgentTurn(
       const page = parseChatwootMessages(
         await client.getMessages(conversationId),
       );
+      // NOTE: On upstream Chatwoot the meta write-back never lands, so a quoted voice note only
+      // resolves to its transcription through the in-process overlay (issue #49).
+      overlayMediaAnnotations(tenantId, instanceId, page);
       const withQuote = renderInboundMessage(renderable, {
         resolveQuoted: buildQuoteResolver(page),
       });
@@ -637,6 +648,48 @@ export async function runAgentTurn(
   });
   if (!loaded) return "no-agent";
 
+  // NOTE: Post gate, mirroring the debounce flush (issue #49): concurrent direct turns on the same
+  // conversation (webhook deliveries are not serialized) each generate a reply — without this gate
+  // the STALE one posts too, answering a message the customer already moved past. Re-fetch to
+  // detect a newer incoming message (defer to its own turn), then advance the watermark via the
+  // monotonic CAS so a duplicate/stale claim can never double-post. Re-fetch failure is non-fatal
+  // (same contract as the flush); the CAS is the backstop.
+  const triggerId = n.message?.id ?? null;
+  const convDbId = loaded.conversationDbId;
+  const shouldPost =
+    triggerId !== null && convDbId !== null
+      ? async (): Promise<boolean> => {
+          try {
+            const client = await loadChatwootClient(tenantId, instanceId, {
+              base,
+              makeClient: params.deps?.makeClient,
+            });
+            const latest = parseChatwootMessages(
+              await client.getMessages(conversationId),
+            );
+            if (maxIncomingId(latest, triggerId) > triggerId) {
+              logger.info(
+                "direct turn: superseded mid-turn (conv=%s), deferring",
+                String(conversationId),
+              );
+              return false;
+            }
+          } catch (e) {
+            logger.warn(
+              "direct turn: supersede re-fetch failed (conv=%s): %s",
+              String(conversationId),
+              e instanceof Error ? e.message : String(e),
+            );
+          }
+          return advanceHandledWatermark({
+            tenantId,
+            conversationDbId: convDbId,
+            toMessageId: triggerId,
+            base,
+          });
+        }
+      : undefined;
+
   const outcome = await runLoadedTurn({
     loaded,
     tenantId,
@@ -649,14 +702,19 @@ export async function runAgentTurn(
     userSentAudio: firstAudioAttachment(n) !== null,
     base,
     deps: params.deps,
+    shouldPost,
   });
-  // The direct path never uses shouldPost (no supersede gate), so nothing else advances the handled
-  // watermark here — left alone it stays NULL forever, and the first flush after debounce is later
-  // enabled (or after an arm failure fell back here) re-answers the whole recent page (issue #8).
-  // Every completed outcome consumed this message: posted/empty/blocked, or taken over (the human
-  // owns it now). Best-effort — the reply is already delivered, a watermark miss must not fail the
+  // NOTE: Watermark tail for the outcomes shouldPost's CAS did not cover ("posted" already advanced):
+  // empty/blocked consumed the message, taken over hands it to the human — left alone the watermark
+  // stays NULL forever, and the first flush after debounce is later enabled (or after an arm failure
+  // fell back here) re-answers the whole recent page (issue #8). "superseded" stays put BY DESIGN:
+  // the newer message's own turn advances past it. Best-effort — a watermark miss must not fail the
   // turn.
-  if (n.message?.id != null && loaded.conversationDbId !== null) {
+  if (
+    outcome !== "superseded" &&
+    n.message?.id != null &&
+    loaded.conversationDbId !== null
+  ) {
     try {
       await advanceHandledWatermark({
         tenantId,

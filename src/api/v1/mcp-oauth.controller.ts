@@ -6,7 +6,7 @@ import { doc, errors, OAuthErrorResponse } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
-import { ForbiddenError, NotFoundError, UnauthorizedError } from "@/lib/errors";
+import { NotFoundError, UnauthorizedError } from "@/lib/errors";
 import {
   asSuperAdmin,
   roleAtLeast,
@@ -118,10 +118,11 @@ export const mcpOAuthController = new Elysia({
   tags: ["MCP"],
 })
   .use(tenancyPlugin)
-  // RFC 7591 Dynamic Client Registration. CLOSED by default (MCP_DCR_ENABLED): a disabled server
-  // returns 404 (no signal that the route exists). When open, it registers a PUBLIC PKCE client
-  // (token_endpoint_auth_method "none"); redirect_uris pass the strict allowlist; requested scopes
-  // are intersected with MCP_SCOPES (the effective grant is still role-gated at /authorize).
+  // NOTE: RFC 7591 Dynamic Client Registration. OPEN by default (every supported MCP client self-registers
+  // and none has a fallback); MCP_DCR_ENABLED=false closes it and the route then returns 404 (no
+  // signal that it exists). It registers a PUBLIC PKCE client (token_endpoint_auth_method "none");
+  // redirect_uris pass the strict allowlist; requested scopes are intersected with MCP_SCOPES (the
+  // effective grant is still role-gated at /authorize).
   .post(
     "/register",
     async ({ body, set }) => {
@@ -167,7 +168,7 @@ export const mcpOAuthController = new Elysia({
       detail: {
         ...doc(
           "Register an MCP OAuth client",
-          "RFC 7591 Dynamic Client Registration for a public PKCE client. Disabled by default (returns 404 with no signal the route exists); when enabled, registers the redirect URIs (strict allowlist) and intersects scopes with the supported set.",
+          "RFC 7591 Dynamic Client Registration for a public PKCE client. Enabled by default: registers the redirect URIs (strict allowlist) and intersects scopes with the supported set. With MCP_DCR_ENABLED=false it returns 404, with no signal the route exists.",
         ),
         security: [],
       },
@@ -207,9 +208,26 @@ export const mcpOAuthController = new Elysia({
   )
   .get(
     "/authorize",
-    async ({ tenantContext, query, set }) => {
+    async ({ tenantContext, query, set, request }) => {
       const ctx: TenantContext | null = tenantContext;
-      if (!ctx?.userId) throw new ForbiddenError();
+      // NOTE: this endpoint is reached by a BROWSER NAVIGATION (the MCP client opens it), so an
+      // anonymous visitor must get the login screen, not the API's 401/403 JSON — which is what the
+      // user would otherwise stare at while the MCP client waits forever for a callback. `redirect`
+      // is our own path, and LoginPage only honors single-leading-slash local paths.
+      // The client/redirect_uri checks stay BELOW this gate on purpose: validating first would let an
+      // anonymous caller probe which client_ids and redirect URIs are registered. The cost is that a
+      // bogus client_id reaches the login screen before its 400, and the open-redirect guarantee is
+      // untouched — the only redirect an anonymous request can get is this local /login one, never
+      // the supplied redirect_uri.
+      if (!ctx?.userId) {
+        const here = new URL(request.url);
+        return new Response(null, {
+          status: 302,
+          headers: {
+            location: `/login?redirect=${encodeURIComponent(`${here.pathname}${here.search}`)}`,
+          },
+        });
+      }
 
       const client = await basePrisma.mcpOAuthClient.findUnique({
         where: { clientId: query.client_id },
@@ -295,10 +313,18 @@ export const mcpOAuthController = new Elysia({
     {
       detail: doc(
         "Authorization endpoint",
-        "OAuth 2.1 authorization endpoint, behind the app session. For the scopes the logged-in principal may hold and a redirect_uri in the client's exact allowlist, it either redirects to the consent screen (default) or, when the client is first-party or a sufficient prior approval exists, mints a single-use code and 302-redirects back with code + state + iss. An invalid client/redirect is rejected with 400 (never redirected) to prevent open redirects.",
+        "OAuth 2.1 authorization endpoint, behind the app session. An anonymous visitor is 302-redirected to the login screen with this URL as the return destination (it is opened by a browser, so an API 401 would dead-end the flow); the client and redirect_uri are only validated after that, on the authenticated pass, so an anonymous request carrying a bogus client_id also lands on the login screen rather than a 400. Once authenticated, for the scopes the principal may hold and a redirect_uri in the client's exact allowlist, it either redirects to the consent screen (default) or, when the client is first-party or a sufficient prior approval exists, mints a single-use code and 302-redirects back with code + state + iss. An invalid client/redirect is rejected with 400 and is never redirected TO THE SUPPLIED redirect_uri, which is what prevents open redirects — the only pre-authentication redirect is the local /login one.",
       ),
-      requireAuth: true,
-      response: errors(400, 403),
+      // NOTE: every success path here is a redirect (login, consent, or the client callback), so the
+      // 302 is the operation's real contract and belongs in the spec — `errors()` alone would
+      // document only the rejections. Body is empty; the destination travels in `Location`.
+      response: {
+        302: t.Void({
+          description:
+            "Redirect to the login screen, the consent screen, or the client's registered callback (with code + state + iss). Destination in the `Location` header.",
+        }),
+        ...errors(400, 403),
+      },
       query: t.Object({
         client_id: t.String({
           minLength: 1,

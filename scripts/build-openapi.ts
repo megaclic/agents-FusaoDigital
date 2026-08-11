@@ -84,8 +84,67 @@ function stripTrailingSlashes(
   return out;
 }
 
+// NOTE: For a body-less response (`t.Void()`, e.g. the 302 on the MCP authorize endpoint) the plugin
+// emits the bare schema as `content` — `{"type": "void", …}` — but OpenAPI's `content` is a map of
+// MEDIA TYPES, so that shape is invalid in every dialect. A response with no body simply omits
+// `content`, which is what this restores. Detection: a real media-type map has "/" in its keys. For a
+// redirect the payload IS the destination, so declare the `Location` header (per RFC 9110 every 3xx
+// we emit carries it) — otherwise the operation would document a redirect with no way to follow it.
+function normalizeBodylessResponses(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(normalizeBodylessResponses);
+  if (node === null || typeof node !== "object") return node;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (
+      key === "responses" &&
+      value !== null &&
+      typeof value === "object" &&
+      !Array.isArray(value)
+    ) {
+      const responses: Record<string, unknown> = {};
+      for (const [status, raw] of Object.entries(
+        value as Record<string, unknown>,
+      )) {
+        if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+          responses[status] = raw;
+          continue;
+        }
+        const response = { ...(raw as Record<string, unknown>) };
+        const content = response.content;
+        const isMediaTypeMap =
+          content !== null &&
+          typeof content === "object" &&
+          !Array.isArray(content) &&
+          Object.keys(content as object).every((k) => k.includes("/"));
+        if (content !== undefined && !isMediaTypeMap) {
+          delete response.content;
+          if (/^3\d\d$/.test(status)) {
+            response.headers = {
+              Location: {
+                description: "Redirect destination.",
+                schema: { type: "string" },
+              },
+              ...(typeof response.headers === "object" &&
+              response.headers !== null
+                ? (response.headers as Record<string, unknown>)
+                : {}),
+            };
+          }
+        }
+        responses[status] = response;
+      }
+      out[key] = responses;
+      continue;
+    }
+    out[key] = normalizeBodylessResponses(value);
+  }
+  return out;
+}
+
 function normalize(doc: OpenApiDoc): OpenApiDoc {
-  const cleaned = stripNonOpenApiKeys(doc) as OpenApiDoc;
+  const cleaned = normalizeBodylessResponses(
+    stripNonOpenApiKeys(doc),
+  ) as OpenApiDoc;
   if (cleaned.paths && typeof cleaned.paths === "object") {
     cleaned.paths = stripTrailingSlashes(
       cleaned.paths as Record<string, unknown>,

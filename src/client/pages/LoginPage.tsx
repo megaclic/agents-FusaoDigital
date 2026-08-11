@@ -1,4 +1,4 @@
-import { type FormEvent, useRef, useState } from "react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router";
 import {
@@ -21,6 +21,19 @@ function safeLocalPath(raw: string | null): string {
   return raw;
 }
 
+// NOTE: The MCP OAuth authorization endpoint sends anonymous visitors here with itself as the return
+// destination. It is a SERVER route, not a SPA route, so react-router's navigate() would render a
+// dead SPA path instead of resuming the OAuth flow — it needs a real browser navigation. Kept to
+// this single exact path (never a general "/api/" prefix) so a crafted ?redirect= cannot turn login
+// into a GET against an arbitrary endpoint.
+const MCP_AUTHORIZE_PATH = "/api/v1/mcp/oauth/authorize";
+
+export function isServerNavigation(path: string): boolean {
+  return (
+    path === MCP_AUTHORIZE_PATH || path.startsWith(`${MCP_AUTHORIZE_PATH}?`)
+  );
+}
+
 // biome-ignore lint/plugin/require-page-container: auth page renders its own centered layout outside <Layout>, so <PageContainer> does not apply
 export function LoginPage() {
   const { t } = useTranslation();
@@ -40,7 +53,14 @@ export function LoginPage() {
   // form submit cannot both pass their guards before React commits the pending
   // state update.
   const authInFlightRef = useRef(false);
+  // NOTE: Covers the already-logged-in visit and the Google callback (which only flips `user`); the
+  // password path navigates from its own handler.
+  const resumeServerFlow = user && isServerNavigation(redirectTo);
+  useEffect(() => {
+    if (resumeServerFlow) window.location.assign(redirectTo);
+  }, [resumeServerFlow, redirectTo]);
 
+  if (resumeServerFlow) return null;
   if (user) return <Navigate to={redirectTo} replace />;
 
   const handleGoogleCredential = (credential: string) => {
@@ -75,7 +95,8 @@ export function LoginPage() {
 
       if (data?.user) {
         login(data.user);
-        navigate(redirectTo);
+        if (isServerNavigation(redirectTo)) window.location.assign(redirectTo);
+        else navigate(redirectTo);
       }
     } catch {
       setError(

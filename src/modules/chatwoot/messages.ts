@@ -186,6 +186,29 @@ export function toRenderable(row: ChatwootMessageRow): RenderableMessage {
   };
 }
 
+// The highest incoming, non-private, RENDERABLE message id in a fetched page (or `floor` if none).
+// The supersede gates (debounce flush AND the direct path) compare it against the id a turn is
+// answering to detect a mid-turn arrival. Renderable uses the SAME criterion as pendingIncoming
+// (text OR an attachment): a voice note / image / file carries empty content, and treating it as
+// "no new input" let a stale turn post its reply over a customer who had already moved on.
+export function maxIncomingId(
+  messages: ChatwootMessageRow[],
+  floor: number,
+): number {
+  let max = floor;
+  for (const m of messages) {
+    if (
+      m.messageType === "incoming" &&
+      !m.private &&
+      (m.content.trim().length > 0 || m.attachmentTypes.length > 0) &&
+      m.id > max
+    ) {
+      max = m.id;
+    }
+  }
+  return max;
+}
+
 // The incoming, non-private, RENDERABLE customer messages whose id is beyond the watermark — the
 // burst a flush must answer. Renderable = has text OR an attachment (audio/image/file), so a voice
 // note (empty content) is included. `watermark` null ⇒ everything in the fetched page.

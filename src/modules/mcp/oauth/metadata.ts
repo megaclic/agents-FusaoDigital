@@ -5,7 +5,8 @@ import { MCP_SCOPES } from "./tokens";
 // clients fetch /.well-known/oauth-authorization-server there, so it must return JSON (not the SPA
 // catch-all). RFC 9728 (protected-resource) points the client at the authorization server. The
 // advertised authorize/token endpoints are live (mcp-oauth.controller.ts); registration_endpoint
-// is advertised only when DCR is enabled (MCP_DCR_ENABLED).
+// is advertised unless DCR is closed (MCP_DCR_ENABLED=false). Dropping it is what makes Codex and
+// Claude Code abort before the login screen, so keep it on for any deployment serving MCP clients.
 
 function baseUrl(): string {
   return config.publicUrl.replace(/\/$/, "");
