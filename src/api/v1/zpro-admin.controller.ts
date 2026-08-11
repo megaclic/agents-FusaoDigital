@@ -1,8 +1,10 @@
 // src/api/v1/zpro-admin.controller.ts
 // CRUD de instâncias Z-PRO e bindings agente↔instância (per-tenant). TENANT_ADMIN. SEPARATE from
 // the public webhook receiver controller (same /v1/zpro prefix; no path overlap: /instances* +
-// /webhook-url here vs /webhook there, mirrors chatwootController/chatwootAdminController).
-// bearerToken is write-only — never returned in any response.
+// /probe + /webhook-url here vs /webhook there, mirrors chatwootController/chatwootAdminController).
+// bearerToken is write-only — never returned in any response. /probe is a pure connectivity test
+// (no DB access, no bearerToken persistence) that lets the add-instance UI list channels instead of
+// requiring the operator to type a raw whatsappId.
 
 // translate('errors.zproInstanceNotFound', 'Z-PRO instance not found')
 // translate('errors.zproWhatsappIdInUse', 'whatsappId already in use by another instance')
@@ -23,6 +25,7 @@ import {
   TenantTargetRequiredError,
 } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { ZproClient } from "@/modules/zpro/client";
 import { zproWebhookUrl } from "@/modules/zpro/zpro-webhook-mount";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -43,6 +46,41 @@ function sanitizeZproBaseUrl(raw: string): string {
   } catch {
     return raw.trim();
   }
+}
+
+type ProbedChannel = { id: number; name: string; type: string; status: string };
+
+// NOTE (open-validation): listChannels' response shape has never been captured from a live Z-PRO
+// instance (unlike the rest of this client, which was built from real webhook payloads), so this
+// mapper is deliberately defensive: it probes a few plausible top-level shapes and coerces/defaults
+// every field instead of trusting a schema. Confirm the real shape against a live instance and
+// tighten this once available.
+function extractChannelArray(raw: unknown): unknown[] {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object") {
+    const record = raw as Record<string, unknown>;
+    if (Array.isArray(record.channels)) return record.channels;
+    if (Array.isArray(record.data)) return record.data;
+  }
+  return [];
+}
+
+function mapProbedChannels(raw: unknown): ProbedChannel[] {
+  const out: ProbedChannel[] = [];
+  for (const item of extractChannelArray(raw)) {
+    if (typeof item !== "object" || item === null) continue;
+    const record = item as Record<string, unknown>;
+    const id = record.id;
+    // Unusable without a real numeric id — skip rather than fabricate one.
+    if (typeof id !== "number" || !Number.isFinite(id)) continue;
+    out.push({
+      id,
+      name: String(record.name ?? record.id ?? ""),
+      type: String(record.type ?? record.channel ?? ""),
+      status: String(record.status ?? ""),
+    });
+  }
+  return out;
 }
 
 const INSTANCE_SELECT = {
@@ -181,6 +219,47 @@ export const zproAdminController = new Elysia({
         "Registers a new Z-PRO instance for the tenant (or revives a matching soft-disconnected one).",
       ),
       response: errors(400, 401, 403, 409),
+    },
+  )
+  .post(
+    "/probe",
+    async ({ body }) => {
+      try {
+        const client = new ZproClient(
+          sanitizeZproBaseUrl(body.baseUrl),
+          body.apiId,
+          body.bearerToken,
+        );
+        const raw = await client.listChannels();
+        const channels = mapProbedChannels(raw);
+        if (channels.length === 0) return { ok: false, channels: [] };
+        return { ok: true, channels };
+      } catch {
+        // Network error, non-2xx, or an unrecognized payload shape — never a 500, the caller (the
+        // add-instance modal) treats this the same as "no channel found" and offers the manual
+        // fallback form.
+        return { ok: false, channels: [] };
+      }
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      body: t.Object({
+        baseUrl: t.String({
+          minLength: 1,
+          description: "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+        }),
+        apiId: t.String({ minLength: 1, description: "Z-PRO ApiID." }),
+        bearerToken: t.String({
+          minLength: 1,
+          description:
+            "Z-PRO API bearer token; used only for this connectivity test, never persisted.",
+        }),
+      }),
+      detail: doc(
+        "Probe Z-PRO connection",
+        "Tests connectivity and credentials against a Z-PRO instance and lists its available channels. Does not persist anything — used by the add-instance flow to let the operator pick a channel instead of typing whatsappId manually.",
+      ),
+      response: errors(400, 401, 403),
     },
   )
   .patch(

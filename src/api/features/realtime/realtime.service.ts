@@ -158,7 +158,7 @@ export interface AgentConfigEvent {
 // NOTE: A Z-PRO ticket got a new mirrored message (any sender: client, AI agent, or human
 // attendant). Fans out on the per-tenant topic so the Z-PRO inbox list/detail update live.
 // METADATA ONLY by construction (no message body/contact PII) — the client refetches/appends via
-// REST, mirroring ConversationEvent's PII discipline. See docs/zpro-mirror (mirror.ts).
+// REST, mirroring ConversationEvent's PII discipline. See docs/zpro.md (mirror.ts).
 export type ZproSenderTypeValue = "CLIENT" | "AGENT" | "HUMAN";
 
 export interface ZproMessageEvent {

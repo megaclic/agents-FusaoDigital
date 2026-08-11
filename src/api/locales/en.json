@@ -77,9 +77,9 @@
     "visionFailed": "Image/document extraction failed",
     "visionNotConfigured": "Image/document reading is not configured",
     "webhookSubscriptionNotFound": "Webhook subscription not found",
-    "zproConversationNotFound": "Z-PRO conversation not found",
+    "zproConversationNotFound": "FusaoChatBot CRM conversation not found",
     "zproInstanceDisconnected": "This instance is disconnected; reconnect it before assigning an agent",
-    "zproInstanceNotFound": "Z-PRO instance not found",
+    "zproInstanceNotFound": "FusaoChatBot CRM instance not found",
     "zproWhatsappIdInUse": "whatsappId already in use by another instance"
   }
 }

@@ -27,3 +27,8 @@ export const ZPRO_PRESENCE_PAUSED = "paused" as const;
 
 // TTL do cache de idempotência em memória (ms)
 export const ZPRO_IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
+
+// TTL da marca "agente está enviando" (agent-echo.ts) — janela em que um eco fromMe do webhook é
+// tratado como AGENT em vez de cair no heurístico ticket.userId. Cobre múltiplos balões (split por
+// \n\n em sendTextReply) + latência de rede/ida-volta do webhook.
+export const ZPRO_AGENT_ECHO_TTL_MS = 30 * 1000;

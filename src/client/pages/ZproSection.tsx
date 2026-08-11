@@ -29,6 +29,7 @@ import {
   Input,
   Modal,
   ModalCancelButton,
+  SelectableCard,
   Skeleton,
   useModalController,
   useToast,
@@ -47,6 +48,8 @@ type AgentLite = NonNullable<AgentsData>["agents"][number];
 type UpdateInstanceBody = Parameters<
   ReturnType<typeof api.api.v1.zpro.instances>["patch"]
 >[0];
+type ProbeData = Awaited<ReturnType<typeof api.api.v1.zpro.probe.post>>["data"];
+type ProbedChannel = NonNullable<ProbeData>["channels"][number];
 
 const pickerItemCls =
   "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-text-secondary outline-none transition-colors data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary";
@@ -191,6 +194,18 @@ export function ZproSection() {
     instanceName: "",
   });
   const [saving, setSaving] = useState(false);
+  // Two-phase add-instance flow: "credentials" probes the connection and lists channels (default);
+  // "channels" is reached only after a successful probe, to pick one instead of typing whatsappId.
+  // manualFallback keeps the original single-phase form reachable from "credentials" as an escape
+  // hatch in case /probe doesn't work against some Z-PRO deployment.
+  const [phase, setPhase] = useState<"credentials" | "channels">("credentials");
+  const [manualFallback, setManualFallback] = useState(false);
+  const [probing, setProbing] = useState(false);
+  const [probeFailed, setProbeFailed] = useState(false);
+  const [channels, setChannels] = useState<ProbedChannel[]>([]);
+  const [selectedChannelId, setSelectedChannelId] = useState<number | null>(
+    null,
+  );
 
   const editModal = useModalController();
   const [editTarget, setEditTarget] = useState<InstanceDto | null>(null);
@@ -245,7 +260,74 @@ export function ZproSection() {
       whatsappId: "",
       instanceName: "",
     });
+    setPhase("credentials");
+    setManualFallback(false);
+    setProbeFailed(false);
+    setChannels([]);
+    setSelectedChannelId(null);
     addModal.open();
+  }
+
+  async function probeConnection() {
+    if (
+      !form.baseUrl.trim() ||
+      !form.apiId.trim() ||
+      !form.bearerToken.trim()
+    ) {
+      return;
+    }
+    setProbing(true);
+    setProbeFailed(false);
+    try {
+      const { data, error: err } = await api.api.v1.zpro.probe.post({
+        baseUrl: form.baseUrl.trim(),
+        apiId: form.apiId.trim(),
+        bearerToken: form.bearerToken.trim(),
+      });
+      if (err || !data || !data.ok || data.channels.length === 0) {
+        setProbeFailed(true);
+        return;
+      }
+      setChannels([...data.channels]);
+      setSelectedChannelId(null);
+      setPhase("channels");
+    } catch {
+      setProbeFailed(true);
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  // Pre-fills the instance name from the picked channel, but leaves it editable afterward.
+  function selectChannel(channel: ProbedChannel) {
+    setSelectedChannelId(channel.id);
+    setForm((f) => ({ ...f, instanceName: channel.name }));
+  }
+
+  async function addInstanceFromChannel() {
+    const channel = channels.find((c) => c.id === selectedChannelId);
+    if (!channel || !form.instanceName.trim()) return;
+    setSaving(true);
+    try {
+      const { data, error: err } = await api.api.v1.zpro.instances.post({
+        baseUrl: form.baseUrl.trim(),
+        apiId: form.apiId.trim(),
+        bearerToken: form.bearerToken.trim(),
+        whatsappId: channel.id,
+        instanceName: form.instanceName.trim(),
+      });
+      if (err || !data) throw err ?? new Error("no data");
+      showToast(t("zpro.instanceAdded", "Z-PRO instance added."), "success");
+      addModal.close();
+      void load();
+    } catch {
+      showToast(
+        t("zpro.instanceAddError", "Could not add the instance."),
+        "error",
+      );
+    } finally {
+      setSaving(false);
+    }
   }
 
   async function saveInstance() {
@@ -393,10 +475,12 @@ export function ZproSection() {
     showToast(t("zpro.bound", "Instance updated."), "success");
   }
 
-  const formValid =
+  const credentialsValid =
     form.baseUrl.trim() !== "" &&
     form.apiId.trim() !== "" &&
-    form.bearerToken.trim() !== "" &&
+    form.bearerToken.trim() !== "";
+  const formValid =
+    credentialsValid &&
     form.whatsappId.trim() !== "" &&
     form.instanceName.trim() !== "";
   const formDirty =
@@ -560,85 +644,196 @@ export function ZproSection() {
         title={t("zpro.addInstanceTitle", "Add Z-PRO instance")}
         footer={
           <div className="flex justify-end gap-2">
-            <ModalCancelButton disabled={saving} />
-            <Button
-              onClick={saveInstance}
-              loading={saving}
-              disabled={!formValid}
-            >
-              {t("common.save", "Save")}
-            </Button>
+            <ModalCancelButton disabled={saving || probing} />
+            {phase === "channels" ? (
+              <Button
+                onClick={addInstanceFromChannel}
+                loading={saving}
+                disabled={
+                  selectedChannelId === null || !form.instanceName.trim()
+                }
+              >
+                {t("common.save", "Save")}
+              </Button>
+            ) : manualFallback ? (
+              <Button
+                onClick={saveInstance}
+                loading={saving}
+                disabled={!formValid}
+              >
+                {t("common.save", "Save")}
+              </Button>
+            ) : (
+              <Button
+                onClick={probeConnection}
+                loading={probing}
+                disabled={!credentialsValid}
+              >
+                {t("zpro.probe.action", "Test connection and list channels")}
+              </Button>
+            )}
           </div>
         }
       >
-        <div className="flex flex-col gap-4">
-          <p className="text-sm text-text-muted">
-            {t(
-              "zpro.addInstanceDesc",
-              "Enter the Z-PRO instance credentials. The bearer token is stored encrypted.",
+        {phase === "credentials" ? (
+          <div className="flex flex-col gap-4">
+            <p className="text-sm text-text-muted">
+              {t(
+                "zpro.addInstanceDesc",
+                "Enter the Z-PRO instance credentials. The bearer token is stored encrypted.",
+              )}
+            </p>
+            <FormField label={t("zpro.baseUrl", "Z-PRO base URL")} required>
+              <Input
+                value={form.baseUrl}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, baseUrl: e.target.value }))
+                }
+                placeholder="https://api.fusaobotcrm.com.br"
+              />
+            </FormField>
+            <FormField label={t("zpro.apiId", "ApiID")} required>
+              <Input
+                value={form.apiId}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, apiId: e.target.value }))
+                }
+              />
+            </FormField>
+            <FormField
+              label={t("zpro.bearerToken", "Bearer token")}
+              required
+              description={t(
+                "zpro.bearerTokenHint",
+                "Stored encrypted, never shown again.",
+              )}
+            >
+              <Input
+                type="password"
+                showPasswordToggle
+                value={form.bearerToken}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, bearerToken: e.target.value }))
+                }
+              />
+            </FormField>
+
+            {!manualFallback && probeFailed && (
+              <div className="flex flex-col gap-1 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
+                <p>
+                  {t(
+                    "zpro.probe.noChannels",
+                    "No connected channel found. Check the FusaoChatBot CRM panel.",
+                  )}
+                </p>
+                {form.baseUrl.trim() !== "" && (
+                  <a
+                    href={form.baseUrl.trim()}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="truncate underline underline-offset-2"
+                  >
+                    {form.baseUrl.trim()}
+                  </a>
+                )}
+              </div>
             )}
-          </p>
-          <FormField label={t("zpro.baseUrl", "Z-PRO base URL")} required>
-            <Input
-              value={form.baseUrl}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, baseUrl: e.target.value }))
-              }
-              placeholder="https://api.fusaobotcrm.com.br"
-            />
-          </FormField>
-          <FormField label={t("zpro.apiId", "ApiID")} required>
-            <Input
-              value={form.apiId}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, apiId: e.target.value }))
-              }
-            />
-          </FormField>
-          <FormField
-            label={t("zpro.bearerToken", "Bearer token")}
-            required
-            description={t(
-              "zpro.bearerTokenHint",
-              "Stored encrypted, never shown again.",
+
+            {!manualFallback && (
+              <button
+                type="button"
+                onClick={() => setManualFallback(true)}
+                className="self-start text-accent text-xs underline underline-offset-2"
+              >
+                {t("zpro.probe.manualFallback", "Enter manually instead")}
+              </button>
             )}
-          >
-            <Input
-              type="password"
-              showPasswordToggle
-              value={form.bearerToken}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, bearerToken: e.target.value }))
-              }
-            />
-          </FormField>
-          <FormField
-            label={t("zpro.whatsappId", "WhatsApp ID")}
-            required
-            description={t(
-              "zpro.whatsappIdHint",
-              "The whatsapp.id field from the Z-PRO webhook payload.",
+
+            {manualFallback && (
+              <>
+                <FormField
+                  label={t("zpro.whatsappId", "WhatsApp ID")}
+                  required
+                  description={t(
+                    "zpro.whatsappIdHint",
+                    "The whatsapp.id field from the Z-PRO webhook payload.",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    value={form.whatsappId}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, whatsappId: e.target.value }))
+                    }
+                    placeholder="87"
+                  />
+                </FormField>
+                <FormField
+                  label={t("zpro.instanceName", "Instance name")}
+                  required
+                >
+                  <Input
+                    value={form.instanceName}
+                    onChange={(e) =>
+                      setForm((f) => ({ ...f, instanceName: e.target.value }))
+                    }
+                    placeholder="TesteSindSeg"
+                  />
+                </FormField>
+              </>
             )}
-          >
-            <Input
-              type="number"
-              value={form.whatsappId}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, whatsappId: e.target.value }))
-              }
-              placeholder="87"
-            />
-          </FormField>
-          <FormField label={t("zpro.instanceName", "Instance name")} required>
-            <Input
-              value={form.instanceName}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, instanceName: e.target.value }))
-              }
-              placeholder="TesteSindSeg"
-            />
-          </FormField>
-        </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4">
+            <p className="text-sm text-text-muted">
+              {t(
+                "zpro.probe.selectChannelDesc",
+                "Choose which connected channel this agent should answer.",
+              )}
+            </p>
+            <FormField
+              label={t("zpro.probe.channel", "Channel")}
+              required
+              group
+            >
+              <div className="flex flex-col gap-2">
+                {channels.map((channel) => (
+                  <SelectableCard
+                    key={channel.id}
+                    selected={selectedChannelId === channel.id}
+                    onToggle={() => selectChannel(channel)}
+                    title={channel.name}
+                    description={channel.type}
+                    badge={
+                      <Badge
+                        variant={
+                          channel.status === "CONNECTED" ? "success" : "warning"
+                        }
+                      >
+                        {channel.status}
+                      </Badge>
+                    }
+                  />
+                ))}
+              </div>
+            </FormField>
+            <FormField label={t("zpro.instanceName", "Instance name")} required>
+              <Input
+                value={form.instanceName}
+                onChange={(e) =>
+                  setForm((f) => ({ ...f, instanceName: e.target.value }))
+                }
+              />
+            </FormField>
+            <button
+              type="button"
+              onClick={() => setPhase("credentials")}
+              className="self-start text-accent text-xs underline underline-offset-2"
+            >
+              {t("zpro.probe.back", "Back")}
+            </button>
+          </div>
+        )}
       </Modal>
 
       <Modal

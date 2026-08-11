@@ -40,6 +40,10 @@ type CostsData = Awaited<
   ReturnType<typeof api.api.v1.metrics.costs.get>
 >["data"];
 type Costs = NonNullable<CostsData>["costs"];
+type ZproFunnelData = Awaited<
+  ReturnType<typeof api.api.v1.zpro.conversations.analytics.funnel.get>
+>["data"];
+type ZproFunnel = NonNullable<ZproFunnelData>["funnel"];
 
 type Range = "7d" | "30d" | "90d" | "all";
 const RANGE_DAYS: Record<Range, number | null> = {
@@ -409,6 +413,10 @@ export function DashboardPage() {
   const [usageErrorStatus, setUsageErrorStatus] = useState<number | null>(null);
   const [range, setRange] = useState<Range>("30d");
   const [source, setSource] = useState<Source>("inbox");
+  // FusaoChatBot CRM (Z-PRO) funnel section: only shown for tenants that actually have an instance
+  // configured (most tenants don't use this integration) — resolved once, independent of `range`.
+  const [zproEnabled, setZproEnabled] = useState(false);
+  const [zproFunnel, setZproFunnel] = useState<ZproFunnel | null>(null);
   const [kpiMode, setKpiMode] = useState<"rate" | "count">("rate");
   const [chartMetric, setChartMetric] = useState<"cost" | "calls">("cost");
 
@@ -487,6 +495,46 @@ export function DashboardPage() {
   useEffect(() => {
     void loadUsage(range, source);
   }, [loadUsage, range, source]);
+
+  // Resolved ONCE (not tied to `range`): whether the tenant has any Z-PRO instance configured at
+  // all. No instance → the section stays invisible (no empty-state card), matching how costByModel
+  // is a plain condition guard elsewhere on this page.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await api.api.v1.zpro.instances.get();
+        if (!cancelled) setZproEnabled(!!data && data.instances.length > 0);
+      } catch {
+        if (!cancelled) setZproEnabled(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Funnel metrics, re-fetched whenever the range changes — only once the tenant is known to have
+  // at least one Z-PRO instance (avoids a pointless call for the vast majority of tenants).
+  useEffect(() => {
+    if (!zproEnabled) return;
+    let cancelled = false;
+    (async () => {
+      const since = sinceFor(range);
+      try {
+        const { data } =
+          await api.api.v1.zpro.conversations.analytics.funnel.get({
+            query: since ? { since } : {},
+          });
+        if (!cancelled && data) setZproFunnel(data.funnel);
+      } catch {
+        // best-effort — the section simply keeps its last known values this cycle
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [range, zproEnabled]);
 
   const nf = new Intl.NumberFormat(i18n.language);
   const cf = new Intl.NumberFormat(i18n.language, {
@@ -691,6 +739,102 @@ export function DashboardPage() {
                 />
               </Card>
             </section>
+
+            {/* FusaoChatBot CRM (Z-PRO) funnel: only rendered for tenants with a configured
+                instance — invisible otherwise (see the zproEnabled effect above). */}
+            {zproEnabled && zproFunnel && (
+              <section className="flex flex-col gap-3">
+                <h2 className="font-medium text-sm text-text-primary">
+                  {t("dashboard.zpro.title", "FusaoChatBot CRM")}
+                </h2>
+
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <KpiCard
+                    icon={MessagesSquare}
+                    label={t(
+                      "dashboard.zpro.kpi.conversations",
+                      "Conversations",
+                    )}
+                    primary={nf.format(zproFunnel.conversations)}
+                    secondary={t(
+                      "dashboard.zpro.kpi.conversationsHint",
+                      "in the period",
+                    )}
+                  />
+                  <KpiCard
+                    icon={Bot}
+                    accent
+                    label={t(
+                      "dashboard.zpro.kpi.agentHandled",
+                      "Agent-handled",
+                    )}
+                    primary={nf.format(zproFunnel.agentHandled)}
+                    secondary={t(
+                      "dashboard.zpro.kpi.agentHandledHint",
+                      "currently handled by the AI agent",
+                    )}
+                  />
+                  <KpiCard
+                    icon={ArrowRightLeft}
+                    label={t(
+                      "dashboard.zpro.kpi.humanEscalated",
+                      "Escalated to human",
+                    )}
+                    primary={nf.format(zproFunnel.humanEscalated)}
+                    secondary={t(
+                      "dashboard.zpro.kpi.humanEscalatedHint",
+                      "currently with a human",
+                    )}
+                  />
+                  <KpiCard
+                    icon={Target}
+                    accent
+                    label={t("dashboard.zpro.kpi.resolved", "Resolved")}
+                    primary={nf.format(zproFunnel.resolved)}
+                    secondary={t(
+                      "dashboard.zpro.kpi.resolvedHint",
+                      "closed tickets",
+                    )}
+                  />
+                </div>
+
+                <Card className="flex flex-col gap-3">
+                  <FunnelBar
+                    label={t(
+                      "dashboard.zpro.kpi.conversations",
+                      "Conversations",
+                    )}
+                    count={zproFunnel.conversations}
+                    total={zproFunnel.conversations}
+                    nf={nf}
+                  />
+                  <FunnelBar
+                    label={t(
+                      "dashboard.zpro.kpi.agentHandled",
+                      "Agent-handled",
+                    )}
+                    count={zproFunnel.agentHandled}
+                    total={zproFunnel.conversations}
+                    nf={nf}
+                  />
+                  <FunnelBar
+                    label={t(
+                      "dashboard.zpro.kpi.humanEscalated",
+                      "Escalated to human",
+                    )}
+                    count={zproFunnel.humanEscalated}
+                    total={zproFunnel.conversations}
+                    nf={nf}
+                  />
+                  <FunnelBar
+                    label={t("dashboard.zpro.kpi.resolved", "Resolved")}
+                    count={zproFunnel.resolved}
+                    total={zproFunnel.conversations}
+                    nf={nf}
+                  />
+                </Card>
+              </section>
+            )}
 
             {/* Usage section: segmented by traffic source (real / playground / all). The toggle
                 stays outside the inner boundary so it is interactive while the section reloads. */}

@@ -77,9 +77,9 @@
     "visionFailed": "Falha ao extrair imagem/documento",
     "visionNotConfigured": "A leitura de imagens/documentos não está configurada",
     "webhookSubscriptionNotFound": "Assinatura de webhook não encontrada",
-    "zproConversationNotFound": "Conversa Z-PRO não encontrada",
+    "zproConversationNotFound": "Conversa FusaoChatBot CRM não encontrada",
     "zproInstanceDisconnected": "Esta instância está desconectada; reconecte-a antes de vincular um agente",
-    "zproInstanceNotFound": "Instância Z-PRO não encontrada",
+    "zproInstanceNotFound": "Instância FusaoChatBot CRM não encontrada",
     "zproWhatsappIdInUse": "whatsappId já em uso por outra instância"
   }
 }

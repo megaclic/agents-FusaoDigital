@@ -33,9 +33,12 @@ import {
   type ModelConfig,
   parseModelConfig,
 } from "@/graph/models";
+import { buildPromptVars, interpolatePromptVars } from "@/graph/prompt";
+import { DEFAULT_TIMEZONE } from "@/graph/time";
 import { runScopedOn } from "@/lib/tenancy";
 import { type FlowContext, withFlowStage } from "@/modules/flowlog/service";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { markAgentSending } from "./agent-echo";
 import { ZproClient } from "./client";
 import { sysCtx } from "./ctx";
 import { sendTextReply, sendTyping } from "./messages";
@@ -69,11 +72,13 @@ export type RunZproTurnOutcome =
 
 interface LoadedZproAgent {
   agentId: bigint;
+  agentName: string;
   systemPrompt: string;
   mc: ModelConfig;
   apiKey: string;
   credentialBaseUrl: string | null;
   instance: { baseUrl: string; apiId: string; bearerToken: string };
+  companyName: string | null;
 }
 
 // Scoped read (no network): resolve the binding's Agent + its model credential. Returns null when
@@ -101,6 +106,7 @@ async function loadZproAgent(
       where: { id: binding.agentId },
       select: {
         id: true,
+        name: true,
         systemPrompt: true,
         modelConfig: true,
         enabled: true,
@@ -125,13 +131,19 @@ async function loadZproAgent(
       credentialBaseUrl = entry.baseUrl;
     }
 
+    // Nome da empresa para a variável {{nome_empresa}} — mesma fonte que prepare.ts usa para o
+    // Chatwoot (tenant.name sob RLS).
+    const tenant = await db.tenant.findFirst({ select: { name: true } });
+
     return {
       agentId: agent.id,
+      agentName: agent.name,
       systemPrompt: agent.systemPrompt,
       mc,
       apiKey,
       credentialBaseUrl,
       instance,
+      companyName: tenant?.name ?? null,
     };
   });
 }
@@ -228,9 +240,24 @@ export async function runZproAgentTurn(
       baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
     });
     const checkpointer = await getCheckpointer();
+    // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},
+    // {{nome_agente}} e as variáveis de hora/data — mesmo interpolador sanitizado (proteção contra
+    // prompt injection) que o Chatwoot usa via prepare.ts. Sem grounding aqui: Z-PRO ainda não tem
+    // RAG/tools nesta fase.
+    const systemPrompt = interpolatePromptVars(
+      loaded.systemPrompt,
+      buildPromptVars({
+        contactName: ev.contactName,
+        contactPhone: ev.contactNumber,
+        inboxName: ev.channelType,
+        companyName: loaded.companyName,
+        agentName: loaded.agentName,
+      }),
+      { timezone: DEFAULT_TIMEZONE },
+    );
     const graph = buildAgentGraph({
       model,
-      systemPrompt: loaded.systemPrompt,
+      systemPrompt,
       checkpointer,
     });
 
@@ -251,6 +278,10 @@ export async function runZproAgentTurn(
       return "empty";
     }
 
+    // Marca ANTES de enviar: um eco fromMe deste ticket, chegando pelo webhook nos próximos
+    // segundos, deve ser classificado AGENT por mirror.ts em vez de seguir o heurístico
+    // ticket.userId (ver agent-echo.ts).
+    markAgentSending(zproInstanceId, Number(ev.threadId));
     await sendTextReply(client, ev, reply);
     logger.info(
       "zpro agent replied: thread=%s ticket=%s len=%d",

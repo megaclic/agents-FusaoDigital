@@ -558,7 +558,20 @@
     "usageByAgent": "Uso por agente",
     "usageByInbox": "Uso por inbox",
     "usageByModel": "Uso por modelo",
-    "usageTitle": "Uso de LLM"
+    "usageTitle": "Uso de LLM",
+    "zpro": {
+      "kpi": {
+        "agentHandled": "Atendidas pelo agente",
+        "agentHandledHint": "atualmente atendidas pelo agente IA",
+        "conversations": "Conversas",
+        "conversationsHint": "no período",
+        "humanEscalated": "Escaladas para humano",
+        "humanEscalatedHint": "atualmente com um humano",
+        "resolved": "Resolvidas",
+        "resolvedHint": "tickets fechados"
+      },
+      "title": "FusaoChatBot CRM"
+    }
   },
   "edition": {
     "pro": "Pro"
@@ -1554,7 +1567,7 @@
     "userMenu": "Menu do usuário",
     "webhooks": "Webhooks",
     "website": "",
-    "zproConversations": "Conversas Z-PRO"
+    "zproConversations": "Conversas FusaoChatBot CRM"
   },
   "oauth": {
     "consent": {
@@ -2144,10 +2157,10 @@
   "zpro": {
     "active": "Ativo",
     "addInstance": "Adicionar instância",
-    "addInstanceDesc": "Informe as credenciais da instância Z-PRO. O bearer token é armazenado criptografado.",
-    "addInstanceTitle": "Adicionar instância Z-PRO",
+    "addInstanceDesc": "Informe as credenciais da instância FusaoChatBot CRM. O bearer token é armazenado criptografado.",
+    "addInstanceTitle": "Adicionar instância FusaoChatBot CRM",
     "apiId": "ApiID",
-    "baseUrl": "URL base do Z-PRO",
+    "baseUrl": "URL base do FusaoChatBot CRM",
     "bearerToken": "Bearer token",
     "bearerTokenHint": "Armazenado criptografado, nunca exibido novamente.",
     "bearerTokenUnchanged": "Deixe vazio para manter",
@@ -2162,9 +2175,9 @@
         "ai": "IA",
         "human": "Humano"
       },
-      "back": "Voltar para conversas Z-PRO",
+      "back": "Voltar para conversas FusaoChatBot CRM",
       "deactivateAgent": "Desativar agente",
-      "empty": "Nenhuma conversa Z-PRO ainda.",
+      "empty": "Nenhuma conversa FusaoChatBot CRM ainda.",
       "error": "Não foi possível carregar as conversas.",
       "filters": {
         "agent": "Agente ativo",
@@ -2193,8 +2206,8 @@
         "open": "Aberta",
         "pending": "Pendente"
       },
-      "subtitle": "Conversas de WhatsApp em tempo real espelhadas do Z-PRO, com o status de bot/humano.",
-      "title": "Conversas Z-PRO",
+      "subtitle": "Conversas de WhatsApp em tempo real espelhadas do FusaoChatBot CRM, com o status de bot/humano.",
+      "title": "Conversas FusaoChatBot CRM",
       "toggleError": "Não foi possível atualizar o agente."
     },
     "copyWebhookUrl": "Copiar URL do webhook",
@@ -2204,9 +2217,9 @@
     "editBearerHint": "Preencha apenas para trocar o token atual.",
     "editInstance": "Editar instância",
     "editInstanceDesc": "Deixe o campo Bearer token vazio para manter o token atual.",
-    "editInstanceTitle": "Editar instância Z-PRO",
+    "editInstanceTitle": "Editar instância FusaoChatBot CRM",
     "inactive": "Inativa",
-    "instanceAdded": "Instância Z-PRO adicionada.",
+    "instanceAdded": "Instância FusaoChatBot CRM adicionada.",
     "instanceAddError": "Não foi possível adicionar a instância.",
     "instanceDisconnected": "Instância desconectada.",
     "instanceDisconnectError": "Não foi possível desconectar a instância.",
@@ -2215,14 +2228,22 @@
     "instanceUpdated": "Instância atualizada.",
     "instanceUpdateError": "Não foi possível atualizar a instância.",
     "noAgent": "Sem agente",
-    "noInstances": "Nenhuma instância Z-PRO",
-    "noInstancesDesc": "Adicione uma instância Z-PRO e vincule um agente para começar a atender no WhatsApp.",
-    "noInstancesTenant": "Nenhuma instância Z-PRO configurada ainda. Peça a um administrador para adicionar uma.",
-    "subtitle": "Conecte uma instância Z-PRO e vincule um agente para começar a atender no WhatsApp.",
-    "title": "Z-PRO (WhatsApp)",
+    "noInstances": "Nenhuma instância FusaoChatBot CRM",
+    "noInstancesDesc": "Adicione uma instância FusaoChatBot CRM e vincule um agente para começar a atender no WhatsApp.",
+    "noInstancesTenant": "Nenhuma instância FusaoChatBot CRM configurada ainda. Peça a um administrador para adicionar uma.",
+    "probe": {
+      "action": "Testar conexão e listar canais",
+      "back": "Voltar",
+      "channel": "Canal",
+      "manualFallback": "Inserir manualmente",
+      "noChannels": "Nenhum canal conectado. Verifique o painel do FusaoChatBot CRM.",
+      "selectChannelDesc": "Escolha qual canal conectado este agente deve atender."
+    },
+    "subtitle": "Conecte uma instância FusaoChatBot CRM e vincule um agente para começar a atender no WhatsApp.",
+    "title": "FusaoChatBot CRM (WhatsApp)",
     "toggleBinding": "Responder {{instance}} com este agente",
     "webhookCopied": "URL do webhook copiada!",
     "whatsappId": "WhatsApp ID",
-    "whatsappIdHint": "O campo whatsapp.id do payload do webhook Z-PRO."
+    "whatsappIdHint": "O campo whatsapp.id do payload do webhook FusaoChatBot CRM."
   }
 }

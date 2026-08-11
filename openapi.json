@@ -28490,6 +28490,174 @@
         ]
       }
     },
+    "/v1/zpro/probe": {
+      "post": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Probe Z-PRO connection",
+        "description": "Tests connectivity and credentials against a Z-PRO instance and lists its available channels. Does not persist anything — used by the add-instance flow to let the operator pick a channel instead of typing whatsappId manually.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "description": "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "description": "Z-PRO ApiID.",
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "description": "Z-PRO API bearer token; used only for this connectivity test, never persisted.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseUrl",
+                  "apiId",
+                  "bearerToken"
+                ]
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "description": "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "description": "Z-PRO ApiID.",
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "description": "Z-PRO API bearer token; used only for this connectivity test, never persisted.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseUrl",
+                  "apiId",
+                  "bearerToken"
+                ]
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "baseUrl": {
+                    "minLength": 1,
+                    "description": "Z-PRO base URL, e.g. https://api.fusaobotcrm.com.br",
+                    "type": "string"
+                  },
+                  "apiId": {
+                    "minLength": 1,
+                    "description": "Z-PRO ApiID.",
+                    "type": "string"
+                  },
+                  "bearerToken": {
+                    "minLength": 1,
+                    "description": "Z-PRO API bearer token; used only for this connectivity test, never persisted.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseUrl",
+                  "apiId",
+                  "bearerToken"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "postV1ZproProbe",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
+      }
+    },
     "/v1/zpro/instances/{id}": {
       "patch": {
         "tags": [
@@ -29203,6 +29371,78 @@
           }
         },
         "operationId": "getV1ZproConversations"
+      }
+    },
+    "/v1/zpro/conversations/analytics/funnel": {
+      "get": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Z-PRO funnel metrics",
+        "description": "Returns FusaoChatBot CRM (Z-PRO) funnel counts for the tenant since the given date: total conversations, agent-handled, escalated to human, and resolved.",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "ISO date string; conversations created on/after this instant are counted. Defaults to 30 days ago.",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1ZproConversationsAnalyticsFunnel"
       }
     },
     "/v1/zpro/conversations/{id}": {

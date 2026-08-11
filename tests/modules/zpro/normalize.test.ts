@@ -202,4 +202,20 @@ describe("normalizeZproWebhook", () => {
     const result = normalizeZproWebhook(p, API_ID);
     expect(result?.hasHumanAssigned).toBe(true);
   });
+
+  test("resolve instanceId via ticket.whatsappId quando o payload não traz whatsapp na raiz", () => {
+    // Alguns canais do webhook global (fora do "evo") só mandam ticket.whatsappId — sem o objeto
+    // `whatsapp` na raiz do payload. extractWhatsappId/extractInstanceName devem degradar para
+    // ticket.whatsappId/msg.instance/ticket.channel nesse caso.
+    const p: ZproWebhookPayload = {
+      method: "message",
+      msg: BASE_MSG,
+      ticket: BASE_TICKET,
+    };
+    const result = normalizeZproWebhook(p, API_ID);
+    expect(result).not.toBeNull();
+    expect(result?.instanceId).toBe(BASE_TICKET.whatsappId);
+    expect(result?.instanceName).toBe(BASE_MSG.instance);
+    expect(result?.channelType).toBe(BASE_TICKET.channel);
+  });
 });

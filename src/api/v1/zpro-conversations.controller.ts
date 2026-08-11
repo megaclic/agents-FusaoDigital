@@ -21,6 +21,7 @@ import {
   TenantTargetRequiredError,
 } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { getZproFunnelMetrics } from "@/modules/zpro/analytics";
 import { ZproClient } from "@/modules/zpro/client";
 import { activateAgent, deactivateAgent } from "@/modules/zpro/handoff";
 
@@ -207,6 +208,37 @@ export const zproConversationsController = new Elysia({
       detail: doc(
         "List Z-PRO conversations",
         "Lists mirrored Z-PRO conversations (newest first) for the tenant, optionally filtered by status, agent state or instance.",
+      ),
+      response: errors(400, 401),
+    },
+  )
+  // Registered BEFORE /conversations/:id so the literal "analytics" segment can never be swallowed
+  // by the :id param route (both would otherwise match /conversations/analytics/... equally well).
+  .get(
+    "/conversations/analytics/funnel",
+    async ({ tenantContext, query }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const since = query.since
+        ? new Date(query.since)
+        : new Date(Date.now() - 30 * 86_400_000);
+      const metrics = await runScopedOn(basePrisma, ctx, (db) =>
+        getZproFunnelMetrics(db, since),
+      );
+      return { funnel: metrics };
+    },
+    {
+      requireAuth: true,
+      query: t.Object({
+        since: t.Optional(
+          t.String({
+            description:
+              "ISO date string; conversations created on/after this instant are counted. Defaults to 30 days ago.",
+          }),
+        ),
+      }),
+      detail: doc(
+        "Z-PRO funnel metrics",
+        "Returns FusaoChatBot CRM (Z-PRO) funnel counts for the tenant since the given date: total conversations, agent-handled, escalated to human, and resolved.",
       ),
       response: errors(400, 401),
     },

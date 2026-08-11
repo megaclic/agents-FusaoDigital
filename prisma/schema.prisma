@@ -613,6 +613,7 @@ model ZproConversation {
   @@unique([zproInstanceId, ticketId])
   @@index([tenantId])
   @@index([tenantId, status])
+  @@index([tenantId, lastMessageAt])
   @@map("zpro_conversations")
 }
 
