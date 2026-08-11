@@ -8,6 +8,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 import {
+  Avatar,
   Badge,
   Button,
   Card,
@@ -24,7 +25,8 @@ import { api } from "@/client/lib/api";
 type ZproConversationsData = Awaited<
   ReturnType<typeof api.api.v1.zpro.conversations.get>
 >["data"];
-type ZproConversation = NonNullable<ZproConversationsData>["conversations"][number];
+type ZproConversation =
+  NonNullable<ZproConversationsData>["conversations"][number];
 
 type BadgeVariant = "primary" | "secondary" | "success" | "warning" | "info";
 
@@ -40,16 +42,20 @@ const STATUS_VARIANT: Record<string, BadgeVariant> = {
 // The four filter pills map to two different backend query dimensions (status vs agentActive).
 type FilterKey = "" | "agent" | "human" | "closed";
 
-function filterToQuery(
-  filter: FilterKey,
-): { status?: string; agentActive?: string } {
+function filterToQuery(filter: FilterKey): {
+  status?: string;
+  agentActive?: string;
+} {
   if (filter === "agent") return { agentActive: "true" };
   if (filter === "human") return { agentActive: "false" };
   if (filter === "closed") return { status: "closed" };
   return {};
 }
 
-function previewText(c: ZproConversation, t: (key: string, def: string) => string): string {
+function previewText(
+  c: ZproConversation,
+  t: (key: string, def: string) => string,
+): string {
   if (c.lastMessageBody) return c.lastMessageBody;
   return t("zpro.conversations.mediaPreview", "[Media message]");
 }
@@ -65,20 +71,29 @@ function ZproConversationRow({ c }: { c: ZproConversation }) {
         to={`/zpro/conversations/${c.id}`}
         className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-bg-hover"
       >
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="truncate font-medium text-text-primary">
-              {c.contactName || c.contactNumber}
-            </span>
-            <Badge variant={STATUS_VARIANT[c.status] ?? "secondary"}>
-              {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments above STATUS_VARIANT */}
-              {t(`zpro.conversations.status.${c.status}`, c.status)}
-            </Badge>
+        <div className="flex min-w-0 items-center gap-3">
+          <Avatar
+            name={c.contactName || c.contactNumber}
+            src={
+              c.avatarUrl ? `/api/v1/zpro/conversations/${c.id}/avatar` : null
+            }
+            size="sm"
+          />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="truncate font-medium text-text-primary">
+                {c.contactName || c.contactNumber}
+              </span>
+              <Badge variant={STATUS_VARIANT[c.status] ?? "secondary"}>
+                {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments above STATUS_VARIANT */}
+                {t(`zpro.conversations.status.${c.status}`, c.status)}
+              </Badge>
+            </div>
+            <p className="mt-0.5 truncate text-text-muted text-xs">
+              {previewText(c, t)}
+              {when ? ` · ${when}` : ""}
+            </p>
           </div>
-          <p className="mt-0.5 truncate text-text-muted text-xs">
-            {previewText(c, t)}
-            {when ? ` · ${when}` : ""}
-          </p>
         </div>
         <div className="flex shrink-0 items-center gap-1.5 text-text-secondary text-xs">
           {c.agentActive ? (
@@ -103,7 +118,13 @@ function ZproConversationRow({ c }: { c: ZproConversation }) {
 }
 
 // NOTE: Static keys so the skeleton rows don't key off the array index.
-const CONV_SKELETON_KEYS = ["zconv-0", "zconv-1", "zconv-2", "zconv-3", "zconv-4"];
+const CONV_SKELETON_KEYS = [
+  "zconv-0",
+  "zconv-1",
+  "zconv-2",
+  "zconv-3",
+  "zconv-4",
+];
 
 function ZproConversationsSkeleton() {
   return (
@@ -232,7 +253,10 @@ export function ZproConversationsPage() {
       <FilterPills
         value={filter}
         onChange={(v) => setFilter(v as FilterKey)}
-        aria-label={t("zpro.conversations.filterStatus", "Filter conversations")}
+        aria-label={t(
+          "zpro.conversations.filterStatus",
+          "Filter conversations",
+        )}
         items={
           [
             { key: "", label: t("zpro.conversations.filters.all", "All") },
@@ -257,10 +281,7 @@ export function ZproConversationsPage() {
         error={error}
         isEmpty={conversations.length === 0}
         onRetry={fetchConversations}
-        loadingLabel={t(
-          "zpro.conversations.loading",
-          "Loading conversations…",
-        )}
+        loadingLabel={t("zpro.conversations.loading", "Loading conversations…")}
         errorLabel={t(
           "zpro.conversations.error",
           "Could not load conversations.",

@@ -219,6 +219,15 @@ export async function getInstanceMetrics(
 // resolved without a human taking over (assigneeType != User). Automation = Involvement ×
 // Resolution = resolved-by-bot / total. All computed from local data (LlmUsage + the Conversation
 // mirror), RLS-scoped inside the tx.
+//
+// Chatwoot-only by design: this intentionally does NOT fold in Z-PRO (ZproConversation /
+// LlmUsage.zproConversationId) traffic, even though LlmUsage rows exist for it since UsageCapture
+// was wired into runZproAgentTurn. totalConversations here is the denominator for the dashboard's
+// "cost per conversation" figure, and that cost comes from Langfuse — which has no Z-PRO tracing
+// yet (docs/zpro.md). Adding Z-PRO conversations to the denominator without matching cost in the
+// numerator would silently understate cost-per-conversation. Z-PRO's own AI-usage figures (tokens,
+// calls) are surfaced separately by getZproFunnelMetrics (src/modules/zpro/analytics.ts), which has
+// no such coupling. Revisit this split if Z-PRO ever gets its own cost tracking.
 export interface DashboardKpis {
   totalConversations: number;
   involved: number;
@@ -298,6 +307,12 @@ export interface TimeseriesPoint {
 // `bucket` is a LOCAL day key (YYYY-MM-DD) in `filter.tz`, not a UTC ISO instant, so a 22h-BRT turn
 // (01h UTC) lands on the right local day instead of leaking into "tomorrow" in UTC. Returning the
 // key as text (to_char) keeps it unambiguous on the client (no Date/timezone round-trip).
+//
+// `conversations` (COUNT DISTINCT conversation_id) is Chatwoot-only, same as getKpis.totalConversations
+// — see the comment there. `calls`/token sums are NOT filtered by channel, so they already include
+// Z-PRO rows (conversation_id IS NULL there) once LlmUsage.zproConversationId starts getting written;
+// only the per-day conversation count stays Chatwoot-scoped, since the client divides Langfuse cost
+// (Chatwoot-only) by this column to draw the daily cost-per-conversation line.
 //   created_at is `timestamp WITHOUT time zone` (Prisma's default) holding the UTC wall-clock, so we
 // double-shift: `AT TIME ZONE 'UTC'` reads the naive value AS UTC → a real instant (timestamptz),
 // then `AT TIME ZONE $tz` renders that instant as wall-clock in the target zone. A single shift

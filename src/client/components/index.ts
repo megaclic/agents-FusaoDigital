@@ -1,3 +1,4 @@
+export { Avatar } from "./Avatar";
 export { Badge } from "./Badge";
 export { BrandFooter } from "./BrandFooter";
 export { Breadcrumbs } from "./Breadcrumbs";

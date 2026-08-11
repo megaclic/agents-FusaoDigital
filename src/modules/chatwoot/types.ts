@@ -90,6 +90,10 @@ export interface NormalizedChatwootContact {
   email: string | null;
   phone: string | null;
   identifier: string | null;
+  // meta.sender.thumbnail — the contact's WhatsApp/channel profile photo URL, when Chatwoot has one.
+  // `undefined` = this payload didn't carry it (older event shapes, or a degraded payload) ⇒ the
+  // mirror keeps whatever it had, same convention as customAttributes below.
+  avatarUrl?: string | null;
   // NOTE: meta.sender.custom_attributes — Contact#push_event_data ships the whole jsonb on every
   // event, which is what lets the agent READ it with no extra API call. `undefined` = the payload
   // did not carry it ⇒ the mirror keeps whatever it had (never wiped by a degraded payload).

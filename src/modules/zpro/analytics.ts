@@ -15,19 +15,28 @@ export interface ZproFunnelMetrics {
   agentHandled: number;
   humanEscalated: number;
   resolved: number;
+  // AI usage for this channel, straight from LlmUsage (never Langfuse — Z-PRO has no tracing yet,
+  // see docs/zpro.md). Deliberately NOT folded into the Chatwoot-facing getKpis/getTimeseries
+  // conversation counts in src/modules/analytics/service.ts: those feed a cost-per-conversation
+  // ratio sourced from Langfuse cost (Chatwoot-only today), and Z-PRO conversations would dilute
+  // that denominator without contributing to the numerator, silently understating the figure.
+  promptTokens: number;
+  completionTokens: number;
+  calls: number;
 }
 
-// NOTE: these reflect the CURRENT state of each conversation, not its history — ZproConversation
-// has no audit trail, so a conversation that was agent-handled and later escalated to a human only
-// counts toward `humanEscalated`, never both. This is a known, accepted limitation (mirrors the
-// underlying Z-PRO ticket model), not a bug to fix here.
+// NOTE: conversations/agentHandled/humanEscalated/resolved reflect the CURRENT state of each
+// conversation, not its history — ZproConversation has no audit trail, so a conversation that was
+// agent-handled and later escalated to a human only counts toward `humanEscalated`, never both.
+// This is a known, accepted limitation (mirrors the underlying Z-PRO ticket model), not a bug to
+// fix here.
 export async function getZproFunnelMetrics(
   db: ScopedDb,
   since: Date,
 ): Promise<ZproFunnelMetrics> {
   const where = { createdAt: { gte: since } };
 
-  const [conversations, agentHandled, humanEscalated, resolved] =
+  const [conversations, agentHandled, humanEscalated, resolved, usage] =
     await Promise.all([
       db.zproConversation.count({ where }),
       db.zproConversation.count({ where: { ...where, agentActive: true } }),
@@ -35,7 +44,20 @@ export async function getZproFunnelMetrics(
         where: { ...where, humanUserId: { not: null } },
       }),
       db.zproConversation.count({ where: { ...where, status: "closed" } }),
+      db.llmUsage.aggregate({
+        where: { ...where, zproConversationId: { not: null }, source: "inbox" },
+        _sum: { promptTokens: true, completionTokens: true },
+        _count: { _all: true },
+      }),
     ]);
 
-  return { conversations, agentHandled, humanEscalated, resolved };
+  return {
+    conversations,
+    agentHandled,
+    humanEscalated,
+    resolved,
+    promptTokens: usage._sum.promptTokens ?? 0,
+    completionTokens: usage._sum.completionTokens ?? 0,
+    calls: usage._count._all,
+  };
 }

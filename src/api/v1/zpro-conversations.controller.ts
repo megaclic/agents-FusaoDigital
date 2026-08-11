@@ -20,6 +20,7 @@ import {
   NotFoundError,
   TenantTargetRequiredError,
 } from "@/lib/errors";
+import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getZproFunnelMetrics } from "@/modules/zpro/analytics";
 import { ZproClient } from "@/modules/zpro/client";
@@ -55,6 +56,7 @@ const CONVERSATION_SELECT = {
   status: true,
   contactNumber: true,
   contactName: true,
+  avatarUrl: true,
   agentActive: true,
   humanUserId: true,
   lastMessageAt: true,
@@ -70,6 +72,7 @@ type ConversationRow = {
   status: string;
   contactNumber: string;
   contactName: string;
+  avatarUrl: string | null;
   agentActive: boolean;
   humanUserId: number | null;
   lastMessageAt: Date | null;
@@ -86,6 +89,7 @@ function conversationToDto(row: ConversationRow) {
     status: row.status,
     contactNumber: row.contactNumber,
     contactName: row.contactName,
+    avatarUrl: row.avatarUrl,
     agentActive: row.agentActive,
     humanUserId: row.humanUserId,
     lastMessageAt: row.lastMessageAt ? row.lastMessageAt.toISOString() : null,
@@ -270,6 +274,49 @@ export const zproConversationsController = new Elysia({
       detail: doc(
         "Get Z-PRO conversation",
         "Returns a single mirrored Z-PRO conversation by primary key.",
+      ),
+      response: errors(400, 401, 404),
+    },
+  )
+  // Same CSP constraint as the Chatwoot avatar proxy (img-src is 'self' only) — no caller-supplied
+  // url, just the conversation id; the URL fetched is always the one we already stored server-side
+  // from a trusted Z-PRO webhook (contact-create-update), still anti-SSRF-checked defensively.
+  .get(
+    "/conversations/:id/avatar",
+    async ({ tenantContext, params, set }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const row = await runScopedOn(basePrisma, ctx, (db) =>
+        db.zproConversation.findUnique({
+          where: { id: BigInt(params.id) },
+          select: { avatarUrl: true },
+        }),
+      );
+      if (!row?.avatarUrl) {
+        set.status = 404;
+        return { error: "Not Found" };
+      }
+      const url = await assertSafeOutboundUrl(row.avatarUrl);
+      const res = await fetch(url);
+      if (!res.ok) {
+        set.status = 404;
+        return { error: "Not Found" };
+      }
+      return new Response(await res.arrayBuffer(), {
+        headers: {
+          "content-type":
+            res.headers.get("content-type") ?? "application/octet-stream",
+          "cache-control": "private, max-age=3600",
+        },
+      });
+    },
+    {
+      requireAuth: true,
+      params: t.Object({
+        id: t.String({ description: "Z-PRO conversation id (BigInt string)." }),
+      }),
+      detail: doc(
+        "Stream the Z-PRO contact's avatar",
+        "Proxies the contact's mirrored WhatsApp profile photo through our origin for CSP-clean rendering. 404 when no avatar is on file.",
       ),
       response: errors(400, 401, 404),
     },

@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 import {
+  Avatar,
   Badge,
   Button,
   Card,
@@ -54,28 +55,39 @@ function ConversationRow({ c, active }: { c: Conversation; active: boolean }) {
         to={`/conversations/${c.id}`}
         className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-bg-hover"
       >
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="truncate font-medium text-text-primary">
-              {c.contact?.name ??
-                t("conversations.unknownContact", "Unknown contact")}
-            </span>
-            <Badge variant={STATUS_VARIANT[c.status] ?? "secondary"}>
-              {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments above STATUS_VARIANT */}
-              {t(`conversations.status.${c.status}`, c.status)}
-            </Badge>
-            {c.lastError && (
-              <Badge variant="error" className="flex items-center gap-1">
-                <AlertTriangle className="h-3 w-3" aria-hidden="true" />
-                {t("conversations.errorBadge", "Error")}
+        <div className="flex min-w-0 items-center gap-3">
+          <Avatar
+            name={c.contact?.name}
+            src={
+              c.contact?.avatarUrl
+                ? `/api/v1/conversations/${c.id}/avatar`
+                : null
+            }
+            size="sm"
+          />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="truncate font-medium text-text-primary">
+                {c.contact?.name ??
+                  t("conversations.unknownContact", "Unknown contact")}
+              </span>
+              <Badge variant={STATUS_VARIANT[c.status] ?? "secondary"}>
+                {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments above STATUS_VARIANT */}
+                {t(`conversations.status.${c.status}`, c.status)}
               </Badge>
-            )}
-            {c.outOfHours && <OutOfHoursBadge />}
+              {c.lastError && (
+                <Badge variant="error" className="flex items-center gap-1">
+                  <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                  {t("conversations.errorBadge", "Error")}
+                </Badge>
+              )}
+              {c.outOfHours && <OutOfHoursBadge />}
+            </div>
+            <p className="mt-0.5 truncate text-text-muted text-xs">
+              {c.inbox?.name ?? t("conversations.noInbox", "No inbox")}
+              {when ? ` · ${when}` : ""}
+            </p>
           </div>
-          <p className="mt-0.5 truncate text-text-muted text-xs">
-            {c.inbox?.name ?? t("conversations.noInbox", "No inbox")}
-            {when ? ` · ${when}` : ""}
-          </p>
         </div>
         <div className="flex shrink-0 items-center gap-1.5 text-text-secondary text-xs">
           {active && (

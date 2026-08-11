@@ -4,6 +4,7 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { modelConfigSchema } from "@/graph/model-config";
 import { AppError, NotFoundError } from "@/lib/errors";
+import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import {
@@ -69,7 +70,7 @@ export interface ConversationListItem {
   lastError: string | null;
   lastErrorAt: string | null;
   inbox: { id: string; name: string } | null;
-  contact: { name: string | null } | null;
+  contact: { name: string | null; avatarUrl: string | null } | null;
   // The bound persona's name, so the list can show it for AI-handled rows. Null when no agent bound.
   agentName: string | null;
   // True when the bound agent's availability schedule is currently closed (item 23). Computed
@@ -159,7 +160,7 @@ export async function listConversations(
         lastError: true,
         lastErrorAt: true,
         inbox: { select: { id: true, name: true, agentId: true } },
-        contact: { select: { name: true } },
+        contact: { select: { name: true, avatarUrl: true } },
       },
     }),
   );
@@ -225,7 +226,9 @@ export async function listConversations(
     lastError: r.lastError,
     lastErrorAt: r.lastErrorAt ? r.lastErrorAt.toISOString() : null,
     inbox: r.inbox ? { id: String(r.inbox.id), name: r.inbox.name } : null,
-    contact: r.contact ? { name: r.contact.name } : null,
+    contact: r.contact
+      ? { name: r.contact.name, avatarUrl: r.contact.avatarUrl }
+      : null,
     agentName:
       r.inbox?.agentId != null
         ? (agentNameById.get(String(r.inbox.agentId)) ?? null)
@@ -295,7 +298,11 @@ export interface ConversationDetail {
   lastErrorAt: string | null;
   inbox: { id: string; name: string } | null;
   // contact.voiceReply: the per-contact audio-reply preference (true=audio, false=text, null=unknown).
-  contact: { name: string | null; voiceReply: boolean | null } | null;
+  contact: {
+    name: string | null;
+    voiceReply: boolean | null;
+    avatarUrl: string | null;
+  } | null;
   // The bound persona, so the console can show its name and deep-link to its editor.
   agentId: string | null;
   agentName: string | null;
@@ -497,7 +504,11 @@ async function loadConvRef(
     agentId: bigint | null;
     chatwootInboxId: number;
   } | null;
-  contact: { name: string | null; voiceReply: boolean | null } | null;
+  contact: {
+    name: string | null;
+    voiceReply: boolean | null;
+    avatarUrl: string | null;
+  } | null;
   instance: { accountId: number; deployment: { baseUrl: string } };
 }> {
   const conv = await runScopedOn(base, ctx, (db) =>
@@ -526,7 +537,7 @@ async function loadConvRef(
             chatwootInboxId: true,
           },
         },
-        contact: { select: { name: true, voiceReply: true } },
+        contact: { select: { name: true, voiceReply: true, avatarUrl: true } },
         instance: {
           select: {
             accountId: true,
@@ -913,7 +924,11 @@ export async function getConversationDetail(
       ? { id: String(conv.inbox.id), name: conv.inbox.name }
       : null,
     contact: conv.contact
-      ? { name: conv.contact.name, voiceReply: conv.contact.voiceReply }
+      ? {
+          name: conv.contact.name,
+          voiceReply: conv.contact.voiceReply,
+          avatarUrl: conv.contact.avatarUrl,
+        }
       : null,
     agentId: agentId != null ? String(agentId) : null,
     agentName: agent?.name ?? null,
@@ -1016,6 +1031,32 @@ export async function getConversationMedia(
   return {
     bytes,
     contentType: contentType ?? "application/octet-stream",
+  };
+}
+
+// Proxies the contact's avatar (thumbnail URL mirrored from Chatwoot's meta.sender.thumbnail)
+// through OUR origin — same CSP constraint as getConversationMedia above (img-src is 'self' only).
+// Unlike getConversationMedia, there is no caller-supplied url: this only ever fetches the URL we
+// already stored server-side from a trusted Chatwoot webhook, so there is no query-param SSRF
+// surface. Still anti-SSRF-checked (assertSafeOutboundUrl) since a stored URL could theoretically
+// point anywhere if Chatwoot's own payload were ever compromised/malformed.
+// OPEN-VALIDATION: fetched with a plain unauthenticated request (no bot token) — assumes Chatwoot
+// serves contact thumbnails as a publicly-fetchable (if unguessable/signed) URL, like most
+// self-hosted Chatwoot deployments' ActiveStorage asset links. If a real instance 403s this,
+// switch to client.downloadAttachment (bot-token-authenticated) instead.
+export async function getConversationAvatar(
+  ctx: TenantContext,
+  id: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<ConversationMediaBlob | null> {
+  const conv = await loadConvRef(ctx, id, base);
+  if (!conv.contact?.avatarUrl) return null;
+  const url = await assertSafeOutboundUrl(conv.contact.avatarUrl);
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  return {
+    bytes: await res.arrayBuffer(),
+    contentType: res.headers.get("content-type") ?? "application/octet-stream",
   };
 }
 

@@ -796,6 +796,18 @@ export function DashboardPage() {
                       "closed tickets",
                     )}
                   />
+                  <KpiCard
+                    icon={Hash}
+                    label={t("dashboard.zpro.kpi.tokens", "Tokens (in / out)")}
+                    primary={`${nf.format(zproFunnel.promptTokens)} / ${nf.format(
+                      zproFunnel.completionTokens,
+                    )}`}
+                    secondary={t(
+                      "dashboard.zpro.kpi.tokensHint",
+                      "{{calls}} AI calls in the period",
+                      { calls: nf.format(zproFunnel.calls) },
+                    )}
+                  />
                 </div>
 
                 <Card className="flex flex-col gap-3">

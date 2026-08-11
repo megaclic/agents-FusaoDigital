@@ -7,18 +7,23 @@
 // Ack rápido (<5s) + dispatch assíncrono, igual ao padrão chatwoot.
 
 import { Elysia } from "elysia";
-import { broadcastZproAgentToggled } from "@/api/features/realtime/realtime.service";
+import {
+  broadcastZproAgentToggled,
+  broadcastZproMessage,
+} from "@/api/features/realtime/realtime.service";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import { doc } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { asSuperAdminOn, runScopedOn } from "@/lib/tenancy";
+import type { FlowContext } from "@/modules/flowlog/service";
 import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
 import { deactivateAgent } from "@/modules/zpro/handoff";
-import { mirrorZproMessage } from "@/modules/zpro/mirror";
-import { extractWhatsappId } from "@/modules/zpro/parse";
-import { runZproAgentTurn } from "@/modules/zpro/runtime";
+import { mirrorZproContact, mirrorZproMessage } from "@/modules/zpro/mirror";
+import { extractMedia, extractWhatsappId } from "@/modules/zpro/parse";
+import { runZproAgentTurn, zproThreadId } from "@/modules/zpro/runtime";
+import { resolveZproSttConfig, transcribeZproAudio } from "@/modules/zpro/stt";
 import type {
   ResolvedZproInstance,
   ZproWebhookPayload,
@@ -82,10 +87,87 @@ export const zproController = new Elysia({
       instance.id,
     );
 
+    // 1b. `contact-create-update`: atualiza nome/foto de perfil em toda ZproConversation existente
+    // desse contato (no-op para method !== "contact-create-update", e no-op se o contato ainda não
+    // tem nenhuma conversa). Best-effort — nunca bloqueia o ack da mensagem.
+    // OPEN-VALIDATION: assume que este payload também traz `whatsapp.id` na raiz (mesmo campo que
+    // resolve a instância para "message"), como o tipo declara — sem uma captura real completa de
+    // contact-create-update para confirmar (só "message" foi validado, ver types.ts). Se o Z-PRO não
+    // mandar `whatsapp` nesse método, extractWhatsappId já rejeitou o payload antes deste ponto
+    // (outcome "skipped:no-whatsapp-id") e este código nunca roda — confirmar contra um payload real.
+    try {
+      await mirrorZproContact(payload, instance.tenantId, instance.id);
+    } catch (err) {
+      logger.warn({ err, whatsappId }, "zpro:webhook: contact mirror failed");
+    }
+
+    const ticket = payload.ticket;
+
+    // 1c. STT: transcrição eager de voice notes recebidos (inbound, não fromMe) — mesmo padrão
+    // "eager STT at message arrival" do Chatwoot (docs/stt.md), independente do agent gate
+    // (normalizeZproWebhook), pra atendentes humanos também verem o texto no painel, não só o
+    // agente. `turnId` é gerado aqui e reaproveitado pelo turno do agente (se houver) pra
+    // correlacionar os estágios stt+generate na mesma linha do /logs.
+    const turnId = crypto.randomUUID();
+    // Fed into the dispatched event's `body` below (the normalized event otherwise has an empty
+    // body for a captionless voice note) — declared here so the dispatch callback can read it.
+    let sttText: string | null = null;
+    const msg = payload.msg;
+    const audioContent = msg?.data?.message?.audioMessage;
+    if (mirrored && msg && !msg.fromMe && audioContent && ticket) {
+      const media = extractMedia(msg.data?.message);
+      if (media.mediaUrl) {
+        const sttCfg = await resolveZproSttConfig(
+          instance.tenantId,
+          instance.id,
+        );
+        if (sttCfg) {
+          const flow: FlowContext = {
+            tenantId: instance.tenantId,
+            turnId,
+            source: "inbox",
+            threadId: zproThreadId(
+              instance.tenantId,
+              instance.id,
+              String(ticket.id),
+            ),
+          };
+          sttText = await transcribeZproAudio({
+            tenantId: instance.tenantId,
+            mediaUrl: media.mediaUrl,
+            mediaMimetype: media.mediaMimetype ?? null,
+            cfg: sttCfg,
+            flow,
+          });
+          if (sttText) {
+            const transcribedBody = sttText;
+            await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+              db.zproMessage.update({
+                where: {
+                  conversationId_messageId: {
+                    conversationId: mirrored.conversationId,
+                    messageId: msg.id,
+                  },
+                },
+                data: { body: transcribedBody },
+              }),
+            );
+            // Re-broadcast so an operator already viewing the conversation sees the transcript
+            // land live instead of only on their next manual refresh (mirrorZproMessage already
+            // broadcast once, with the empty body, when the voice note first arrived).
+            broadcastZproMessage(instance.tenantId, {
+              conversationId: String(mirrored.conversationId),
+              ticketId: ticket.id,
+              senderType: "CLIENT",
+            });
+          }
+        }
+      }
+    }
+
     // 2. Handoff automático: um atendente humano respondeu (fromMe + userId preenchido) enquanto
     // o agente ainda estava marcado ativo no ticket — desativa. Nunca reativa automaticamente;
     // reativação é sempre manual via POST /v1/zpro/conversations/:id/toggle-agent.
-    const ticket = payload.ticket;
     if (mirrored?.isHumanIntervention && ticket?.n8nStatus) {
       try {
         const client = new ZproClient(
@@ -145,6 +227,10 @@ export const zproController = new Elysia({
         // A genuine re-delivery of a messageId already claimed/terminal — nothing to dispatch.
         if (delivery.status !== "PENDING") return;
 
+        // A transcribed voice note has no text of its own in the normalized event (audio never
+        // carries a caption) — feed the transcription in so the agent responds to its content.
+        if (sttText && !event.body) event.body = sttText;
+
         // Ack fast: the dispatch runs detached. runZproAgentTurn CAS-claims the row itself, so a
         // re-fired duplicate that raced this same check is still safe.
         runZproAgentTurn({
@@ -152,6 +238,7 @@ export const zproController = new Elysia({
           zproInstanceId: instance.id,
           deliveryRowId: delivery.id,
           event,
+          turnId,
         })
           .then((outcome) => {
             logger.info(

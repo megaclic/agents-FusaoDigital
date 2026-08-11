@@ -1,4 +1,11 @@
-import { BookOpen, Database, FileText, Pencil, Plus } from "lucide-react";
+import {
+  BookOpen,
+  Database,
+  FileText,
+  Pencil,
+  Plus,
+  Trash2,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { SelectableCard, SwitchField } from "@/client/components";
 import { Tooltip } from "@/client/components/Tooltip";
@@ -164,6 +171,19 @@ export function KnowledgeGrantsEditor({
                         className="flex h-5 w-5 items-center justify-center rounded text-text-muted hover:text-text-primary"
                       >
                         <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
+                      </button>
+                    </Tooltip>
+                    <Tooltip content={t("common.delete", "Delete")}>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          km.askDelete(kb);
+                        }}
+                        aria-label={t("common.delete", "Delete")}
+                        className="flex h-5 w-5 items-center justify-center rounded text-text-muted hover:text-error"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
                       </button>
                     </Tooltip>
                   </div>

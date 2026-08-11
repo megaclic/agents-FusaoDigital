@@ -566,7 +566,9 @@
         "humanEscalated": "Escalated to human",
         "humanEscalatedHint": "currently with a human",
         "resolved": "Resolved",
-        "resolvedHint": "closed tickets"
+        "resolvedHint": "closed tickets",
+        "tokens": "Tokens (in / out)",
+        "tokensHint": "{{calls}} AI calls in the period"
       },
       "title": "FusaoChatBot CRM"
     }
@@ -2154,7 +2156,9 @@
     "addInstanceDesc": "Enter the FusaoChatBot CRM instance credentials. The bearer token is stored encrypted.",
     "addInstanceTitle": "Add FusaoChatBot CRM instance",
     "apiId": "ApiID",
+    "apiIdHint": "Detected automatically from the URL above — only edit it if it looks wrong.",
     "baseUrl": "FusaoChatBot CRM base URL",
+    "baseUrlHint": "Paste the full URL shown in the Z-PRO panel — the ApiID below is filled in automatically.",
     "bearerToken": "Bearer token",
     "bearerTokenHint": "Stored encrypted, never shown again.",
     "bearerTokenUnchanged": "Leave empty to keep",

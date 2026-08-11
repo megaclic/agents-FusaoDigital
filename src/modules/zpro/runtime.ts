@@ -35,6 +35,7 @@ import {
 } from "@/graph/models";
 import { buildPromptVars, interpolatePromptVars } from "@/graph/prompt";
 import { DEFAULT_TIMEZONE } from "@/graph/time";
+import { UsageCapture } from "@/graph/usage";
 import { runScopedOn } from "@/lib/tenancy";
 import { type FlowContext, withFlowStage } from "@/modules/flowlog/service";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
@@ -42,6 +43,7 @@ import { markAgentSending } from "./agent-echo";
 import { ZproClient } from "./client";
 import { sysCtx } from "./ctx";
 import { sendTextReply, sendTyping } from "./messages";
+import { loadZproIntegrationTools } from "./tools";
 import type { NormalizedZproEvent } from "./types";
 
 // Chave canônica do thread do checkpointer para um ticket Z-PRO. Mirrors chatwootThreadId's
@@ -61,6 +63,10 @@ export interface RunZproTurnParams {
   deliveryRowId: bigint;
   event: NormalizedZproEvent;
   base?: PrismaClient;
+  // Correlates this turn's flowlog stages with a `stt` stage the controller may have already
+  // emitted (eager transcription runs before dispatch — see zpro.controller.ts). Falls back to a
+  // fresh id when absent, same as before this param existed.
+  turnId?: string;
 }
 
 export type RunZproTurnOutcome =
@@ -223,7 +229,7 @@ export async function runZproAgentTurn(
 
   const flow: FlowContext = {
     tenantId,
-    turnId: crypto.randomUUID(),
+    turnId: params.turnId ?? crypto.randomUUID(),
     source: "inbox",
     agentId: loaded.agentId,
     threadId,
@@ -255,10 +261,36 @@ export async function runZproAgentTurn(
       }),
       { timezone: DEFAULT_TIMEZONE },
     );
+    // Ferramentas INTEGRATION (Google Calendar, Asaas, ...) concedidas ao agente vinculado a esta
+    // instância — mesma tela/aba de concessão do Chatwoot (ToolGrantsEditor), sem gate de canal.
+    // Vazio por padrão (agente sem nenhuma INTEGRATION concedida) — buildAgentGraph trata `tools`
+    // ausente/vazio como hoje (grafo linear, sem ToolNode). conversationId (ZproConversation.id)
+    // vem da mesma consulta e alimenta o UsageCapture abaixo — LlmUsage.zproConversationId, NUNCA
+    // LlmUsage.conversationId (ver docs/zpro.md: risco de colisão de id com Conversation/Chatwoot).
+    const { tools, conversationId } = await loadZproIntegrationTools(
+      base,
+      tenantId,
+      loaded.agentId,
+      zproInstanceId,
+      Number(ev.threadId),
+      threadId,
+    );
     const graph = buildAgentGraph({
       model,
       systemPrompt,
       checkpointer,
+      tools,
+    });
+
+    const usageCapture = new UsageCapture({
+      tenantId,
+      agentId: loaded.agentId,
+      zproConversationId: conversationId,
+      threadId,
+      model: loaded.mc.model,
+      node: "agent",
+      source: "inbox",
+      base,
     });
 
     const result = await withFlowStage(
@@ -268,7 +300,7 @@ export async function runZproAgentTurn(
       () =>
         graph.invoke(
           { messages: [new HumanMessage(text)] },
-          { configurable: { thread_id: threadId } },
+          { configurable: { thread_id: threadId }, callbacks: [usageCapture] },
         ),
     );
 

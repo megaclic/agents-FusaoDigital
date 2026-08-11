@@ -5,10 +5,11 @@
 // messageType em vez do player/imagem embutido).
 
 import { ArrowLeft, Bot, User } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useParams } from "react-router";
 import {
+  Avatar,
   Badge,
   Button,
   Card,
@@ -62,7 +63,13 @@ const MEDIA_TYPE_KEYS = new Set([
   "stickerMessage",
 ]);
 
-function MessageBubble({ m }: { m: ZproMessageItem }) {
+function MessageBubble({
+  m,
+  contactName,
+}: {
+  m: ZproMessageItem;
+  contactName: string;
+}) {
   const { t, i18n } = useTranslation();
   const when = new Date(Number(m.timestamp)).toLocaleString(i18n.language);
   const outgoing = m.senderType !== "CLIENT";
@@ -77,29 +84,35 @@ function MessageBubble({ m }: { m: ZproMessageItem }) {
             : "bg-bg-tertiary text-text-primary",
         )}
       >
-        {outgoing && (
-          <p className="mb-0.5 flex items-center gap-1 font-medium text-accent-foreground/80 text-xs">
-            {m.senderType === "HUMAN" ? (
-              <>
-                <User className="h-3 w-3" aria-hidden="true" />
-                {t("zpro.conversations.assignee.human", "Human")}
-              </>
-            ) : (
-              <>
-                <Bot className="h-3 w-3" aria-hidden="true" />
-                {t("zpro.conversations.assignee.ai", "AI")}
-              </>
-            )}
-          </p>
-        )}
+        <p
+          className={cn(
+            "mb-0.5 flex items-center gap-1 font-medium text-xs",
+            outgoing ? "text-accent-foreground/80" : "text-text-muted",
+          )}
+        >
+          {m.senderType === "HUMAN" ? (
+            <>
+              <User className="h-3 w-3" aria-hidden="true" />
+              {t("zpro.conversations.assignee.human", "Human")}
+            </>
+          ) : m.senderType === "AGENT" ? (
+            <>
+              <Bot className="h-3 w-3" aria-hidden="true" />
+              {t("zpro.conversations.assignee.ai", "AI")}
+            </>
+          ) : (
+            <>
+              <User className="h-3 w-3" aria-hidden="true" />
+              {contactName}
+            </>
+          )}
+        </p>
         <p className="whitespace-pre-wrap text-sm">
           {m.body ||
-            (MEDIA_TYPE_KEYS.has(mediaType) ? (
-              // biome-ignore lint/plugin/no-dynamic-i18n-key: media type keys extracted via magic comments above MEDIA_TYPE_KEYS
-              t(`zpro.conversations.mediaType.${mediaType}`, mediaType)
-            ) : (
-              mediaType
-            ))}
+            (MEDIA_TYPE_KEYS.has(mediaType)
+              ? // biome-ignore lint/plugin/no-dynamic-i18n-key: media type keys extracted via magic comments above MEDIA_TYPE_KEYS
+                t(`zpro.conversations.mediaType.${mediaType}`, mediaType)
+              : mediaType)}
         </p>
         <p
           className={cn(
@@ -122,10 +135,7 @@ function MessagesSkeleton() {
       {MSG_SKELETON_KEYS.map((key, i) => (
         <div
           key={key}
-          className={cn(
-            "flex",
-            i % 2 === 0 ? "justify-start" : "justify-end",
-          )}
+          className={cn("flex", i % 2 === 0 ? "justify-start" : "justify-end")}
         >
           <Skeleton className="h-12 w-64 rounded-2xl" />
         </div>
@@ -145,6 +155,17 @@ export function ZproConversationDetailPage() {
   const [messagesLoading, setMessagesLoading] = useState(true);
   const [messagesError, setMessagesError] = useState(false);
   const [toggling, setToggling] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  // Sticky-to-bottom: true until the operator scrolls up to read older messages, so a background
+  // refresh (realtime or polling) doesn't yank them back down while they're reading history.
+  const stickToBottom = useRef(true);
+
+  const onMessagesScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickToBottom.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
 
   const loadMeta = useCallback(
     async (opts?: { background?: boolean }) => {
@@ -201,6 +222,15 @@ export function ZproConversationDetailPage() {
     void loadMessages();
   }, [loadMeta, loadMessages]);
 
+  // Auto-scroll on mount (initial load) and whenever the message list changes (realtime arrival),
+  // but only while the operator hasn't scrolled up to read history (see onMessagesScroll above).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: messages is the scroll trigger, not a read.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !stickToBottom.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
   useTenantEvents({
     onZproMessage: (event) => {
       if (event.conversationId !== id) return;
@@ -236,10 +266,7 @@ export function ZproConversationDetailPage() {
       showToast(
         data.agentActive
           ? t("zpro.conversations.agentActivated", "AI agent activated.")
-          : t(
-              "zpro.conversations.agentDeactivated",
-              "AI agent deactivated.",
-            ),
+          : t("zpro.conversations.agentDeactivated", "AI agent deactivated."),
         "success",
       );
     } catch {
@@ -252,8 +279,12 @@ export function ZproConversationDetailPage() {
     }
   }, [conv, id, showToast, t]);
 
+  const zproStatusKey = `zpro.conversations.status.${conv?.status}`;
+  // biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments in ZproConversationsPage
+  const zproStatusLabel = conv ? t(zproStatusKey, conv.status) : "";
+
   return (
-    <PageContainer className="flex flex-col gap-4">
+    <PageContainer className="flex h-full min-h-0 flex-col gap-4">
       <Link
         to="/zpro/conversations"
         className="inline-flex w-fit items-center gap-1.5 text-sm text-text-secondary hover:text-text-primary"
@@ -274,24 +305,31 @@ export function ZproConversationDetailPage() {
         {conv && (
           <>
             <Card className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate font-semibold text-lg text-text-primary">
-                    {conv.contactName || conv.contactNumber}
-                  </h1>
-                  <Badge variant={STATUS_VARIANT[conv.status] ?? "secondary"}>
-                    {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments in ZproConversationsPage */}
-                    {t(
-                      `zpro.conversations.status.${conv.status}`,
-                      conv.status,
-                    )}
-                  </Badge>
+              <div className="flex min-w-0 items-center gap-3">
+                <Avatar
+                  name={conv.contactName || conv.contactNumber}
+                  src={
+                    conv.avatarUrl
+                      ? `/api/v1/zpro/conversations/${conv.id}/avatar`
+                      : null
+                  }
+                  size="md"
+                />
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="truncate font-semibold text-lg text-text-primary">
+                      {conv.contactName || conv.contactNumber}
+                    </h1>
+                    <Badge variant={STATUS_VARIANT[conv.status] ?? "secondary"}>
+                      {zproStatusLabel}
+                    </Badge>
+                  </div>
+                  <p className="mt-0.5 text-sm text-text-muted">
+                    {conv.contactNumber}
+                    {conv.ticketProtocol ? ` · #${conv.ticketProtocol}` : ""}
+                    {` · ${conv.instanceName}`}
+                  </p>
                 </div>
-                <p className="mt-0.5 text-sm text-text-muted">
-                  {conv.contactNumber}
-                  {conv.ticketProtocol ? ` · #${conv.ticketProtocol}` : ""}
-                  {` · ${conv.instanceName}`}
-                </p>
               </div>
               <Button
                 variant={conv.agentActive ? "secondary" : "primary"}
@@ -310,16 +348,17 @@ export function ZproConversationDetailPage() {
                 ) : (
                   <>
                     <Bot className="h-4 w-4" aria-hidden="true" />
-                    {t(
-                      "zpro.conversations.activateAgent",
-                      "Activate agent",
-                    )}
+                    {t("zpro.conversations.activateAgent", "Activate agent")}
                   </>
                 )}
               </Button>
             </Card>
 
-            <Card>
+            <div
+              ref={scrollRef}
+              onScroll={onMessagesScroll}
+              className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-xl border border-border bg-bg-secondary p-6"
+            >
               <DataBoundary
                 loading={messagesLoading}
                 error={messagesError}
@@ -342,11 +381,15 @@ export function ZproConversationDetailPage() {
               >
                 <div className="flex flex-col gap-3">
                   {messages.map((m) => (
-                    <MessageBubble key={m.id} m={m} />
+                    <MessageBubble
+                      key={m.id}
+                      m={m}
+                      contactName={conv.contactName || conv.contactNumber}
+                    />
                   ))}
                 </div>
               </DataBoundary>
-            </Card>
+            </div>
           </>
         )}
       </DataBoundary>

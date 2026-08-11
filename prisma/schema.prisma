@@ -392,6 +392,8 @@ model Contact {
   // touched by several conversations, so the write is gated on it to keep the snapshot monotonic.
   customAttributes   Json      @default("{}") @map("custom_attributes")
   customAttributesAt DateTime? @map("custom_attributes_at")
+  // Chatwoot's meta.sender.thumbnail, refreshed on every webhook event that carries it.
+  avatarUrl          String?   @map("avatar_url")
   // Per-contact audio-reply preference (TTS mode "preference"): true = wants audio, false = wants
   // text, null = unknown (falls back to mirroring what the customer sent). Set by the agent's
   // set_voice_preference native tool. RLS-scoped column — NOT a Chatwoot custom attribute.
@@ -599,6 +601,8 @@ model ZproConversation {
   contactId        Int       @map("contact_id") // ticket.contact.id
   contactNumber    String    @map("contact_number") // ticket.contact.number
   contactName      String    @map("contact_name") // ticket.contact.name
+  // ticket.contact.profilePicUrl, atualizado via payload contact-create-update (mirrorZproContact).
+  avatarUrl        String?   @map("avatar_url")
   agentActive      Boolean   @default(false) @map("agent_active") // n8nStatus espelhado
   humanUserId      Int?      @map("human_user_id") // ticket.userId quando humano ativo
   lastMessageAt    DateTime? @map("last_message_at")
@@ -1187,6 +1191,11 @@ model LlmUsage {
   tenantId            BigInt   @map("tenant_id")
   agentId             BigInt?  @map("agent_id")
   conversationId      BigInt?  @map("conversation_id")
+  // Z-PRO's own conversation id (ZproConversation.id) — kept in a SEPARATE column from
+  // conversationId (Chatwoot's Conversation.id) on purpose: the two are independent autoincrement
+  // sequences, so reusing conversationId for Z-PRO would risk an id collision silently attributing
+  // one channel's row to an unrelated conversation on the other. Never both set on the same row.
+  zproConversationId  BigInt?  @map("zpro_conversation_id")
   // The DB Inbox.id this usage was attributed to (null in the playground and for legacy rows).
   // Granularity for the per-inbox dashboard break-down.
   inboxId             BigInt?  @map("inbox_id")
@@ -1210,6 +1219,7 @@ model LlmUsage {
   @@index([tenantId, createdAt])
   @@index([tenantId, agentId])
   @@index([tenantId, inboxId])
+  @@index([tenantId, zproConversationId])
   @@map("llm_usage")
 }
 

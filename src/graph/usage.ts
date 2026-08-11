@@ -18,6 +18,11 @@ export interface UsageRow {
   tenantId: bigint;
   agentId: bigint | null;
   conversationId: bigint | null;
+  // Z-PRO's own conversation id (ZproConversation.id) — a SEPARATE column from conversationId
+  // (Chatwoot's Conversation.id). Never both set on the same row: the two are independent
+  // autoincrement sequences, so reusing one for the other risks an id collision silently
+  // attributing a row to an unrelated conversation on the other channel.
+  zproConversationId: bigint | null;
   // The DB Inbox.id this usage is attributed to (null in the playground / when unresolved).
   inboxId: bigint | null;
   threadId: string | null;
@@ -50,6 +55,7 @@ export function defaultUsagePersist(
           tenantId: row.tenantId,
           agentId: row.agentId ?? undefined,
           conversationId: row.conversationId ?? undefined,
+          zproConversationId: row.zproConversationId ?? undefined,
           inboxId: row.inboxId ?? undefined,
           threadId: row.threadId ?? undefined,
           model: row.model,
@@ -68,6 +74,10 @@ export function defaultUsagePersist(
         agent_id: row.agentId != null ? String(row.agentId) : null,
         conversation_id:
           row.conversationId != null ? String(row.conversationId) : null,
+        zpro_conversation_id:
+          row.zproConversationId != null
+            ? String(row.zproConversationId)
+            : null,
         inbox_id: row.inboxId != null ? String(row.inboxId) : null,
         source: row.source,
         model: row.model,
@@ -161,6 +171,9 @@ export interface UsageCaptureParams {
   tenantId: bigint;
   agentId?: bigint | null;
   conversationId?: bigint | null;
+  // Z-PRO's own conversation id — see UsageRow.zproConversationId. Never set together with
+  // conversationId on the same capture instance.
+  zproConversationId?: bigint | null;
   inboxId?: bigint | null;
   threadId?: string | null;
   model: string;
@@ -178,6 +191,7 @@ export class UsageCapture extends BaseCallbackHandler {
   private readonly tenantId: bigint;
   private readonly agentId: bigint | null;
   private readonly conversationId: bigint | null;
+  private readonly zproConversationId: bigint | null;
   private readonly inboxId: bigint | null;
   private readonly threadId: string | null;
   private readonly model: string;
@@ -190,6 +204,7 @@ export class UsageCapture extends BaseCallbackHandler {
     this.tenantId = params.tenantId;
     this.agentId = params.agentId ?? null;
     this.conversationId = params.conversationId ?? null;
+    this.zproConversationId = params.zproConversationId ?? null;
     this.inboxId = params.inboxId ?? null;
     this.threadId = params.threadId ?? null;
     this.model = params.model;
@@ -211,6 +226,7 @@ export class UsageCapture extends BaseCallbackHandler {
         tenantId: this.tenantId,
         agentId: this.agentId,
         conversationId: this.conversationId,
+        zproConversationId: this.zproConversationId,
         inboxId: this.inboxId,
         threadId: this.threadId,
         model: this.model,

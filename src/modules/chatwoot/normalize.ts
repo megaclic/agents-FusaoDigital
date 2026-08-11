@@ -125,6 +125,7 @@ export function normalizeChatwootEvent(
       email: str(sender.email),
       phone: str(sender.phone_number),
       identifier: str(sender.identifier),
+      avatarUrl: str(sender.thumbnail),
       ...(contactAttrs ? { customAttributes: contactAttrs } : {}),
     };
   }

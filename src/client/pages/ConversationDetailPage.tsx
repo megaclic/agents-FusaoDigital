@@ -36,6 +36,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { Link, useParams } from "react-router";
 import {
+  Avatar,
   Badge,
   Button,
   Card,
@@ -1466,94 +1467,105 @@ export function ConversationDetailPage() {
         {conv && (
           <>
             <Card className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate font-semibold text-lg text-text-primary">
-                    {conv.contact?.name ??
-                      t("conversations.unknownContact", "Unknown contact")}
-                  </h1>
-                  <Badge variant={STATUS_VARIANT[conv.status] ?? "secondary"}>
-                    {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted in ConversationsPage */}
-                    {t(`conversations.status.${conv.status}`, conv.status)}
-                  </Badge>
-                  {conv.agentMode === "test" && (
-                    <TestModeBadge
-                      state={conv.testActivatedAt ? "active" : "waiting"}
-                    />
-                  )}
-                  {conv.outOfHours && <OutOfHoursBadge />}
-                </div>
-                <p className="mt-0.5 flex items-center gap-1.5 text-sm text-text-muted">
-                  {isHuman ? (
-                    <>
-                      <User className="h-3.5 w-3.5" aria-hidden="true" />
-                      {conv.assigneeName ??
-                        t("conversations.assignee.human", "Human #{{id}}", {
-                          id: conv.assigneeId ?? "?",
-                        })}
-                    </>
-                  ) : (
-                    <>
-                      <Bot
-                        className="h-3.5 w-3.5 text-accent"
-                        aria-hidden="true"
+              <div className="flex min-w-0 items-center gap-3">
+                <Avatar
+                  name={conv.contact?.name}
+                  src={
+                    conv.contact?.avatarUrl
+                      ? `/api/v1/conversations/${conv.id}/avatar`
+                      : null
+                  }
+                  size="md"
+                />
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="truncate font-semibold text-lg text-text-primary">
+                      {conv.contact?.name ??
+                        t("conversations.unknownContact", "Unknown contact")}
+                    </h1>
+                    <Badge variant={STATUS_VARIANT[conv.status] ?? "secondary"}>
+                      {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted in ConversationsPage */}
+                      {t(`conversations.status.${conv.status}`, conv.status)}
+                    </Badge>
+                    {conv.agentMode === "test" && (
+                      <TestModeBadge
+                        state={conv.testActivatedAt ? "active" : "waiting"}
                       />
-                      {conv.agentName ?? t("conversations.assignee.ai", "AI")}
-                    </>
-                  )}
-                  {conv.inbox?.name ? ` · ${conv.inbox.name}` : ""}
-                  {!isHuman && conv.agentModel ? (
-                    <span className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
-                      {conv.agentModel}
-                    </span>
-                  ) : null}
-                </p>
-                {conv.contact && (
-                  <p className="mt-1 flex items-center gap-1.5 text-xs">
-                    <span
-                      className={cn("h-2 w-2 shrink-0 rounded-full", {
-                        "bg-success": conv.contact.voiceReply === true,
-                        "bg-info": conv.contact.voiceReply === false,
-                        "bg-text-muted": conv.contact.voiceReply == null,
-                      })}
-                      aria-hidden="true"
-                    />
-                    {conv.contact.voiceReply === true ? (
+                    )}
+                    {conv.outOfHours && <OutOfHoursBadge />}
+                  </div>
+                  <p className="mt-0.5 flex items-center gap-1.5 text-sm text-text-muted">
+                    {isHuman ? (
                       <>
-                        <Volume2
-                          className="h-3.5 w-3.5 text-success"
-                          aria-hidden="true"
-                        />
-                        <span className="text-text-secondary">
-                          {t(
-                            "conversation.voicePref.audio",
-                            "Prefers audio replies",
-                          )}
-                        </span>
-                      </>
-                    ) : conv.contact.voiceReply === false ? (
-                      <>
-                        <Type
-                          className="h-3.5 w-3.5 text-info"
-                          aria-hidden="true"
-                        />
-                        <span className="text-text-secondary">
-                          {t(
-                            "conversation.voicePref.text",
-                            "Prefers text replies",
-                          )}
-                        </span>
+                        <User className="h-3.5 w-3.5" aria-hidden="true" />
+                        {conv.assigneeName ??
+                          t("conversations.assignee.human", "Human #{{id}}", {
+                            id: conv.assigneeId ?? "?",
+                          })}
                       </>
                     ) : (
-                      <span className="text-text-muted">
-                        {t(
-                          "conversation.voicePref.none",
-                          "No audio preference set",
-                        )}
-                      </span>
+                      <>
+                        <Bot
+                          className="h-3.5 w-3.5 text-accent"
+                          aria-hidden="true"
+                        />
+                        {conv.agentName ?? t("conversations.assignee.ai", "AI")}
+                      </>
                     )}
+                    {conv.inbox?.name ? ` · ${conv.inbox.name}` : ""}
+                    {!isHuman && conv.agentModel ? (
+                      <span className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
+                        {conv.agentModel}
+                      </span>
+                    ) : null}
                   </p>
-                )}
+                  {conv.contact && (
+                    <p className="mt-1 flex items-center gap-1.5 text-xs">
+                      <span
+                        className={cn("h-2 w-2 shrink-0 rounded-full", {
+                          "bg-success": conv.contact.voiceReply === true,
+                          "bg-info": conv.contact.voiceReply === false,
+                          "bg-text-muted": conv.contact.voiceReply == null,
+                        })}
+                        aria-hidden="true"
+                      />
+                      {conv.contact.voiceReply === true ? (
+                        <>
+                          <Volume2
+                            className="h-3.5 w-3.5 text-success"
+                            aria-hidden="true"
+                          />
+                          <span className="text-text-secondary">
+                            {t(
+                              "conversation.voicePref.audio",
+                              "Prefers audio replies",
+                            )}
+                          </span>
+                        </>
+                      ) : conv.contact.voiceReply === false ? (
+                        <>
+                          <Type
+                            className="h-3.5 w-3.5 text-info"
+                            aria-hidden="true"
+                          />
+                          <span className="text-text-secondary">
+                            {t(
+                              "conversation.voicePref.text",
+                              "Prefers text replies",
+                            )}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="text-text-muted">
+                          {t(
+                            "conversation.voicePref.none",
+                            "No audio preference set",
+                          )}
+                        </span>
+                      )}
+                    </p>
+                  )}
+                </div>
               </div>
               {/* Actions + navigation. Below lg: one wrapping row (item 12) — below sm they stack
                   full-width; at sm+ they flow right-aligned and wrap as the width shrinks. The two

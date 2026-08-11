@@ -112,7 +112,9 @@ function sysCtx(tenantId: bigint): TenantContext {
 // stored value is a JSON object, so we auto-refresh and return the fresh access token (the bearer
 // value). Returns null when the entry is missing. The refresh paths do their own scoped reads/writes
 // + a refresh network call OUTSIDE any caller tx, so this must not be invoked inside one.
-async function resolveInjectableCredential(
+// Exported so src/modules/zpro/tools.ts can build the same ToolpackCtx.resolveCredential the
+// Chatwoot path uses — the body is channel-agnostic (vault + OAuth refresh, no Chatwoot object).
+export async function resolveInjectableCredential(
   base: PrismaClient,
   tenantId: bigint,
   ref: string,
@@ -126,9 +128,22 @@ async function resolveInjectableCredential(
       ? BigInt(ref.slice("vault:".length))
       : null;
     if (id === null) return null;
-    return entry.kind === "mcp_oauth"
-      ? ensureFreshMcpAccessToken(sysCtx(tenantId), id, base)
-      : ensureFreshGoogleAccessToken(sysCtx(tenantId), id, base);
+    // A refresh failure (revoked/expired grant, network hiccup) used to throw here and propagate as
+    // an unhandled exception inside the tool call — unlike the "entry missing" case above, which
+    // already degrades gracefully to null (the tool then reports NOT_CONNECTED to the model instead
+    // of crashing the turn).
+    try {
+      return await (entry.kind === "mcp_oauth"
+        ? ensureFreshMcpAccessToken(sysCtx(tenantId), id, base)
+        : ensureFreshGoogleAccessToken(sysCtx(tenantId), id, base));
+    } catch (err) {
+      logger.warn(
+        "resolveInjectableCredential: OAuth refresh failed for %s: %s",
+        ref,
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    }
   }
   return typeof entry.secret === "string" ? entry.secret : null;
 }

@@ -38,6 +38,7 @@ import { useAuth } from "@/client/contexts/AuthContext";
 import { api } from "@/client/lib/api";
 import { isAdminRole } from "@/client/lib/roles";
 import { cn } from "@/client/lib/utils";
+import { extractZproCredentialsFromUrl } from "@/client/lib/zpro";
 
 type InstancesData = Awaited<
   ReturnType<typeof api.api.v1.zpro.instances.get>
@@ -683,16 +684,40 @@ export function ZproSection() {
                 "Enter the Z-PRO instance credentials. The bearer token is stored encrypted.",
               )}
             </p>
-            <FormField label={t("zpro.baseUrl", "Z-PRO base URL")} required>
+            <FormField
+              label={t("zpro.baseUrl", "Z-PRO base URL")}
+              required
+              description={t(
+                "zpro.baseUrlHint",
+                "Paste the full URL shown in the Z-PRO panel — the ApiID below is filled in automatically.",
+              )}
+            >
               <Input
                 value={form.baseUrl}
                 onChange={(e) =>
                   setForm((f) => ({ ...f, baseUrl: e.target.value }))
                 }
-                placeholder="https://api.fusaobotcrm.com.br"
+                onBlur={() => {
+                  const extracted = extractZproCredentialsFromUrl(form.baseUrl);
+                  if (extracted) {
+                    setForm((f) => ({
+                      ...f,
+                      baseUrl: extracted.baseUrl,
+                      apiId: extracted.apiId,
+                    }));
+                  }
+                }}
+                placeholder="https://api.fusaobotcrm.com.br/v2/api/external/b4c2ae0c-..."
               />
             </FormField>
-            <FormField label={t("zpro.apiId", "ApiID")} required>
+            <FormField
+              label={t("zpro.apiId", "ApiID")}
+              required
+              description={t(
+                "zpro.apiIdHint",
+                "Detected automatically from the URL above — only edit it if it looks wrong.",
+              )}
+            >
               <Input
                 value={form.apiId}
                 onChange={(e) =>
@@ -856,16 +881,42 @@ export function ZproSection() {
               "Leave the bearer token field empty to keep the current token.",
             )}
           </p>
-          <FormField label={t("zpro.baseUrl", "Z-PRO base URL")} required>
+          <FormField
+            label={t("zpro.baseUrl", "Z-PRO base URL")}
+            required
+            description={t(
+              "zpro.baseUrlHint",
+              "Paste the full URL shown in the Z-PRO panel — the ApiID below is filled in automatically.",
+            )}
+          >
             <Input
               value={editForm.baseUrl}
               onChange={(e) =>
                 setEditForm((f) => ({ ...f, baseUrl: e.target.value }))
               }
-              placeholder="https://api.fusaobotcrm.com.br"
+              onBlur={() => {
+                const extracted = extractZproCredentialsFromUrl(
+                  editForm.baseUrl,
+                );
+                if (extracted) {
+                  setEditForm((f) => ({
+                    ...f,
+                    baseUrl: extracted.baseUrl,
+                    apiId: extracted.apiId,
+                  }));
+                }
+              }}
+              placeholder="https://api.fusaobotcrm.com.br/v2/api/external/b4c2ae0c-..."
             />
           </FormField>
-          <FormField label={t("zpro.apiId", "ApiID")} required>
+          <FormField
+            label={t("zpro.apiId", "ApiID")}
+            required
+            description={t(
+              "zpro.apiIdHint",
+              "Detected automatically from the URL above — only edit it if it looks wrong.",
+            )}
+          >
             <Input
               value={editForm.apiId}
               onChange={(e) =>

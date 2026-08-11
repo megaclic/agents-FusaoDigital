@@ -568,7 +568,9 @@
         "humanEscalated": "Escaladas para humano",
         "humanEscalatedHint": "atualmente com um humano",
         "resolved": "Resolvidas",
-        "resolvedHint": "tickets fechados"
+        "resolvedHint": "tickets fechados",
+        "tokens": "Tokens (entrada / saída)",
+        "tokensHint": "{{calls}} chamadas de IA no período"
       },
       "title": "FusaoChatBot CRM"
     }
@@ -2160,7 +2162,9 @@
     "addInstanceDesc": "Informe as credenciais da instância FusaoChatBot CRM. O bearer token é armazenado criptografado.",
     "addInstanceTitle": "Adicionar instância FusaoChatBot CRM",
     "apiId": "ApiID",
+    "apiIdHint": "Detectado automaticamente a partir da URL acima — edite somente se parecer errado.",
     "baseUrl": "URL base do FusaoChatBot CRM",
+    "baseUrlHint": "Cole a URL completa exibida no painel do Z-PRO — o ApiID abaixo é preenchido automaticamente.",
     "bearerToken": "Bearer token",
     "bearerTokenHint": "Armazenado criptografado, nunca exibido novamente.",
     "bearerTokenUnchanged": "Deixe vazio para manter",

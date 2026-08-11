@@ -15,6 +15,7 @@ import {
 } from "@/modules/analytics/service";
 import { reengageConversation } from "@/modules/conversations/reengage";
 import {
+  getConversationAvatar,
   getConversationDetail,
   getConversationMedia,
   getConversationMessages,
@@ -417,6 +418,44 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ...doc(
           "Stream conversation media",
           "Proxies a conversation attachment (voice note, image, or file) from the tenant's Chatwoot through our origin for CSP-clean in-app playback.",
+        ),
+        tags: ["Conversations"],
+      },
+      response: errors(400, 401, 404),
+    },
+  )
+  // Same CSP constraint as the media proxy above, but for the contact's avatar thumbnail — no
+  // caller-supplied url (see getConversationAvatar), just the conversation id.
+  .get(
+    "/conversations/:id/avatar",
+    async ({ tenantContext, params, set }) => {
+      const blob = await getConversationAvatar(
+        ctxOrThrow(tenantContext),
+        BigInt(params.id),
+      );
+      if (!blob) {
+        set.status = 404;
+        return { error: "Not Found" };
+      }
+      return new Response(blob.bytes, {
+        headers: {
+          "content-type": blob.contentType,
+          "cache-control": "private, max-age=3600",
+        },
+      });
+    },
+    {
+      requireAuth: true,
+      params: t.Object({
+        id: t.String({
+          description:
+            "Conversation primary key (BigInt serialized as a decimal string).",
+        }),
+      }),
+      detail: {
+        ...doc(
+          "Stream the contact's avatar",
+          "Proxies the contact's mirrored avatar thumbnail through our origin for CSP-clean rendering. 404 when the contact has no avatar on file.",
         ),
         tags: ["Conversations"],
       },

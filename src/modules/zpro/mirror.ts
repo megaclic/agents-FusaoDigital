@@ -13,7 +13,7 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { runScopedOn } from "@/lib/tenancy";
 import { wasAgentSending } from "./agent-echo";
-import { ZPRO_METHOD_MESSAGE } from "./constants";
+import { ZPRO_METHOD_CONTACT, ZPRO_METHOD_MESSAGE } from "./constants";
 import { sysCtx } from "./ctx";
 import { extractMedia, extractMessageBody } from "./parse";
 import type { ZproWebhookPayload } from "./types";
@@ -93,6 +93,8 @@ export async function mirrorZproMessage(
         },
         update: {
           status: ticket.status,
+          contactNumber: ticket.contact.number,
+          contactName: ticket.contact.name ?? ticket.contact.number,
           agentActive: ticket.n8nStatus,
           humanUserId: ticket.userId,
           lastMessageAt,
@@ -163,4 +165,32 @@ export async function mirrorZproMessage(
   });
 
   return { conversationId: conversation.id, isHumanIntervention };
+}
+
+// Processa um payload `contact-create-update`: atualiza nome + foto de perfil em toda
+// ZproConversation existente desse contato nesta instância (um contato pode ter vários tickets ao
+// longo do tempo — contact-create-update não é por ticket). Nenhuma mensagem é criada; se o contato
+// ainda não tem nenhuma conversa (nunca mandou mensagem), não há o que atualizar — updateMany
+// simplesmente afeta zero linhas, sem erro.
+export async function mirrorZproContact(
+  payload: ZproWebhookPayload,
+  tenantId: bigint,
+  zproInstanceId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  if (payload.method !== ZPRO_METHOD_CONTACT) return;
+  const contact = payload.contact;
+  if (!contact) return;
+
+  const name = contact.name || contact.number;
+  await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.updateMany({
+      where: { zproInstanceId, contactId: contact.id },
+      data: {
+        contactName: name,
+        contactNumber: contact.number,
+        ...(contact.profilePicUrl ? { avatarUrl: contact.profilePicUrl } : {}),
+      },
+    }),
+  );
 }

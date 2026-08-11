@@ -2,6 +2,8 @@
 
 WhatsApp customers send voice notes constantly. STT transcribes them so the agent can read and answer; the same pass also shapes every inbound message (audio/image/file markers, quoted-message context) into the text the agent sees, mirroring the n8n "Extrair mensagem" node. On by default per agent (effective only once a provider credential is configured).
 
+This file documents the **Chatwoot** channel. The independent **Z-PRO** ("FusaoChatBot CRM") channel has its own STT path (`src/modules/zpro/stt.ts`) that shares the config schema (`agent.settings.stt`, `readSttConfig`) and the provider registry (`src/modules/stt/providers.ts`) documented below, but differs on download (raw WhatsApp CDN URL, anti-SSRF checked, instead of an authenticated Chatwoot attachment call) and write-back target (`ZproMessage.body`, the Z-PRO inbox's own source of truth, instead of Chatwoot attachment meta). See [`docs/zpro.md`](zpro.md#audio-transcription-stt) for the full Z-PRO flow.
+
 ## Flow (eager, at message arrival)
 
 ```

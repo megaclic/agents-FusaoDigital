@@ -139,6 +139,60 @@ export interface UseTenantEventsOptions {
   onZproAgentToggled?: (event: ZproAgentToggledRealtimeEvent) => void;
 }
 
+// Pure dispatcher, exported for direct unit testing without standing up the WebSocket/auth
+// machinery: maps a wire event to its typed handler. Every new `TenantRealtimeEvent` variant
+// needs a branch here, or it silently reaches no one (see the zpro-message/zpro-agent-toggled
+// regression this now guards against — the option existed on `UseTenantEventsOptions` but this
+// switch had no case for it).
+export function dispatchTenantEvent(
+  msg: TenantRealtimeEvent,
+  handlers: UseTenantEventsOptions,
+): void {
+  if (msg.type === "conversation") {
+    handlers.onConversation?.({
+      conversationId: msg.conversationId,
+      status: msg.status,
+      assigneeId: msg.assigneeId,
+      assigneeType: msg.assigneeType,
+      lastEventAt: msg.lastEventAt,
+    });
+  } else if (msg.type === "agent-activity") {
+    handlers.onAgentActivity?.({
+      conversationId: msg.conversationId,
+      phase: msg.phase,
+      stage: msg.stage,
+      tool: msg.tool,
+      runAt: msg.runAt ?? null,
+      balloons: msg.balloons ?? null,
+    });
+  } else if (msg.type === "knowledge-document") {
+    handlers.onKnowledgeDocument?.({
+      knowledgeBaseId: msg.knowledgeBaseId,
+      documentId: msg.documentId,
+      status: msg.status,
+      chunkCount: msg.chunkCount,
+      error: msg.error,
+    });
+  } else if (msg.type === "agent-config") {
+    handlers.onAgentConfig?.({
+      agentId: msg.agentId,
+      updatedAt: msg.updatedAt,
+    });
+  } else if (msg.type === "zpro-message") {
+    handlers.onZproMessage?.({
+      conversationId: msg.conversationId,
+      ticketId: msg.ticketId,
+      senderType: msg.senderType,
+    });
+  } else if (msg.type === "zpro-agent-toggled") {
+    handlers.onZproAgentToggled?.({
+      conversationId: msg.conversationId,
+      ticketId: msg.ticketId,
+      agentActive: msg.agentActive,
+    });
+  }
+}
+
 export function useTenantEvents(options: UseTenantEventsOptions = {}) {
   const { user } = useAuth();
   // A tenant-bound user uses their own tenant; a SUPER_ADMIN follows the active
@@ -155,41 +209,8 @@ export function useTenantEvents(options: UseTenantEventsOptions = {}) {
     [tenantId],
   );
 
-  const onConversation = options.onConversation;
-  const onAgentActivity = options.onAgentActivity;
-  const onKnowledgeDocument = options.onKnowledgeDocument;
-  const onAgentConfig = options.onAgentConfig;
   return useWebSocket<never, TenantRealtimeEvent>(subscribe, {
     enabled,
-    onMessage: (msg) => {
-      if (msg.type === "conversation") {
-        onConversation?.({
-          conversationId: msg.conversationId,
-          status: msg.status,
-          assigneeId: msg.assigneeId,
-          assigneeType: msg.assigneeType,
-          lastEventAt: msg.lastEventAt,
-        });
-      } else if (msg.type === "agent-activity") {
-        onAgentActivity?.({
-          conversationId: msg.conversationId,
-          phase: msg.phase,
-          stage: msg.stage,
-          tool: msg.tool,
-          runAt: msg.runAt ?? null,
-          balloons: msg.balloons ?? null,
-        });
-      } else if (msg.type === "knowledge-document") {
-        onKnowledgeDocument?.({
-          knowledgeBaseId: msg.knowledgeBaseId,
-          documentId: msg.documentId,
-          status: msg.status,
-          chunkCount: msg.chunkCount,
-          error: msg.error,
-        });
-      } else if (msg.type === "agent-config") {
-        onAgentConfig?.({ agentId: msg.agentId, updatedAt: msg.updatedAt });
-      }
-    },
+    onMessage: (msg) => dispatchTenantEvent(msg, options),
   });
 }

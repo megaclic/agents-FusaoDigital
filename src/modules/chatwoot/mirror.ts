@@ -308,12 +308,14 @@ async function upsertContact(
       name: c.name,
       email: c.email,
       phone: c.phone,
+      avatarUrl: c.avatarUrl,
       attributes,
     },
     update: {
       ...(c.name != null ? { name: c.name } : {}),
       ...(c.email != null ? { email: c.email } : {}),
       ...(c.phone != null ? { phone: c.phone } : {}),
+      ...(c.avatarUrl != null ? { avatarUrl: c.avatarUrl } : {}),
     },
     select: { id: true },
   });
