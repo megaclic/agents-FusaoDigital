@@ -16,9 +16,11 @@ import logger from "@/api/lib/logger";
 import { doc } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { asSuperAdminOn, runScopedOn } from "@/lib/tenancy";
+import { armDebounce } from "@/modules/debounce/service";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
+import { resolveZproDebounceConfig } from "@/modules/zpro/debounce";
 import { deactivateAgent } from "@/modules/zpro/handoff";
 import { mirrorZproContact, mirrorZproMessage } from "@/modules/zpro/mirror";
 import { extractMedia, extractWhatsappId } from "@/modules/zpro/parse";
@@ -28,6 +30,10 @@ import type {
   ResolvedZproInstance,
   ZproWebhookPayload,
 } from "@/modules/zpro/types";
+import {
+  extractZproFile,
+  resolveZproVisionConfig,
+} from "@/modules/zpro/vision";
 import { handleZproWebhook } from "@/modules/zpro/webhook";
 
 export const zproController = new Elysia({
@@ -165,6 +171,62 @@ export const zproController = new Elysia({
       }
     }
 
+    // 1d. Vision: extração eager de imagem/documento recebidos (inbound, não fromMe) — mesmo
+    // padrão "eager at message arrival" do STT acima. audioMessage e imageMessage/documentMessage
+    // são mutuamente exclusivos (extractMessageBody/extractMedia já tratam isso), então no máximo
+    // um dos dois blocos roda por mensagem.
+    let visionText: string | null = null;
+    const imageOrDocContent =
+      msg?.data?.message?.imageMessage ?? msg?.data?.message?.documentMessage;
+    if (mirrored && msg && !msg.fromMe && imageOrDocContent && ticket) {
+      const media = extractMedia(msg.data?.message);
+      if (media.mediaUrl) {
+        const visionCfg = await resolveZproVisionConfig(
+          instance.tenantId,
+          instance.id,
+        );
+        if (visionCfg) {
+          const flow: FlowContext = {
+            tenantId: instance.tenantId,
+            turnId,
+            source: "inbox",
+            threadId: zproThreadId(
+              instance.tenantId,
+              instance.id,
+              String(ticket.id),
+            ),
+          };
+          const extracted = await extractZproFile({
+            tenantId: instance.tenantId,
+            mediaUrl: media.mediaUrl,
+            mediaMimetype: media.mediaMimetype ?? null,
+            cfg: visionCfg,
+            flow,
+          });
+          if (extracted) {
+            visionText = extracted.text;
+            const describedBody = extracted.text;
+            await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+              db.zproMessage.update({
+                where: {
+                  conversationId_messageId: {
+                    conversationId: mirrored.conversationId,
+                    messageId: msg.id,
+                  },
+                },
+                data: { body: describedBody },
+              }),
+            );
+            broadcastZproMessage(instance.tenantId, {
+              conversationId: String(mirrored.conversationId),
+              ticketId: ticket.id,
+              senderType: "CLIENT",
+            });
+          }
+        }
+      }
+    }
+
     // 2. Handoff automático: um atendente humano respondeu (fromMe + userId preenchido) enquanto
     // o agente ainda estava marcado ativo no ticket — desativa. Nunca reativa automaticamente;
     // reativação é sempre manual via POST /v1/zpro/conversations/:id/toggle-agent.
@@ -229,7 +291,58 @@ export const zproController = new Elysia({
 
         // A transcribed voice note has no text of its own in the normalized event (audio never
         // carries a caption) — feed the transcription in so the agent responds to its content.
+        // Same for a described image/document with no caption (mutually exclusive with sttText —
+        // see the comment above step 1d).
         if (sttText && !event.body) event.body = sttText;
+        if (visionText && !event.body) event.body = visionText;
+
+        // Debounce: an incoming message on a debounce-enabled agent re-arms the durable DEBOUNCE
+        // job (coalescing window) instead of replying balloon-by-balloon — the fast worker flushes
+        // it later (src/modules/zpro/debounce.ts). Arming REPLACES the direct turn (same as
+        // Chatwoot's webhook), so on success this delivery is marked PROCESSED without ever
+        // calling runZproAgentTurn — the eventual reply is tracked by the watermark, not this
+        // ledger row. Best-effort: any arm failure falls back to the direct turn below so the
+        // customer is never left unanswered. mirrored.messageDbId seeds the burst's high-water
+        // mark (armDebounce's lastMessageId) so a flush abandoned by the agent-inactive gate can
+        // still advance the watermark without a query (mirrors Chatwoot's issue #8 fix).
+        if (mirrored) {
+          try {
+            const debounceCfg = await resolveZproDebounceConfig(
+              instance.tenantId,
+              instance.id,
+            );
+            if (debounceCfg) {
+              await armDebounce({
+                tenantId: instance.tenantId,
+                threadId: zproThreadId(
+                  instance.tenantId,
+                  instance.id,
+                  event.threadId,
+                ),
+                agentBotId: null,
+                cfg: debounceCfg,
+                lastMessageId: Number(mirrored.messageDbId),
+              });
+              await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                db.zproWebhookDelivery.update({
+                  where: { id: delivery.id },
+                  data: { status: "PROCESSED", processedAt: new Date() },
+                }),
+              );
+              logger.info(
+                "zpro:dispatch debounced delivery=%s window=%ds",
+                String(delivery.id),
+                debounceCfg.windowSeconds,
+              );
+              return;
+            }
+          } catch (err) {
+            logger.warn(
+              { err, deliveryId: String(delivery.id) },
+              "zpro:webhook: debounce arm failed — falling back to a direct turn",
+            );
+          }
+        }
 
         // Ack fast: the dispatch runs detached. runZproAgentTurn CAS-claims the row itself, so a
         // re-fired duplicate that raced this same check is still safe.

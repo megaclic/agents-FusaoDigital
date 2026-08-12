@@ -2,6 +2,8 @@
 
 WhatsApp customers send several quick balloons ("oi", "tudo bem?", "queria saber…"). Answering each one is the #1 amateur tell and duplicates replies. Debounce waits for the customer to stop, then answers the **whole burst in one turn**. This is feature parity with the n8n workflows (which used a durable Postgres queue + a fixed Wait + supersede), reimplemented on our durable scheduler with the guards n8n lacked. It is **on by default** per agent.
 
+This file documents the **Chatwoot** flush (`flushDebounceJob`, re-fetches the conversation from the live API). The independent **Z-PRO** channel shares the SAME `SchedulerJob` kind, fast worker, and `armDebounce` arming function (zero Chatwoot coupling) — `debounceFlushHandler` (`handler.ts`, below) branches to a Z-PRO-specific flush (`src/modules/zpro/debounce.ts`'s `flushZproDebounceJob`) that coalesces directly from the locally-mirrored `ZproMessage` table instead of re-fetching (Z-PRO has no anti-PII no-body-mirror constraint). See [`docs/zpro.md`](zpro.md#debounce-inbound-message-coalescing) for the full Z-PRO flow.
+
 ## Flow
 
 ```

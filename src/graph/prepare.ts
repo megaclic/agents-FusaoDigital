@@ -150,7 +150,8 @@ export async function resolveInjectableCredential(
 
 // Optional grounding threshold from agent.settings.grounding.maxDistance (a positive cosine
 // distance). Anything malformed → null (no filtering), so a bad setting never silently blinds RAG.
-function readMaxDistance(settings: unknown): number | null {
+// Exported for src/modules/zpro/tools.ts, which reads the same agent.settings bag.
+export function readMaxDistance(settings: unknown): number | null {
   if (!settings || typeof settings !== "object") return null;
   const g = (settings as Record<string, unknown>).grounding;
   if (!g || typeof g !== "object") return null;

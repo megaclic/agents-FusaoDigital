@@ -1,0 +1,180 @@
+// src/modules/zpro/vision.ts
+// Vision (extração de imagem/documento) para o canal Z-PRO — espelha o padrão eager de
+// src/modules/vision/service.ts (Chatwoot, o agente "vê" a mídia antes de responder), com as
+// mesmas duas diferenças estruturais que stt.ts já estabeleceu: (1) o download é a URL crua da
+// mídia do WhatsApp já presente no payload do webhook (não um attachment autenticado via
+// ChatwootClient) — passa por assertSafeOutboundUrl (anti-SSRF); (2) não há write-back pro
+// Chatwoot — o texto extraído é escrito direto no ZproMessage.body já criado pelo mirror, que é a
+// fonte de verdade da UI do inbox Z-PRO (ver docs/zpro.md). agent.settings.vision é lido pelo mesmo
+// readVisionConfig genérico do Chatwoot — a config não é por canal.
+
+import type { PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
+import basePrisma from "@/api/lib/prisma";
+import { assertSafeOutboundUrl } from "@/lib/ssrf";
+import { runScopedOn } from "@/lib/tenancy";
+import {
+  emitFlowEvent,
+  type FlowContext,
+  withFlowStage,
+} from "@/modules/flowlog/service";
+import { tryResolveVaultEntry } from "@/modules/vault/service";
+import {
+  getVisionProvider,
+  type VisionKind,
+  visionKindForMime,
+} from "@/modules/vision/providers";
+import { readVisionConfig, type VisionConfig } from "@/modules/vision/settings";
+import { sysCtx } from "./ctx";
+
+// Resolves the vision config for the agent bound to this Z-PRO instance (scoped read, no network).
+// null when unbound, disabled, or vision off — the caller then leaves the media undescribed.
+export async function resolveZproVisionConfig(
+  tenantId: bigint,
+  zproInstanceId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<VisionConfig | null> {
+  const cfg = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const binding = await db.zproAgentBinding.findFirst({
+      where: { tenantId, zproInstanceId },
+      select: { agentId: true },
+    });
+    if (!binding) return null;
+    const agent = await db.agent.findUnique({
+      where: { id: binding.agentId },
+      select: { enabled: true, settings: true },
+    });
+    if (!agent?.enabled) return null;
+    return readVisionConfig(agent.settings);
+  });
+  if (!cfg?.enabled) return null;
+  return cfg;
+}
+
+export interface ExtractZproFileParams {
+  tenantId: bigint;
+  mediaUrl: string;
+  mediaMimetype: string | null;
+  cfg: VisionConfig;
+  base?: PrismaClient;
+  deps?: { fetchImpl?: typeof fetch };
+  // Optional execution-flow context: when present, the extraction is logged as a `vision` stage
+  // (visible in /logs), same contract as the Chatwoot path.
+  flow?: FlowContext;
+}
+
+export interface ExtractZproFileResult {
+  kind: VisionKind;
+  text: string;
+}
+
+// Downloads (anti-SSRF checked) and extracts an image/PDF the customer sent. Returns the
+// extraction, or null when vision is not runnable (no key / misconfigured / unsupported mime) or
+// yields nothing. Best-effort: NEVER throws — a download/provider failure is logged (+ flowlogged
+// when `flow` is present) and treated the same as "no extraction", so the webhook ack is never
+// stranded on a provider hiccup.
+export async function extractZproFile(
+  params: ExtractZproFileParams,
+): Promise<ExtractZproFileResult | null> {
+  const { cfg } = params;
+  const base = params.base ?? basePrisma;
+
+  const skip = (reason: string): null => {
+    if (params.flow) {
+      emitFlowEvent(params.flow, {
+        stage: "vision",
+        level: "warn",
+        status: "skipped",
+        provider: cfg.provider,
+        detail: { reason },
+      });
+    }
+    return null;
+  };
+
+  const provider = getVisionProvider(cfg.provider);
+  if (!provider) {
+    logger.warn("zpro:vision: unknown provider %s", cfg.provider);
+    return skip("unknown_provider");
+  }
+  if (!cfg.credentialRef) {
+    logger.warn("zpro:vision: no credentialRef configured — skipping");
+    return skip("no_credential");
+  }
+  const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+    tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
+  );
+  if (!entry) {
+    logger.warn(
+      "zpro:vision: credential %s not found in the vault — skipping",
+      cfg.credentialRef,
+    );
+    return skip("credential_not_found");
+  }
+
+  const fetchImpl = params.deps?.fetchImpl ?? fetch;
+  let bytes: ArrayBuffer;
+  let contentType: string | null;
+  try {
+    const url = await assertSafeOutboundUrl(params.mediaUrl);
+    const res = await fetchImpl(url);
+    if (!res.ok)
+      throw new Error(`media download failed with status ${res.status}`);
+    bytes = await res.arrayBuffer();
+    contentType = res.headers.get("content-type");
+  } catch (err) {
+    if (params.flow) {
+      emitFlowEvent(params.flow, {
+        stage: "vision",
+        level: "warn",
+        status: "error",
+        provider: cfg.provider,
+        detail: { step: "download" },
+        errorMessage: err instanceof Error ? err.message : String(err),
+      });
+    }
+    logger.warn(
+      "zpro:vision: media download failed: %s",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
+
+  const kind = visionKindForMime(contentType ?? params.mediaMimetype);
+  if (!kind) return skip("unsupported_mime");
+  if (kind === "document" && !provider.supportsDocuments)
+    return skip("document_not_supported");
+
+  let text: string;
+  try {
+    text = await withFlowStage(
+      params.flow,
+      "vision",
+      {
+        provider: cfg.provider,
+        model: cfg.model || provider.defaultModel,
+        detail: { kind },
+      },
+      () =>
+        provider.extract({
+          bytes,
+          mimeType:
+            contentType ?? params.mediaMimetype ?? "application/octet-stream",
+          kind,
+          prompt: cfg.extractionPrompt,
+          model: cfg.model || provider.defaultModel,
+          apiKey: entry.secret,
+          baseURL: entry.baseUrl ?? cfg.baseURL,
+          fetchImpl,
+        }),
+    );
+  } catch (err) {
+    logger.warn(
+      "zpro:vision: extraction failed: %s",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
+  const trimmed = text.trim();
+  return trimmed ? { kind, text: trimmed } : null;
+}

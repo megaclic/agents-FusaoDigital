@@ -50,6 +50,10 @@ function resolveSenderType(
 
 export interface MirrorZproMessageResult {
   conversationId: bigint;
+  // The mirrored ZproMessage's own PK — feeds debounce arming (src/modules/zpro/debounce.ts's
+  // armDebounce lastMessageId, the burst's high-water mark) so a flush abandoned by the
+  // agent-inactive gate can still advance the watermark without re-querying.
+  messageDbId: bigint;
   isHumanIntervention: boolean;
 }
 
@@ -124,8 +128,9 @@ export async function mirrorZproMessage(
   // Idempotente por messageId: uma redelivery sequencial hit a unique index e é um no-op via
   // `update: {}`; uma redelivery CONCORRENTE pode colidir como P2002 antes disso (ver
   // isUniqueViolation) — mesma mensagem, então ignorar é seguro.
+  let messageDbId: bigint;
   try {
-    await runScopedOn(base, sysCtx(tenantId), (db) =>
+    const created = await runScopedOn(base, sysCtx(tenantId), (db) =>
       db.zproMessage.upsert({
         where: {
           conversationId_messageId: {
@@ -147,14 +152,28 @@ export async function mirrorZproMessage(
           timestamp: BigInt(msg.timestamp),
         },
         update: {},
+        select: { id: true },
       }),
     );
+    messageDbId = created.id;
   } catch (err) {
     if (!isUniqueViolation(err)) throw err;
     logger.debug(
       { conversationId: conversation.id.toString(), messageId: msg.id },
       "zpro:mirror: lost message upsert race (duplicate Z-PRO redelivery), skipping",
     );
+    const winner = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.zproMessage.findUniqueOrThrow({
+        where: {
+          conversationId_messageId: {
+            conversationId: conversation.id,
+            messageId: msg.id,
+          },
+        },
+        select: { id: true },
+      }),
+    );
+    messageDbId = winner.id;
   }
 
   // Best-effort: nunca bloqueia o pipeline principal (ver broadcastZproMessage/publish).
@@ -164,7 +183,7 @@ export async function mirrorZproMessage(
     senderType,
   });
 
-  return { conversationId: conversation.id, isHumanIntervention };
+  return { conversationId: conversation.id, messageDbId, isHumanIntervention };
 }
 
 // Processa um payload `contact-create-update`: atualiza nome + foto de perfil em toda

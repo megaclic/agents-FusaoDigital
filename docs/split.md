@@ -1,12 +1,14 @@
 # Split + typing (humanized delivery)
 
-Instead of dumping one wall of text, optionally break the agent's reply into several balloons paced with a typing indicator + a proportional delay — the n8n "Quebrar e enviar mensagens" behavior. Per agent, **off by default** (typing delays are real latency; opt-in). Applies to TEXT replies only — an audio reply is a single voice note.
+Instead of dumping one wall of text, optionally break the agent's reply into several balloons paced with a typing indicator + a proportional delay — the n8n "Quebrar e enviar mensagens" behavior. Per agent, **on by default** (`SPLIT_DEFAULTS.enabled`) — opt-out, not opt-in (the added latency is small and bounded by `maxDelayMs`). Applies to TEXT replies only — an audio reply is a single voice note.
 
 ## Module (`src/modules/split/service.ts`)
 
 - `splitReply(text, cfg)` — split on blank lines (paragraphs); any paragraph over `maxChars` is further split on sentence boundaries; the balloon count is capped at `maxChunks` (overflow merged into the last). Always ≥1 non-empty chunk.
 - `typingDelayMs(chunk, cfg)` — `words / typingWpm × 60s`, clamped to `[minDelayMs, maxDelayMs]`.
 - `deliverReply(client, conversationId, reply, cfg, sleep?)` — the loop the runtime calls for text replies: disabled → one `sendMessage`; enabled → per balloon `toggleTyping(on)` → `sleep(delay)` → `sendMessage`, then a final `toggleTyping(off)`. Typing toggles are **best-effort** (admin token, `.catch` swallows failures — the indicator may be unsupported on a channel; the pacing still applies). `sleep` is injectable (tests pass a no-op).
+
+This file documents the **Chatwoot** channel (`deliverReply`, hard-coded to `ChatwootClient`). The independent **Z-PRO** channel reuses the same pure helpers (`splitReply`/`typingDelayMs`/`readSplitConfig`/`SplitConfig`) but has its own delivery loop, `src/modules/zpro/split.ts`'s `deliverZproReply`, over `ZproClient.sendText`/`sendPresence("typing"|"paused")` instead of `ChatwootClient.sendMessage`/`toggleTyping`. See [`docs/zpro.md`](zpro.md#split--typing-pacing).
 
 `client.toggleTyping(id, on)` = `POST …/conversations/{id}/toggle_typing_status { typing_status }` (admin token — not in the bot allowlist). The runtime threads an injectable `sleep` via `RuntimeDeps`.
 

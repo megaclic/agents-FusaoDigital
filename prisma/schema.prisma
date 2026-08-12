@@ -603,8 +603,19 @@ model ZproConversation {
   contactName      String    @map("contact_name") // ticket.contact.name
   // ticket.contact.profilePicUrl, atualizado via payload contact-create-update (mirrorZproContact).
   avatarUrl        String?   @map("avatar_url")
+  // Preferência de resposta em áudio (TTS modo "preference"), mesma semântica de Contact.voiceReply:
+  // true = quer áudio, false = quer texto, null = desconhecido (mirror do que o cliente mandou).
+  // Setado pela tool set_voice_preference (src/modules/zpro/tts.ts) — não existe Contact no Z-PRO,
+  // então o preference fica por ZproConversation (mesmo trade-off de contactDbId em tools.ts).
+  voiceReply       Boolean?  @map("voice_reply")
   agentActive      Boolean   @default(false) @map("agent_active") // n8nStatus espelhado
   humanUserId      Int?      @map("human_user_id") // ticket.userId quando humano ativo
+  // Watermark de debounce (src/modules/zpro/debounce.ts): id do último ZproMessage (CLIENT) já
+  // respondido ou deliberadamente pulado. Mirrors Conversation.lastHandledMessageId (Chatwoot), mas
+  // aponta pro NOSSO PK (ZproMessage.id) em vez de um id externo — o mirror do Z-PRO já persiste o
+  // body localmente, então o flush coaleça direto daqui, sem re-fetch de rede. Todo writer passa
+  // pelo CAS monotônico em debounce.ts (nunca anda pra trás).
+  lastHandledMessageId BigInt? @map("last_handled_message_id")
   lastMessageAt    DateTime? @map("last_message_at")
   lastMessageBody  String?   @map("last_message_body")
   createdAt        DateTime  @default(now()) @map("created_at")

@@ -28,6 +28,7 @@ import { emitFlowEvent } from "@/modules/flowlog/service";
 import type { FlowStage } from "@/modules/flowlog/stages";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
+import { flushZproDebounceJob } from "@/modules/zpro/debounce";
 import { readLastMessageId } from "./service";
 import { readDebounceConfig } from "./settings";
 import { advanceHandledWatermark } from "./watermark";
@@ -370,11 +371,21 @@ export async function flushDebounceJob(
   }
 }
 
-// Production handler: no injected deps (real client/model/checkpointer).
+// Production handler: no injected deps (real client/model/checkpointer). Dispatches by threadId
+// shape: Z-PRO threads (`zpro:<tenantId>:<instanceId>:<ticketId>`, see src/modules/zpro/runtime.ts's
+// zproThreadId) go to the Z-PRO flush (src/modules/zpro/debounce.ts); everything else is Chatwoot's
+// `tenantId:instanceId:conversationId` shape, unchanged. One SchedulerJob kind ("DEBOUNCE") serves
+// both channels — same fast worker, same dedupeKey/arm mechanics (armDebounce has zero Chatwoot
+// coupling) — only the flush differs, so no scheduler-side change was needed to add the second channel.
 function debounceFlushHandler(
   job: ClaimedJob,
   base: PrismaClient,
 ): Promise<JobResult> {
+  const threadId =
+    typeof job.payload.threadId === "string" ? job.payload.threadId : null;
+  if (threadId?.startsWith("zpro:")) {
+    return flushZproDebounceJob({ job, base });
+  }
   return flushDebounceJob({ job, base });
 }
 
