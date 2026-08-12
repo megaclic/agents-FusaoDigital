@@ -3,12 +3,18 @@
 // builder chain the Chatwoot path uses (loadToolSelections + buildToolpackTools/buildRagTools/
 // buildHttpTools/loadMcpToolsForAgent/buildNativeTools). Covers each of the 5 grant sources plus
 // the always-on utility native tools (calculator/get_current_time), keyed off ZproConversation.id
-// as the contactDbId stamp since Z-PRO has no Contact table — see docs/zpro.md.
+// as the contactDbId stamp since Z-PRO has no Contact table — see docs/zpro.md. The bottom section
+// covers the conversation-scoped NATIVE tools (src/modules/zpro/native-tools.ts), built only when a
+// `client` is passed — per-tool behavior is covered in tests/modules/zpro/native-tools.test.ts, this
+// file only checks the WIRING (allowlist respected, react_to_message never appears, kanban context
+// resolved only when granted).
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import type { ZproClient } from "@/modules/zpro/client";
+import { __resetZproCrmCaches } from "@/modules/zpro/crm";
 import { loadZproAgentTools } from "@/modules/zpro/tools";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -313,5 +319,153 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
       "calculator",
       "get_current_time",
     ]);
+  });
+
+  test("NATIVE: without a client, conversation-scoped native tools are NOT built (utility-only, matches no-grants)", async () => {
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native no-client agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2001,
+        status: "open",
+        contactId: 42,
+        contactNumber: "5511900000042",
+        contactName: "Cliente Nativo",
+        agentActive: true,
+      },
+    });
+    // No native selection row ⇒ the permissive default (all tools) would apply IF a client were
+    // passed — but none is, so conversation tools stay absent regardless.
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2001,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2001`,
+    });
+    expect(result.tools.map((t) => t.name).sort()).toEqual([
+      "calculator",
+      "get_current_time",
+    ]);
+  });
+
+  test("NATIVE: with a client + an explicit allowlist, only the granted conversation tools are built (never react_to_message)", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: [
+          "private_note",
+          "handoff_to_human",
+          "react_to_message",
+          "calculator",
+        ],
+        knowledgeBaseIds: [],
+      },
+    });
+    const conv = await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2002,
+        status: "open",
+        contactId: 43,
+        contactNumber: "5511900000043",
+        contactName: "Cliente Nativo 2",
+        agentActive: true,
+      },
+    });
+    const client = {} as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2002,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2002`,
+      client,
+      contactName: "Cliente Nativo 2",
+      contactNumber: "5511900000043",
+    });
+    expect(result.conversationId).toBe(conv.id);
+    expect(result.tools.map((t) => t.name).sort()).toEqual([
+      "calculator",
+      "handoff_to_human",
+      "private_note",
+    ]);
+  });
+
+  test("NATIVE: kanban_move_card granted resolves the CRM pipeline context; when omitted, it is skipped (no extra network call)", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native kanban agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["kanban_move_card"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2003,
+        status: "open",
+        contactId: 44,
+        contactNumber: "5511900000044",
+        contactName: "Cliente Kanban",
+        agentActive: true,
+      },
+    });
+    let pipelinesCalled = 0;
+    const client = {
+      listPipelines: async () => {
+        pipelinesCalled++;
+        return [{ id: 16, name: "Vendas" }];
+      },
+      listStages: async () => [{ id: 1, name: "Novo" }],
+    } as unknown as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2003,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2003`,
+      client,
+    });
+    expect(result.tools.map((t) => t.name)).toEqual(
+      expect.arrayContaining(["kanban_move_card"]),
+    );
+    const moveTool = result.tools.find((t) => t.name === "kanban_move_card");
+    expect(moveTool?.description).toContain("Vendas");
+    expect(pipelinesCalled).toBe(1);
   });
 });

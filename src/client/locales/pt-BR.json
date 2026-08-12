@@ -636,6 +636,9 @@
       "entryNone": "Selecione uma caixa de entrada…",
       "entryNotBound": "A caixa selecionada não está ativada neste agente (está vinculada a outro agente, ou a nenhum). Ative-a em Canais, ou escolha uma que esteja.",
       "entryNotWhatsapp": "Esse canal não tem cobrança por mensagem, então redirecioná-lo não gera economia. O redirecionamento é para o WhatsApp oficial (pago).",
+      "entryZproInstance": "Instância de entrada Z-PRO",
+      "entryZproInstanceHint": "Independente da caixa de entrada do WhatsApp acima: um lead que chega por essa instância Z-PRO (FusaoChatBot CRM) também é redirecionado, caindo no MESMO chat do site.",
+      "entryZproNone": "Nenhuma (Z-PRO sem gate)",
       "goToChannels": "Ir para Canais",
       "instructions": "Instruções",
       "intro": "Receba o lead no WhatsApp, responda com um link automático que o leva para o chat do seu site e faça o atendimento por lá, sem custo por mensagem do WhatsApp.",
@@ -648,6 +651,7 @@
       "navWidget": "Chat do site",
       "noEntryInbox": "Nenhuma caixa de WhatsApp ativada neste agente ainda. Ative-a na aba Canais e depois selecione-a aqui.",
       "noWidgetInbox": "Nenhuma caixa de chat do site ativada neste agente. Crie uma no Chatwoot (Inbox → Website) com a Website URL, sincronize em Canais e ative-a neste agente.",
+      "noZproInstance": "Nenhuma instância Z-PRO vinculada a este agente ainda. Vincule uma nas configurações do canal Z-PRO e depois selecione-a aqui.",
       "openWidget": "Abrir o chat automaticamente",
       "openWidgetHint": "O lead chega na página com o chat já aberto.",
       "redirectMessage": "Mensagem de resposta automática",
@@ -676,7 +680,8 @@
       "widgetNotBound": "A caixa selecionada não está ativada neste agente (está vinculada a outro agente, ou a nenhum). Ative-a em Canais, ou escolha uma que esteja.",
       "widgetUrlInvalid": "A Website URL desta inbox no Chatwoot não é um endereço válido. Corrija (ex.: https://seu-site.com) para o redirecionamento funcionar.",
       "widgetUrlMissing": "Esta inbox de web widget não tem Website URL definida no Chatwoot. Defina (ex.: https://seu-site.com) para o link de redirecionamento poder ser gerado.",
-      "widgetUrlUnknown": "Não foi possível acessar o Chatwoot para verificar a Website URL desta inbox agora, então ela não é checada aqui. O redirecionamento continua usando o que estiver definido no Chatwoot."
+      "widgetUrlUnknown": "Não foi possível acessar o Chatwoot para verificar a Website URL desta inbox agora, então ela não é checada aqui. O redirecionamento continua usando o que estiver definido no Chatwoot.",
+      "zproEntryNotBound": "A instância Z-PRO selecionada não está mais vinculada a este agente. Vincule-a novamente, ou escolha uma que esteja."
     },
     "channels": {
       "desc": "Conecte este agente às caixas que ele deve atender. As mudanças são aplicadas no Chatwoot na hora.",

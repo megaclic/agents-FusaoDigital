@@ -850,6 +850,37 @@ export class ChatwootClient {
     );
   }
 
+  // Create a Chatwoot contact directly (admin token, standard Contacts API — not fork-specific). Used
+  // by the Z-PRO channel-redirect gate: unlike the WhatsApp-native flow (where Chatwoot itself
+  // auto-creates the contact on the first inbound message, before our webhook ever runs), a Z-PRO lead
+  // never touches Chatwoot at all, so THIS repo has to create the contact before it can stamp an
+  // `identifier` and mint a redirect token onto it (mintRedirectToken/updateContact both need an
+  // existing chatwootContactId). OPEN-VALIDATION: response shape unconfirmed against a live instance —
+  // Chatwoot's contacts#create commonly returns the contact at the top level; a payload/contact
+  // wrapper is tolerated defensively too.
+  async createContact(fields: {
+    name?: string;
+    phone_number?: string;
+    identifier?: string;
+    inbox_id?: number;
+  }): Promise<{ id: number }> {
+    const res = (await this.request(
+      this.config.adminToken,
+      "POST",
+      "/contacts",
+      fields,
+    )) as {
+      id?: number;
+      payload?: { contact?: { id?: number } };
+      contact?: { id?: number };
+    } | null;
+    const id = res?.id ?? res?.payload?.contact?.id ?? res?.contact?.id;
+    if (typeof id !== "number") {
+      throw new ChatwootApiError(502, "createContact: missing id");
+    }
+    return { id };
+  }
+
   // Merge two contacts (admin token): moves the mergee's conversations/contact_inboxes onto the base
   // and destroys the mergee. Fallback for the redirect flow when identity-validation did not unify the
   // widget visitor with the WhatsApp contact. Route is the singular action resource (NOT

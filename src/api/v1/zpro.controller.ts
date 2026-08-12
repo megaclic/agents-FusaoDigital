@@ -16,6 +16,11 @@ import logger from "@/api/lib/logger";
 import { doc } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { asSuperAdminOn, runScopedOn } from "@/lib/tenancy";
+import { runZproRedirectGate } from "@/modules/channel-redirect/gate";
+import {
+  isRedirectEntryZproInstance,
+  readChannelRedirectConfig,
+} from "@/modules/channel-redirect/service";
 import { armDebounce } from "@/modules/debounce/service";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { ZproClient } from "@/modules/zpro/client";
@@ -295,6 +300,105 @@ export const zproController = new Elysia({
         // see the comment above step 1d).
         if (sttText && !event.body) event.body = sttText;
         if (visionText && !event.body) event.body = visionText;
+
+        // 1e. Channel redirect: an official-WhatsApp-via-Z-PRO lead gets a fixed no-AI reply
+        // pointing at the Chatwoot web widget instead of a real agent turn — same feature as
+        // Chatwoot's WhatsApp entry inbox (docs/channel-redirect.md), gated on THIS Z-PRO instance
+        // instead of a Chatwoot inbox. Runs BEFORE debounce/the direct turn so a redirected lead's
+        // message never reaches the agent. Consumed ("sent"/"silent") marks the delivery PROCESSED
+        // and returns; "misconfigured" (feature off, or provisioning incomplete) falls through to
+        // the normal flow below so the lead is served on WhatsApp as a fallback rather than
+        // dead-ended. The settings lookup is cheap and only runs once per inbound message — the
+        // Z-PRO controller has no other pre-resolved agent-settings bundle to piggyback on yet.
+        if (mirrored) {
+          const binding = await runScopedOn(
+            basePrisma,
+            sysCtx(instance.tenantId),
+            (db) =>
+              db.zproAgentBinding.findFirst({
+                where: {
+                  tenantId: instance.tenantId,
+                  zproInstanceId: instance.id,
+                },
+                select: { agent: { select: { settings: true } } },
+              }),
+          );
+          const redirectCfg = readChannelRedirectConfig(
+            binding?.agent.settings,
+          );
+          if (
+            redirectCfg.widgetInboxId !== null &&
+            isRedirectEntryZproInstance(redirectCfg, Number(instance.id))
+          ) {
+            const conv = await runScopedOn(
+              basePrisma,
+              sysCtx(instance.tenantId),
+              (db) =>
+                db.zproConversation.findUnique({
+                  where: { id: mirrored.conversationId },
+                  select: {
+                    redirectSentAt: true,
+                    redirectCount: true,
+                    redirectChatwootContactId: true,
+                  },
+                }),
+            );
+            const widgetInbox = conv
+              ? await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                  db.inbox.findFirst({
+                    where: {
+                      tenantId: instance.tenantId,
+                      chatwootInboxId: redirectCfg.widgetInboxId as number,
+                    },
+                    select: { chatwootInstanceId: true },
+                  }),
+                )
+              : null;
+            if (conv && widgetInbox) {
+              const zproClient = new ZproClient(
+                instance.baseUrl,
+                instance.apiId,
+                decryptJson<string>(instance.bearerToken),
+              );
+              const outcome = await runZproRedirectGate({
+                tenantId: instance.tenantId,
+                chatwootInstanceId: widgetInbox.chatwootInstanceId,
+                ticketId: Number(event.threadId),
+                conv: {
+                  id: mirrored.conversationId,
+                  contactNumber: event.contactNumber,
+                  contactName: event.contactName,
+                  redirectSentAt: conv.redirectSentAt,
+                  redirectCount: conv.redirectCount,
+                  redirectChatwootContactId: conv.redirectChatwootContactId,
+                },
+                cfg: redirectCfg,
+                clonedMessage: event.body || null,
+                now: new Date(),
+                base: basePrisma,
+                send: async (text) => {
+                  await zproClient.sendText(event.contactNumber, text, {
+                    validateNumber: false,
+                  });
+                },
+              });
+              if (outcome !== "misconfigured") {
+                await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                  db.zproWebhookDelivery.update({
+                    where: { id: delivery.id },
+                    data: { status: "PROCESSED", processedAt: new Date() },
+                  }),
+                );
+                logger.info(
+                  "zpro:dispatch redirect-gate outcome=%s delivery=%s",
+                  outcome,
+                  String(delivery.id),
+                );
+                return;
+              }
+            }
+          }
+        }
 
         // Debounce: an incoming message on a debounce-enabled agent re-arms the durable DEBOUNCE
         // job (coalescing window) instead of replying balloon-by-balloon — the fast worker flushes

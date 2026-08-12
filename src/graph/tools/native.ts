@@ -1066,7 +1066,11 @@ export function utilityNativeAllow(allowed?: Iterable<string>): string[] {
 
 // Replaces a tool's execution with a no-op that returns a synthetic success — keeps the model-facing
 // name/description/schema so the agent can still decide to call it, but nothing happens for real.
-function simulatedTool(orig: StructuredToolInterface): StructuredToolInterface {
+// Exported: channel-agnostic (only touches StructuredToolInterface), reused by Z-PRO's own
+// simulated-tools builder (src/modules/zpro/native-tools.ts) for the same playground purpose.
+export function simulatedTool(
+  orig: StructuredToolInterface,
+): StructuredToolInterface {
   return tool(
     async () =>
       `[simulated] '${orig.name}' was called — no real effect in the playground.`,

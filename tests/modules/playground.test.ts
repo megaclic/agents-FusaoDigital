@@ -42,6 +42,7 @@ let agentOk = 0n;
 let agentNoKey = 0n;
 let agentDisabled = 0n;
 let agentTools = 0n;
+let agentZpro = 0n;
 let llmRef = "";
 
 const REPLY = "Oi! Sou o agente de teste.";
@@ -150,6 +151,47 @@ describe.skipIf(!dbUp)("playground", () => {
         },
       ],
     });
+
+    // An agent bound ONLY to a Z-PRO instance (no Chatwoot Inbox) — exercises the channel-aware
+    // native-tool builder (resolvePlaygroundChannel / buildSimulatedZproNativeTools).
+    agentZpro = (
+      await suDb.agent.create({
+        data: {
+          tenantId,
+          name: "ZproBound",
+          systemPrompt: "x",
+          modelConfig: mc(`vault:${llmKeyId}`),
+        },
+      })
+    ).id;
+    const zproInstance = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.example.com",
+        apiId: "test-api-id",
+        bearerToken: encryptJson("token"),
+        whatsappId: 1,
+        instanceName: "Test",
+      },
+    });
+    await suDb.zproAgentBinding.create({
+      data: { tenantId, zproInstanceId: zproInstance.id, agentId: agentZpro },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agentZpro,
+        source: "NATIVE",
+        enabledTools: [
+          "handoff_to_human",
+          "resolve_conversation",
+          "kanban_move_card",
+          "react_to_message",
+          "calculator",
+        ],
+        knowledgeBaseIds: [],
+      },
+    });
   });
 
   afterAll(async () => {
@@ -157,6 +199,8 @@ describe.skipIf(!dbUp)("playground", () => {
       for (const table of [
         "llm_usage",
         "agent_tool_selections",
+        "zpro_agent_bindings",
+        "zpro_instances",
         "tool_definitions",
         "knowledge_bases",
         "agents",
@@ -332,6 +376,31 @@ describe.skipIf(!dbUp)("playground", () => {
     });
     // The native allowlist excluded the other conversation tools.
     expect(byName.has("resolve_conversation")).toBe(false);
+  });
+
+  test("listPlaygroundTools simulates the Z-PRO native-tool flavor for a Z-PRO-bound agent", async () => {
+    const tools = await listPlaygroundTools({
+      tenantId,
+      agentId: agentZpro,
+      base: appDb,
+    });
+    const byName = new Map(tools.map((tl) => [tl.name, tl]));
+    // Granted, Z-PRO-backed conversation tools show up, simulated.
+    expect(byName.get("handoff_to_human")).toMatchObject({
+      category: "native",
+      simulated: true,
+    });
+    expect(byName.get("kanban_move_card")).toMatchObject({
+      category: "native",
+      simulated: true,
+    });
+    // react_to_message has no Z-PRO analog — never built, even though it was granted.
+    expect(byName.has("react_to_message")).toBe(false);
+    // Utility tools still run for real, unaffected by channel.
+    expect(byName.get("calculator")).toMatchObject({
+      category: "utility",
+      simulated: false,
+    });
   });
 
   test("listPlaygroundTools throws when the agent has no runnable model", async () => {

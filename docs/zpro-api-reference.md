@@ -12,7 +12,7 @@ Every endpoint follows `{baseUrl}/v2/api/external/{apiId}/...` with a Bearer tok
 
 ## Most of `ZproClient` is unused today
 
-`docs/zpro.md` already flags this: `ZproClient` is a ~90-method wrapper built ahead of the UI/tools that will call it. `runZproAgentTurn` (`src/modules/zpro/runtime.ts`) only uses `sendTyping`/`sendText` today (see `messages.ts`). If you're adding a new agent tool or admin feature backed by one of these methods, check this file's collection first for the exact request/response shape instead of guessing from the method name.
+`docs/zpro.md` already flags this: `ZproClient` was originally a ~90-method wrapper built ahead of the UI/tools that would call it. As of the native-tools + CRM funnel port (`native-tools.ts`/`crm.ts`), the runtime now also uses `createNote`/`updateTicketInfo`/`addTag`/`addTagContact`/`createTag`/`updateContactExtraInfo`/`getContactExtraInfo`/`createOpportunity`/`updateOpportunity`/`listPipelines`/`listStages`/`listTags` beyond the send/presence methods — but most of the ~90 are still unwired. If you're adding a new agent tool or admin feature backed by one of the remaining methods, check this file's collection first for the exact request/response shape instead of guessing from the method name.
 
 ## Google Calendar vs. the "Agendamentos e Lembretes" API — do not conflate these
 

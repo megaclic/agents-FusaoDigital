@@ -13,6 +13,7 @@ import {
 } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
+import { runZproAgentNudge } from "@/modules/zpro/nudge";
 
 // Deterministic appointment reminders (n8n v3 parity, no Google polling). When the agent books an
 // appointment, the Calendar toolpack calls enqueueAppointmentReminders → one APPOINTMENT_REMINDER
@@ -267,8 +268,16 @@ export async function appointmentReminderHandler(
   const threadId = typeof p.threadId === "string" ? p.threadId : null;
   const eventId = typeof p.eventId === "string" ? p.eventId : null;
   if (!threadId || !eventId) return { outcome: "done" };
-  const parsed = parseThreadId(threadId);
-  if (!parsed || parsed.tenantId !== job.tenantId) return { outcome: "done" };
+  // Dispatch by threadId shape (mirrors debounce/handler.ts's debounceFlushHandler): a Z-PRO thread
+  // (`zpro:<tenantId>:<zproInstanceId>:<ticketId>`, see src/modules/zpro/runtime.ts's zproThreadId)
+  // never matches Chatwoot's parseThreadId (3-segment, no "zpro" prefix) — reminders for a Z-PRO-
+  // bound agent's booking used to enqueue this way but then dead-end here, since parseThreadId
+  // rejected the shape and the job silently completed as "done" without ever nudging.
+  const isZpro = threadId.startsWith("zpro:");
+  if (!isZpro) {
+    const parsed = parseThreadId(threadId);
+    if (!parsed || parsed.tenantId !== job.tenantId) return { outcome: "done" };
+  }
   const calendarId =
     typeof p.calendarId === "string" ? p.calendarId : "primary";
   const credentialRef =
@@ -299,20 +308,19 @@ export async function appointmentReminderHandler(
     }
   }
 
-  await runAgentNudge({
-    tenantId,
-    threadId,
-    nudge: reminderNudge({
-      isLast,
-      askConfirmation,
-      summary,
-      startISO,
-      eventId,
-      calendarId,
-    }),
-    base,
-    deps,
+  const nudge = reminderNudge({
+    isLast,
+    askConfirmation,
+    summary,
+    startISO,
+    eventId,
+    calendarId,
   });
+  if (isZpro) {
+    await runZproAgentNudge({ tenantId, threadId, nudge, base });
+  } else {
+    await runAgentNudge({ tenantId, threadId, nudge, base, deps });
+  }
   return { outcome: "done" };
 }
 

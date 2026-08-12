@@ -32,7 +32,11 @@ import {
   UTILITY_NATIVE_TOOL_NAMES,
 } from "@/graph/tools/catalog";
 import type { McpLoadDeps } from "@/graph/tools/mcp";
-import { buildSimulatedNativeTools } from "@/graph/tools/native";
+import {
+  buildNativeTools,
+  buildSimulatedNativeTools,
+  utilityNativeAllow,
+} from "@/graph/tools/native";
 import {
   buildPlaygroundTrace,
   buildVisionTraceEntry,
@@ -55,6 +59,8 @@ import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import { extractPlaygroundFile } from "@/modules/vision/service";
 import { readVisionConfig } from "@/modules/vision/settings";
+import type { ZproClient } from "@/modules/zpro/client";
+import { buildSimulatedZproNativeTools } from "@/modules/zpro/native-tools";
 import { type PlaygroundMediaKind, savePlaygroundMedia } from "./media";
 import { upsertPlaygroundSession } from "./sessions";
 import { isValidPlaygroundThread, newPlaygroundThreadId } from "./thread";
@@ -183,18 +189,50 @@ async function loadPlaygroundConfig(params: {
   return loaded;
 }
 
+// Which native-tool flavor to simulate: an agent is tested against whichever channel it is
+// actually bound to, so handoff/kanban/etc. descriptions (and which tools even exist — e.g.
+// react_to_message has no Z-PRO analog) match what the agent would really see. Chatwoot is the
+// fallback for an unbound agent (and for one bound to BOTH — Chatwoot is the more capable surface,
+// and this preserves the pre-existing default for agents nobody has bound yet).
+async function resolvePlaygroundChannel(
+  base: PrismaClient,
+  tenantId: bigint,
+  agentId: bigint,
+): Promise<"zpro" | "chatwoot"> {
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const zproBound = await db.zproAgentBinding.findFirst({
+      where: { agentId },
+      select: { id: true },
+    });
+    if (!zproBound) return "chatwoot";
+    const chatwootBound = await db.inbox.findFirst({
+      where: { agentId },
+      select: { id: true },
+    });
+    return chatwootBound ? "chatwoot" : "zpro";
+  });
+}
+
 // Builds the playground toolset: the CONVERSATION native tools SIMULATED (no real effect; a dummy
-// client satisfies the type and is never called) alongside the real utility/HTTP/MCP/KB tools.
-// Shared by the turn path (then mocks are applied over it) and the tool-listing endpoint.
-function buildPlaygroundToolset(
+// client satisfies the type and is never called) alongside the real utility/HTTP/MCP/KB tools. The
+// native-tool flavor (Chatwoot vs Z-PRO) follows the tested agent's actual channel binding — see
+// resolvePlaygroundChannel. Shared by the turn path (then mocks are applied over it) and the
+// tool-listing endpoint.
+async function buildPlaygroundToolset(
   loaded: AgentConfig,
   params: {
     tenantId: bigint;
+    agentId: bigint;
     threadId: string;
     base: PrismaClient;
     deps?: PlaygroundDeps;
   },
 ): Promise<StructuredToolInterface[]> {
+  const channel = await resolvePlaygroundChannel(
+    params.base,
+    params.tenantId,
+    params.agentId,
+  );
   return buildToolset(
     loaded,
     {
@@ -209,7 +247,27 @@ function buildPlaygroundToolset(
       // Conversation tools (handoff/resolve/…) are SIMULATED (no real effect); utility tools
       // (calculator, get_current_time) run for real. `allowed` is the agent's own native set.
       buildNativeTools: (ctx, allowed) =>
-        buildSimulatedNativeTools(ctx, allowed),
+        channel === "zpro"
+          ? [
+              // Conversation tools, Z-PRO-flavored + simulated (see buildSimulatedZproNativeTools).
+              ...buildSimulatedZproNativeTools(
+                {
+                  client: {} as ZproClient,
+                  ticketId: 0,
+                  contactId: 0,
+                  contactNumber: "",
+                  contactName: null,
+                  tenantId: params.tenantId,
+                  base: params.base,
+                  conversationDbId: 0n,
+                },
+                allowed,
+              ),
+              // Utility tools (calculator/get_current_time) run for real, same as production Z-PRO
+              // turns (tools.ts stubs a ChatwootClient for these too — they never touch it).
+              ...buildNativeTools(ctx, utilityNativeAllow(allowed)),
+            ]
+          : buildSimulatedNativeTools(ctx, allowed),
       mcp: params.deps?.mcp,
     },
   );
@@ -238,6 +296,7 @@ async function buildPlaygroundGraph(params: {
   });
   const rawTools = await buildPlaygroundToolset(loaded, {
     tenantId,
+    agentId,
     threadId,
     base,
     deps: params.deps,
@@ -311,6 +370,7 @@ export async function listPlaygroundTools(params: {
   });
   const tools = await buildPlaygroundToolset(loaded, {
     tenantId: params.tenantId,
+    agentId: params.agentId,
     threadId,
     base,
     deps: params.deps,

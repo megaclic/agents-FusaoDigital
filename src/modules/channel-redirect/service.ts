@@ -15,6 +15,11 @@ export interface ChannelRedirectConfig {
   // The OFFICIAL WhatsApp Cloud API inbox that leads arrive on (chatwootInboxId). The gate only fires
   // for this inbox; null → the feature is inert (nothing to redirect from).
   entryInboxId: number | null;
+  // The Z-PRO instance that leads arrive on (ZproInstance.id, OUR OWN pk — unlike entryInboxId, Z-PRO
+  // has no separate "channel id" to reference; a tenant's synced instances are what the Redirect tab's
+  // picker lists). Independent of entryInboxId — an agent can gate on either, both, or neither; the
+  // landing target (widgetInboxId) is always the SAME Chatwoot widget regardless of which one fired.
+  entryZproInstanceId: number | null;
   // The Channel::WebWidget inbox the lead is redirected to (chatwootInboxId). null → not provisioned yet.
   widgetInboxId: number | null;
   // The no-AI auto-reply sent on WhatsApp. Must contain the `{link}` placeholder (the per-lead widget URL).
@@ -56,6 +61,7 @@ export const CHANNEL_REDIRECT_DEFAULTS: ChannelRedirectConfig = {
   // Opt-in: this reshapes the whole inbound flow, so it stays off until explicitly enabled.
   enabled: false,
   entryInboxId: null,
+  entryZproInstanceId: null,
   widgetInboxId: null,
   redirectMessage:
     "Olá! Para te atender melhor, vamos continuar a conversa pelo nosso chat. É só acessar o link: {link}",
@@ -124,8 +130,9 @@ function delayUnit(v: unknown, fallback: RedirectDelayUnit): RedirectDelayUnit {
     : fallback;
 }
 
-// A chatwootInboxId reference: a positive integer, or null when absent/invalid.
-function inboxRef(v: unknown): number | null {
+// A positive-integer id reference (chatwootInboxId, or OUR OWN ZproInstance.id), or null when
+// absent/invalid.
+function positiveIntRef(v: unknown): number | null {
   return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : null;
 }
 
@@ -141,8 +148,9 @@ export function readChannelRedirectConfig(
   const D = CHANNEL_REDIRECT_DEFAULTS;
   return {
     enabled: bool(bag.enabled, D.enabled),
-    entryInboxId: inboxRef(bag.entryInboxId),
-    widgetInboxId: inboxRef(bag.widgetInboxId),
+    entryInboxId: positiveIntRef(bag.entryInboxId),
+    entryZproInstanceId: positiveIntRef(bag.entryZproInstanceId),
+    widgetInboxId: positiveIntRef(bag.widgetInboxId),
     redirectMessage: str(bag.redirectMessage, D.redirectMessage),
     resendDelayValue: clampInt(
       bag.resendDelayValue,
@@ -203,6 +211,20 @@ export function isRedirectEntryInbox(
     cfg.enabled &&
     cfg.entryInboxId !== null &&
     cfg.entryInboxId === chatwootInboxId
+  );
+}
+
+// Z-PRO analog of isRedirectEntryInbox: whether the redirect gate should fire for a given Z-PRO
+// instance. `zproInstanceId` is OUR OWN ZproInstance.id (a bigint pk); compared as a number since
+// agent.settings is plain JSON and ZproInstance ids stay well within Number.MAX_SAFE_INTEGER.
+export function isRedirectEntryZproInstance(
+  cfg: ChannelRedirectConfig,
+  zproInstanceId: number,
+): boolean {
+  return (
+    cfg.enabled &&
+    cfg.entryZproInstanceId !== null &&
+    cfg.entryZproInstanceId === zproInstanceId
   );
 }
 

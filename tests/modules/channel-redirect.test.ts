@@ -7,6 +7,7 @@ import {
 import {
   CHANNEL_REDIRECT_DEFAULTS,
   isRedirectEntryInbox,
+  isRedirectEntryZproInstance,
   readChannelRedirectConfig,
   redirectDelayMinutes,
   shouldSendRedirect,
@@ -67,6 +68,19 @@ describe("readChannelRedirectConfig", () => {
     expect(c.entryInboxId).toBeNull();
     expect(c.widgetInboxId).toBeNull();
   });
+
+  test("reads + rejects entryZproInstanceId the same way as entryInboxId", () => {
+    expect(
+      readChannelRedirectConfig({ channelRedirect: { entryZproInstanceId: 5 } })
+        .entryZproInstanceId,
+    ).toBe(5);
+    expect(
+      readChannelRedirectConfig({
+        channelRedirect: { entryZproInstanceId: -1 },
+      }).entryZproInstanceId,
+    ).toBeNull();
+    expect(readChannelRedirectConfig({}).entryZproInstanceId).toBeNull();
+  });
 });
 
 describe("isRedirectEntryInbox", () => {
@@ -77,6 +91,29 @@ describe("isRedirectEntryInbox", () => {
     expect(isRedirectEntryInbox({ ...base, enabled: false }, 7)).toBe(false);
     expect(isRedirectEntryInbox({ ...base, entryInboxId: null }, 7)).toBe(
       false,
+    );
+  });
+});
+
+describe("isRedirectEntryZproInstance", () => {
+  const base = {
+    ...CHANNEL_REDIRECT_DEFAULTS,
+    enabled: true,
+    entryZproInstanceId: 9,
+  };
+  test("true only when enabled + entry set + matching instance, independent of entryInboxId", () => {
+    expect(isRedirectEntryZproInstance(base, 9)).toBe(true);
+    expect(isRedirectEntryZproInstance(base, 10)).toBe(false);
+    expect(isRedirectEntryZproInstance({ ...base, enabled: false }, 9)).toBe(
+      false,
+    );
+    expect(
+      isRedirectEntryZproInstance({ ...base, entryZproInstanceId: null }, 9),
+    ).toBe(false);
+    // A Chatwoot entryInboxId being set (or not) never affects this gate — the two entries are
+    // independent, both landing on the same widget.
+    expect(isRedirectEntryZproInstance({ ...base, entryInboxId: 7 }, 9)).toBe(
+      true,
     );
   });
 });

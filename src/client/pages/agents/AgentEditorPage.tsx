@@ -374,6 +374,8 @@ function toChannelRedirectForm(
   return {
     enabled: cfg.enabled,
     entryInboxId: cfg.entryInboxId === null ? "" : String(cfg.entryInboxId),
+    entryZproInstanceId:
+      cfg.entryZproInstanceId === null ? "" : String(cfg.entryZproInstanceId),
     widgetInboxId: cfg.widgetInboxId,
     redirectMessage: cfg.redirectMessage,
     resendDelayValue: String(cfg.resendDelayValue),
@@ -411,6 +413,9 @@ function fromChannelRedirectForm(
   return {
     enabled: f.enabled,
     entryInboxId: f.entryInboxId ? intFieldOr(f.entryInboxId, 0) || null : null,
+    entryZproInstanceId: f.entryZproInstanceId
+      ? intFieldOr(f.entryZproInstanceId, 0) || null
+      : null,
     widgetInboxId: f.widgetInboxId,
     redirectMessage: f.redirectMessage,
     resendDelayValue: intFieldOr(f.resendDelayValue, D.resendDelayValue),
@@ -1218,6 +1223,7 @@ export function AgentEditorPage() {
     embeddingCredentialRef,
     redirectEnabled: channelRedirect.enabled,
     redirectEntryInboxId: channelRedirect.entryInboxId,
+    redirectEntryZproInstanceId: channelRedirect.entryZproInstanceId,
     redirectWidgetInboxId: channelRedirect.widgetInboxId,
   });
 

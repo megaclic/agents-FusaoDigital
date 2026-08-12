@@ -618,6 +618,27 @@ model ZproConversation {
   lastHandledMessageId BigInt? @map("last_handled_message_id")
   lastMessageAt    DateTime? @map("last_message_at")
   lastMessageBody  String?   @map("last_message_body")
+  // CRM Opportunity linked to this ticket (kanban_move_card/update_kanban_task, src/modules/zpro/
+  // native-tools.ts), created lazily on first use. null = no linked opportunity yet. The external
+  // Z-PRO API has no per-id GET for an Opportunity, so pipeline/stage are OUR mirror — best-effort,
+  // updated on every successful move/update, may drift if changed directly in the Z-PRO panel.
+  opportunityId         Int?    @map("opportunity_id")
+  opportunityPipelineId Int?    @map("opportunity_pipeline_id")
+  opportunityStageId    Int?    @map("opportunity_stage_id")
+  opportunityStageName  String? @map("opportunity_stage_name")
+  // Last known deal title. Z-PRO's updateOpportunity requires `name` on EVERY call (no partial-field
+  // PATCH for it), so this is what kanban_move_card resends when it only means to change the stage —
+  // without it, a title the model set via update_kanban_task would get silently reverted on the next
+  // plain move.
+  opportunityTitle     String?  @map("opportunity_title")
+  // WhatsApp → website-chat redirect watermarks (src/modules/channel-redirect/*), Z-PRO analog of
+  // Conversation.redirectSentAt/redirectCount. redirectChatwootContactId is Z-PRO-only: unlike the
+  // Chatwoot-native flow (where Chatwoot already auto-created the WhatsApp contact), a Z-PRO lead has
+  // no Chatwoot contact at all until the gate creates one — remembered here so a resend reuses the
+  // SAME contact instead of creating a new one every time.
+  redirectSentAt             DateTime? @map("redirect_sent_at")
+  redirectCount              Int       @default(0) @map("redirect_count")
+  redirectChatwootContactId  Int?      @map("redirect_chatwoot_contact_id")
   createdAt        DateTime  @default(now()) @map("created_at")
   updatedAt        DateTime  @updatedAt @map("updated_at")
 

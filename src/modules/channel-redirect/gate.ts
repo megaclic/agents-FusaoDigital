@@ -185,3 +185,105 @@ export async function runRedirectGate(
   );
   return "sent";
 }
+
+export interface RunZproRedirectGateParams {
+  tenantId: bigint;
+  // The widget inbox's ChatwootInstance (OUR pk) — resolved by the caller from cfg.widgetInboxId via
+  // the Inbox mirror, since the Z-PRO webhook has no Chatwoot context of its own to derive it from.
+  chatwootInstanceId: bigint;
+  ticketId: number; // Z-PRO ticket id, for logging only.
+  conv: {
+    id: bigint; // ZproConversation.id
+    contactNumber: string;
+    contactName: string;
+    redirectSentAt: Date | null;
+    redirectCount: number;
+    // Remembered Chatwoot contact from a PRIOR redirect on this same ticket, if any — reused so a
+    // resend never creates a second Chatwoot contact for the same lead.
+    redirectChatwootContactId: number | null;
+  };
+  cfg: ChannelRedirectConfig;
+  clonedMessage: string | null;
+  now: Date;
+  base: PrismaClient;
+  // Sends a message via the Z-PRO client (mirrors Chatwoot gate's `send`).
+  send: (text: string) => Promise<void>;
+}
+
+// Z-PRO analog of runRedirectGate. Structurally identical from the token-mint point onward (reuses
+// resolveRedirectLink/interpolateLink/shouldSendRedirect verbatim — the landing target is ALWAYS the
+// same Chatwoot widget, only the entry channel differs) — the one real difference is identity: a
+// Chatwoot-native WhatsApp lead already HAS a chatwootContactId (Chatwoot auto-creates it on inbound
+// message, before this repo's webhook even runs); a Z-PRO lead never touches Chatwoot at all, so this
+// function creates the Chatwoot contact itself on first redirect and persists its id on
+// ZproConversation.redirectChatwootContactId for reuse on any resend.
+export async function runZproRedirectGate(
+  p: RunZproRedirectGateParams,
+): Promise<RedirectGateOutcome> {
+  const { tenantId, chatwootInstanceId, cfg, base } = p;
+  if (cfg.widgetInboxId === null) return "misconfigured";
+  const widgetInboxId = cfg.widgetInboxId;
+
+  if (
+    !shouldSendRedirect(cfg, p.conv.redirectSentAt, p.conv.redirectCount, p.now)
+  ) {
+    return "silent";
+  }
+
+  let chatwootContactId = p.conv.redirectChatwootContactId;
+  if (chatwootContactId === null) {
+    try {
+      const admin = await loadChatwootClient(tenantId, chatwootInstanceId, {
+        base,
+      });
+      const created = await admin.createContact({
+        name: p.conv.contactName || p.conv.contactNumber,
+        phone_number: p.conv.contactNumber.startsWith("+")
+          ? p.conv.contactNumber
+          : `+${p.conv.contactNumber}`,
+      });
+      chatwootContactId = created.id;
+    } catch (err) {
+      logger.warn(
+        { err },
+        "channel-redirect: zpro createContact failed (ticket=%s)",
+        String(p.ticketId),
+      );
+      return "misconfigured";
+    }
+  }
+
+  const url = await resolveRedirectLink({
+    tenantId,
+    instanceId: chatwootInstanceId,
+    chatwootContactId,
+    widgetInboxId,
+    clonedMessage:
+      cfg.cloneWaMessage && p.clonedMessage
+        ? p.clonedMessage.slice(0, MAX_CLONE_CHARS)
+        : undefined,
+    openWidget: cfg.openWidget,
+    ttlSeconds: REDIRECT_LINK_TTL_SECONDS,
+    base,
+  });
+  if (url === null) return "misconfigured";
+
+  await p.send(interpolateLink(cfg.redirectMessage, url));
+
+  await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.update({
+      where: { id: p.conv.id },
+      data: {
+        redirectSentAt: p.now,
+        redirectCount: p.conv.redirectCount + 1,
+        redirectChatwootContactId: chatwootContactId,
+      },
+    }),
+  );
+  logger.info(
+    "channel-redirect: zpro link sent (ticket=%s count=%d)",
+    String(p.ticketId),
+    p.conv.redirectCount + 1,
+  );
+  return "sent";
+}

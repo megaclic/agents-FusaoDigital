@@ -1,13 +1,12 @@
 # WhatsApp → website-chat redirect (`channel-redirect`)
 
-Use the **official WhatsApp Cloud API** only as an entry door: a lead who messages WhatsApp gets a fixed
-(no-AI) auto-reply with a link to the customer's website chat (a Chatwoot **web widget**), and the AI
-serves the conversation **there**, where messages have no per-message WhatsApp cost. The widget
-conversation is merged onto the same contact, so it is one continuous history across both channels.
+Use an official WhatsApp entry — the **Chatwoot WhatsApp Cloud API** inbox, and/or a **Z-PRO** (FusaoChatBot CRM) instance — only as an entry door: a lead who messages it gets a fixed (no-AI) auto-reply with a link to the customer's website chat (always a Chatwoot **web widget**), and the AI serves the conversation **there**, where messages have no per-message cost. The widget conversation is merged onto the same contact, so it is one continuous history across both channels.
 
 The whole feature is **per-agent** (`agent.settings.channelRedirect`) and configured from the agent
-editor's **Redirect** tab. This repo provisions **nothing** on Chatwoot for it — the two inboxes are
-created and wired **manually** in Chatwoot, then selected in the tab (see setup below).
+editor's **Redirect** tab. This repo provisions **nothing** on Chatwoot for it — the widget inbox (and,
+if used, the Chatwoot WhatsApp entry inbox) are created and wired **manually** in Chatwoot, then selected
+in the tab (see setup below). The Z-PRO entry point needs no Chatwoot-side provisioning at all — it's
+just an existing Z-PRO instance, picked in the same tab.
 
 ## Runtime flow
 
@@ -29,10 +28,13 @@ AI serves the conversation in the widget (no per-message cost). Re-entries alway
 ```
 
 Key module files: `src/modules/channel-redirect/` (`service.ts` config reader, `gate.ts` the runtime
-gate, `link.ts` the token link, `followup.ts` the cross-channel follow-up, `cross-link.ts` the on-merge
-conversation link). The gate is called from
-`src/modules/chatwoot/webhook.ts` (a sibling of the test-mode / availability gates). `runAgentNudge`
-(`src/graph/nudge.ts`) is the proactive-send engine reused by the follow-up.
+gate — `runRedirectGate` for the Chatwoot entry, `runZproRedirectGate` for the Z-PRO entry — `link.ts`
+the token link, `followup.ts` the cross-channel follow-up, `cross-link.ts` the on-merge conversation
+link). `runRedirectGate` is called from `src/modules/chatwoot/webhook.ts` (a sibling of the test-mode /
+availability gates); `runZproRedirectGate` from `src/api/v1/zpro.controller.ts`'s dispatch callback
+(there are no test-mode/availability gates on the Z-PRO side to be a sibling of). `runAgentNudge`
+(`src/graph/nudge.ts`) is the proactive-send engine reused by the follow-up — Chatwoot-only, since the
+follow-up ladder always runs on the widget side regardless of which channel originated the redirect.
 
 ### Token, expiry and resends
 
@@ -65,6 +67,30 @@ gate, it:
   whoever picks up either channel sees the continuous history. Best-effort; the watermark is set
   regardless, so a transient failure never re-spams.
 
+### Z-PRO entry point
+
+`agent.settings.channelRedirect.entryZproInstanceId` (a `ZproInstance.id`) is an **independent** gate
+alongside `entryInboxId` — an agent can be gated on the Chatwoot WhatsApp inbox, a Z-PRO instance, both,
+or neither; whichever fires, the lead lands on the SAME `widgetInboxId`. Mechanically identical to the
+Chatwoot-native gate from the token-mint point onward (`resolveRedirectLink`/`interpolateLink`/
+`shouldSendRedirect` are reused verbatim — none of that logic is Chatwoot-specific), with one necessary
+difference:
+
+- **Identity.** A Chatwoot WhatsApp lead already has a `chatwootContactId` (Chatwoot auto-creates the
+  contact on the first inbound message, before the webhook even runs). A Z-PRO lead never touches
+  Chatwoot at all, so `runZproRedirectGate` creates the Chatwoot contact itself on first redirect
+  (`ChatwootClient.createContact`, the standard Contacts API — not fork-specific), then stamps the
+  `fzwa:<id>` identifier and mints the token exactly like the native path. The created contact's id is
+  remembered on `ZproConversation.redirectChatwootContactId` so a resend reuses it rather than creating a
+  new Chatwoot contact every time.
+- **Watermarks** live on `ZproConversation.redirectSentAt`/`redirectCount` (additive columns mirroring
+  `Conversation`'s), not `Conversation` — a Z-PRO ticket has no `Conversation` row.
+- **The follow-up ladder is NOT duplicated for Z-PRO** — it already runs entirely on the widget-side
+  Chatwoot conversation, so it fires identically no matter which channel originated the redirect.
+
+See [`docs/zpro.md`](zpro.md)'s "Channel redirect (WhatsApp → website chat)" section for the Z-PRO-side
+wiring (webhook insertion point, `OPEN-VALIDATION` on `createContact`'s response shape).
+
 ## Manual setup (once per instance)
 
 ### 1. Chatwoot — create the website-chat (web widget) inbox
@@ -81,17 +107,25 @@ gate, it:
    *Configuration → Installation*). The site must run the **patched SDK** (the fazer.ai Chatwoot fork:
    the widget reads `#cw_redirect` and resolves it) — the stock Chatwoot SDK ignores the token.
 
-### 2. Chatwoot — the WhatsApp entry inbox
+### 2. Chatwoot — the WhatsApp entry inbox (optional — skip if using Z-PRO as the entry)
 
 Use the existing **official WhatsApp Cloud API** inbox (`Channel::Whatsapp`, provider `whatsapp_cloud`).
 Bind it to the agent under the agent editor's **Channels** tab (the persona bot must answer it so the
 webhook reaches the gate).
 
+### 2b. Z-PRO — the entry instance (optional — skip if using Chatwoot WhatsApp as the entry)
+
+Bind the agent to the Z-PRO instance leads arrive on (agent editor → **Channels**, same as any Z-PRO
+binding). No Chatwoot-side setup is needed for this entry point — only the widget inbox (step 1) is
+Chatwoot-side.
+
 ### 3. fazer.ai agents — sync + configure the agent
 
-1. Under **Channels**, sync the instance's inboxes so both inboxes appear.
+1. Under **Channels**, sync inboxes/instances so they appear in the pickers below.
 2. Open the agent → **Redirect** tab → enable it, then:
-   - **Entry (WhatsApp):** pick the official WhatsApp inbox (the paid one).
+   - **Entry (WhatsApp):** pick the official WhatsApp inbox, if using it as an entry.
+   - **Entry (Z-PRO):** pick the Z-PRO instance, if using it as an entry. At least one of the two
+     entries is required; both may be set at once.
    - **Website chat:** pick the web-widget inbox you created in step 1.
    - **Redirect message:** the fixed WhatsApp auto-reply; it **must** contain `{link}` (the per-lead link
      is interpolated there).
@@ -113,7 +147,7 @@ generic estimate with a redirect indicator: the pending `REDIRECT_FOLLOWUP` on t
 
 ## Transports
 
-`agent.settings.channelRedirect` is an opaque settings block: REST v1 (`PUT /agents/:id`) and MCP
+`agent.settings.channelRedirect` is an opaque settings block: REST v1 (`PATCH /agents/:id`) and MCP
 (`agent_settings_set`) accept it as-is; the editor's Redirect tab is the primary UI. The config reader
 (`readChannelRedirectConfig`) is the single source of defaults + clamping.
 
@@ -133,6 +167,9 @@ The widget patch and the two endpoints live in the fazer.ai Chatwoot fork (not t
 - The **WhatsApp entry inbox is not hard-checked** to be `whatsapp_cloud` at runtime — the gate keys only
   on the selected inbox id + `enabled`. The editor warns when the selected entry channel has no
   per-message cost (redirecting it saves nothing).
+- The **Z-PRO entry's created Chatwoot contact can drift**: `redirectChatwootContactId` is a point-in-time
+  snapshot (set once, on first redirect) — if that contact is later merged/deleted directly in Chatwoot, a
+  resend would target a stale id. No reconciliation job exists.
 - If the widget inbox has **no Website URL** set in Chatwoot, the gate cannot build the link and falls
   through (`misconfigured` → the lead is served on WhatsApp as a fallback rather than dead-ended).
 - The `Inbox.webWidget` column and `writeWebWidgetBlob` are legacy from the removed provisioning path and

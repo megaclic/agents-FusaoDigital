@@ -29,4 +29,6 @@ Per-agent `agent.settings.serviceWindow` (`readServiceWindowConfig`): `enabled` 
 - `processed_params` is **BODY-only** here; header/button params and the exact shape for a given WhatsApp provider must be confirmed against a live approved template.
 - The `sendTemplate` bot-token path (vs admin) and that the template name/language match an approved template synced into the inbox need a live check. Until then, prefer leaving `templateName` blank (outside-window → safe private note) on instances without a verified template.
 
+**Z-PRO has no equivalent.** `ZproConversation` has no `lastInboundAt` column, and `nudge.ts`'s `runZproAgentNudge` (the only Z-PRO proactive-nudge path today — Google Calendar appointment reminders, see `docs/zpro.md`'s "Proactive nudges") always sends freeform, unconditionally. No HSM/template gate exists for Z-PRO.
+
 Read before touching `src/modules/service-window/*`, `Conversation.lastInboundAt`, `client.sendTemplate`, or the proactive-send gate in `runAgentNudge`.

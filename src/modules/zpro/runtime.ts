@@ -51,8 +51,10 @@ import {
   interpolatePromptVars,
 } from "@/graph/prompt";
 import { DEFAULT_TIMEZONE } from "@/graph/time";
+import type { NativeToolName } from "@/graph/tools/catalog";
 import { UsageCapture } from "@/graph/usage";
 import { runScopedOn } from "@/lib/tenancy";
+import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
   emitFlowEvent,
   type FlowContext,
@@ -73,9 +75,12 @@ import {
 import { tryResolveVaultEntry } from "@/modules/vault/service";
 import { markAgentSending } from "./agent-echo";
 import { ZproClient } from "./client";
+import { readZproCrmConfig, type ZproCrmConfig } from "./crm";
 import { sysCtx } from "./ctx";
 import { makeZproGuardrailRunner } from "./guardrails";
+import { deactivateAgent } from "./handoff";
 import { sendTextReply, sendTyping } from "./messages";
+import type { TurnState } from "./native-tools";
 import { deliverZproReply } from "./split";
 import { loadZproAgentTools } from "./tools";
 import { buildSetVoicePreferenceTool, sendZproVoiceReply } from "./tts";
@@ -128,6 +133,13 @@ export interface LoadedZproAgent {
   guardrails: GuardrailsConfig;
   guardrailsApiKey: string;
   guardrailsCredentialBaseUrl: string | null;
+  // Native-tool config: whether handoff_to_human posts a summary note (Agent.transferWithSummary
+  // column, shared with Chatwoot), operator guidance per tool (agent.settings.toolGuidance, same
+  // generic reader Chatwoot uses), and the CRM pipeline kanban_move_card/update_kanban_task operate
+  // on (agent.settings.zproCrm — Z-PRO's own, see src/modules/zpro/crm.ts).
+  transferWithSummary: boolean;
+  toolGuidance: Partial<Record<NativeToolName, string>>;
+  crmConfig: ZproCrmConfig;
 }
 
 // Scoped read (no network): resolve the binding's Agent + its model credential. Returns null when
@@ -162,6 +174,7 @@ export async function loadZproAgent(
         modelConfig: true,
         settings: true,
         enabled: true,
+        transferWithSummary: true,
       },
     });
     if (!agent?.enabled) return null;
@@ -225,6 +238,9 @@ export async function loadZproAgent(
       guardrails,
       guardrailsApiKey,
       guardrailsCredentialBaseUrl,
+      transferWithSummary: agent.transferWithSummary,
+      toolGuidance: readToolGuidance(agent.settings),
+      crmConfig: readZproCrmConfig(agent.settings),
     };
   });
 }
@@ -254,6 +270,43 @@ export type RunLoadedZproTurnOutcome =
   | "blocked"
   | "superseded"
   | "taken-over";
+
+// Applies a deferred resolve_conversation intent AFTER the reply is delivered — mirrors
+// src/graph/runtime.ts's applyDeferredResolve exactly (see its comment for the full invariant):
+// toggling mid-turn would make the next webhook mirror read our own resolve as a human takeover and
+// discard the reply. Best-effort, never throws: the reply is already out, so a failed toggle only
+// leaves the ticket open (flow warn pages the operator).
+async function applyDeferredZproResolve(
+  client: ZproClient,
+  ticketId: number,
+  turnState: TurnState,
+  flow: FlowContext,
+): Promise<void> {
+  if (!turnState.resolveRequested) return;
+  turnState.resolveRequested = false;
+  try {
+    await deactivateAgent(client, ticketId, { closeTicket: true });
+    emitFlowEvent(flow, {
+      stage: "handoff",
+      status: "ok",
+      detail: { outcome: "resolved" },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn(
+      "zpro deferred resolve failed (ticket=%s): %s",
+      String(ticketId),
+      msg,
+    );
+    emitFlowEvent(flow, {
+      stage: "handoff",
+      level: "warn",
+      status: "error",
+      detail: { outcome: "resolved" },
+      errorMessage: msg,
+    });
+  }
+}
 
 // The shared turn tail: build → invoke → recheck → post. Reused by runZproAgentTurn (direct) and
 // flushZproDebounceJob (debounce). Does NOT touch turn-in-flight bookkeeping or any delivery/
@@ -351,6 +404,18 @@ export async function runLoadedZproTurn(
   // LlmUsage.zproConversationId, NUNCA LlmUsage.conversationId (ver docs/zpro.md: risco de
   // colisão de id com Conversation/Chatwoot). Carregado ANTES do systemPrompt pra `grounded`
   // (search_knowledge concedida) alimentar composeSystemPrompt abaixo, mesma ordem do Chatwoot.
+  // Mutable per-turn state shared with the native tools (deferred resolve intent) — mirrors
+  // src/graph/runtime.ts's own turnState exactly.
+  const turnState: TurnState = { resolveRequested: false };
+  // Operator guidance per tool (agent.settings.toolGuidance), plus the CRM funnel guidance
+  // (agent.settings.zproCrm.instructions) folded onto kanban_move_card specifically — mirrors
+  // src/graph/prepare.ts's exact merge (its own grouped configs win over the flat map for that tool).
+  const toolInstructions: Partial<Record<NativeToolName, string>> = {
+    ...loaded.toolGuidance,
+  };
+  if (loaded.crmConfig.instructions) {
+    toolInstructions.kanban_move_card = loaded.crmConfig.instructions;
+  }
   const {
     tools: agentTools,
     conversationId,
@@ -362,6 +427,12 @@ export async function runLoadedZproTurn(
     zproInstanceId,
     ticketId,
     threadId,
+    client,
+    turnState,
+    transferWithSummary: loaded.transferWithSummary,
+    toolInstructions,
+    pipelineId: loaded.crmConfig.pipelineId,
+    flow,
     maxDistance: loaded.maxDistance,
     contactName: ev.contactName,
     contactNumber: ev.contactNumber,
@@ -383,10 +454,11 @@ export async function runLoadedZproTurn(
     { timezone: DEFAULT_TIMEZONE },
   );
   // set_voice_preference (TTS "preference" mode only — no point exposing it when the agent always
-  // replies in text/mirror): Z-PRO has no NATIVE tool-grant UI yet, so this is the one native-style
-  // tool wired directly here rather than through a picklist. currentVoiceReply feeds the tool's
-  // <current_preference> description; voiceReplyNow below re-reads it AFTER the invoke so a
-  // preference set THIS turn still governs THIS reply.
+  // replies in text/mirror): unlike the other native tools (built inside loadZproAgentTools, gated
+  // by the SAME grant UI Chatwoot uses), this one needs currentVoiceReply (resolved below, after
+  // the tools call) so it is wired directly here rather than through buildZproNativeTools.
+  // voiceReplyNow further down re-reads it AFTER the invoke so a preference set THIS turn still
+  // governs THIS reply.
   let currentVoiceReply: boolean | null = null;
   if (loaded.ttsConfig.mode === "preference" && conversationId != null) {
     const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
@@ -464,7 +536,13 @@ export async function runLoadedZproTurn(
   // (the re-armed flush answers the full burst).
   if (params.shouldPost && !(await params.shouldPost())) return "superseded";
 
-  if (!reply) return "empty";
+  // Empty reply: nothing to post, but a deferred resolve intent still applies (resolve with no
+  // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
+  // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
+  if (!reply) {
+    await applyDeferredZproResolve(client, ticketId, turnState, flow);
+    return "empty";
+  }
 
   // OUTPUT guardrail: screen the model's reply BEFORE delivery. A violation either replaces the
   // reply (template / a guardrails-generated safe reply) or suppresses the send entirely.
@@ -515,6 +593,7 @@ export async function runLoadedZproTurn(
           ev.threadId,
           reply.length,
         );
+        await applyDeferredZproResolve(client, ticketId, turnState, flow);
         return "posted";
       }
     } catch (e) {
@@ -546,6 +625,7 @@ export async function runLoadedZproTurn(
     reply.length,
     balloons,
   );
+  await applyDeferredZproResolve(client, ticketId, turnState, flow);
   return "posted";
 }
 

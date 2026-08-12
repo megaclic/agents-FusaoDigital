@@ -822,8 +822,12 @@ export class ZproClient {
   }
 
   /** Lista etapas (stages) de funil. */
-  async listStages() {
-    return this.get("stage/list");
+  async listStages(opts?: {
+    pipelineId?: number;
+    page?: number;
+    limit?: number;
+  }) {
+    return this.get("stage/list", opts);
   }
 
   /** Busca etapa por id. */

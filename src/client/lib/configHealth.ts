@@ -52,9 +52,11 @@ export interface ConfigHealthInput {
   // Indexing a knowledge base needs it; when it is missing or pending, the KB "needs indexing" prompts
   // roll up into one "embedding" issue that points at the real fix.
   embeddingCredentialRef?: string;
-  // WhatsApp→web-chat redirect: enabled but missing one of the two required inboxes → it cannot run.
+  // WhatsApp→web-chat redirect: enabled but missing the widget inbox, or missing BOTH entry points
+  // (WhatsApp via Chatwoot AND Z-PRO — either alone is enough) → it cannot run.
   redirectEnabled?: boolean;
   redirectEntryInboxId?: string;
+  redirectEntryZproInstanceId?: string;
   redirectWidgetInboxId?: number | null;
 }
 
@@ -141,11 +143,13 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       }
     }
   }
-  // Redirect is on but one of its two required inboxes is unset → the funnel is inert. Deep-link to the
-  // Redirect tab's entry section so the operator can complete it (the runtime already no-ops meanwhile).
+  // Redirect is on but the widget inbox is unset, or neither entry point is → the funnel is inert.
+  // Deep-link to the Redirect tab's entry section so the operator can complete it (the runtime
+  // already no-ops meanwhile).
   if (
     input.redirectEnabled &&
-    (!input.redirectEntryInboxId || input.redirectWidgetInboxId == null)
+    (input.redirectWidgetInboxId == null ||
+      (!input.redirectEntryInboxId && !input.redirectEntryZproInstanceId))
   ) {
     issues.push({
       key: "redirect",

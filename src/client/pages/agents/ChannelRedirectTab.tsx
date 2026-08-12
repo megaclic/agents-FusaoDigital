@@ -20,6 +20,7 @@ import { TabActionBar } from "./TabActionBar";
 export interface ChannelRedirectFormState {
   enabled: boolean;
   entryInboxId: string; // chatwootInboxId as string; "" = none
+  entryZproInstanceId: string; // ZproInstance.id as string; "" = none
   widgetInboxId: number | null; // chatwootInboxId of the picked web-widget inbox; null = none
   redirectMessage: string;
   resendDelayValue: string; // numeric held as string; unit picks the meaning
@@ -116,6 +117,11 @@ type InboxesData = Awaited<
 >["data"];
 type Inbox = NonNullable<InboxesData>["inboxes"][number];
 
+type ZproInstancesData = Awaited<
+  ReturnType<typeof api.api.v1.zpro.instances.get>
+>["data"];
+type ZproInstance = NonNullable<ZproInstancesData>["instances"][number];
+
 // The redirect message must carry this placeholder — the per-lead website-chat link is interpolated
 // into it at send time. Kept as a value (not a JSX literal) so it can be shown inline.
 const LINK_TOKEN = "{link}";
@@ -163,6 +169,7 @@ export function ChannelRedirectTab({
   const { t } = useTranslation();
 
   const [inboxes, setInboxes] = useState<Inbox[]>([]);
+  const [zproInstances, setZproInstances] = useState<ZproInstance[]>([]);
   // Live website_url health of the picked web-widget inbox ("ok" | "recovered" | "invalid" |
   // "missing", or null while unknown), fetched from Chatwoot; drives the misconfig warning below.
   const [widgetHealth, setWidgetHealth] = useState<string | null>(null);
@@ -175,6 +182,21 @@ export function ChannelRedirectTab({
         if (!cancelled && data) setInboxes([...data.inboxes]);
       } catch {
         // best-effort: the entry picker falls back to an empty list
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.zpro.instances.get();
+        if (!cancelled && data) setZproInstances([...data.instances]);
+      } catch {
+        // best-effort: the Z-PRO entry picker falls back to an empty list
       }
     })();
     return () => {
@@ -213,6 +235,22 @@ export function ChannelRedirectTab({
   const entryInboxOptions = withSelected(entryEligible, selectedEntry);
   const widgetInboxOptions = withSelected(widgetEligible, selectedWidget);
 
+  // Z-PRO instances have no separate "channel type" to filter by (a ZproInstance IS one WhatsApp
+  // number) — only "bound to this agent" applies, same rationale as the Chatwoot pickers.
+  const zproBoundToThis = (zi: ZproInstance) =>
+    zi.agentBindings.some((b) => b.agentId === agentId);
+  const selectedZproEntry = zproInstances.find(
+    (zi) => zi.id === cr.entryZproInstanceId,
+  );
+  const zproEntryEligible = zproInstances.filter(zproBoundToThis);
+  const zproEntryOptions =
+    selectedZproEntry &&
+    !zproEntryEligible.some((zi) => zi.id === selectedZproEntry.id)
+      ? [...zproEntryEligible, selectedZproEntry]
+      : zproEntryEligible;
+  const zproEntryNotBound =
+    !!selectedZproEntry && !zproBoundToThis(selectedZproEntry);
+
   // The saved value points at an inbox that no longer qualifies (wrong channel, or bound to another
   // agent / unbound) — surfaced as a warning under the picker.
   const entryNotWhatsapp =
@@ -227,9 +265,13 @@ export function ChannelRedirectTab({
     cr.waFollowupEnabled &&
     !cr.waFollowupMessage.includes(LINK_TOKEN);
   // Item 4: redirect is on but an inbox is missing → it can't run. A warning, not a hard block: the
-  // runtime already no-ops without both inboxes, and the operator may be mid-configuration.
+  // runtime already no-ops without a widget inbox + at least one entry point, and the operator may be
+  // mid-configuration. At least one entry (WhatsApp via Chatwoot, and/or a Z-PRO instance) is needed —
+  // the two are independent gates onto the SAME widget, not mutually exclusive.
   const missingInbox =
-    cr.enabled && (cr.entryInboxId === "" || cr.widgetInboxId === null);
+    cr.enabled &&
+    (cr.widgetInboxId === null ||
+      (cr.entryInboxId === "" && cr.entryZproInstanceId === ""));
 
   // Fetch the live health of the picked web-widget inbox's website_url so a missing/invalid domain
   // surfaces here instead of silently degrading to the WhatsApp fallback at redirect time. A
@@ -285,6 +327,9 @@ export function ChannelRedirectTab({
       ? `${ib.name} · ${type} #${ib.chatwootInboxId}`
       : `${ib.name} #${ib.chatwootInboxId}`;
   };
+
+  const zproInstanceLabel = (zi: ZproInstance) =>
+    `${zi.instanceName} #${zi.whatsappId}`;
 
   return (
     <div className="flex grow flex-col gap-4">
@@ -395,6 +440,51 @@ export function ChannelRedirectTab({
                 {t(
                   "editor.channelRedirect.entryNotWhatsapp",
                   "This channel has no per-message cost, so redirecting it saves nothing. The redirect is meant for the official (paid) WhatsApp.",
+                )}
+              </p>
+            )}
+            <FormField
+              label={t(
+                "editor.channelRedirect.entryZproInstance",
+                "Z-PRO entry instance",
+              )}
+              description={t(
+                "editor.channelRedirect.entryZproInstanceHint",
+                "Independent of the WhatsApp entry inbox above: a lead arriving through this Z-PRO (FusaoChatBot CRM) instance gets redirected too, landing on the SAME website chat.",
+              )}
+            >
+              <Select
+                value={cr.entryZproInstanceId}
+                onChange={(e) =>
+                  setCr({ ...cr, entryZproInstanceId: e.target.value })
+                }
+              >
+                <option value="">
+                  {t(
+                    "editor.channelRedirect.entryZproNone",
+                    "None (Z-PRO not gated)",
+                  )}
+                </option>
+                {zproEntryOptions.map((zi) => (
+                  <option key={zi.id} value={zi.id}>
+                    {zproInstanceLabel(zi)}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+            {zproEntryEligible.length === 0 && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "editor.channelRedirect.noZproInstance",
+                  "No Z-PRO instance is bound to this agent yet. Bind one under the Z-PRO channel settings, then pick it here.",
+                )}
+              </p>
+            )}
+            {zproEntryNotBound && (
+              <p className="text-warning text-xs">
+                {t(
+                  "editor.channelRedirect.zproEntryNotBound",
+                  "The selected Z-PRO instance is no longer bound to this agent. Rebind it, or pick one that is.",
                 )}
               </p>
             )}

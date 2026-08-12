@@ -634,6 +634,9 @@
       "entryNone": "Select an inbox…",
       "entryNotBound": "The selected inbox is not activated for this agent (it's bound to another agent, or none). Activate it in Channels, or pick one that is.",
       "entryNotWhatsapp": "This channel has no per-message cost, so redirecting it saves nothing. The redirect is meant for the official (paid) WhatsApp.",
+      "entryZproInstance": "Z-PRO entry instance",
+      "entryZproInstanceHint": "Independent of the WhatsApp entry inbox above: a lead arriving through this Z-PRO (FusaoChatBot CRM) instance gets redirected too, landing on the SAME website chat.",
+      "entryZproNone": "None (Z-PRO not gated)",
       "goToChannels": "Go to Channels",
       "instructions": "Instructions",
       "intro": "Receive the lead on WhatsApp, reply with an automatic link that sends them to your website chat, and handle the conversation there, with no per-message WhatsApp cost.",
@@ -646,6 +649,7 @@
       "navWidget": "Website chat",
       "noEntryInbox": "No WhatsApp inbox is activated for this agent yet. Activate it in the Channels tab, then pick it here.",
       "noWidgetInbox": "No web-widget inbox found. Create one in Chatwoot (Inbox → Website), set its Website URL, then sync inboxes under Channels.",
+      "noZproInstance": "No Z-PRO instance is bound to this agent yet. Bind one under the Z-PRO channel settings, then pick it here.",
       "openWidget": "Open the chat automatically",
       "openWidgetHint": "The lead lands on the page with the chat already open.",
       "redirectMessage": "Auto-reply message",
@@ -674,7 +678,8 @@
       "widgetNotBound": "The selected inbox is not activated for this agent (it's bound to another agent, or none). Activate it in Channels, or pick one that is.",
       "widgetUrlInvalid": "This inbox's Website URL in Chatwoot isn't a valid address. Fix it (e.g. https://your-site.com) so the redirect works.",
       "widgetUrlMissing": "This web-widget inbox has no Website URL set in Chatwoot. Set it (e.g. https://your-site.com) so the redirect link can be built.",
-      "widgetUrlUnknown": "Couldn't reach Chatwoot to verify this inbox's Website URL right now, so it isn't checked here. The redirect still uses whatever is set in Chatwoot."
+      "widgetUrlUnknown": "Couldn't reach Chatwoot to verify this inbox's Website URL right now, so it isn't checked here. The redirect still uses whatever is set in Chatwoot.",
+      "zproEntryNotBound": "The selected Z-PRO instance is no longer bound to this agent. Rebind it, or pick one that is."
     },
     "channels": {
       "desc": "Connect this agent to the inboxes it should answer. Changes apply immediately on Chatwoot.",
