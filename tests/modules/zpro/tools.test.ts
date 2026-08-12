@@ -13,6 +13,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { resolveBusinessHoursById } from "@/graph/prepare";
 import type { ZproClient } from "@/modules/zpro/client";
 import { __resetZproCrmCaches } from "@/modules/zpro/crm";
 import { loadZproAgentTools } from "@/modules/zpro/tools";
@@ -73,6 +74,7 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
         "zpro_conversations",
         "zpro_agent_bindings",
         "zpro_instances",
+        "business_hours",
         "agents",
       ]) {
         await suDb.$executeRawUnsafe(
@@ -161,6 +163,52 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
 
     expect(result.tools.map((t) => t.name)).toContain("calendar_create_event");
     expect(result.conversationId).toBe(conversation.id);
+  });
+
+  test("wires resolveBusinessHours: the exact function Chatwoot's buildToolset uses, bound to this tenant", async () => {
+    const bh = await suDb.businessHours.create({
+      data: {
+        tenantId,
+        name: "Expediente",
+        timezone: "America/Sao_Paulo",
+        windows: [{ day: 1, start: "09:00", end: "18:00" }],
+        source: "LOCAL",
+      },
+    });
+
+    const resolved = await resolveBusinessHoursById(
+      appDb,
+      tenantId,
+      String(bh.id),
+    );
+    expect(resolved).toEqual({
+      windows: [{ day: 1, start: "09:00", end: "18:00" }],
+      timezone: "America/Sao_Paulo",
+    });
+
+    // Cross-tenant id must not resolve (RLS fence) — mirrors the "always on" fallback the toolpack
+    // relies on for a stale/other-tenant businessHoursId.
+    const otherTenant = await suDb.tenant.create({
+      data: { name: "Other", slug: `zpro-tools-other-${process.pid}` },
+    });
+    const otherBh = await suDb.businessHours.create({
+      data: {
+        tenantId: otherTenant.id,
+        name: "Other expediente",
+        windows: [],
+        source: "LOCAL",
+      },
+    });
+    expect(
+      await resolveBusinessHoursById(appDb, tenantId, String(otherBh.id)),
+    ).toBeNull();
+
+    await suDb.$executeRawUnsafe(
+      `DELETE FROM business_hours WHERE tenant_id = ${otherTenant.id}`,
+    );
+    await suDb.$executeRawUnsafe(
+      `DELETE FROM tenants WHERE id = ${otherTenant.id}`,
+    );
   });
 
   test("still resolves the tool for a ticket with no matching ZproConversation (no crash on the lookup miss)", async () => {

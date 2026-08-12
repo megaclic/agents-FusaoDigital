@@ -20,7 +20,10 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import config from "@/config";
-import { resolveInjectableCredential } from "@/graph/prepare";
+import {
+  resolveBusinessHoursById,
+  resolveInjectableCredential,
+} from "@/graph/prepare";
 import { buildHttpTools, loadToolSelections } from "@/graph/tools/assemble";
 import type { NativeToolName } from "@/graph/tools/catalog";
 import { loadMcpToolsForAgent } from "@/graph/tools/mcp";
@@ -118,6 +121,8 @@ export async function loadZproAgentTools(
 
   const resolveCredential = (ref: string) =>
     resolveInjectableCredential(base, tenantId, ref);
+  const resolveBusinessHours = (id: string) =>
+    resolveBusinessHoursById(base, tenantId, id);
 
   // Hoisted above toolpackTools (native-tools-only in the original port) so the Calendar toolpack's
   // reminder-enqueue failures can also surface here — see scheduleAppointmentReminders below.
@@ -206,6 +211,7 @@ export async function loadZproAgentTools(
           threadId,
           contactDbId: conversationId,
           resolveCredential,
+          resolveBusinessHours,
           scheduleAppointmentReminders,
           cancelAppointmentReminders: cancelAppointmentRemindersFn,
           onSideEffectError,

@@ -148,6 +148,28 @@ export async function resolveInjectableCredential(
   return typeof entry.secret === "string" ? entry.secret : null;
 }
 
+// Resolves an integration's chosen BusinessHours by id → windows + timezone (scoped read; RLS
+// fences it to this tenant, so a stale/other-tenant id yields null ⇒ the Calendar availability
+// tool treats the schedule as "always on"). Exported so src/modules/zpro/tools.ts can build the
+// same ToolpackCtx.resolveBusinessHours the Chatwoot path uses — the body is channel-agnostic (our
+// own BusinessHours model, no Chatwoot object).
+export async function resolveBusinessHoursById(
+  base: PrismaClient,
+  tenantId: bigint,
+  id: string,
+): Promise<{ windows: WindowSpec[]; timezone: string } | null> {
+  const bhId = /^\d+$/.test(id) ? BigInt(id) : null;
+  if (bhId === null) return null;
+  const row = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.businessHours.findUnique({
+      where: { id: bhId },
+      select: { windows: true, timezone: true },
+    }),
+  );
+  if (!row) return null;
+  return { windows: parseWindows(row.windows), timezone: row.timezone };
+}
+
 // Optional grounding threshold from agent.settings.grounding.maxDistance (a positive cosine
 // distance). Anything malformed → null (no filtering), so a bad setting never silently blinds RAG.
 // Exported for src/modules/zpro/tools.ts, which reads the same agent.settings bag.
@@ -632,23 +654,8 @@ export async function buildToolset(
 ): Promise<StructuredToolInterface[]> {
   const resolveCredential = (ref: string) =>
     resolveInjectableCredential(ctx.base, ctx.tenantId, ref);
-  // Resolves an integration's chosen BusinessHours by id → windows + timezone (scoped read; RLS fences
-  // it to this tenant, so a stale/other-tenant id yields null ⇒ the Calendar availability tool treats
-  // the schedule as "always on"). Mirrors resolveCredential's bound-closure shape.
-  const resolveBusinessHours = async (
-    id: string,
-  ): Promise<{ windows: WindowSpec[]; timezone: string } | null> => {
-    const bhId = /^\d+$/.test(id) ? BigInt(id) : null;
-    if (bhId === null) return null;
-    const row = await runScopedOn(ctx.base, sysCtx(ctx.tenantId), (db) =>
-      db.businessHours.findUnique({
-        where: { id: bhId },
-        select: { windows: true, timezone: true },
-      }),
-    );
-    if (!row) return null;
-    return { windows: parseWindows(row.windows), timezone: row.timezone };
-  };
+  const resolveBusinessHours = (id: string) =>
+    resolveBusinessHoursById(ctx.base, ctx.tenantId, id);
   const flow = deps.flow;
   // NOTE: A side effect that fails INSIDE a tool that still returns success is invisible in the
   // tool's own flowlog line (the tool legitimately succeeded for the model). This binding lets toolpacks and
