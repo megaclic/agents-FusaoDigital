@@ -43,6 +43,11 @@ export interface TtsProvider {
   requiresBaseURL?: boolean;
   // NOTE: containers this provider can emit; pickTtsFormat picks from these per channel.
   formats: readonly TtsOutputFormat[];
+  // NOTE: the provider-level value a container maps onto (ElevenLabs `output_format=opus_48000_64`,
+  // OpenAI `response_format: "opus"`). The adapters build their request from this same function, so
+  // what the flow log reports is what went on the wire — `ogg_opus` alone is our INTERNAL name and
+  // has been read as the wire value by operators debugging a failed synth.
+  providerFormat(format: TtsOutputFormat): string;
   synthesize(req: TtsRequest): Promise<TtsResult>;
 }
 
@@ -50,10 +55,82 @@ export class TtsError extends Error {
   constructor(
     readonly provider: string,
     readonly status: number,
+    // NOTE: the provider's own machine-readable error code, when it sent one (see readProviderErrorCode).
+    readonly code: string | null = null,
   ) {
-    // NOTE: never capture the response body (provider detail / billing info).
-    super(`TTS ${provider} failed with ${status}`);
+    // NOTE: never capture the response body (provider detail / billing info) — only the code, which is
+    // what turns an opaque "failed with 400" into something an operator can act on.
+    super(`TTS ${provider} failed with ${status}${code ? ` (${code})` : ""}`);
     this.name = "TtsError";
+  }
+}
+
+// NOTE: a provider error body is not a safe thing to keep (free-text messages carry account/billing
+// detail and echoed credentials), but the machine-readable STATUS inside it is: `voice_not_found`,
+// `invalid_api_key`, `quota_exceeded` each end a debugging session in one line. Known shapes:
+// ElevenLabs `{detail: {status}}`, OpenAI/OpenRouter `{error: {code|type}}`.
+const MAX_ERROR_BODY = 8_192;
+// NOTE: the guard that keeps prose out by construction — a code is a slug, a message has spaces and
+// punctuation. A body whose "code" field holds a sentence is dropped rather than logged.
+const ERROR_CODE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
+
+function pickErrorCode(value: unknown): string | null {
+  return typeof value === "string" && ERROR_CODE_RE.test(value) ? value : null;
+}
+
+// NOTE: reads at most `max` bytes and cancels the stream past that, instead of `res.text()`, which
+// buffers the WHOLE body before any size check — a chunked error body has no declared length, so an
+// unbounded one would be fully materialized just to be discarded.
+async function readCappedText(
+  res: Response,
+  max: number,
+): Promise<string | null> {
+  if (!res.body) return null;
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const joined = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
+// NOTE: reads the provider's error code off a failed response. Never throws and never returns free text:
+// a body that is absent, oversized, not JSON, or carries no slug-shaped code yields null.
+export async function readProviderErrorCode(
+  res: Response,
+): Promise<string | null> {
+  try {
+    const raw = await readCappedText(res, MAX_ERROR_BODY);
+    if (!raw) return null;
+    const body: unknown = JSON.parse(raw);
+    if (!body || typeof body !== "object") return null;
+    const { detail, error, status, code } = body as Record<string, unknown>;
+    const nested = (v: unknown, key: string): unknown =>
+      v && typeof v === "object" ? (v as Record<string, unknown>)[key] : null;
+    return (
+      pickErrorCode(nested(detail, "status")) ??
+      pickErrorCode(nested(error, "code")) ??
+      pickErrorCode(nested(error, "type")) ??
+      pickErrorCode(status) ??
+      pickErrorCode(code) ??
+      null
+    );
+  } catch {
+    return null;
   }
 }
 
@@ -113,7 +190,8 @@ async function openaiSynthesize(req: TtsRequest): Promise<TtsResult> {
     redirect: "error",
     signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
   });
-  if (!res.ok) throw new TtsError("openai", res.status);
+  if (!res.ok)
+    throw new TtsError("openai", res.status, await readProviderErrorCode(res));
   return { audio: await res.arrayBuffer(), ...RESULT_BY_FORMAT[req.format] };
 }
 
@@ -128,12 +206,16 @@ const ELEVENLABS_OUTPUT: Partial<Record<TtsOutputFormat, string>> = {
 };
 const ELEVENLABS_PCM_RATE = 24_000;
 
+function elevenlabsOutput(format: TtsOutputFormat): string {
+  return ELEVENLABS_OUTPUT[format] ?? "opus_48000_64";
+}
+
 async function elevenlabsSynthesize(req: TtsRequest): Promise<TtsResult> {
   const base = (req.baseURL ?? "https://api.elevenlabs.io/v1").replace(
     /\/+$/,
     "",
   );
-  const output = ELEVENLABS_OUTPUT[req.format] ?? "opus_48000_64";
+  const output = elevenlabsOutput(req.format);
   const res = await req.fetchImpl(
     `${base}/text-to-speech/${encodeURIComponent(req.voice)}?output_format=${output}`,
     {
@@ -148,7 +230,12 @@ async function elevenlabsSynthesize(req: TtsRequest): Promise<TtsResult> {
       signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
     },
   );
-  if (!res.ok) throw new TtsError("elevenlabs", res.status);
+  if (!res.ok)
+    throw new TtsError(
+      "elevenlabs",
+      res.status,
+      await readProviderErrorCode(res),
+    );
   const raw = await res.arrayBuffer();
   if (req.format === "wav") {
     return {
@@ -185,7 +272,12 @@ async function openrouterSynthesize(req: TtsRequest): Promise<TtsResult> {
     redirect: "error",
     signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
   });
-  if (!res.ok) throw new TtsError("openrouter", res.status);
+  if (!res.ok)
+    throw new TtsError(
+      "openrouter",
+      res.status,
+      await readProviderErrorCode(res),
+    );
   return { audio: await res.arrayBuffer(), ...RESULT_BY_FORMAT.mp3 };
 }
 
@@ -194,6 +286,7 @@ const PROVIDERS: Record<string, TtsProvider> = {
     defaultModel: "gpt-4o-mini-tts",
     defaultVoice: "alloy",
     formats: ["ogg_opus", "aac", "wav", "mp3"],
+    providerFormat: (format) => OPENAI_FORMAT[format],
     synthesize: openaiSynthesize,
   },
   elevenlabs: {
@@ -201,6 +294,7 @@ const PROVIDERS: Record<string, TtsProvider> = {
     defaultVoice: "",
     requiresVoice: true,
     formats: ["ogg_opus", "wav", "mp3"],
+    providerFormat: elevenlabsOutput,
     synthesize: elevenlabsSynthesize,
   },
   openrouter: {
@@ -214,6 +308,7 @@ const PROVIDERS: Record<string, TtsProvider> = {
     defaultModel: "hexgrad/kokoro-82m",
     defaultVoice: "af_alloy",
     formats: ["mp3"],
+    providerFormat: () => "mp3",
     synthesize: openrouterSynthesize,
   },
 };
