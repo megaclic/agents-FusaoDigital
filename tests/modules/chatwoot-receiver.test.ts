@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
+import { outOfHoursGate } from "@/modules/business-hours/service";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import { mirrorChatwootEvent } from "@/modules/chatwoot/mirror";
@@ -13,7 +14,6 @@ import {
 import { ensureAgentBot } from "@/modules/chatwoot/provisioning";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import {
-  outOfHoursGate,
   processChatwootDelivery,
   receiveChatwootWebhook,
 } from "@/modules/chatwoot/webhook";

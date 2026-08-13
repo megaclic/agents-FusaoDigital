@@ -4,6 +4,7 @@ import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
+  isOpenAt,
   isWindowOrdered,
   parseWindows,
   type WindowSpec,
@@ -205,4 +206,25 @@ export async function deleteBusinessHours(
       );
     }
   });
+}
+
+// Reactive availability decision: the agent's business hours (the "Disponibilidade" schedule) gate
+// replies to the customer. Outside the configured window the agent stays SILENT; the operator gets a
+// one-shot private note (postNote true only the first time, mirroring the test-mode notice). No
+// schedule / empty windows → always on (never silenced). Pure so it is unit-testable. Channel-
+// agnostic by design — shared verbatim by both src/modules/chatwoot/webhook.ts and
+// src/modules/zpro/* rather than duplicated, since the two channel integrations never import from
+// each other directly (see docs/zpro.md's module map).
+export function outOfHoursGate(
+  hours: { windows: WindowSpec[]; timezone: string } | null,
+  now: Date,
+  noticeAlreadySent: boolean,
+): { silence: boolean; postNote: boolean } {
+  if (!hours || hours.windows.length === 0) {
+    return { silence: false, postNote: false };
+  }
+  if (isOpenAt(hours.windows, hours.timezone, now)) {
+    return { silence: false, postNote: false };
+  }
+  return { silence: true, postNote: !noticeAlreadySent };
 }

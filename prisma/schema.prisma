@@ -639,6 +639,13 @@ model ZproConversation {
   redirectSentAt             DateTime? @map("redirect_sent_at")
   redirectCount              Int       @default(0) @map("redirect_count")
   redirectChatwootContactId  Int?      @map("redirect_chatwoot_contact_id")
+  // Availability (Business Hours) gate watermark — mirrors Conversation.outOfHoursNoticeSentAt
+  // (chatwoot/webhook.ts's outOfHoursGate, reused as-is): a ONE-SHOT private note the first time a
+  // reply is silenced outside the agent's configured schedule. On the Chatwoot side this is only
+  // ever cleared by the /reset test-mode command; Z-PRO has no such command, so once set it is
+  // permanent for this ticket — a new ticket (new row) gets a fresh notice. Accepted, matches the
+  // Chatwoot watermark's own semantics rather than inventing a new reset mechanism.
+  outOfHoursNoticeSentAt     DateTime? @map("out_of_hours_notice_sent_at")
   createdAt        DateTime  @default(now()) @map("created_at")
   updatedAt        DateTime  @updatedAt @map("updated_at")
 

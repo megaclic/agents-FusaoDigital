@@ -16,6 +16,7 @@ import logger from "@/api/lib/logger";
 import { doc } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { asSuperAdminOn, runScopedOn } from "@/lib/tenancy";
+import { outOfHoursGate } from "@/modules/business-hours/service";
 import { runZproRedirectGate } from "@/modules/channel-redirect/gate";
 import {
   isRedirectEntryZproInstance,
@@ -23,6 +24,7 @@ import {
 } from "@/modules/channel-redirect/service";
 import { armDebounce } from "@/modules/debounce/service";
 import type { FlowContext } from "@/modules/flowlog/service";
+import { resolveZproAvailability } from "@/modules/zpro/availability";
 import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
 import { resolveZproDebounceConfig } from "@/modules/zpro/debounce";
@@ -428,6 +430,79 @@ export const zproController = new Elysia({
                 String(delivery.id),
               );
             }
+          }
+        }
+
+        // 1f. Availability gate: the agent's business hours ("Disponibilidade" schedule) gate
+        // REACTIVE replies — same feature Chatwoot already has (chatwoot/webhook.ts), now wired for
+        // Z-PRO too: previously a Z-PRO agent answered around the clock no matter what schedule was
+        // configured. Runs BEFORE the debounce-arm decision, exactly like the Chatwoot gate, so an
+        // out-of-hours message never even arms a coalescing window. reusable outOfHoursGate (shared
+        // with Chatwoot, src/modules/business-hours/service.ts) decides; a one-shot private note
+        // (ZproConversation.outOfHoursNoticeSentAt watermark, anti-spam) tells the operator why.
+        if (mirrored) {
+          const availConv = await runScopedOn(
+            basePrisma,
+            sysCtx(instance.tenantId),
+            (db) =>
+              db.zproConversation.findUnique({
+                where: { id: mirrored.conversationId },
+                select: { outOfHoursNoticeSentAt: true },
+              }),
+          );
+          const hours = await resolveZproAvailability(
+            instance.tenantId,
+            instance.id,
+            basePrisma,
+          );
+          const availability = outOfHoursGate(
+            hours,
+            new Date(),
+            availConv?.outOfHoursNoticeSentAt != null,
+          );
+          if (availability.silence) {
+            if (availability.postNote) {
+              try {
+                const zproClient = new ZproClient(
+                  instance.baseUrl,
+                  instance.apiId,
+                  decryptJson<string>(instance.bearerToken),
+                );
+                await zproClient.createNote(
+                  Number(event.threadId),
+                  "🌙 Mensagem recebida fora do horário de atendimento. O agente não respondeu automaticamente; ele volta a responder no próximo horário disponível.",
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, delivery: String(delivery.id) },
+                  "zpro:dispatch availability-gate note failed",
+                );
+              }
+              try {
+                await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                  db.zproConversation.update({
+                    where: { id: mirrored.conversationId },
+                    data: { outOfHoursNoticeSentAt: new Date() },
+                  }),
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, delivery: String(delivery.id) },
+                  "zpro:dispatch availability-gate notice-flag write failed",
+                );
+              }
+            }
+            await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+              db.zproWebhookDelivery.update({
+                where: { id: delivery.id },
+                data: { status: "PROCESSED", processedAt: new Date() },
+              }),
+            );
+            logger.info(
+              "zpro:dispatch availability-gate silenced delivery=%s",
+              String(delivery.id),
+            );
+            return;
           }
         }
 
