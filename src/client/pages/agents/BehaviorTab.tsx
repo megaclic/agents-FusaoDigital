@@ -1508,21 +1508,7 @@ export function BehaviorTab({
                   )}
                 </p>
               </div>
-              {zproOnly && (
-                <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
-                  <AlertTriangle
-                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning"
-                    aria-hidden="true"
-                  />
-                  <span>
-                    {t(
-                      "editor.followUpZproOnly",
-                      "Not available yet for a Z-PRO-only agent — the generic follow-up sweep only runs for Chatwoot-bound conversations. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
-                    )}
-                  </span>
-                </div>
-              )}
-              {redirectSuppressesFollowUp && !zproOnly && (
+              {redirectSuppressesFollowUp && (
                 <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
                   <ArrowRightLeft
                     className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent"
@@ -1541,13 +1527,12 @@ export function BehaviorTab({
                 onCheckedChange={(v) =>
                   setFollowUp({ ...followUp, enabled: v })
                 }
-                disabled={zproOnly}
                 label={t(
                   "editor.followUpEnabled",
                   "Send a follow-up when the conversation goes silent",
                 )}
               />
-              {followUp.enabled && !zproOnly && (
+              {followUp.enabled && (
                 <>
                   <FormField
                     label={t("editor.followUpWindowField", "Allowed schedule")}

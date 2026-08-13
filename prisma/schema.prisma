@@ -646,6 +646,12 @@ model ZproConversation {
   // permanent for this ticket — a new ticket (new row) gets a fresh notice. Accepted, matches the
   // Chatwoot watermark's own semantics rather than inventing a new reset mechanism.
   outOfHoursNoticeSentAt     DateTime? @map("out_of_hours_notice_sent_at")
+  // Generic follow-up (reengagement sweep) watermarks — Z-PRO analog of Conversation.lastInboundAt/
+  // lastFollowUpAt. lastInboundAt is CLIENT-only (advanced in mirror.ts's mirrorZproMessage), distinct
+  // from lastMessageAt (any sender) — needed for the "fresh episode" gate (isNewFollowUpEpisode) the
+  // same way the Chatwoot sweep uses it. lastFollowUpAt is the watermark stamped after each step fires.
+  lastInboundAt              DateTime? @map("last_inbound_at")
+  lastFollowUpAt             DateTime? @map("last_follow_up_at")
   createdAt        DateTime  @default(now()) @map("created_at")
   updatedAt        DateTime  @updatedAt @map("updated_at")
 

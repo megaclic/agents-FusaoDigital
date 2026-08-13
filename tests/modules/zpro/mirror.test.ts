@@ -104,6 +104,22 @@ function outboundMsg(id: string, body: string): ZproMsgTop {
   };
 }
 
+function inboundMsg(id: string, body: string): ZproMsgTop {
+  return {
+    event: "messages.upsert",
+    instance: "TesteSindSeg",
+    fromMe: false,
+    id,
+    body,
+    type: "conversation",
+    timestamp: Date.now(),
+    from: "5511963529979",
+    read: false,
+    ack: 1,
+    data: { message: { conversation: body } },
+  };
+}
+
 function payloadFor(ticket: ZproTicket, msg: ZproMsgTop): ZproWebhookPayload {
   return {
     method: "message",
@@ -259,5 +275,114 @@ describe.skipIf(!dbUp)("mirrorZproMessage sender-type classification", () => {
       select: { contactId: true },
     });
     expect(after?.contactId).toBe(4242);
+  });
+});
+
+// DB-backed: lastInboundAt is the CLIENT-only anchor the generic follow-up sweep uses
+// (isNewFollowUpEpisode) — distinct from lastMessageAt (any sender). Regression coverage for the
+// Fase 6 follow-up watermark (src/modules/followups/handlers.ts's Z-PRO branch).
+describe.skipIf(!dbUp)("mirrorZproMessage lastInboundAt watermark", () => {
+  beforeAll(async () => {
+    const t = await suDb.tenant.create({
+      data: {
+        name: "ZproMirrorInbound",
+        slug: `zpro-mirror-inbound-${process.pid}`,
+      },
+    });
+    tenantId = t.id;
+    const inst = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.fusaobotcrm.com.br",
+        apiId: "TEST_API_ID",
+        bearerToken: encryptJson("test-token"),
+        whatsappId: 88,
+        instanceName: "TesteSindSeg2",
+      },
+    });
+    zproInstanceId = inst.id;
+  });
+
+  afterAll(async () => {
+    if (tenantId) {
+      for (const table of [
+        "zpro_messages",
+        "zpro_conversations",
+        "zpro_agent_bindings",
+        "zpro_instances",
+      ]) {
+        await suDb.$executeRawUnsafe(
+          `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
+        );
+      }
+      await suDb.tenant.delete({ where: { id: tenantId } });
+    }
+    await su?.$disconnect();
+    await app?.$disconnect();
+  });
+
+  test("a CLIENT message advances lastInboundAt", async () => {
+    const ticket = baseTicket(9101, null);
+    const result = await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-IN-1", "Oi, tudo bem?")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(result).not.toBeNull();
+    const row = await suDb.zproConversation.findUnique({
+      where: { id: result?.conversationId as bigint },
+      select: { lastInboundAt: true, lastMessageAt: true },
+    });
+    expect(row?.lastInboundAt).not.toBeNull();
+    expect(row?.lastInboundAt?.getTime()).toBe(row?.lastMessageAt?.getTime());
+  });
+
+  test("an AGENT (outbound) message does NOT advance lastInboundAt", async () => {
+    const ticket = baseTicket(9102, null);
+    const result = await mirrorZproMessage(
+      payloadFor(ticket, outboundMsg("MSG-OUT-1", "Claro, como posso ajudar?")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(result).not.toBeNull();
+    const row = await suDb.zproConversation.findUnique({
+      where: { id: result?.conversationId as bigint },
+      select: { lastInboundAt: true, lastMessageAt: true },
+    });
+    expect(row?.lastInboundAt).toBeNull();
+    expect(row?.lastMessageAt).not.toBeNull();
+  });
+
+  test("lastInboundAt never regresses on a later AGENT reply", async () => {
+    const ticket = baseTicket(9103, null);
+    const first = await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-SEQ-1", "Primeira pergunta")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    const firstRow = await suDb.zproConversation.findUnique({
+      where: { id: first?.conversationId as bigint },
+      select: { lastInboundAt: true },
+    });
+    const firstInboundAt = firstRow?.lastInboundAt;
+    expect(firstInboundAt).not.toBeNull();
+
+    await mirrorZproMessage(
+      payloadFor(ticket, outboundMsg("MSG-SEQ-2", "Resposta do agente")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    const afterAgentRow = await suDb.zproConversation.findUnique({
+      where: { id: first?.conversationId as bigint },
+      select: { lastInboundAt: true },
+    });
+    // The agent reply advanced lastMessageAt but must NOT touch lastInboundAt.
+    expect(afterAgentRow?.lastInboundAt?.getTime()).toBe(
+      firstInboundAt?.getTime(),
+    );
   });
 });

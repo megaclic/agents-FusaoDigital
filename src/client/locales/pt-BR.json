@@ -785,7 +785,6 @@
     "followUpStep": "Etapa {{n}}",
     "followUpStepDelay": "Aguardar após a etapa anterior",
     "followUpWindowField": "Horário permitido",
-    "followUpZproOnly": "Ainda não disponível para um agente só-Z-PRO — a varredura genérica de follow-up só roda para conversas vinculadas ao Chatwoot. Sua configuração salva é mantida, mas não tem efeito até este agente também atender pelo Chatwoot.",
     "formatExamplesTitle": "Exemplos",
     "formatHelpAria": "Ajuda sobre formatos de data e hora",
     "formatHelpTitle": "Tokens de formato de data e hora",

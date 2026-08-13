@@ -291,6 +291,34 @@ function existingLabelsXml(names: string[]): string {
   return `<existing_labels>\n${els.join("\n")}\n</existing_labels>`;
 }
 
+// Resolve a label name to a tag id against the known (pre-listed) tags, case-insensitive; auto-
+// creates a new tag on a miss (mirrors Chatwoot's effective behavior, where posting an unknown label
+// string auto-creates it server-side). Exported so the generic follow-up's deterministic assignLabels
+// post-action (src/modules/followups/handlers.ts) can reuse the exact same resolve-or-create logic
+// instead of re-implementing it against ZproClient.
+export async function resolveOrCreateZproTagId(
+  client: ZproClient,
+  label: string,
+  known: ZproPipeline[] = [],
+): Promise<number | null> {
+  const clean = label.trim();
+  if (!clean) return null;
+  const existing = known.find(
+    (t) => t.name.toLowerCase() === clean.toLowerCase(),
+  )?.id;
+  if (existing != null) return existing;
+  try {
+    return extractId(await client.createTag(clean, DEFAULT_TAG_COLOR, true));
+  } catch (e) {
+    logger.warn(
+      "zpro: createTag failed (%s): %s",
+      clean,
+      e instanceof Error ? e.message : String(e),
+    );
+    return null;
+  }
+}
+
 function assignLabelTool(ctx: ZproToolCtx) {
   const known = ctx.knownTags ?? [];
   const labelsXml = existingLabelsXml(known.map((t) => t.name));
@@ -309,24 +337,9 @@ function assignLabelTool(ctx: ZproToolCtx) {
     }) => {
       const clean = label.trim();
       if (!clean) return "No label provided.";
-      let tagId =
-        known.find((t) => t.name.toLowerCase() === clean.toLowerCase())?.id ??
-        null;
+      const tagId = await resolveOrCreateZproTagId(ctx.client, clean, known);
       if (tagId == null) {
-        try {
-          tagId = extractId(
-            await ctx.client.createTag(clean, DEFAULT_TAG_COLOR, true),
-          );
-        } catch (e) {
-          logger.warn(
-            "zpro assign_label: createTag failed (%s): %s",
-            clean,
-            e instanceof Error ? e.message : String(e),
-          );
-        }
-        if (tagId == null) {
-          return `Could not create the label "${clean}".`;
-        }
+        return `Could not create the label "${clean}".`;
       }
       if (scope === "contact") {
         await ctx.client.addTagContact(ctx.contactId, tagId);

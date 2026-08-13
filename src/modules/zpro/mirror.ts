@@ -73,6 +73,9 @@ export async function mirrorZproMessage(
   const body = extractMessageBody(msg);
   const media = extractMedia(msg.data?.message);
   const lastMessageAt = new Date(msg.timestamp);
+  // CLIENT-only anchor for the generic follow-up sweep (isNewFollowUpEpisode), distinct from
+  // lastMessageAt (any sender) — mirrors Conversation.lastInboundAt (chatwoot/mirror.ts).
+  const lastInboundAt = senderType === "CLIENT" ? lastMessageAt : undefined;
 
   let conversation: { id: bigint };
   try {
@@ -94,6 +97,7 @@ export async function mirrorZproMessage(
           humanUserId: ticket.userId,
           lastMessageAt,
           lastMessageBody: body,
+          ...(lastInboundAt ? { lastInboundAt } : {}),
         },
         update: {
           status: ticket.status,
@@ -108,6 +112,7 @@ export async function mirrorZproMessage(
           humanUserId: ticket.userId,
           lastMessageAt,
           lastMessageBody: body,
+          ...(lastInboundAt ? { lastInboundAt } : {}),
         },
         select: { id: true },
       }),

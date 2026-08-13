@@ -783,7 +783,6 @@
     "followUpStep": "Step {{n}}",
     "followUpStepDelay": "Wait after previous step",
     "followUpWindowField": "Allowed schedule",
-    "followUpZproOnly": "Not available yet for a Z-PRO-only agent — the generic follow-up sweep only runs for Chatwoot-bound conversations. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
     "formatExamplesTitle": "Examples",
     "formatHelpAria": "Date and time format help",
     "formatHelpTitle": "Date and time format tokens",

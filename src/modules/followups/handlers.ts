@@ -1,4 +1,5 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
+import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { isTurnInFlight } from "@/graph/inflight";
@@ -16,6 +17,12 @@ import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { shouldBotHandle } from "@/modules/chatwoot/normalize";
 import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
+import { ZproClient } from "@/modules/zpro/client";
+import { loadZproTags } from "@/modules/zpro/crm";
+import { parseZproThreadId } from "@/modules/zpro/debounce";
+import { deactivateAgent } from "@/modules/zpro/handoff";
+import { resolveOrCreateZproTagId } from "@/modules/zpro/native-tools";
+import { runZproAgentNudge } from "@/modules/zpro/nudge";
 import {
   type FollowUpStep,
   isNewFollowUpEpisode,
@@ -189,7 +196,82 @@ async function sweepHandler(
       LIMIT 500
     `,
   );
-  for (const t of threads) {
+
+  // Z-PRO analog of the query above, adapted to its own schema (no inbox: the agent binding is
+  // ZproAgentBinding on the instance; "bot owns it" is agentActive, not assigneeType; status has no
+  // 'pending' value, so status <> 'closed' is the equivalent "still open" gate). Z-PRO has no test
+  // mode (confirmed: no isTestSilenced/testActivatedAt reference anywhere under src/modules/zpro/*),
+  // so that filter is simply absent here. thread_id is zproThreadId()'s exact format
+  // (src/modules/zpro/runtime.ts) so the SAME "FOLLOWUP" job kind + followUpHandler's thread-shape
+  // dispatch (mirrors appointmentReminderHandler) can enqueue and process both channels uniformly.
+  const zproThreads = await runScopedOn(
+    base,
+    sysCtx(tenantId),
+    (db) =>
+      db.$queryRaw<Array<{ thread_id: string }>>`
+      SELECT 'zpro:' || c.tenant_id || ':' || c.zpro_instance_id || ':' || c.ticket_id AS thread_id
+      FROM zpro_conversations c
+      JOIN zpro_agent_bindings b
+        ON b.zpro_instance_id = c.zpro_instance_id AND b.tenant_id = c.tenant_id
+      JOIN agents a ON a.id = b.agent_id
+      WHERE c.tenant_id = ${tenantId}
+        AND c.status <> 'closed'
+        AND c.agent_active = true
+        AND a.enabled = true
+        AND c.last_message_at < ${cutoff}
+        AND c.last_inbound_at IS NOT NULL
+        AND (
+          c.last_follow_up_at IS NULL
+          OR c.last_inbound_at > c.last_follow_up_at
+        )
+        AND a.follow_up_armed_at IS NOT NULL
+        AND c.last_inbound_at >= a.follow_up_armed_at
+        -- Same appointment-suppression mirror as the Chatwoot query above, keyed on the Z-PRO thread
+        -- id format instead.
+        AND NOT (
+          coalesce(a.settings->'followUp'->>'pauseWhileAppointment', 'true') <> 'false'
+          AND EXISTS (
+            SELECT 1
+            FROM scheduler_jobs sj
+            CROSS JOIN LATERAL (
+              SELECT CASE
+                WHEN sj.payload->>'startISO' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                  THEN sj.payload->>'startISO' || 'T00:00:00Z'
+                WHEN sj.payload->>'startISO' ~ '[Tt ][0-9]{2}:'
+                     AND sj.payload->>'startISO' !~ '([Zz]|[+-][0-9]{2}:?[0-9]{2})$'
+                  THEN sj.payload->>'startISO' || 'Z'
+                ELSE sj.payload->>'startISO'
+              END AS start_iso
+            ) norm
+            WHERE sj.tenant_id = c.tenant_id
+              AND sj.kind = 'APPOINTMENT_REMINDER'
+              AND sj.payload->>'threadId' = 'zpro:' || c.tenant_id || ':' || c.zpro_instance_id || ':' || c.ticket_id
+              AND sj.payload->>'cancelledAt' IS NULL
+              AND (
+                sj.status IN ('PENDING', 'CLAIMED')
+                OR CASE
+                  WHEN norm.start_iso IS NOT NULL
+                       AND pg_input_is_valid(norm.start_iso, 'timestamptz')
+                    THEN norm.start_iso::timestamptz > now()
+                  ELSE false
+                END
+              )
+          )
+        )
+        -- Skip a Z-PRO ticket managed by a WhatsApp→chat redirect entering through THIS instance —
+        -- the dedicated REDIRECT_FOLLOWUP ladder (runZproRedirectGate, src/modules/channel-redirect/
+        -- gate.ts) owns re-engagement for it. Z-PRO has no "widget side" to also guard (the widget is
+        -- always a Chatwoot Conversation, never a ZproConversation).
+        AND NOT (
+          coalesce(a.settings->'channelRedirect'->>'enabled', 'false') = 'true'
+          AND a.settings->'channelRedirect'->>'entryZproInstanceId' IS NOT NULL
+          AND (a.settings->'channelRedirect'->>'entryZproInstanceId')::bigint = c.zpro_instance_id
+        )
+      LIMIT 500
+    `,
+  );
+
+  for (const t of [...threads, ...zproThreads]) {
     await enqueueJob({
       tenantId,
       kind: "FOLLOWUP",
@@ -213,6 +295,12 @@ export async function followUpHandler(
   const threadId =
     typeof job.payload.threadId === "string" ? job.payload.threadId : null;
   if (!threadId) return { outcome: "done" };
+  // Dispatch by threadId shape (mirrors appointmentReminderHandler's exact pattern,
+  // src/modules/appointments/reminders.ts:271-280): a Z-PRO thread (`zpro:<tenantId>:
+  // <zproInstanceId>:<ticketId>`) never matches Chatwoot's parseThreadId (3-segment, no "zpro" prefix).
+  if (threadId.startsWith("zpro:")) {
+    return zproFollowUpStep(job, base, threadId);
+  }
   const parsed = parseThreadId(threadId);
   if (!parsed || parsed.tenantId !== job.tenantId) return { outcome: "done" };
   const { instanceId, conversationId } = parsed;
@@ -470,6 +558,246 @@ export async function followUpHandler(
   if (nudgeOutcome === "noted-window") return { outcome: "done" };
 
   // Advance to the next step on the SAME job row (reschedule carries the new stepIndex), or end.
+  const nextIndex = stepIndex + 1;
+  const nextStep = steps[nextIndex];
+  if (nextStep) {
+    return {
+      outcome: "reschedule",
+      runAt: new Date(Date.now() + stepDelayMinutes(nextStep) * 60_000),
+      payload: { threadId, stepIndex: nextIndex },
+    };
+  }
+  return { outcome: "done" };
+}
+
+// Z-PRO analog of the Chatwoot step above — followUpHandler dispatches here by thread-id shape
+// (mirrors appointmentReminderHandler exactly). Reuses every piece that's already channel-agnostic
+// (hasLiveAppointment, isTurnInFlight, the business-hours resolution) as-is, and only rebuilds the
+// pieces that touch Chatwoot-specific tables (Conversation/Inbox) against ZproConversation/
+// ZproAgentBinding instead. No retry-on-"live-unavailable"/"deferred" backoff loop here:
+// runZproAgentNudge has no live-Chatwoot-probe or human-in-the-loop-interrupt concept to fail on, so
+// its outcome set is exhaustively handled without one. No test-mode gate either — Z-PRO doesn't
+// implement /teste (confirmed: zero isTestSilenced/testActivatedAt references under src/modules/
+// zpro/*).
+function zproSysCtx(tenantId: bigint): TenantContext {
+  return { tenantId, userId: null, role: "TENANT_ADMIN" };
+}
+
+async function zproFollowUpStep(
+  job: ClaimedJob,
+  base: PrismaClient,
+  threadId: string,
+): Promise<JobResult> {
+  const parsed = parseZproThreadId(threadId);
+  if (!parsed || parsed.tenantId !== job.tenantId) return { outcome: "done" };
+  const { tenantId, zproInstanceId, ticketId } = parsed;
+
+  const ctx = await runScopedOn(base, zproSysCtx(tenantId), async (db) => {
+    const conv = await db.zproConversation.findUnique({
+      where: { zproInstanceId_ticketId: { zproInstanceId, ticketId } },
+      select: {
+        id: true,
+        status: true,
+        agentActive: true,
+        lastMessageAt: true,
+        lastInboundAt: true,
+        lastFollowUpAt: true,
+      },
+    });
+    if (!conv) return null;
+    const binding = await db.zproAgentBinding.findFirst({
+      where: { tenantId, zproInstanceId },
+      select: { agentId: true },
+    });
+    if (!binding) return null;
+    const agent = await db.agent.findUnique({
+      where: { id: binding.agentId },
+      select: {
+        enabled: true,
+        settings: true,
+        businessHoursId: true,
+        followUpHoursId: true,
+        followUpArmedAt: true,
+      },
+    });
+    if (!agent?.enabled) return null;
+    // Defense in depth (mirrors the Chatwoot branch above): a Z-PRO ticket managed by a
+    // channelRedirect entering through THIS instance is owned by the dedicated REDIRECT_FOLLOWUP
+    // ladder — catches a job enqueued before the redirect config changed underneath it (the sweep's
+    // SQL already filters this at enqueue time).
+    const redirectCfg = readChannelRedirectConfig(agent.settings);
+    if (
+      redirectCfg.enabled &&
+      redirectCfg.entryZproInstanceId === Number(zproInstanceId)
+    ) {
+      return null;
+    }
+    const followUpCfg = readFollowUpConfig(agent.settings);
+    if (!followUpCfg.enabled) return null;
+
+    const hoursId = agent.followUpHoursId ?? agent.businessHoursId;
+    const hours = hoursId
+      ? await db.businessHours.findUnique({
+          where: { id: hoursId },
+          select: { windows: true, timezone: true },
+        })
+      : null;
+    return { conv, followUpCfg, hours, armedAt: agent.followUpArmedAt };
+  });
+  if (!ctx) return { outcome: "done" };
+
+  if (ctx.followUpCfg.pauseWhileAppointment) {
+    const blockedByAppointment = await hasLiveAppointment(
+      tenantId,
+      threadId,
+      base,
+    );
+    if (blockedByAppointment) {
+      return {
+        outcome: "reschedule",
+        runAt: new Date(Date.now() + APPOINTMENT_BACKOFF_MS),
+      };
+    }
+  }
+
+  const steps = ctx.followUpCfg.steps;
+  const stepIndex =
+    typeof job.payload.stepIndex === "number" &&
+    Number.isInteger(job.payload.stepIndex)
+      ? job.payload.stepIndex
+      : 0;
+  const step = steps[stepIndex];
+  if (!step) return { outcome: "done" };
+  const isLast = stepIndex === steps.length - 1;
+
+  const { lastFollowUpAt, lastInboundAt, lastMessageAt } = ctx.conv;
+
+  const newEpisode = isNewFollowUpEpisode(lastFollowUpAt, lastInboundAt);
+  if (stepIndex === 0) {
+    if (!newEpisode) return { outcome: "done" };
+    if (
+      ctx.armedAt == null ||
+      lastInboundAt == null ||
+      lastInboundAt < ctx.armedAt
+    ) {
+      return { outcome: "done" };
+    }
+  } else if (newEpisode) {
+    return { outcome: "done" };
+  }
+
+  // Bot-ownership gate: Z-PRO's equivalent of shouldBotHandle — the AI still active and the ticket
+  // not closed.
+  if (!ctx.conv.agentActive || ctx.conv.status === "closed") {
+    return { outcome: "done" };
+  }
+
+  // Cadence: step 0 measures inactivity from lastMessageAt (any activity, plays lastEventAt's role
+  // here); later steps measure from when the previous step fired.
+  const anchor = stepIndex === 0 ? lastMessageAt : lastFollowUpAt;
+  if (anchor) {
+    const dueAt = anchor.getTime() + stepDelayMinutes(step) * 60_000;
+    if (Date.now() < dueAt) {
+      return { outcome: "reschedule", runAt: new Date(dueAt) };
+    }
+  }
+
+  if (ctx.hours) {
+    const windows = parseWindows(ctx.hours.windows);
+    const now = new Date();
+    if (windows.length > 0 && !isOpenAt(windows, ctx.hours.timezone, now)) {
+      const next = nextOpenAt(windows, ctx.hours.timezone, now);
+      if (next) return { outcome: "reschedule", runAt: next };
+      return { outcome: "done" };
+    }
+  }
+
+  if (isTurnInFlight(threadId)) {
+    return {
+      outcome: "reschedule",
+      runAt: new Date(Date.now() + IN_FLIGHT_BACKOFF_MS),
+    };
+  }
+
+  const idleMin = lastMessageAt
+    ? Math.round((Date.now() - lastMessageAt.getTime()) / 60_000)
+    : stepDelayMinutes(step);
+  const nudgeOutcome = await runZproAgentNudge({
+    tenantId,
+    threadId,
+    nudge: {
+      source: "followup",
+      kind: "inactivity",
+      summary: `The customer has been inactive for about ${idleMin} minutes.`,
+      instructions: step.instructions || undefined,
+      step: stepIndex + 1,
+    },
+    base,
+  });
+
+  // The ticket is no longer bot-owned (taken over during the turn) or the binding/agent vanished
+  // underneath us — the episode is moot. No watermark, no next step.
+  if (
+    nudgeOutcome === "human-owned" ||
+    nudgeOutcome === "no-conversation" ||
+    nudgeOutcome === "no-agent"
+  ) {
+    return { outcome: "done" };
+  }
+
+  // Deterministic post-actions (resolve / assignLabels), best-effort — applied whenever the turn
+  // completed without a takeover. A dedicated small ZproInstance credential fetch (not a full
+  // loadZproAgent, which also resolves model/guardrails/TTS this call never needs).
+  if (step.assignLabels?.length || (isLast && step.resolve === true)) {
+    const instance = await runScopedOn(base, zproSysCtx(tenantId), (db) =>
+      db.zproInstance.findUnique({
+        where: { id: zproInstanceId },
+        select: { baseUrl: true, apiId: true, bearerToken: true },
+      }),
+    );
+    if (instance) {
+      const zc = new ZproClient(
+        instance.baseUrl,
+        instance.apiId,
+        decryptJson<string>(instance.bearerToken),
+      );
+      if (step.assignLabels?.length) {
+        const known = await loadZproTags(
+          zc,
+          `${tenantId}:${zproInstanceId}`,
+        ).catch(() => []);
+        for (const label of step.assignLabels) {
+          try {
+            const tagId = await resolveOrCreateZproTagId(zc, label, known);
+            if (tagId != null) await zc.addTag(ticketId, tagId);
+          } catch (err) {
+            logger.warn(
+              { err, ticketId, label },
+              "zpro followUp: assignLabels failed",
+            );
+          }
+        }
+      }
+      if (isLast && step.resolve === true) {
+        try {
+          await deactivateAgent(zc, ticketId, { closeTicket: true });
+        } catch (err) {
+          logger.warn({ err, ticketId }, "zpro followUp: resolve failed");
+        }
+      }
+    }
+  }
+
+  // Watermark: stamp regardless of whether the nudge sent or stayed silent, so the next step's
+  // cadence anchors here and the episode-interruption check works.
+  await runScopedOn(base, zproSysCtx(tenantId), (db) =>
+    db.zproConversation.update({
+      where: { id: ctx.conv.id },
+      data: { lastFollowUpAt: new Date() },
+    }),
+  );
+
+  // Advance to the next step on the SAME job row, or end.
   const nextIndex = stepIndex + 1;
   const nextStep = steps[nextIndex];
   if (nextStep) {
