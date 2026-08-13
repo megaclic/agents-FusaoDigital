@@ -343,14 +343,18 @@ function ZproInstancesForAgent({ agentId }: { agentId: string }) {
   const { showToast } = useToast();
   const [instances, setInstances] = useState<ZproInstanceDto[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    setLoading(true);
+    setError(false);
     try {
       const { data } = await api.api.v1.zpro.instances.get();
       if (data) setInstances([...data.instances]);
+      else setError(true);
     } catch {
-      // best-effort — the Chatwoot section above already surfaces a load error
+      setError(true);
     } finally {
       setLoading(false);
     }
@@ -386,7 +390,10 @@ function ZproInstancesForAgent({ agentId }: { agentId: string }) {
     }
   }
 
-  if (!loading && instances.length === 0) return null;
+  // A confirmed-empty tenant (no error, no instances) hides the whole section — matches the pattern
+  // used elsewhere for tenants that don't use Z-PRO. A FAILED fetch must NOT hide it the same way:
+  // that previously looked identical to "no Z-PRO here" with zero indication anything went wrong.
+  if (!loading && !error && instances.length === 0) return null;
 
   return (
     <section className="flex flex-col gap-3">
@@ -394,12 +401,17 @@ function ZproInstancesForAgent({ agentId }: { agentId: string }) {
         <MessageSquare className="h-4 w-4 text-accent" aria-hidden="true" />
         {t("zpro.title", "Z-PRO (WhatsApp)")}
       </h2>
-      {loading ? (
-        <Card className="flex items-center justify-between gap-4">
-          <Skeleton className="h-4 w-40" />
-          <Skeleton className="h-6 w-11" />
-        </Card>
-      ) : (
+      <DataBoundary
+        loading={loading}
+        error={error}
+        onRetry={load}
+        skeleton={
+          <Card className="flex items-center justify-between gap-4">
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="h-6 w-11" />
+          </Card>
+        }
+      >
         <Card className="p-0">
           <ul>
             {instances.map((inst) => {
@@ -440,7 +452,7 @@ function ZproInstancesForAgent({ agentId }: { agentId: string }) {
             })}
           </ul>
         </Card>
-      )}
+      </DataBoundary>
     </section>
   );
 }

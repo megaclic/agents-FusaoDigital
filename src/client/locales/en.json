@@ -558,6 +558,7 @@
     "usageByModel": "Usage by model",
     "usageTitle": "LLM usage",
     "zpro": {
+      "error": "Could not load the FusaoChatBot CRM funnel.",
       "kpi": {
         "agentHandled": "Agent-handled",
         "agentHandledHint": "currently handled by the AI agent",
@@ -832,6 +833,8 @@
     },
     "handoffAgentChoice": "Let the AI choose",
     "handoffAgentChoiceHint": "The AI automatically sees your Chatwoot agents and teams and picks one when handing off. Optionally steer it from the instructions (e.g. send billing questions to Finance).",
+    "handoffAgentChoiceZproOnly": "Not available for a Z-PRO-only agent — targets Chatwoot's own agents/teams.",
+    "handoffAgentChoiceZproOnlyActive": "This agent is Z-PRO-only — \"Let the AI choose\" has no effect here (it always behaves like Chatwoot routing on Z-PRO). Your saved setting is kept.",
     "handoffAgents": "Agents",
     "handoffInstructions": "Transfer instructions",
     "handoffInstructionsHint": "Optional. Centralizes the transfer logic (when and to whom to escalate). Appended to the handoff tool description the AI reads.",
@@ -872,8 +875,11 @@
     "importWarningsTitle": "Imported with warnings",
     "indexKnowledge": "Index",
     "kanbanInstructions": "Funnel guidance",
+    "kanbanInstructionsChatwoot": "Funnel guidance (Chatwoot)",
     "kanbanInstructionsHint": "Optional. Explains your funnel and when to move a card between steps. The AI already sees the current step, the available steps, and the card data; this adds your rules. Appended to the kanban tool description.",
     "kanbanInstructionsPlaceholder": "e.g. Move to \"Proposal sent\" only after pricing was shared. Never skip steps.",
+    "kanbanInstructionsZpro": "Funnel guidance (Z-PRO)",
+    "kanbanInstructionsZproHint": "Optional. Same as above, but for this agent's Z-PRO CRM Pipeline funnel — a separate configuration from the Chatwoot one.",
     "knowledge": {
       "bases": "Knowledge bases",
       "createNew": "New",
@@ -1617,6 +1623,8 @@
     },
     "audioInputUnavailable": "Speech-to-text is not configured. Set a provider and API key in the Behavior tab to send voice notes.",
     "audioReplyUnavailable": "Text-to-speech is not configured. Set a provider and API key in the Behavior tab to reply with audio.",
+    "channelBadge": "Simulating: Chatwoot",
+    "channelBadgeHint": "This agent answers on both channels. The playground always simulates the Chatwoot-flavored native tools (handoff, kanban, …) — it cannot preview the Z-PRO ones here.",
     "deleteSessionMessage": "This deletes the saved session and its transcript. This cannot be undone.",
     "deleteSessionTitle": "Delete session",
     "empty": "(no reply)",

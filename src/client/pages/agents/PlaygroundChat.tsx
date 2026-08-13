@@ -27,6 +27,7 @@ import { type ReactElement, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 import {
+  Badge,
   Button,
   Input,
   Markdown,
@@ -45,6 +46,7 @@ import { useModalController } from "@/client/components/Modal";
 import { useMediaObjectUrl } from "@/client/components/useMediaObjectUrl";
 import { cn } from "@/client/lib/utils";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
+import type { ChannelBinding } from "./types";
 import type {
   PlaygroundSessionMeta,
   PlaygroundTurn,
@@ -108,6 +110,7 @@ export function PlaygroundChat({
   missingConfig,
   capabilities,
   toolsDirty,
+  channelBinding,
   showSidebar = true,
   heightClass = "h-[72dvh]",
   bare = false,
@@ -119,6 +122,10 @@ export function PlaygroundChat({
   // The playground tests prompt/model/settings LIVE (draft override), but NOT tool grants — so the
   // only "unsaved" caveat is pending tool/knowledge changes.
   toolsDirty: boolean;
+  // Optional: only supplied by the editor (not e.g. a future standalone embed). Drives the
+  // Chatwoot/Z-PRO native-tool-flavor badge below — only shown when it matters (a dual-bound agent;
+  // resolvePlaygroundChannel defaults to Chatwoot in that case, silently, without this badge).
+  channelBinding?: ChannelBinding;
   showSidebar?: boolean;
   heightClass?: string;
   // When embedded (e.g. the popup), drop the outer border/bg so the host frame owns the chrome.
@@ -177,9 +184,25 @@ export function PlaygroundChat({
 
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex flex-wrap items-center justify-between gap-2 border-border border-b px-3 py-2">
-            <p className="text-text-secondary text-xs">
-              {t("playground.hint", "Tests your live (unsaved) edits.")}
-            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-text-secondary text-xs">
+                {t("playground.hint", "Tests your live (unsaved) edits.")}
+              </p>
+              {channelBinding?.chatwoot && channelBinding.zpro && (
+                <Tooltip
+                  content={t(
+                    "playground.channelBadgeHint",
+                    "This agent answers on both channels. The playground always simulates the Chatwoot-flavored native tools (handoff, kanban, …) — it cannot preview the Z-PRO ones here.",
+                  )}
+                >
+                  <span className="inline-flex">
+                    <Badge variant="info">
+                      {t("playground.channelBadge", "Simulating: Chatwoot")}
+                    </Badge>
+                  </span>
+                </Tooltip>
+              )}
+            </div>
             <div className="flex flex-wrap items-center gap-3">
               <SwitchField
                 checked={chat.forceAudio && capabilities.audioReply}

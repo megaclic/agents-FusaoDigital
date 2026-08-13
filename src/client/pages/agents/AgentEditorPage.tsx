@@ -270,6 +270,7 @@ function readBehaviorState(a: Agent) {
   const vi = (s.vision ?? {}) as Record<string, unknown>;
   const ho = (s.handoff ?? {}) as Record<string, unknown>;
   const ka = (s.kanban ?? {}) as Record<string, unknown>;
+  const zc = (s.zproCrm ?? {}) as Record<string, unknown>;
   const tg = (s.toolGuidance ?? {}) as Record<string, unknown>;
   const li = (s.limits ?? {}) as Record<string, unknown>;
   const ac = (s.attributeContext ?? {}) as Record<string, unknown>;
@@ -279,6 +280,7 @@ function readBehaviorState(a: Agent) {
   return {
     transferWithSummary: a.transferWithSummary,
     kanbanInstructions: str(ka.instructions),
+    zproCrmInstructions: str(zc.instructions),
     customAttributeInstructions: str(tg.set_custom_attribute),
     labelInstructions: str(tg.assign_label),
     updateKanbanTaskInstructions: str(tg.update_kanban_task),
@@ -647,6 +649,9 @@ export function AgentEditorPage() {
   // Operator funnel guidance for kanban_move_card (Tools-tab config, like handoff). Synced only by
   // syncToolConfig (NOT applyAgent), so a Behavior save never wipes an unsaved edit here.
   const [kanbanInstructions, setKanbanInstructions] = useState("");
+  // Same as kanbanInstructions, but for Z-PRO's own CRM Pipeline funnel — a separate settings key
+  // (agent.settings.zproCrm.instructions) since Z-PRO's kanban_move_card never reads .kanban.*.
+  const [zproCrmInstructions, setZproCrmInstructions] = useState("");
   // Operator usage guidance for set_custom_attribute + assign_label (Tools-tab config, like kanban).
   // Persisted in agent.settings.toolGuidance; synced only by syncToolConfig.
   const [customAttributeInstructions, setCustomAttributeInstructions] =
@@ -755,6 +760,7 @@ export function AgentEditorPage() {
     setTransferWithSummary(b.transferWithSummary);
     setHandoff(b.handoff);
     setKanbanInstructions(b.kanbanInstructions);
+    setZproCrmInstructions(b.zproCrmInstructions);
     setCustomAttributeInstructions(b.customAttributeInstructions);
     setLabelInstructions(b.labelInstructions);
     setUpdateKanbanTaskInstructions(b.updateKanbanTaskInstructions);
@@ -1120,6 +1126,7 @@ export function AgentEditorPage() {
       transferWithSummary,
       handoff,
       kanbanInstructions,
+      zproCrmInstructions,
       customAttributeInstructions,
       labelInstructions,
       updateKanbanTaskInstructions,
@@ -1776,6 +1783,17 @@ export function AgentEditorPage() {
       >;
       const handoffJson = serializeHandoff(handoff);
       const kanbanJson = { instructions: kanbanInstructions.trim() || null };
+      // zproCrm is a separate settings bag (independently namespaced from kanban.* — see
+      // docs/zpro.md) that may also carry pipelineId, set outside this editor (REST/MCP only, no
+      // dedicated picker yet) — preserve it, only touching instructions.
+      const existingZproCrm = (syncedSettings.zproCrm ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const zproCrmJson = {
+        ...existingZproCrm,
+        instructions: zproCrmInstructions.trim() || null,
+      };
       // Merge the per-tool guidance map: preserve any entries for other tools, set/clear ours.
       const existingGuidance = (syncedSettings.toolGuidance ?? {}) as Record<
         string,
@@ -1807,6 +1825,7 @@ export function AgentEditorPage() {
           ...syncedSettings,
           handoff: handoffJson,
           kanban: kanbanJson,
+          zproCrm: zproCrmJson,
           toolGuidance: toolGuidanceJson,
         },
         ...(patchExpected ? { expectedUpdatedAt: patchExpected } : {}),
@@ -1827,6 +1846,7 @@ export function AgentEditorPage() {
         ...s,
         handoff: handoffJson,
         kanban: kanbanJson,
+        zproCrm: zproCrmJson,
         toolGuidance: toolGuidanceJson,
       }));
       markSynced(String(agentRes.data.agent.updatedAt));
@@ -2421,6 +2441,7 @@ export function AgentEditorPage() {
             {tab === "tools" && (
               <ToolsTab
                 agentId={id}
+                channelBinding={channelBinding}
                 catalog={catalog}
                 grants={grants}
                 onChange={setGrants}
@@ -2431,6 +2452,8 @@ export function AgentEditorPage() {
                 setHandoff={setHandoff}
                 kanbanInstructions={kanbanInstructions}
                 setKanbanInstructions={setKanbanInstructions}
+                zproCrmInstructions={zproCrmInstructions}
+                setZproCrmInstructions={setZproCrmInstructions}
                 customAttributeInstructions={customAttributeInstructions}
                 setCustomAttributeInstructions={setCustomAttributeInstructions}
                 labelInstructions={labelInstructions}
@@ -2555,6 +2578,7 @@ export function AgentEditorPage() {
                 missingConfig={playgroundMissing}
                 capabilities={playgroundCapabilities}
                 toolsDirty={toolsDirty}
+                channelBinding={channelBinding}
               />
             )}
 
@@ -2567,6 +2591,7 @@ export function AgentEditorPage() {
                 missingConfig={playgroundMissing}
                 capabilities={playgroundCapabilities}
                 toolsDirty={toolsDirty}
+                channelBinding={channelBinding}
                 open={playgroundOpen}
                 onOpenChange={setPlaygroundOpen}
               />

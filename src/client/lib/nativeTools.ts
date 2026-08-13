@@ -104,7 +104,7 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
         label: t("nativeTools.update_kanban_task.label", "Update kanban card"),
         description: t(
           "nativeTools.update_kanban_task.desc",
-          "Update a funnel card's title, description, priority or scheduled dates.",
+          "Update a funnel card's fields (title, description, and more — the exact fields depend on the channel).",
         ),
       };
     case "set_voice_preference":

@@ -9,6 +9,7 @@ import { Button, Tooltip } from "@/client/components";
 import { cn } from "@/client/lib/utils";
 import type { PlaygroundCapabilities } from "./PlaygroundChat";
 import { PlaygroundChat } from "./PlaygroundChat";
+import type { ChannelBinding } from "./types";
 import type { usePlaygroundChat } from "./usePlaygroundChat";
 
 // Floating playground: a FAB that toggles a docked, RESIZABLE + DRAGGABLE chat panel over the editor
@@ -122,6 +123,7 @@ export function PlaygroundFab({
   missingConfig,
   capabilities,
   toolsDirty,
+  channelBinding,
   open,
   onOpenChange,
 }: {
@@ -130,6 +132,7 @@ export function PlaygroundFab({
   missingConfig: string[];
   capabilities: PlaygroundCapabilities;
   toolsDirty: boolean;
+  channelBinding: ChannelBinding;
   // Controlled by AgentEditorPage; the open trigger lives in the editor's save bar (TabActionBar),
   // not a floating button. The panel still owns its own close (X) in the header.
   open: boolean;
@@ -376,6 +379,7 @@ export function PlaygroundFab({
               missingConfig={missingConfig}
               capabilities={capabilities}
               toolsDirty={toolsDirty}
+              channelBinding={channelBinding}
               showSidebar={false}
               bare
             />

@@ -449,8 +449,12 @@ export function ZproSection() {
   }
 
   async function copyWebhookUrl() {
-    await navigator.clipboard.writeText(webhookUrl);
-    showToast(t("zpro.webhookCopied", "Webhook URL copied!"), "success");
+    try {
+      await navigator.clipboard.writeText(webhookUrl);
+      showToast(t("zpro.webhookCopied", "Webhook URL copied!"), "success");
+    } catch {
+      // Clipboard may be unavailable (insecure context); the URL stays selectable.
+    }
   }
 
   // Non-optimistic: local state updates only on success, rethrows on failure so the picker's

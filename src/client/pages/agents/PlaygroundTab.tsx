@@ -1,5 +1,6 @@
 import type { PlaygroundCapabilities } from "./PlaygroundChat";
 import { PlaygroundChat } from "./PlaygroundChat";
+import type { ChannelBinding } from "./types";
 import type { usePlaygroundChat } from "./usePlaygroundChat";
 
 // Chat with the agent directly, with no Chatwoot round trip — same model + prompt + knowledge/tools
@@ -12,12 +13,14 @@ export function PlaygroundTab({
   missingConfig,
   capabilities,
   toolsDirty,
+  channelBinding,
 }: {
   chat: ReturnType<typeof usePlaygroundChat>;
   agentId: string;
   missingConfig: string[];
   capabilities: PlaygroundCapabilities;
   toolsDirty: boolean;
+  channelBinding: ChannelBinding;
 }) {
   return (
     <PlaygroundChat
@@ -26,6 +29,7 @@ export function PlaygroundTab({
       missingConfig={missingConfig}
       capabilities={capabilities}
       toolsDirty={toolsDirty}
+      channelBinding={channelBinding}
     />
   );
 }

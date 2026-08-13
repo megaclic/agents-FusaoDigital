@@ -37,7 +37,12 @@ import { cn } from "@/client/lib/utils";
 import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditModal";
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
-import type { GrantState, HandoffUiState, ToolCatalog } from "./types";
+import type {
+  ChannelBinding,
+  GrantState,
+  HandoffUiState,
+  ToolCatalog,
+} from "./types";
 
 // Service-logo adapters so a toolpack integration shows its brand mark in the SelectableCard's
 // `icon` slot (which expects a LucideIcon). Module-level → stable identity (no remount per render).
@@ -84,6 +89,9 @@ const UPDATE_KANBAN_TOOL = "update_kanban_task";
 interface Props {
   // The agent being edited — scopes the handoff target picker to the accounts it serves.
   agentId: string;
+  // Which transport(s) this agent is bound to — gates handoff's "agent_choice" (Chatwoot-only) and
+  // selects which funnel-guidance field(s) below actually reach the granted kanban_move_card tool.
+  channelBinding: ChannelBinding;
   catalog: ToolCatalog;
   grants: GrantState[];
   onChange: (grants: GrantState[]) => void;
@@ -97,9 +105,17 @@ interface Props {
   handoff: HandoffUiState;
   setHandoff: React.Dispatch<React.SetStateAction<HandoffUiState>>;
   // Operator-authored funnel guidance for the kanban_move_card tool (when/why to move a card between
-  // steps), appended to its model-facing description. Persisted in agent.settings.kanban.instructions.
+  // steps), appended to its model-facing description. Persisted in agent.settings.kanban.instructions
+  // — the CHATWOOT-side funnel (see zproCrmInstructions below for the Z-PRO-side one; the two are
+  // independently namespaced so a dual-bound agent can carry different guidance per channel).
   kanbanInstructions: string;
   setKanbanInstructions: (v: string) => void;
+  // Z-PRO's own funnel guidance for kanban_move_card (the CRM Pipeline funnel — see docs/zpro.md).
+  // A SEPARATE key (agent.settings.zproCrm.instructions) from kanbanInstructions above: Z-PRO's
+  // kanban_move_card never reads agent.settings.kanban.instructions, so that field alone is silently
+  // inert for a Z-PRO-bound agent.
+  zproCrmInstructions: string;
+  setZproCrmInstructions: (v: string) => void;
   // Operator-authored guidance for set_custom_attribute + assign_label (when to use each scope/label/
   // attribute), appended to their model-facing descriptions. Persisted in agent.settings.toolGuidance.
   customAttributeInstructions: string;
@@ -418,6 +434,7 @@ function ConfigurableToolCard({
 // the Knowledge tab; this component preserves any RAG grant untouched.
 export function ToolGrantsEditor({
   agentId,
+  channelBinding,
   catalog,
   grants,
   onChange,
@@ -428,6 +445,8 @@ export function ToolGrantsEditor({
   setHandoff,
   kanbanInstructions,
   setKanbanInstructions,
+  zproCrmInstructions,
+  setZproCrmInstructions,
   customAttributeInstructions,
   setCustomAttributeInstructions,
   labelInstructions,
@@ -445,6 +464,12 @@ export function ToolGrantsEditor({
 }: Props) {
   const { t } = useTranslation();
   const { showToast } = useToast();
+  // handoff_to_human's "agent_choice" targets Chatwoot's own agents/teams — it always behaves like
+  // "route" on Z-PRO (docs/zpro.md). kanban_move_card's Chatwoot-labeled funnel-guidance field is
+  // likewise inert for a Z-PRO-only agent (its guidance lives in a separate key — see
+  // zproCrmInstructions below). Neither matters for a dual-bound agent, which still gets full
+  // Chatwoot-side functionality.
+  const zproOnly = channelBinding.zpro && !channelBinding.chatwoot;
   // Create/edit a resource without leaving the agent editor. On save the catalog refetches; a
   // newly-created one is auto-granted to this agent (still needs the Tools-tab save to persist).
   const toolModal = useModalController<{ id?: string }>();
@@ -1225,12 +1250,27 @@ export function ToolGrantsEditor({
                   {
                     value: "agent_choice",
                     label: t("editor.handoffAgentChoice", "Let the AI choose"),
+                    disabled: zproOnly,
+                    disabledHint: zproOnly
+                      ? t(
+                          "editor.handoffAgentChoiceZproOnly",
+                          "Not available for a Z-PRO-only agent — targets Chatwoot's own agents/teams.",
+                        )
+                      : undefined,
                   },
                 ]}
               />
             </FormField>
             {handoffData && !pinnedAvailable && (
               <p className="text-text-muted text-xs">{pinnedHint}</p>
+            )}
+            {zproOnly && handoff.mode === "agent_choice" && (
+              <p className="text-warning text-xs">
+                {t(
+                  "editor.handoffAgentChoiceZproOnlyActive",
+                  'This agent is Z-PRO-only — "Let the AI choose" has no effect here (it always behaves like Chatwoot routing on Z-PRO). Your saved setting is kept.',
+                )}
+              </p>
             )}
             {handoff.mode === "pinned" && pinnedAvailable && (
               <FormField
@@ -1314,26 +1354,65 @@ export function ToolGrantsEditor({
             icon={nativeToolMeta(KANBAN_TOOL, t).icon}
             title={nativeToolMeta(KANBAN_TOOL, t).label}
             description={nativeToolMeta(KANBAN_TOOL, t).description}
-            configured={kanbanInstructions.trim() !== ""}
+            configured={
+              kanbanInstructions.trim() !== "" ||
+              zproCrmInstructions.trim() !== ""
+            }
           >
-            <FormField
-              label={t("editor.kanbanInstructions", "Funnel guidance")}
-              group
-              description={t(
-                "editor.kanbanInstructionsHint",
-                "Optional. Explains your funnel and when to move a card between steps. The AI already sees the current step, the available steps, and the card data; this adds your rules. Appended to the kanban tool description.",
-              )}
-            >
-              <Textarea
-                value={kanbanInstructions}
-                onChange={(e) => setKanbanInstructions(e.target.value)}
-                rows={3}
-                placeholder={t(
-                  "editor.kanbanInstructionsPlaceholder",
-                  'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
+            {/* Chatwoot and Z-PRO's kanban_move_card read funnel guidance from SEPARATE settings
+                keys (agent.settings.kanban.instructions vs .zproCrm.instructions — see docs/zpro.md)
+                — a dual-bound agent needs both, independently, since its funnel context differs per
+                channel. Each field only renders when this agent is actually bound to that channel. */}
+            {(channelBinding.chatwoot || !channelBinding.zpro) && (
+              <FormField
+                label={
+                  channelBinding.zpro
+                    ? t(
+                        "editor.kanbanInstructionsChatwoot",
+                        "Funnel guidance (Chatwoot)",
+                      )
+                    : t("editor.kanbanInstructions", "Funnel guidance")
+                }
+                group
+                description={t(
+                  "editor.kanbanInstructionsHint",
+                  "Optional. Explains your funnel and when to move a card between steps. The AI already sees the current step, the available steps, and the card data; this adds your rules. Appended to the kanban tool description.",
                 )}
-              />
-            </FormField>
+              >
+                <Textarea
+                  value={kanbanInstructions}
+                  onChange={(e) => setKanbanInstructions(e.target.value)}
+                  rows={3}
+                  placeholder={t(
+                    "editor.kanbanInstructionsPlaceholder",
+                    'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
+                  )}
+                />
+              </FormField>
+            )}
+            {channelBinding.zpro && (
+              <FormField
+                label={t(
+                  "editor.kanbanInstructionsZpro",
+                  "Funnel guidance (Z-PRO)",
+                )}
+                group
+                description={t(
+                  "editor.kanbanInstructionsZproHint",
+                  "Optional. Same as above, but for this agent's Z-PRO CRM Pipeline funnel — a separate configuration from the Chatwoot one.",
+                )}
+              >
+                <Textarea
+                  value={zproCrmInstructions}
+                  onChange={(e) => setZproCrmInstructions(e.target.value)}
+                  rows={3}
+                  placeholder={t(
+                    "editor.kanbanInstructionsPlaceholder",
+                    'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
+                  )}
+                />
+              </FormField>
+            )}
           </ConfigurableToolCard>
         )}
         {updateKanbanEntry && (

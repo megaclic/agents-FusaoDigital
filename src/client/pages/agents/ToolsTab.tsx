@@ -4,10 +4,16 @@ import type { DiscoveredMcpTool } from "@/client/components/mcp/DiscoveredMcpToo
 import { SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
 import { ToolGrantsEditor } from "./ToolGrantsEditor";
-import type { GrantState, HandoffUiState, ToolCatalog } from "./types";
+import type {
+  ChannelBinding,
+  GrantState,
+  HandoffUiState,
+  ToolCatalog,
+} from "./types";
 
 interface ToolsTabProps {
   agentId: string;
+  channelBinding: ChannelBinding;
   catalog: ToolCatalog;
   grants: GrantState[];
   onChange: React.Dispatch<React.SetStateAction<GrantState[]>>;
@@ -18,6 +24,8 @@ interface ToolsTabProps {
   setHandoff: React.Dispatch<React.SetStateAction<HandoffUiState>>;
   kanbanInstructions: string;
   setKanbanInstructions: (v: string) => void;
+  zproCrmInstructions: string;
+  setZproCrmInstructions: (v: string) => void;
   customAttributeInstructions: string;
   setCustomAttributeInstructions: (v: string) => void;
   labelInstructions: string;
@@ -51,6 +59,7 @@ interface ToolsTabProps {
 
 export function ToolsTab({
   agentId,
+  channelBinding,
   catalog,
   grants,
   onChange,
@@ -61,6 +70,8 @@ export function ToolsTab({
   setHandoff,
   kanbanInstructions,
   setKanbanInstructions,
+  zproCrmInstructions,
+  setZproCrmInstructions,
   customAttributeInstructions,
   setCustomAttributeInstructions,
   labelInstructions,
@@ -114,6 +125,7 @@ export function ToolsTab({
         <div className="flex min-w-0 grow flex-col gap-4">
           <ToolGrantsEditor
             agentId={agentId}
+            channelBinding={channelBinding}
             catalog={catalog}
             grants={grants}
             onChange={onChange}
@@ -124,6 +136,8 @@ export function ToolsTab({
             setHandoff={setHandoff}
             kanbanInstructions={kanbanInstructions}
             setKanbanInstructions={setKanbanInstructions}
+            zproCrmInstructions={zproCrmInstructions}
+            setZproCrmInstructions={setZproCrmInstructions}
             customAttributeInstructions={customAttributeInstructions}
             setCustomAttributeInstructions={setCustomAttributeInstructions}
             labelInstructions={labelInstructions}
