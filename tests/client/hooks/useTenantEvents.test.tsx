@@ -54,6 +54,32 @@ describe("dispatchTenantEvent", () => {
     });
   });
 
+  test("dispatches zpro-agent-activity to onZproAgentActivity", () => {
+    const onZproAgentActivity = mock();
+    dispatchTenantEvent(
+      {
+        type: "zpro-agent-activity",
+        at: Date.now(),
+        tenantId: "11",
+        conversationId: "42",
+        phase: "step",
+        stage: "tool",
+        tool: "handoff_to_human",
+        runAt: null,
+        balloons: null,
+      },
+      { onZproAgentActivity },
+    );
+    expect(onZproAgentActivity).toHaveBeenCalledWith({
+      conversationId: "42",
+      phase: "step",
+      stage: "tool",
+      tool: "handoff_to_human",
+      runAt: null,
+      balloons: null,
+    });
+  });
+
   test("still dispatches conversation events (no regression on existing branches)", () => {
     const onConversation = mock();
     dispatchTenantEvent(

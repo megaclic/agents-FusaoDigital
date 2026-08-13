@@ -8,6 +8,7 @@
 
 import { Elysia } from "elysia";
 import {
+  broadcastZproAgentActivity,
   broadcastZproAgentToggled,
   broadcastZproMessage,
 } from "@/api/features/realtime/realtime.service";
@@ -522,7 +523,7 @@ export const zproController = new Elysia({
               instance.id,
             );
             if (debounceCfg) {
-              await armDebounce({
+              const flushAt = await armDebounce({
                 tenantId: instance.tenantId,
                 threadId: zproThreadId(
                   instance.tenantId,
@@ -532,6 +533,16 @@ export const zproController = new Elysia({
                 agentBotId: null,
                 cfg: debounceCfg,
                 lastMessageId: Number(mirrored.messageDbId),
+              });
+              // Live "receiving messages…" indicator while the window coalesces — mirrors Chatwoot's
+              // webhook.ts exactly (the flush's turn then takes over with "thinking" and clears on
+              // finish). Best-effort, keyed by the ZproConversation row id.
+              broadcastZproAgentActivity(instance.tenantId, {
+                conversationId: String(mirrored.conversationId),
+                phase: "started",
+                stage: "debounce",
+                tool: null,
+                runAt: flushAt.toISOString(),
               });
               await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
                 db.zproWebhookDelivery.update({

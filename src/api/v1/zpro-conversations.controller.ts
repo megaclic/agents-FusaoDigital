@@ -10,6 +10,7 @@
 // translate('errors.zproConversationNotFound', 'Z-PRO conversation not found')
 
 import { Elysia, t } from "elysia";
+import type { Prisma } from "@/../generated/prisma/client";
 import { broadcastZproAgentToggled } from "@/api/features/realtime/realtime.service";
 import { decryptJson } from "@/api/lib/crypto";
 import { doc, errors } from "@/api/lib/openapi";
@@ -47,6 +48,25 @@ function parseCursor(cursor: string | undefined): bigint | null {
   } catch {
     return null;
   }
+}
+
+// Free-text search: case-insensitive substring on the contact name or WhatsApp number, OR (for an
+// all-digit query) an exact match on the Z-PRO ticket id — mirrors buildConversationsWhere's Chatwoot
+// equivalent (src/modules/conversations/service.ts), adapted to the mirror's own columns.
+function buildZproSearchWhere(
+  q: string | undefined,
+): Prisma.ZproConversationWhereInput {
+  const term = q?.trim();
+  if (!term) return {};
+  const or: Prisma.ZproConversationWhereInput[] = [
+    { contactName: { contains: term, mode: "insensitive" } },
+    { contactNumber: { contains: term } },
+  ];
+  if (/^\d+$/.test(term)) {
+    const n = Number(term);
+    if (Number.isSafeInteger(n)) or.push({ ticketId: n });
+  }
+  return { OR: or };
 }
 
 const CONVERSATION_SELECT = {
@@ -164,6 +184,7 @@ export const zproConversationsController = new Elysia({
             ...(query.instanceId
               ? { zproInstanceId: BigInt(query.instanceId) }
               : {}),
+            ...buildZproSearchWhere(query.q),
           },
           // lastMessageAt is the canonical recency signal (nulls sort last); id breaks ties.
           orderBy: [
@@ -197,6 +218,12 @@ export const zproConversationsController = new Elysia({
         instanceId: t.Optional(
           t.String({
             description: "Z-PRO instance id (BigInt string) to filter by.",
+          }),
+        ),
+        q: t.Optional(
+          t.String({
+            description:
+              "Free-text search on the contact name/number, or an exact ticket id for an all-digit query.",
           }),
         ),
         limit: t.Optional(
@@ -357,6 +384,56 @@ export const zproConversationsController = new Elysia({
       detail: doc(
         "List Z-PRO messages",
         "Lists mirrored messages for a Z-PRO conversation (oldest first).",
+      ),
+      response: errors(400, 401, 404),
+    },
+  )
+  // Same CSP constraint + anti-SSRF discipline as the avatar proxy above: no caller-supplied url,
+  // just the message id; the URL fetched is always the one stored server-side from the Z-PRO
+  // webhook payload. WhatsApp media URLs can expire — an upstream fetch failure 404s here too, and
+  // the frontend falls back to the existing text label rather than breaking the bubble.
+  .get(
+    "/conversations/:id/messages/:messageId/media",
+    async ({ tenantContext, params, set }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const row = await runScopedOn(basePrisma, ctx, (db) =>
+        db.zproMessage.findFirst({
+          where: {
+            id: BigInt(params.messageId),
+            conversationId: BigInt(params.id),
+          },
+          select: { mediaUrl: true },
+        }),
+      );
+      if (!row?.mediaUrl) {
+        set.status = 404;
+        return { error: "Not Found" };
+      }
+      const url = await assertSafeOutboundUrl(row.mediaUrl);
+      const res = await fetch(url);
+      if (!res.ok) {
+        set.status = 404;
+        return { error: "Not Found" };
+      }
+      return new Response(await res.arrayBuffer(), {
+        headers: {
+          "content-type":
+            res.headers.get("content-type") ?? "application/octet-stream",
+          "cache-control": "private, max-age=3600",
+        },
+      });
+    },
+    {
+      requireAuth: true,
+      params: t.Object({
+        id: t.String({ description: "Z-PRO conversation id (BigInt string)." }),
+        messageId: t.String({
+          description: "Z-PRO message id (BigInt string).",
+        }),
+      }),
+      detail: doc(
+        "Stream a Z-PRO message's media",
+        "Proxies a mirrored WhatsApp media attachment (audio/image/file) through our origin for CSP-clean rendering. 404 when the message has no media on file, or the upstream URL has expired.",
       ),
       response: errors(400, 401, 404),
     },

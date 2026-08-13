@@ -2214,6 +2214,7 @@
       "messagesLoading": "Loading messages…",
       "metaError": "Could not load the conversation.",
       "noMessages": "No messages yet.",
+      "search": "Search by contact or ticket #…",
       "status": {
         "closed": "Closed",
         "open": "Open",

@@ -182,6 +182,23 @@ export interface ZproAgentToggledEvent {
   agentActive: boolean;
 }
 
+// NOTE: Z-PRO analogue of AgentActivityEvent — the live "agent is working" indicator for a Z-PRO
+// ticket. Same TRANSIENT, metadata-only contract; the only difference is the id field, which is our
+// internal ZproConversation row id (string-serialized bigint, a DIFFERENT sequence than
+// Conversation.id — never conflate the two, same discipline as LlmUsage.zproConversationId). Fans
+// out on the per-tenant topic.
+export interface ZproAgentActivityEvent {
+  type: "zpro-agent-activity";
+  at: number;
+  tenantId: string;
+  conversationId: string;
+  phase: AgentActivityPhase;
+  stage: AgentActivityStage | null;
+  tool: string | null;
+  runAt?: string | null;
+  balloons?: number | null;
+}
+
 export type ServerEvent =
   | PresenceTick
   | ChatMessage
@@ -192,7 +209,8 @@ export type ServerEvent =
   | KnowledgeDocumentEvent
   | AgentConfigEvent
   | ZproMessageEvent
-  | ZproAgentToggledEvent;
+  | ZproAgentToggledEvent
+  | ZproAgentActivityEvent;
 
 type Publisher = (topic: string, data: string) => unknown;
 let publisher: Publisher = () => {};
@@ -338,6 +356,22 @@ export function broadcastZproAgentToggled(
 ): void {
   publish(TOPICS.tenant(tenantId), {
     type: "zpro-agent-toggled",
+    at: Date.now(),
+    tenantId: tenantId.toString(),
+    ...data,
+  });
+}
+
+// NOTE: Live "the agent is working" indicator for a Z-PRO ticket. Called from the Z-PRO runtime
+// (the LangChain callback ZproAgentStatusReporter + the started/finished envelope around the invoke,
+// src/modules/zpro/status.ts) — outside any WS handler, same background-publish pattern as
+// broadcastAgentActivity.
+export function broadcastZproAgentActivity(
+  tenantId: bigint,
+  data: Omit<ZproAgentActivityEvent, "type" | "at" | "tenantId">,
+): void {
+  publish(TOPICS.tenant(tenantId), {
+    type: "zpro-agent-activity",
     at: Date.now(),
     tenantId: tenantId.toString(),
     ...data,

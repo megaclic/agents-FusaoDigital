@@ -2220,6 +2220,7 @@
       "messagesLoading": "Carregando mensagens…",
       "metaError": "Não foi possível carregar a conversa.",
       "noMessages": "Nenhuma mensagem ainda.",
+      "search": "Buscar por contato ou # do ticket…",
       "status": {
         "closed": "Fechada",
         "open": "Aberta",

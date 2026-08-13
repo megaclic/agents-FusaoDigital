@@ -1097,12 +1097,17 @@ export async function processChatwootDelivery(
           );
           // (2) Closing message on the WhatsApp sibling (at most once, CAS-guarded). Chatwoot is
           //     already resolving the widget conversation, so resolveWidget:false.
-          if (redirectCfg.closingEnabled && redirectCfg.entryInboxId !== null) {
+          if (
+            redirectCfg.closingEnabled &&
+            (redirectCfg.entryInboxId !== null ||
+              redirectCfg.entryZproInstanceId !== null)
+          ) {
             const outcome = await deliverRedirectClosing({
               tenantId: params.tenantId,
               instanceId: params.instanceId,
               widgetConversationId: conversationId,
               entryInboxId: redirectCfg.entryInboxId,
+              entryZproInstanceId: redirectCfg.entryZproInstanceId,
               closingMessage: redirectCfg.closingMessage,
               // The widget conversation is already being resolved by this trigger — only the WhatsApp
               // sibling still needs the closing message.
@@ -1316,6 +1321,7 @@ export async function processChatwootDelivery(
               ),
               agentId: rt.agentId,
               entryInboxId: redirectCfg.entryInboxId,
+              entryZproInstanceId: redirectCfg.entryZproInstanceId,
               cfg: redirectCfg,
               base,
             });

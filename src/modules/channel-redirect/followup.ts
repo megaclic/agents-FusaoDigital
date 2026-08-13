@@ -1,4 +1,5 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
+import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { type AgentNudge, parseThreadId, runAgentNudge } from "@/graph/nudge";
@@ -13,6 +14,8 @@ import {
   proactiveSendMode,
   readServiceWindowConfig,
 } from "@/modules/service-window/service";
+import { ZproClient } from "@/modules/zpro/client";
+import { deactivateAgent } from "@/modules/zpro/handoff";
 import { interpolateLink, resolveRedirectLink } from "./gate";
 import {
   type ChannelRedirectConfig,
@@ -54,6 +57,11 @@ export interface RedirectFollowUpPayload {
   // Agent.id, serialized as a string — scheduler job payloads are plain JSON.
   agentId: string;
   entryInboxId: number | null;
+  // Z-PRO analog of entryInboxId (OUR OWN ZproInstance.id) — an agent can gate on either, both, or
+  // neither (see ChannelRedirectConfig). Carried so a config change mid-flight is still reconciled
+  // the same way entryInboxId already is (redirectFollowUpHandler re-reads the live config first;
+  // this is only the arm-time fallback when the reload can't find the agent).
+  entryZproInstanceId: number | null;
 }
 
 // Parse (and validate) a claimed job's raw payload. Pure — no I/O — so "is this payload usable" is
@@ -74,8 +82,18 @@ export function parseRedirectFollowUpPayload(
   const agentId = typeof payload.agentId === "string" ? payload.agentId : null;
   const entryInboxId =
     typeof payload.entryInboxId === "number" ? payload.entryInboxId : null;
+  const entryZproInstanceId =
+    typeof payload.entryZproInstanceId === "number"
+      ? payload.entryZproInstanceId
+      : null;
   if (!stage || !widgetThreadId || !agentId) return null;
-  return { stage, widgetThreadId, agentId, entryInboxId };
+  return {
+    stage,
+    widgetThreadId,
+    agentId,
+    entryInboxId,
+    entryZproInstanceId,
+  };
 }
 
 // Pure: the nudge content for each stage, kept separate from I/O so "what do we say" is trivially
@@ -101,6 +119,7 @@ export interface ArmRedirectChatFollowUpParams {
   widgetThreadId: string;
   agentId: bigint;
   entryInboxId: number | null;
+  entryZproInstanceId: number | null;
   cfg: {
     chatFollowupEnabled: boolean;
     chatFollowupDelayValue: number;
@@ -156,6 +175,7 @@ export async function armRedirectChatFollowUp(
       widgetThreadId: p.widgetThreadId,
       agentId: p.agentId.toString(),
       entryInboxId: p.entryInboxId,
+      entryZproInstanceId: p.entryZproInstanceId,
     },
     base: p.base,
   });
@@ -220,6 +240,67 @@ async function resolveWhatsAppSibling(
   });
 }
 
+export interface ZproFollowUpSibling {
+  zproConversationId: bigint;
+  ticketId: number;
+  contactNumber: string;
+  chatwootContactId: number;
+  instance: { baseUrl: string; apiId: string; bearerToken: string };
+}
+
+// Z-PRO analog of resolveWhatsAppSibling: reverse-map the widget conversation's Chatwoot contact back
+// to the ZproConversation that originally redirected it. Unlike the Chatwoot sibling (matched by
+// inbox), Z-PRO leads have no Chatwoot conversation of their own to search for — the bridge is
+// ZproConversation.redirectChatwootContactId, stamped by runZproRedirectGate on first redirect (see
+// its header comment). null when the widget contact was never redirected from this Z-PRO instance
+// (never redirected at all, or redirected from Chatwoot-native WhatsApp instead). Exported for direct
+// unit testing (mirrors resolveZproInstanceCandidate's precedent — a pure-DB reverse-lookup helper).
+export async function resolveZproSibling(
+  tenantId: bigint,
+  chatwootInstanceId: bigint,
+  widgetConversationId: number,
+  entryZproInstanceId: number,
+  base: PrismaClient,
+): Promise<ZproFollowUpSibling | null> {
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const widgetConv = await db.conversation.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_chatwootConversationId: {
+          tenantId,
+          chatwootInstanceId,
+          chatwootConversationId: widgetConversationId,
+        },
+      },
+      select: { contact: { select: { chatwootContactId: true } } },
+    });
+    const chatwootContactId = widgetConv?.contact?.chatwootContactId;
+    if (!chatwootContactId) return null;
+    const zconv = await db.zproConversation.findFirst({
+      where: {
+        zproInstanceId: BigInt(entryZproInstanceId),
+        redirectChatwootContactId: chatwootContactId,
+      },
+      select: {
+        id: true,
+        ticketId: true,
+        contactNumber: true,
+        zproInstance: {
+          select: { baseUrl: true, apiId: true, bearerToken: true },
+        },
+      },
+      orderBy: { id: "desc" },
+    });
+    if (!zconv) return null;
+    return {
+      zproConversationId: zconv.id,
+      ticketId: zconv.ticketId,
+      contactNumber: zconv.contactNumber,
+      chatwootContactId,
+      instance: zconv.zproInstance,
+    };
+  });
+}
+
 export type WhatsAppFollowUpOutcome = "sent" | "no-sibling" | "misconfigured";
 
 export interface SendWhatsAppFollowUpParams {
@@ -228,9 +309,13 @@ export interface SendWhatsAppFollowUpParams {
   agentId: bigint;
   // The widget conversation whose contact's WhatsApp sibling we re-engage.
   widgetConversationId: number;
-  entryInboxId: number;
+  // Both null-able and independent — an agent can gate on either, both, or neither (see
+  // ChannelRedirectConfig). The Chatwoot sibling is tried first; the Z-PRO sibling is the fallback,
+  // matching whichever channel THIS lead actually entered through.
+  entryInboxId: number | null;
+  entryZproInstanceId: number | null;
   cfg: ChannelRedirectConfig;
-  // agent.settings — for the service-window config (the 24h-window gate).
+  // agent.settings — for the service-window config (the 24h-window gate, Chatwoot sibling only).
   settings: unknown;
   base: PrismaClient;
   now: Date;
@@ -245,49 +330,89 @@ export async function sendWhatsAppFollowUp(
   p: SendWhatsAppFollowUpParams,
 ): Promise<WhatsAppFollowUpOutcome> {
   if (p.cfg.widgetInboxId === null) return "misconfigured";
-  const sibling = await resolveWhatsAppSibling(
-    p.tenantId,
-    p.instanceId,
-    p.widgetConversationId,
-    p.entryInboxId,
-    p.base,
-  );
-  if (!sibling) return "no-sibling";
 
-  const url = await resolveRedirectLink({
-    tenantId: p.tenantId,
-    instanceId: p.instanceId,
-    chatwootContactId: sibling.chatwootContactId,
-    widgetInboxId: p.cfg.widgetInboxId,
-    openWidget: p.cfg.openWidget,
-    ttlSeconds: REDIRECT_LINK_TTL_SECONDS,
-    base: p.base,
-  });
-  if (url === null) return "misconfigured";
-  const text = interpolateLink(p.cfg.waFollowupMessage, url);
+  const sibling =
+    p.entryInboxId !== null
+      ? await resolveWhatsAppSibling(
+          p.tenantId,
+          p.instanceId,
+          p.widgetConversationId,
+          p.entryInboxId,
+          p.base,
+        )
+      : null;
+  if (sibling) {
+    const url = await resolveRedirectLink({
+      tenantId: p.tenantId,
+      instanceId: p.instanceId,
+      chatwootContactId: sibling.chatwootContactId,
+      widgetInboxId: p.cfg.widgetInboxId,
+      openWidget: p.cfg.openWidget,
+      ttlSeconds: REDIRECT_LINK_TTL_SECONDS,
+      base: p.base,
+    });
+    if (url === null) return "misconfigured";
+    const text = interpolateLink(p.cfg.waFollowupMessage, url);
 
-  const bot = await loadAgentBot(p.tenantId, p.instanceId, p.agentId, p.base);
-  const client = await loadChatwootClient(p.tenantId, p.instanceId, {
-    base: p.base,
-    botToken: bot?.accessToken,
-  });
-  const sw = readServiceWindowConfig(p.settings);
-  const mode = proactiveSendMode(sw, sibling.lastInboundAt, p.now, {
-    channelType: sibling.channelType,
-    provider: sibling.provider,
-  });
-  if (mode === "template") {
-    const payload = buildTemplatePayload(sw, null);
-    if (payload) {
-      await client.sendTemplate(sibling.chatwootConversationId, payload);
+    const bot = await loadAgentBot(p.tenantId, p.instanceId, p.agentId, p.base);
+    const client = await loadChatwootClient(p.tenantId, p.instanceId, {
+      base: p.base,
+      botToken: bot?.accessToken,
+    });
+    const sw = readServiceWindowConfig(p.settings);
+    const mode = proactiveSendMode(sw, sibling.lastInboundAt, p.now, {
+      channelType: sibling.channelType,
+      provider: sibling.provider,
+    });
+    if (mode === "template") {
+      const payload = buildTemplatePayload(sw, null);
+      if (payload) {
+        await client.sendTemplate(sibling.chatwootConversationId, payload);
+        return "sent";
+      }
+      // No template configured → fall through to a private note (never a rejected free-form send).
+    }
+    await client.sendMessage(sibling.chatwootConversationId, text, {
+      private: mode === "note",
+    });
+    return "sent";
+  }
+
+  if (p.entryZproInstanceId !== null) {
+    const zSibling = await resolveZproSibling(
+      p.tenantId,
+      p.instanceId,
+      p.widgetConversationId,
+      p.entryZproInstanceId,
+      p.base,
+    );
+    if (zSibling) {
+      const url = await resolveRedirectLink({
+        tenantId: p.tenantId,
+        instanceId: p.instanceId,
+        chatwootContactId: zSibling.chatwootContactId,
+        widgetInboxId: p.cfg.widgetInboxId,
+        openWidget: p.cfg.openWidget,
+        ttlSeconds: REDIRECT_LINK_TTL_SECONDS,
+        base: p.base,
+      });
+      if (url === null) return "misconfigured";
+      const text = interpolateLink(p.cfg.waFollowupMessage, url);
+      // Z-PRO has no 24h-window/HSM distinction of its own (docs/service-window.md documents this as
+      // an accepted gap) — send free-form, same as a no-window Chatwoot channel (baileys).
+      const zc = new ZproClient(
+        zSibling.instance.baseUrl,
+        zSibling.instance.apiId,
+        decryptJson<string>(zSibling.instance.bearerToken),
+      );
+      await zc.sendText(zSibling.contactNumber, text, {
+        validateNumber: false,
+      });
       return "sent";
     }
-    // No template configured → fall through to a private note (never a rejected free-form send).
   }
-  await client.sendMessage(sibling.chatwootConversationId, text, {
-    private: mode === "note",
-  });
-  return "sent";
+
+  return "no-sibling";
 }
 
 export async function redirectFollowUpHandler(
@@ -319,6 +444,8 @@ export async function redirectFollowUpHandler(
   const cfg = readChannelRedirectConfig(agent.settings);
   if (!cfg.enabled) return { outcome: "done" };
   const entryInboxId = cfg.entryInboxId ?? payload.entryInboxId;
+  const entryZproInstanceId =
+    cfg.entryZproInstanceId ?? payload.entryZproInstanceId;
 
   // Reschedule this same job to the next stage after its configured delay. The payload is authoritative
   // on re-enqueue, so this advances the ladder on the SAME row (mirrors the two-stage original).
@@ -334,6 +461,7 @@ export async function redirectFollowUpHandler(
       widgetThreadId: payload.widgetThreadId,
       agentId: payload.agentId,
       entryInboxId,
+      entryZproInstanceId,
     },
   });
 
@@ -365,13 +493,17 @@ export async function redirectFollowUpHandler(
   }
 
   if (payload.stage === "whatsapp") {
-    if (cfg.waFollowupEnabled && entryInboxId !== null) {
+    if (
+      cfg.waFollowupEnabled &&
+      (entryInboxId !== null || entryZproInstanceId !== null)
+    ) {
       const outcome = await sendWhatsAppFollowUp({
         tenantId,
         instanceId: parsed.instanceId,
         agentId,
         widgetConversationId: parsed.conversationId,
         entryInboxId,
+        entryZproInstanceId,
         cfg,
         settings: agent.settings,
         base,
@@ -396,12 +528,16 @@ export async function redirectFollowUpHandler(
   }
 
   // stage === "closing" — the ladder's terminal give-up: post the closing on BOTH channels + resolve, once.
-  if (cfg.closingEnabled && entryInboxId !== null) {
+  if (
+    cfg.closingEnabled &&
+    (entryInboxId !== null || entryZproInstanceId !== null)
+  ) {
     await deliverRedirectClosing({
       tenantId,
       instanceId: parsed.instanceId,
       widgetConversationId: parsed.conversationId,
       entryInboxId,
+      entryZproInstanceId,
       closingMessage: cfg.closingMessage,
       closeChat: true,
       base,
@@ -444,8 +580,11 @@ export interface DeliverRedirectClosingParams {
   // The WIDGET conversation's chatwootConversationId. The closing watermark lives on this row; the agent
   // (bot token), the service-window config + the chat channel are all derived from it.
   widgetConversationId: number;
-  // The agent's configured entry (official WhatsApp) inbox — used to find the sibling to close.
-  entryInboxId: number;
+  // The agent's configured entry channel(s) — used to find the sibling to close. Both null-able and
+  // independent, same as sendWhatsAppFollowUp's params: the Chatwoot sibling is tried first, the
+  // Z-PRO sibling is the fallback.
+  entryInboxId: number | null;
+  entryZproInstanceId: number | null;
   // The fixed goodbye, posted verbatim on BOTH channels (not AI: the WhatsApp closing nudge silences).
   closingMessage: string;
   // Post + resolve the CHAT (widget) conversation too. true from the timed ladder's closing stage (the
@@ -535,13 +674,16 @@ export async function deliverRedirectClosing(
   }
 
   // WhatsApp channel: the sibling conversation (same contact, the entry inbox). Post the goodbye + resolve.
-  const sibling = await resolveWhatsAppSibling(
-    p.tenantId,
-    p.instanceId,
-    p.widgetConversationId,
-    p.entryInboxId,
-    base,
-  );
+  const sibling =
+    p.entryInboxId !== null
+      ? await resolveWhatsAppSibling(
+          p.tenantId,
+          p.instanceId,
+          p.widgetConversationId,
+          p.entryInboxId,
+          base,
+        )
+      : null;
   if (sibling) {
     const waMode = proactiveSendMode(sw, sibling.lastInboundAt, now, {
       channelType: sibling.channelType,
@@ -553,6 +695,38 @@ export async function deliverRedirectClosing(
       p.closingMessage,
       waMode,
     );
+  } else if (p.entryZproInstanceId !== null) {
+    // Z-PRO fallback: the "sibling" IS the Z-PRO ticket itself (no separate Chatwoot conversation to
+    // resolve) — post the closing text via ZproClient and close the ticket directly, mirroring
+    // runLoadedZproTurn's applyDeferredZproResolve. Best-effort: a delivery failure here must not
+    // undo the watermark claim above (the closing is still "delivered" — the chat side, if any,
+    // already went out).
+    const zSibling = await resolveZproSibling(
+      p.tenantId,
+      p.instanceId,
+      p.widgetConversationId,
+      p.entryZproInstanceId,
+      base,
+    );
+    if (zSibling) {
+      try {
+        const zc = new ZproClient(
+          zSibling.instance.baseUrl,
+          zSibling.instance.apiId,
+          decryptJson<string>(zSibling.instance.bearerToken),
+        );
+        await zc.sendText(zSibling.contactNumber, p.closingMessage, {
+          validateNumber: false,
+        });
+        await deactivateAgent(zc, zSibling.ticketId, { closeTicket: true });
+      } catch (err) {
+        logger.warn(
+          { err },
+          "channel-redirect: zpro closing delivery failed (ticket=%s)",
+          String(zSibling.ticketId),
+        );
+      }
+    }
   }
   return "delivered";
 }

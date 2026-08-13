@@ -75,6 +75,17 @@ export type TenantRealtimeEvent =
       conversationId: string;
       ticketId: number;
       agentActive: boolean;
+    }
+  | {
+      type: "zpro-agent-activity";
+      at: number;
+      tenantId: string;
+      conversationId: string;
+      phase: AgentActivityPhase;
+      stage: AgentActivityStage | null;
+      tool: string | null;
+      runAt?: string | null;
+      balloons?: number | null;
     };
 
 export interface ConversationRealtimeEvent {
@@ -119,6 +130,15 @@ export interface ZproAgentToggledRealtimeEvent {
   agentActive: boolean;
 }
 
+export interface ZproAgentActivityRealtimeEvent {
+  conversationId: string;
+  phase: AgentActivityPhase;
+  stage: AgentActivityStage | null;
+  tool: string | null;
+  runAt?: string | null;
+  balloons?: number | null;
+}
+
 export interface UseTenantEventsOptions {
   enabled?: boolean;
   // Fired for every `conversation` event on the active tenant's channel.
@@ -137,6 +157,8 @@ export interface UseTenantEventsOptions {
   // Fired when a Z-PRO ticket's agent gate (n8nStatus) changes, automatically (human intervened)
   // or manually (toggle button in the Z-PRO inbox).
   onZproAgentToggled?: (event: ZproAgentToggledRealtimeEvent) => void;
+  // Fired for every `zpro-agent-activity` event — the Z-PRO analogue of onAgentActivity.
+  onZproAgentActivity?: (event: ZproAgentActivityRealtimeEvent) => void;
 }
 
 // Pure dispatcher, exported for direct unit testing without standing up the WebSocket/auth
@@ -189,6 +211,15 @@ export function dispatchTenantEvent(
       conversationId: msg.conversationId,
       ticketId: msg.ticketId,
       agentActive: msg.agentActive,
+    });
+  } else if (msg.type === "zpro-agent-activity") {
+    handlers.onZproAgentActivity?.({
+      conversationId: msg.conversationId,
+      phase: msg.phase,
+      stage: msg.stage,
+      tool: msg.tool,
+      runAt: msg.runAt ?? null,
+      balloons: msg.balloons ?? null,
     });
   }
 }

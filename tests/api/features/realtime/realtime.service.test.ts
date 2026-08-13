@@ -5,6 +5,7 @@ import {
   broadcastAgentActivity,
   broadcastChatMessage,
   broadcastConversationEvent,
+  broadcastZproAgentActivity,
   type ChatMessage,
   currentUserCount,
   detachEvents,
@@ -445,6 +446,43 @@ describe("realtime.service", () => {
         TOPICS.tenant(BigInt(3)),
         TOPICS.tenant(BigInt(3)),
       ]);
+    });
+
+    test("broadcastZproAgentActivity publishes a transient metadata-only event to the tenant topic, keyed by ZproConversation id", () => {
+      broadcastZproAgentActivity(BigInt(7), {
+        conversationId: "42",
+        phase: "step",
+        stage: "tool",
+        tool: "kanban_move_card",
+      });
+
+      expect(recorder.calls).toHaveLength(1);
+      const [call] = recorder.calls;
+      expect(call?.topic).toBe("tenant:7");
+      const decoded = JSON.parse(call?.data ?? "{}");
+      expect(decoded).toEqual({
+        type: "zpro-agent-activity",
+        at: expect.any(Number),
+        tenantId: "7",
+        conversationId: "42",
+        phase: "step",
+        stage: "tool",
+        tool: "kanban_move_card",
+      });
+    });
+
+    test("broadcastZproAgentActivity carries runAt for the debounce stage (live countdown)", () => {
+      broadcastZproAgentActivity(BigInt(7), {
+        conversationId: "42",
+        phase: "started",
+        stage: "debounce",
+        tool: null,
+        runAt: "2026-06-02T10:05:00.000Z",
+      });
+
+      const decoded = JSON.parse(recorder.calls[0]?.data ?? "{}");
+      expect(decoded.stage).toBe("debounce");
+      expect(decoded.runAt).toBe("2026-06-02T10:05:00.000Z");
     });
 
     test("events-channel cap is independent from the presence cap", () => {

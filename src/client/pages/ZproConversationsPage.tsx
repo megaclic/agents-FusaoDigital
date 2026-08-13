@@ -3,7 +3,7 @@
 // (src/modules/zpro/mirror.ts). Atualiza em tempo real via useTenantEvents (mesmo canal por
 // tenant da página Chatwoot, eventos zpro-message/zpro-agent-toggled).
 
-import { Bot, ChevronRight, MessagesSquare, User } from "lucide-react";
+import { Bot, ChevronRight, MessagesSquare, Search, User } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -160,13 +160,24 @@ export function ZproConversationsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [filter, setFilter] = useState<FilterKey>("");
+  const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const refetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Debounce the search box so each keystroke doesn't fire a request.
+  useEffect(() => {
+    const id = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(id);
+  }, [search]);
+
   const fetchConversations = useCallback(async () => {
     const { data, error: err } = await api.api.v1.zpro.conversations.get({
-      query: filterToQuery(filter),
+      query: {
+        ...filterToQuery(filter),
+        ...(debouncedSearch ? { q: debouncedSearch } : {}),
+      },
     });
     if (err || !data) {
       setError(true);
@@ -175,14 +186,18 @@ export function ZproConversationsPage() {
     setError(false);
     setConversations(data.conversations);
     setNextCursor(data.nextCursor);
-  }, [filter]);
+  }, [filter, debouncedSearch]);
 
   const loadMore = useCallback(async () => {
     if (!nextCursor) return;
     setLoadingMore(true);
     try {
       const { data, error: err } = await api.api.v1.zpro.conversations.get({
-        query: { ...filterToQuery(filter), cursor: nextCursor },
+        query: {
+          ...filterToQuery(filter),
+          ...(debouncedSearch ? { q: debouncedSearch } : {}),
+          cursor: nextCursor,
+        },
       });
       if (err || !data) return;
       setConversations((prev) => {
@@ -193,7 +208,7 @@ export function ZproConversationsPage() {
     } finally {
       setLoadingMore(false);
     }
-  }, [nextCursor, filter]);
+  }, [nextCursor, filter, debouncedSearch]);
 
   useEffect(() => {
     let active = true;
@@ -249,6 +264,27 @@ export function ZproConversationsPage() {
           </div>
         </div>
       </header>
+
+      <div className="relative min-w-0">
+        <Search
+          className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-text-muted"
+          aria-hidden="true"
+        />
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder={t(
+            "zpro.conversations.search",
+            "Search by contact or ticket #…",
+          )}
+          aria-label={t(
+            "zpro.conversations.search",
+            "Search by contact or ticket #…",
+          )}
+          className="w-full rounded-lg border border-border bg-bg-tertiary py-2 pr-4 pl-9 text-text-primary placeholder-text-placeholder focus:border-border-focus focus:outline-none"
+        />
+      </div>
 
       <FilterPills
         value={filter}

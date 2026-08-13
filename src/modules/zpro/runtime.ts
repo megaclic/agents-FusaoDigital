@@ -82,6 +82,7 @@ import { deactivateAgent } from "./handoff";
 import { sendTextReply, sendTyping } from "./messages";
 import type { TurnState } from "./native-tools";
 import { deliverZproReply } from "./split";
+import { ZproAgentStatusReporter } from "./status";
 import { loadZproAgentTools } from "./tools";
 import { buildSetVoicePreferenceTool, sendZproVoiceReply } from "./tts";
 import type { NormalizedZproEvent } from "./types";
@@ -495,138 +496,158 @@ export async function runLoadedZproTurn(
     base,
   });
 
-  const result = await withFlowStage(
-    flow,
-    "generate",
-    { provider: loaded.mc.provider, model: loaded.mc.model },
-    () =>
-      graph.invoke(
-        { messages: [new HumanMessage(text)] },
-        { configurable: { thread_id: threadId }, callbacks: [usageCapture] },
-      ),
-  );
-
-  let reply = lastAssistantText(result.messages).trim();
-
-  // Re-check AFTER the invoke: did a human take over WHILE the LLM call ran? Mirrors
-  // src/graph/runtime.ts's "taken-over" recheck (Chatwoot's assigneeType), keyed here on
-  // ZproConversation.agentActive — the same flag the auto-handoff-on-human-intervention gate in
-  // zpro.controller.ts flips. Same read also refreshes voiceReply (set_voice_preference may have
-  // written it DURING the invoke) so "prefiro texto" takes effect in THIS same turn.
-  let voiceReplyNow = currentVoiceReply;
-  if (conversationId != null) {
-    const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
-      db.zproConversation.findUnique({
-        where: { id: conversationId },
-        select: { agentActive: true, voiceReply: true },
-      }),
+  // The live "agent is working" indicator on the per-tenant realtime channel — Z-PRO analogue of
+  // src/graph/runtime.ts's AgentStatusReporter wiring. `started` here (conversationId is only known
+  // once tools have loaded, unlike Chatwoot where it's known upfront) through a GUARANTEED
+  // `finished` in the finally below (every exit — posted, empty, taken-over, superseded, or thrown
+  // — clears it).
+  const status = new ZproAgentStatusReporter({
+    tenantId,
+    zproConversationId: conversationId,
+  });
+  status.started();
+  let deliveredBalloons: number | null = null;
+  try {
+    const result = await withFlowStage(
+      flow,
+      "generate",
+      { provider: loaded.mc.provider, model: loaded.mc.model },
+      () =>
+        graph.invoke(
+          { messages: [new HumanMessage(text)] },
+          {
+            configurable: { thread_id: threadId },
+            callbacks: [usageCapture, status],
+          },
+        ),
     );
-    if (conv && !conv.agentActive) {
-      emitFlowEvent(flow, {
-        stage: "handoff",
-        status: "ok",
-        detail: { outcome: "taken_over" },
-      });
-      return "taken-over";
-    }
-    voiceReplyNow = conv?.voiceReply ?? voiceReplyNow;
-  }
 
-  // Last-moment supersede gate (debounce): a newer message arrived mid-turn → drop this reply
-  // (the re-armed flush answers the full burst).
-  if (params.shouldPost && !(await params.shouldPost())) return "superseded";
+    let reply = lastAssistantText(result.messages).trim();
 
-  // Empty reply: nothing to post, but a deferred resolve intent still applies (resolve with no
-  // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
-  // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
-  if (!reply) {
-    await applyDeferredZproResolve(client, ticketId, turnState, flow);
-    return "empty";
-  }
-
-  // OUTPUT guardrail: screen the model's reply BEFORE delivery. A violation either replaces the
-  // reply (template / a guardrails-generated safe reply) or suppresses the send entirely.
-  const outGuard = await runGuardrail("output", reply);
-  if (outGuard) {
-    if (outGuard.reply === null) return "blocked";
-    reply = outGuard.reply;
-  }
-
-  // Reply modality: audio (TTS) per the agent's mode + the customer's modality/preference, else
-  // text. TTS is best-effort — any synthesis failure falls back to a text reply.
-  const wantAudio = shouldReplyWithAudio(
-    loaded.ttsConfig.mode,
-    params.userSentAudio,
-    voiceReplyNow,
-  );
-  if (wantAudio) {
-    try {
-      // Opt-in LLM speech normalization: a temp-0 model from the agent's own model config (no
-      // extra credential). Best-effort — synthesizeReply falls back to raw text if it throws.
-      let normalizeSpeech: ((t: string) => Promise<string>) | undefined;
-      if (loaded.ttsConfig.normalize) {
-        const normModel = createChatModel({
-          ...loaded.mc,
-          apiKey: loaded.apiKey,
-          baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
-          temperature: 0,
-        });
-        normalizeSpeech = (t) => llmNormalizeForSpeech(normModel, t);
-      }
-      const tts = await synthesizeReply({
-        tenantId,
-        cfg: loaded.ttsConfig,
-        text: reply,
-        // Z-PRO is WhatsApp-only (no Instagram-style channel split), so leave channelType unset —
-        // pickTtsFormat's default already resolves to Ogg/Opus (the WhatsApp voice-note format).
-        channelType: null,
-        base,
-        deps: { normalizeSpeech },
-        flow,
-      });
-      if (tts) {
-        markAgentSending(zproInstanceId, ticketId);
-        await sendZproVoiceReply(client, ev, tts);
-        logger.info(
-          "zpro agent replied (audio): thread=%s ticket=%s len=%d",
-          threadId,
-          ev.threadId,
-          reply.length,
-        );
-        await applyDeferredZproResolve(client, ticketId, turnState, flow);
-        return "posted";
-      }
-    } catch (e) {
-      logger.warn(
-        "zpro tts failed (thread=%s), falling back to text: %s",
-        threadId,
-        e instanceof Error ? e.message : String(e),
+    // Re-check AFTER the invoke: did a human take over WHILE the LLM call ran? Mirrors
+    // src/graph/runtime.ts's "taken-over" recheck (Chatwoot's assigneeType), keyed here on
+    // ZproConversation.agentActive — the same flag the auto-handoff-on-human-intervention gate in
+    // zpro.controller.ts flips. Same read also refreshes voiceReply (set_voice_preference may have
+    // written it DURING the invoke) so "prefiro texto" takes effect in THIS same turn.
+    let voiceReplyNow = currentVoiceReply;
+    if (conversationId != null) {
+      const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.zproConversation.findUnique({
+          where: { id: conversationId },
+          select: { agentActive: true, voiceReply: true },
+        }),
       );
+      if (conv && !conv.agentActive) {
+        emitFlowEvent(flow, {
+          stage: "handoff",
+          status: "ok",
+          detail: { outcome: "taken_over" },
+        });
+        return "taken-over";
+      }
+      voiceReplyNow = conv?.voiceReply ?? voiceReplyNow;
     }
-  }
 
-  // Marca ANTES de enviar: um eco fromMe deste ticket, chegando pelo webhook nos próximos
-  // segundos, deve ser classificado AGENT por mirror.ts em vez de seguir o heurístico
-  // ticket.userId (ver agent-echo.ts). Split + typing pacing por balão (docs/split.md) —
-  // deliverZproReply reaproveita os helpers puros do registry compartilhado.
-  markAgentSending(zproInstanceId, ticketId);
-  const balloons = await deliverZproReply(
-    client,
-    ev,
-    reply,
-    loaded.splitConfig,
-    undefined,
-    flow,
-  );
-  logger.info(
-    "zpro agent replied: thread=%s ticket=%s len=%d balloons=%d",
-    threadId,
-    ev.threadId,
-    reply.length,
-    balloons,
-  );
-  await applyDeferredZproResolve(client, ticketId, turnState, flow);
-  return "posted";
+    // Last-moment supersede gate (debounce): a newer message arrived mid-turn → drop this reply
+    // (the re-armed flush answers the full burst).
+    if (params.shouldPost && !(await params.shouldPost())) return "superseded";
+
+    // Empty reply: nothing to post, but a deferred resolve intent still applies (resolve with no
+    // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
+    // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
+    if (!reply) {
+      await applyDeferredZproResolve(client, ticketId, turnState, flow);
+      return "empty";
+    }
+
+    // OUTPUT guardrail: screen the model's reply BEFORE delivery. A violation either replaces the
+    // reply (template / a guardrails-generated safe reply) or suppresses the send entirely.
+    const outGuard = await runGuardrail("output", reply);
+    if (outGuard) {
+      if (outGuard.reply === null) return "blocked";
+      reply = outGuard.reply;
+    }
+
+    // Reply modality: audio (TTS) per the agent's mode + the customer's modality/preference, else
+    // text. TTS is best-effort — any synthesis failure falls back to a text reply.
+    const wantAudio = shouldReplyWithAudio(
+      loaded.ttsConfig.mode,
+      params.userSentAudio,
+      voiceReplyNow,
+    );
+    if (wantAudio) {
+      try {
+        // Opt-in LLM speech normalization: a temp-0 model from the agent's own model config (no
+        // extra credential). Best-effort — synthesizeReply falls back to raw text if it throws.
+        let normalizeSpeech: ((t: string) => Promise<string>) | undefined;
+        if (loaded.ttsConfig.normalize) {
+          const normModel = createChatModel({
+            ...loaded.mc,
+            apiKey: loaded.apiKey,
+            baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
+            temperature: 0,
+          });
+          normalizeSpeech = (t) => llmNormalizeForSpeech(normModel, t);
+        }
+        const tts = await synthesizeReply({
+          tenantId,
+          cfg: loaded.ttsConfig,
+          text: reply,
+          // Z-PRO is WhatsApp-only (no Instagram-style channel split), so leave channelType unset —
+          // pickTtsFormat's default already resolves to Ogg/Opus (the WhatsApp voice-note format).
+          channelType: null,
+          base,
+          deps: { normalizeSpeech },
+          flow,
+        });
+        if (tts) {
+          markAgentSending(zproInstanceId, ticketId);
+          await sendZproVoiceReply(client, ev, tts);
+          logger.info(
+            "zpro agent replied (audio): thread=%s ticket=%s len=%d",
+            threadId,
+            ev.threadId,
+            reply.length,
+          );
+          deliveredBalloons = 1;
+          await applyDeferredZproResolve(client, ticketId, turnState, flow);
+          return "posted";
+        }
+      } catch (e) {
+        logger.warn(
+          "zpro tts failed (thread=%s), falling back to text: %s",
+          threadId,
+          e instanceof Error ? e.message : String(e),
+        );
+      }
+    }
+
+    // Marca ANTES de enviar: um eco fromMe deste ticket, chegando pelo webhook nos próximos
+    // segundos, deve ser classificado AGENT por mirror.ts em vez de seguir o heurístico
+    // ticket.userId (ver agent-echo.ts). Split + typing pacing por balão (docs/split.md) —
+    // deliverZproReply reaproveita os helpers puros do registry compartilhado.
+    markAgentSending(zproInstanceId, ticketId);
+    const balloons = await deliverZproReply(
+      client,
+      ev,
+      reply,
+      loaded.splitConfig,
+      undefined,
+      flow,
+    );
+    logger.info(
+      "zpro agent replied: thread=%s ticket=%s len=%d balloons=%d",
+      threadId,
+      ev.threadId,
+      reply.length,
+      balloons,
+    );
+    deliveredBalloons = balloons;
+    await applyDeferredZproResolve(client, ticketId, turnState, flow);
+    return "posted";
+  } finally {
+    status.finished(deliveredBalloons);
+  }
 }
 
 export async function runZproAgentTurn(
