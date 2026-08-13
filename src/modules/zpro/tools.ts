@@ -273,7 +273,19 @@ export async function loadZproAgentTools(
 
     const needsTags = !allow || allow.includes("assign_label");
     const knownTags = needsTags
-      ? await loadZproTags(client, cacheKey).catch(() => [])
+      ? await loadZproTags(client, cacheKey).catch((e) => {
+          logger.warn(
+            "zpro assign_label: tag list failed (ticket=%s): %s",
+            String(ticketId),
+            e instanceof Error ? e.message : String(e),
+          );
+          onSideEffectError?.({
+            tool: "assign_label",
+            phase: "list_tags",
+            err: e,
+          });
+          return [];
+        })
       : undefined;
 
     const needsKanban =
@@ -301,9 +313,15 @@ export async function loadZproAgentTools(
           currentStageId: conversation.opportunityStageId,
           currentStageName: conversation.opportunityStageName,
         };
-      } catch {
+      } catch (e) {
+        // resolveZproPipelineId's own contract (crm.ts) is "keep the configured id even if a listing
+        // call fails — a transient error must not silently disable an explicitly-configured pipeline."
+        // That guarantee only covers a SUCCESSFUL list missing the id; listPipelines/listStages
+        // THROWING lands here instead, so preserve params.pipelineId ourselves (not null) to actually
+        // honor it — an empty `stages` array still degrades gracefully (kanban_move_card reports
+        // "unknown stage, available: (none)" rather than "no pipeline configured").
         kanban = {
-          pipelineId: null,
+          pipelineId: params.pipelineId ?? null,
           pipelineName: null,
           stages: [],
           opportunityId: conversation.opportunityId,
@@ -311,6 +329,17 @@ export async function loadZproAgentTools(
           currentStageId: conversation.opportunityStageId,
           currentStageName: conversation.opportunityStageName,
         };
+        logger.warn(
+          "zpro kanban pipeline/stage resolution failed (ticket=%s): %s",
+          String(ticketId),
+          e instanceof Error ? e.message : String(e),
+        );
+        onSideEffectError?.({
+          tool: "kanban_move_card",
+          phase: "pipeline_resolve",
+          detail: { configuredPipelineId: params.pipelineId ?? null },
+          err: e,
+        });
       }
     }
 

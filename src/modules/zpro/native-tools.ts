@@ -246,17 +246,22 @@ function setCustomAttributeTool(ctx: ZproToolCtx) {
     async ({ key, value }: { key: string; value: string }) => {
       const k = key.trim();
       if (!k) return "No attribute key provided.";
-      let current: Array<{ name: string; value: string }> = [];
+      let current: Array<{ name: string; value: string }>;
       try {
         current = parseExtraInfo(
           await ctx.client.getContactExtraInfo(ctx.contactId),
         );
       } catch (e) {
+        // Fail CLOSED: this write always resends the FULL attribute array (no partial-update API on
+        // Z-PRO's side), so proceeding with current=[] on a read failure would silently erase every
+        // other attribute already stored for this contact. Abort before ever calling
+        // updateContactExtraInfo rather than risk that destructive overwrite.
         logger.warn(
           "zpro set_custom_attribute: read failed (contact=%s): %s",
           String(ctx.contactId),
           e instanceof Error ? e.message : String(e),
         );
+        return "Could not set the attribute: failed to read the contact's existing attributes first, so writing now would have erased them. Try again.";
       }
       const next = [...current.filter((f) => f.name !== k), { name: k, value }];
       await ctx.client.updateContactExtraInfo(ctx.contactId, next);

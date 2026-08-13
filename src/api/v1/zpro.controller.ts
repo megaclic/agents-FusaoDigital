@@ -28,7 +28,11 @@ import { sysCtx } from "@/modules/zpro/ctx";
 import { resolveZproDebounceConfig } from "@/modules/zpro/debounce";
 import { deactivateAgent } from "@/modules/zpro/handoff";
 import { mirrorZproContact, mirrorZproMessage } from "@/modules/zpro/mirror";
-import { extractMedia, extractWhatsappId } from "@/modules/zpro/parse";
+import {
+  extractMedia,
+  extractWhatsappId,
+  resolveZproInstanceCandidate,
+} from "@/modules/zpro/parse";
 import { runZproAgentTurn, zproThreadId } from "@/modules/zpro/runtime";
 import { resolveZproSttConfig, transcribeZproAudio } from "@/modules/zpro/stt";
 import type {
@@ -60,9 +64,14 @@ export const zproController = new Elysia({
       return { ack: true, outcome: "skipped:no-whatsapp-id" };
     }
 
-    // Tenant unknown at this point — resolve the instance as super-admin (audited, bypasses RLS).
-    const instance = await asSuperAdminOn(basePrisma, (db) =>
-      db.zproInstance.findFirst({
+    // Tenant unknown at this point — resolve the instance(s) as super-admin (audited, bypasses RLS).
+    // whatsappId is unique only PER TENANT (@@unique([tenantId, whatsappId]), see schema comment) —
+    // two independent Z-PRO installs across different tenants CAN report the same whatsappId, so a
+    // bare findFirst would silently and permanently mirror one tenant's conversations into another's.
+    // Disambiguate via msg.apikey (present on the real captured payload, types.ts) against the
+    // instance's own apiId (the URL segment) when more than one candidate matches.
+    const candidates = await asSuperAdminOn(basePrisma, (db) =>
+      db.zproInstance.findMany({
         where: { whatsappId, disconnectedAt: null },
         select: {
           id: true,
@@ -75,9 +84,21 @@ export const zproController = new Elysia({
       }),
     );
 
-    if (!instance) {
+    if (candidates.length === 0) {
       logger.debug({ whatsappId }, "zpro:webhook: no instance found");
       return { ack: true, outcome: "skipped:no-instance" };
+    }
+
+    const instance = resolveZproInstanceCandidate(
+      candidates,
+      payload.msg?.apikey,
+    );
+    if (!instance) {
+      logger.error(
+        { whatsappId, tenantIds: candidates.map((c) => c.tenantId.toString()) },
+        "zpro:webhook: whatsappId collision across tenants — cannot disambiguate via apikey, dropping delivery",
+      );
+      return { ack: true, outcome: "skipped:ambiguous-instance" };
     }
 
     // Fallback de identidade de canal para normalizeZproWebhook quando o payload não traz
@@ -396,6 +417,16 @@ export const zproController = new Elysia({
                 );
                 return;
               }
+            } else {
+              // Unlike every other redirect-gate exit above, this fallthrough (no local
+              // ZproConversation row yet, or the configured widgetInboxId doesn't match any locally
+              // mirrored Inbox — stale config, wrong chatwootInstanceId, inbox deleted) previously left
+              // zero trace that redirect was supposed to fire and silently didn't.
+              logger.info(
+                "zpro:dispatch redirect-gate skipped reason=%s delivery=%s",
+                !conv ? "no-conversation" : "widget-inbox-not-found",
+                String(delivery.id),
+              );
             }
           }
         }

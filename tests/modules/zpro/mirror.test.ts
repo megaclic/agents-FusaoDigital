@@ -223,4 +223,41 @@ describe.skipIf(!dbUp)("mirrorZproMessage sender-type classification", () => {
     });
     expect(rows.length).toBe(1);
   });
+
+  test("a later message with a DIFFERENT ticket.contact.id refreshes ZproConversation.contactId (contact merge)", async () => {
+    const ticket = baseTicket(9004, null);
+    const first = await mirrorZproMessage(
+      payloadFor(ticket, outboundMsg("MSG-CONTACT-1", "primeira")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(first).not.toBeNull();
+    const before = await suDb.zproConversation.findUnique({
+      where: { id: first?.conversationId as bigint },
+      select: { contactId: true },
+    });
+    expect(before?.contactId).toBe(999);
+
+    // Same ticket, but the Z-PRO panel merged this contact into a different one — a later message
+    // carries the NEW contact.id. The `update` block used to omit contactId entirely, so this went
+    // silently stale forever.
+    const mergedTicket = {
+      ...ticket,
+      contact: { ...ticket.contact, id: 4242 },
+    };
+    const second = await mirrorZproMessage(
+      payloadFor(mergedTicket, outboundMsg("MSG-CONTACT-2", "segunda")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(second?.conversationId).toBe(first?.conversationId as bigint);
+
+    const after = await suDb.zproConversation.findUnique({
+      where: { id: first?.conversationId as bigint },
+      select: { contactId: true },
+    });
+    expect(after?.contactId).toBe(4242);
+  });
 });

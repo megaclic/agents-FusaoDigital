@@ -82,7 +82,8 @@ function toWhatsappId(v: unknown): number | null {
 
 export function extractWhatsappId(payload: ZproWebhookPayload): number | null {
   return (
-    toWhatsappId(payload.whatsapp?.id) ?? toWhatsappId(payload.ticket?.whatsappId)
+    toWhatsappId(payload.whatsapp?.id) ??
+    toWhatsappId(payload.ticket?.whatsappId)
   );
 }
 
@@ -95,4 +96,20 @@ export function extractInstanceName(payload: ZproWebhookPayload): string {
     payload.msg?.data?.instanceId ??
     "unknown"
   );
+}
+
+// whatsappId é único só POR TENANT (@@unique([tenantId, whatsappId]) no schema — duas instalações
+// Z-PRO independentes em tenants diferentes podem reportar o mesmo id). Desambigua candidatos via
+// msg.apikey (presente no payload real capturado, types.ts) contra o apiId de cada instância (o
+// segmento da URL). null significa "não adivinhar" — rotear pro tenant errado vazaria silenciosamente
+// a conversa de um cliente pro tenant errado, então o chamador deve descartar a entrega nesse caso.
+export function resolveZproInstanceCandidate<T extends { apiId: string }>(
+  candidates: T[],
+  apikey: string | undefined,
+): T | null {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0] ?? null;
+  if (!apikey) return null;
+  const matches = candidates.filter((c) => c.apiId === apikey);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
 }

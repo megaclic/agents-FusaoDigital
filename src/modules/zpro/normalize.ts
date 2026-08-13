@@ -90,7 +90,7 @@ export function normalizeZproWebhook(
     apiId,
     contactId: contact.id,
     contactNumber: contact.number,
-    contactName: contact.name ?? contact.pushname ?? contact.number,
+    contactName: contact.name || contact.pushname || contact.number,
     extraInfo: contact.extraInfo ?? [],
     messageType,
     body,

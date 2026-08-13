@@ -232,6 +232,25 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     await tools[0]?.invoke({ key: "orcamento", value: "9000" });
   });
 
+  test("set_custom_attribute: fails CLOSED on a read failure — never overwrites with a partial array", async () => {
+    let writeCalled = false;
+    const client = {
+      getContactExtraInfo: async () => {
+        throw new Error("transient 500");
+      },
+      updateContactExtraInfo: async () => {
+        writeCalled = true;
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(baseCtx({ client }), [
+      "set_custom_attribute",
+    ]);
+    const out = await tools[0]?.invoke({ key: "orcamento", value: "9000" });
+    expect(writeCalled).toBe(false);
+    expect(String(out).toLowerCase()).toContain("failed to read");
+  });
+
   test("assign_label: reuses a known tag id (no createTag call)", async () => {
     const calls: Array<[string, unknown]> = [];
     const client = {

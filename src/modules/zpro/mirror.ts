@@ -89,7 +89,7 @@ export async function mirrorZproMessage(
           status: ticket.status,
           contactId: ticket.contact.id,
           contactNumber: ticket.contact.number,
-          contactName: ticket.contact.name ?? ticket.contact.number,
+          contactName: ticket.contact.name || ticket.contact.number,
           agentActive: ticket.n8nStatus,
           humanUserId: ticket.userId,
           lastMessageAt,
@@ -97,8 +97,13 @@ export async function mirrorZproMessage(
         },
         update: {
           status: ticket.status,
+          // contactId is refreshed here too (not just on create) — a contact merge/dedup in the
+          // Z-PRO panel changes ticket.contact.id going forward, and without this the mirrored id
+          // would go stale forever (set_custom_attribute/assign_label contact-scope writes, and
+          // mirrorZproContact's updateMany match, would all silently keep targeting the old id).
+          contactId: ticket.contact.id,
           contactNumber: ticket.contact.number,
-          contactName: ticket.contact.name ?? ticket.contact.number,
+          contactName: ticket.contact.name || ticket.contact.number,
           agentActive: ticket.n8nStatus,
           humanUserId: ticket.userId,
           lastMessageAt,

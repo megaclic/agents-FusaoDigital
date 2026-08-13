@@ -516,4 +516,64 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
     expect(moveTool?.description).toContain("Vendas");
     expect(pipelinesCalled).toBe(1);
   });
+
+  test("NATIVE: kanban pipeline resolution failure preserves the CONFIGURED pipelineId instead of nulling it", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native kanban agent (pipeline throws)",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["kanban_move_card"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2004,
+        status: "open",
+        contactId: 45,
+        contactNumber: "5511900000045",
+        contactName: "Cliente Kanban Falho",
+        agentActive: true,
+      },
+    });
+    // client.listPipelines THROWS (not just "returns a list missing the id") — the case
+    // resolveZproPipelineId's own doc comment (crm.ts) promises is safe, but only tools.ts's outer
+    // catch actually controls what happens to params.pipelineId when the call itself fails.
+    const client = {
+      listPipelines: async () => {
+        throw new Error("network blip");
+      },
+    } as unknown as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2004,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2004`,
+      client,
+      pipelineId: 16, // explicitly configured — must survive the throw, not become null
+    });
+    const moveTool = result.tools.find((t) => t.name === "kanban_move_card");
+    expect(moveTool?.description).not.toContain(
+      "no CRM pipeline is configured",
+    );
+    const out = await moveTool?.invoke({ targetStep: "Fechado" });
+    // Configured-but-unresolved degrades to "unknown stage" (an empty stage list), NOT the
+    // "no CRM pipeline is configured" message a nulled pipelineId would have produced.
+    expect(String(out)).toContain("Unknown stage");
+    expect(String(out)).not.toContain("no CRM pipeline is configured");
+  });
 });

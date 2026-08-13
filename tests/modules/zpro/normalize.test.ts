@@ -101,6 +101,30 @@ describe("normalizeZproWebhook", () => {
     expect(result?.hasHumanAssigned).toBe(false);
   });
 
+  test("contactName falls back to pushname/number on an EMPTY string name, not just null/undefined", () => {
+    // WhatsApp commonly reports name: "" for a contact that never set a display name — `??` would
+    // NOT fall through here (only null/undefined do), silently blanking {{nome_contato}}.
+    const emptyName: ZproWebhookPayload = {
+      ...BASE_FIXTURE,
+      ticket: {
+        ...BASE_TICKET,
+        contact: { ...BASE_TICKET.contact, name: "", pushname: "Sam" },
+      },
+    };
+    expect(normalizeZproWebhook(emptyName, API_ID)?.contactName).toBe("Sam");
+
+    const emptyNameNoPushname: ZproWebhookPayload = {
+      ...BASE_FIXTURE,
+      ticket: {
+        ...BASE_TICKET,
+        contact: { ...BASE_TICKET.contact, name: "", pushname: undefined },
+      },
+    };
+    expect(normalizeZproWebhook(emptyNameNoPushname, API_ID)?.contactName).toBe(
+      "5511963529979",
+    );
+  });
+
   test("ignora mensagem fromMe (enviada pelo atendente)", () => {
     const p: ZproWebhookPayload = {
       ...BASE_FIXTURE,
