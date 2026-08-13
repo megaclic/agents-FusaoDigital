@@ -4,6 +4,7 @@ import {
   CalendarClock,
   Gauge,
   Image,
+  Info,
   Layers,
   ListChecks,
   Megaphone,
@@ -165,8 +166,9 @@ interface FollowUpState {
 
 interface BehaviorTabProps {
   agentId: string;
-  // Which transport(s) this agent is bound to — gates the WhatsApp 24h window and Follow-up
-  // sections below, neither of which has a Z-PRO backend yet (see docs/zpro.md).
+  // Which transport(s) this agent is bound to — the WhatsApp 24h window section below reads it to
+  // surface a Z-PRO-specific hint (the gate only applies to instances flagged WABA official; see
+  // docs/service-window.md).
   channelBinding: ChannelBinding;
   hours: Hours[];
   businessHoursId: string;
@@ -762,12 +764,6 @@ export function BehaviorTab({
   onOpenPlayground,
 }: BehaviorTabProps) {
   const { t, i18n } = useTranslation();
-
-  // No Z-PRO backend yet for the WhatsApp 24h window (HSM templates) or the generic inactivity
-  // follow-up sweep (docs/zpro.md's "Known, accepted gaps") — both only ever run for a Chatwoot-
-  // bound conversation. A dual-bound agent still gets full functionality on its Chatwoot side, so
-  // only a Z-PRO-ONLY agent needs the controls disabled.
-  const zproOnly = channelBinding.zpro && !channelBinding.chatwoot;
 
   const sttBaseUrlInvalid =
     stt.provider === "openai-compatible" &&
@@ -1621,16 +1617,16 @@ export function BehaviorTab({
                   )}
                 </p>
               </div>
-              {zproOnly && (
+              {channelBinding.zpro && (
                 <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
-                  <AlertTriangle
-                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning"
+                  <Info
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent"
                     aria-hidden="true"
                   />
                   <span>
                     {t(
-                      "editor.svcWindowZproOnly",
-                      "Not available yet for a Z-PRO-only agent — every proactive message sends free-form regardless of this setting. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
+                      "editor.svcWindowZproHint",
+                      "For Z-PRO tickets, this only takes effect on instances explicitly marked as official WhatsApp Business API (WABA) in Channels → FusaoChatBot CRM. Other Z-PRO instances (Baileys, UazAPI, etc.) always send free-form.",
                     )}
                   </span>
                 </div>
@@ -1640,13 +1636,12 @@ export function BehaviorTab({
                 onCheckedChange={(v) =>
                   setServiceWindow({ ...serviceWindow, enabled: v })
                 }
-                disabled={zproOnly}
                 label={t(
                   "editor.svcWindowEnabled",
                   "Enforce the 24h window for proactive messages",
                 )}
               />
-              {serviceWindow.enabled && !zproOnly && (
+              {serviceWindow.enabled && (
                 <>
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField

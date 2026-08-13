@@ -101,16 +101,19 @@ export function channelHasServiceWindow(channel: InboxChannel): boolean {
 
 export type ProactiveSendMode = "freeform" | "template" | "note";
 
-// What a proactive sender may do right now. Free-form when: the channel has no 24h window (baileys/zapi
-// and non-WhatsApp channels), the operator disabled the gate, or we are inside the window. Outside the
-// window on an official WhatsApp channel → template if configured, else a private note.
+// What a proactive sender may do right now. Free-form when: the channel has no 24h window, the
+// operator disabled the gate, or we are inside the window. Outside the window on a channel WITH a
+// window → template if configured, else a private note. `hasWindow` is a plain boolean so this stays
+// channel-agnostic: the Chatwoot caller computes it via channelHasServiceWindow(channel) (official
+// WhatsApp providers only); the Z-PRO caller passes ZproInstance.isOfficialWaba directly (Z-PRO has
+// no channelType/provider concept of its own — see docs/service-window.md).
 export function proactiveSendMode(
   cfg: ServiceWindowConfig,
   lastInboundAt: Date | null,
   now: Date,
-  channel: InboxChannel,
+  hasWindow: boolean,
 ): ProactiveSendMode {
-  if (!cfg.enabled || !channelHasServiceWindow(channel)) return "freeform";
+  if (!cfg.enabled || !hasWindow) return "freeform";
   if (isWithinServiceWindow(lastInboundAt, now, cfg.windowHours)) {
     return "freeform";
   }

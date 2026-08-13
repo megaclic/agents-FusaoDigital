@@ -968,7 +968,7 @@
     "svcWindowTemplate": "Nome do template (HSM)",
     "svcWindowTemplateHint": "Template aprovado enviado fora da janela. Se vazio, envia uma nota interna em vez do template.",
     "svcWindowTemplatePick": "Escolha um template aprovado…",
-    "svcWindowZproOnly": "Ainda não disponível para um agente só-Z-PRO — toda mensagem proativa sai em formato livre independente desta configuração. Sua configuração salva é mantida, mas não tem efeito até este agente também atender pelo Chatwoot.",
+    "svcWindowZproHint": "Para tickets Z-PRO, isso só tem efeito em instâncias marcadas explicitamente como WhatsApp Business API oficial (WABA) em Canais → FusaoChatBot CRM. Outras instâncias Z-PRO (Baileys, UazAPI etc.) sempre enviam em formato livre.",
     "systemPrompt": "Instruções do agente",
     "tab": {
       "behavior": "Comportamento",
@@ -2246,6 +2246,8 @@
     "instanceName": "Nome da instância",
     "instanceUpdated": "Instância atualizada.",
     "instanceUpdateError": "Não foi possível atualizar a instância.",
+    "isOfficialWaba": "WhatsApp Business API oficial (WABA)",
+    "isOfficialWabaHint": "Ative só se esta instância se conecta pela WhatsApp Business API oficial. Ela passa a ficar sujeita à janela de 24h e a templates aprovados (HSM); uma conexão não-oficial (Baileys, UazAPI etc.) sempre envia em formato livre e deve deixar isso desligado.",
     "noAgent": "Sem agente",
     "noInstances": "Nenhuma instância FusaoChatBot CRM",
     "noInstancesDesc": "Adicione uma instância FusaoChatBot CRM e vincule um agente para começar a atender no WhatsApp.",

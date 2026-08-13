@@ -44,6 +44,7 @@ import {
   type ModelConfig,
   parseModelConfig,
 } from "@/graph/models";
+import { OUTSIDE_WINDOW_NOTE_PREFIX } from "@/graph/nudge";
 import { readMaxDistance } from "@/graph/prepare";
 import {
   buildPromptVars,
@@ -64,6 +65,12 @@ import {
   type GuardrailsConfig,
   readGuardrailsConfig,
 } from "@/modules/guardrails/settings";
+import {
+  buildTemplatePayload,
+  proactiveSendMode,
+  readServiceWindowConfig,
+  type ServiceWindowConfig,
+} from "@/modules/service-window/service";
 import { readSplitConfig, type SplitConfig } from "@/modules/split/service";
 import { llmNormalizeForSpeech } from "@/modules/tts/normalize";
 import { synthesizeReply } from "@/modules/tts/service";
@@ -79,7 +86,7 @@ import { readZproCrmConfig, type ZproCrmConfig } from "./crm";
 import { sysCtx } from "./ctx";
 import { makeZproGuardrailRunner } from "./guardrails";
 import { deactivateAgent } from "./handoff";
-import { sendTextReply, sendTyping } from "./messages";
+import { sendTextReply, sendTyping, sendZproTemplate } from "./messages";
 import type { TurnState } from "./native-tools";
 import { deliverZproReply } from "./split";
 import { ZproAgentStatusReporter } from "./status";
@@ -126,7 +133,12 @@ export interface LoadedZproAgent {
   mc: ModelConfig;
   apiKey: string;
   credentialBaseUrl: string | null;
-  instance: { baseUrl: string; apiId: string; bearerToken: string };
+  instance: {
+    baseUrl: string;
+    apiId: string;
+    bearerToken: string;
+    isOfficialWaba: boolean;
+  };
   companyName: string | null;
   ttsConfig: TtsConfig;
   splitConfig: SplitConfig;
@@ -134,6 +146,10 @@ export interface LoadedZproAgent {
   guardrails: GuardrailsConfig;
   guardrailsApiKey: string;
   guardrailsCredentialBaseUrl: string | null;
+  // WhatsApp 24h window/HSM gate for PROACTIVE sends only (nudges — see runZproAgentNudge). Never
+  // applied to the reactive turn tail below (always in-window by construction). See
+  // docs/service-window.md.
+  serviceWindowConfig: ServiceWindowConfig;
   // Native-tool config: whether handoff_to_human posts a summary note (Agent.transferWithSummary
   // column, shared with Chatwoot), operator guidance per tool (agent.settings.toolGuidance, same
   // generic reader Chatwoot uses), and the CRM pipeline kanban_move_card/update_kanban_task operate
@@ -162,7 +178,12 @@ export async function loadZproAgent(
 
     const instance = await db.zproInstance.findUnique({
       where: { id: zproInstanceId },
-      select: { baseUrl: true, apiId: true, bearerToken: true },
+      select: {
+        baseUrl: true,
+        apiId: true,
+        bearerToken: true,
+        isOfficialWaba: true,
+      },
     });
     if (!instance) return null;
 
@@ -242,6 +263,7 @@ export async function loadZproAgent(
       transferWithSummary: agent.transferWithSummary,
       toolGuidance: readToolGuidance(agent.settings),
       crmConfig: readZproCrmConfig(agent.settings),
+      serviceWindowConfig: readServiceWindowConfig(agent.settings),
     };
   });
 }
@@ -263,10 +285,21 @@ export interface RunLoadedZproTurnParams {
   // that posts. false ⇒ drop this reply ("superseded"; the re-armed flush answers the full burst).
   // Absent ⇒ always post (the direct webhook path, no concurrent burst to compete with).
   shouldPost?: () => Promise<boolean>;
+  // Set ONLY by a PROACTIVE caller (runZproAgentNudge) — never by the reactive webhook/debounce
+  // paths, which are always in-window by construction. When present, the main text reply is gated
+  // by proactiveSendMode(loaded.serviceWindowConfig, lastInboundAt, now, loaded.instance.
+  // isOfficialWaba) instead of always going out free-form: outside the window on a WABA-official
+  // instance it sends an approved template (or, with none configured, an explained private note)
+  // and SKIPS TTS entirely (a template/note is text-only). See docs/service-window.md.
+  proactive?: { lastInboundAt: Date | null };
 }
 
 export type RunLoadedZproTurnOutcome =
   | "posted"
+  // The two PROACTIVE-only outcomes below — never returned on the reactive/debounce paths (no
+  // `proactive` param there, so `mode` is always "freeform").
+  | "posted-template"
+  | "posted-note-window"
   | "empty"
   | "blocked"
   | "superseded"
@@ -568,6 +601,49 @@ export async function runLoadedZproTurn(
       reply = outGuard.reply;
     }
 
+    // PROACTIVE-only WhatsApp 24h window gate (runZproAgentNudge sets `proactive`; the reactive
+    // webhook/debounce paths never do, so `mode` is always "freeform" there). Outside the window on
+    // a WABA-official instance: an approved template if configured, else an explained private note —
+    // text-only, so this branch SKIPS the TTS/text delivery below entirely on either sub-outcome.
+    if (params.proactive) {
+      const mode = proactiveSendMode(
+        loaded.serviceWindowConfig,
+        params.proactive.lastInboundAt,
+        new Date(),
+        loaded.instance.isOfficialWaba,
+      );
+      if (mode === "template") {
+        const payload = buildTemplatePayload(loaded.serviceWindowConfig, null);
+        if (payload) {
+          markAgentSending(zproInstanceId, ticketId);
+          await sendZproTemplate(client, ev.contactNumber, payload);
+          logger.info(
+            "zpro agent replied (template, outside 24h window): thread=%s ticket=%s template=%s",
+            threadId,
+            ev.threadId,
+            payload.name,
+          );
+          await applyDeferredZproResolve(client, ticketId, turnState, flow);
+          return "posted-template";
+        }
+        // No template configured → fall through to the explained note below (never a free-form
+        // send WhatsApp/the WABA provider would reject).
+      }
+      if (mode !== "freeform") {
+        await client.createNote(
+          ticketId,
+          `${OUTSIDE_WINDOW_NOTE_PREFIX}${reply}`,
+        );
+        logger.info(
+          "zpro agent noted (outside 24h window, no template): thread=%s ticket=%s",
+          threadId,
+          ev.threadId,
+        );
+        await applyDeferredZproResolve(client, ticketId, turnState, flow);
+        return "posted-note-window";
+      }
+    }
+
     // Reply modality: audio (TTS) per the agent's mode + the customer's modality/preference, else
     // text. TTS is best-effort — any synthesis failure falls back to a text reply.
     const wantAudio = shouldReplyWithAudio(
@@ -735,7 +811,13 @@ export async function runZproAgentTurn(
       // Unreachable in practice (no shouldPost is passed on this path), kept for exhaustiveness.
       return "empty";
     }
-    return outcome === "posted" ? "replied" : outcome;
+    // "posted-template"/"posted-note-window" are unreachable on this path (no `proactive` param is
+    // ever passed here — only runZproAgentNudge sets it), but map them defensively for exhaustiveness.
+    return outcome === "posted" ||
+      outcome === "posted-template" ||
+      outcome === "posted-note-window"
+      ? "replied"
+      : outcome;
   } catch (err) {
     logger.error(
       {

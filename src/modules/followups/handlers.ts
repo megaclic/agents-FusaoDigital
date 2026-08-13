@@ -778,7 +778,10 @@ async function zproFollowUpStep(
           }
         }
       }
-      if (isLast && step.resolve === true) {
+      // The outside-window fallback note reached only the operator, not the customer — resolving
+      // here would close the ticket on an unanswered episode (mirrors runAgentNudge's
+      // allowResolve:false on the SAME outcome). Labels still apply either way.
+      if (isLast && step.resolve === true && nudgeOutcome !== "noted-window") {
         try {
           await deactivateAgent(zc, ticketId, { closeTicket: true });
         } catch (err) {
@@ -796,6 +799,10 @@ async function zproFollowUpStep(
       data: { lastFollowUpAt: new Date() },
     }),
   );
+
+  // The outside-window fallback note ENDS the sequence: with no usable template, every further step
+  // would be equally undeliverable (mirrors runAgentNudge's own noted-window handling exactly).
+  if (nudgeOutcome === "noted-window") return { outcome: "done" };
 
   // Advance to the next step on the SAME job row, or end.
   const nextIndex = stepIndex + 1;

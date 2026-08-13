@@ -2,7 +2,12 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
-import { type AgentNudge, parseThreadId, runAgentNudge } from "@/graph/nudge";
+import {
+  type AgentNudge,
+  OUTSIDE_WINDOW_NOTE_PREFIX,
+  parseThreadId,
+  runAgentNudge,
+} from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { loadAgentBot, loadChatwootClient } from "@/modules/chatwoot/instance";
@@ -10,12 +15,14 @@ import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import {
   buildTemplatePayload,
+  channelHasServiceWindow,
   type ProactiveSendMode,
   proactiveSendMode,
   readServiceWindowConfig,
 } from "@/modules/service-window/service";
 import { ZproClient } from "@/modules/zpro/client";
 import { deactivateAgent } from "@/modules/zpro/handoff";
+import { sendZproTemplate } from "@/modules/zpro/messages";
 import { interpolateLink, resolveRedirectLink } from "./gate";
 import {
   type ChannelRedirectConfig,
@@ -245,7 +252,13 @@ export interface ZproFollowUpSibling {
   ticketId: number;
   contactNumber: string;
   chatwootContactId: number;
-  instance: { baseUrl: string; apiId: string; bearerToken: string };
+  lastInboundAt: Date | null;
+  instance: {
+    baseUrl: string;
+    apiId: string;
+    bearerToken: string;
+    isOfficialWaba: boolean;
+  };
 }
 
 // Z-PRO analog of resolveWhatsAppSibling: reverse-map the widget conversation's Chatwoot contact back
@@ -284,8 +297,14 @@ export async function resolveZproSibling(
         id: true,
         ticketId: true,
         contactNumber: true,
+        lastInboundAt: true,
         zproInstance: {
-          select: { baseUrl: true, apiId: true, bearerToken: true },
+          select: {
+            baseUrl: true,
+            apiId: true,
+            bearerToken: true,
+            isOfficialWaba: true,
+          },
         },
       },
       orderBy: { id: "desc" },
@@ -296,6 +315,7 @@ export async function resolveZproSibling(
       ticketId: zconv.ticketId,
       contactNumber: zconv.contactNumber,
       chatwootContactId,
+      lastInboundAt: zconv.lastInboundAt,
       instance: zconv.zproInstance,
     };
   });
@@ -360,10 +380,15 @@ export async function sendWhatsAppFollowUp(
       botToken: bot?.accessToken,
     });
     const sw = readServiceWindowConfig(p.settings);
-    const mode = proactiveSendMode(sw, sibling.lastInboundAt, p.now, {
-      channelType: sibling.channelType,
-      provider: sibling.provider,
-    });
+    const mode = proactiveSendMode(
+      sw,
+      sibling.lastInboundAt,
+      p.now,
+      channelHasServiceWindow({
+        channelType: sibling.channelType,
+        provider: sibling.provider,
+      }),
+    );
     if (mode === "template") {
       const payload = buildTemplatePayload(sw, null);
       if (payload) {
@@ -398,13 +423,35 @@ export async function sendWhatsAppFollowUp(
       });
       if (url === null) return "misconfigured";
       const text = interpolateLink(p.cfg.waFollowupMessage, url);
-      // Z-PRO has no 24h-window/HSM distinction of its own (docs/service-window.md documents this as
-      // an accepted gap) — send free-form, same as a no-window Chatwoot channel (baileys).
       const zc = new ZproClient(
         zSibling.instance.baseUrl,
         zSibling.instance.apiId,
         decryptJson<string>(zSibling.instance.bearerToken),
       );
+      // Gated the same way as the Chatwoot sibling above: freeform unless the instance is flagged
+      // WABA official AND we're outside the window (see docs/service-window.md).
+      const sw = readServiceWindowConfig(p.settings);
+      const mode = proactiveSendMode(
+        sw,
+        zSibling.lastInboundAt,
+        p.now,
+        zSibling.instance.isOfficialWaba,
+      );
+      if (mode === "template") {
+        const payload = buildTemplatePayload(sw, null);
+        if (payload) {
+          await sendZproTemplate(zc, zSibling.contactNumber, payload);
+          return "sent";
+        }
+        // No template configured → fall through to a note (never a rejected free-form send).
+      }
+      if (mode === "note") {
+        await zc.createNote(
+          zSibling.ticketId,
+          `${OUTSIDE_WINDOW_NOTE_PREFIX}${text}`,
+        );
+        return "sent";
+      }
       await zc.sendText(zSibling.contactNumber, text, {
         validateNumber: false,
       });
@@ -661,10 +708,15 @@ export async function deliverRedirectClosing(
   // Chat (website widget): post the goodbye + resolve. Skipped on the resolve-path, where the chat is
   // already being resolved by the trigger. A web widget has no 24h window → proactiveSendMode → freeform.
   if (p.closeChat) {
-    const chatMode = proactiveSendMode(sw, cx.widget.lastInboundAt, now, {
-      channelType: cx.widget.inbox?.channelType ?? null,
-      provider: cx.widget.inbox?.provider ?? null,
-    });
+    const chatMode = proactiveSendMode(
+      sw,
+      cx.widget.lastInboundAt,
+      now,
+      channelHasServiceWindow({
+        channelType: cx.widget.inbox?.channelType ?? null,
+        provider: cx.widget.inbox?.provider ?? null,
+      }),
+    );
     await deliverClosing(
       client,
       p.widgetConversationId,
@@ -685,10 +737,15 @@ export async function deliverRedirectClosing(
         )
       : null;
   if (sibling) {
-    const waMode = proactiveSendMode(sw, sibling.lastInboundAt, now, {
-      channelType: sibling.channelType,
-      provider: sibling.provider,
-    });
+    const waMode = proactiveSendMode(
+      sw,
+      sibling.lastInboundAt,
+      now,
+      channelHasServiceWindow({
+        channelType: sibling.channelType,
+        provider: sibling.provider,
+      }),
+    );
     await deliverClosing(
       client,
       sibling.chatwootConversationId,
@@ -700,7 +757,9 @@ export async function deliverRedirectClosing(
     // resolve) — post the closing text via ZproClient and close the ticket directly, mirroring
     // runLoadedZproTurn's applyDeferredZproResolve. Best-effort: a delivery failure here must not
     // undo the watermark claim above (the closing is still "delivered" — the chat side, if any,
-    // already went out).
+    // already went out). The message itself is gated the same way as the WhatsApp sibling above
+    // (freeform unless the instance is flagged WABA official AND outside the window); the resolve
+    // always fires regardless, mirroring deliverClosing's own contract.
     const zSibling = await resolveZproSibling(
       p.tenantId,
       p.instanceId,
@@ -715,9 +774,32 @@ export async function deliverRedirectClosing(
           zSibling.instance.apiId,
           decryptJson<string>(zSibling.instance.bearerToken),
         );
-        await zc.sendText(zSibling.contactNumber, p.closingMessage, {
-          validateNumber: false,
-        });
+        const zMode = proactiveSendMode(
+          sw,
+          zSibling.lastInboundAt,
+          now,
+          zSibling.instance.isOfficialWaba,
+        );
+        if (zMode === "template") {
+          const payload = buildTemplatePayload(sw, null);
+          if (payload) {
+            await sendZproTemplate(zc, zSibling.contactNumber, payload);
+          } else {
+            await zc.createNote(
+              zSibling.ticketId,
+              `${OUTSIDE_WINDOW_NOTE_PREFIX}${p.closingMessage}`,
+            );
+          }
+        } else if (zMode === "note") {
+          await zc.createNote(
+            zSibling.ticketId,
+            `${OUTSIDE_WINDOW_NOTE_PREFIX}${p.closingMessage}`,
+          );
+        } else {
+          await zc.sendText(zSibling.contactNumber, p.closingMessage, {
+            validateNumber: false,
+          });
+        }
         await deactivateAgent(zc, zSibling.ticketId, { closeTicket: true });
       } catch (err) {
         logger.warn(

@@ -398,8 +398,10 @@ describe.skipIf(!dbUp)("resolveZproSibling", () => {
         bearerToken: encryptJson("test-token"),
         whatsappId: 501,
         instanceName: "ZproSiblingInstance1",
+        isOfficialWaba: true,
       },
     });
+    const lastInboundAt = new Date(Date.now() - 5 * 60_000);
     await suDb.zproConversation.create({
       data: {
         tenantId,
@@ -409,6 +411,7 @@ describe.skipIf(!dbUp)("resolveZproSibling", () => {
         contactNumber: "5511999990000",
         contactName: "Lead Um",
         redirectChatwootContactId: 5001,
+        lastInboundAt,
       },
     });
 
@@ -424,6 +427,9 @@ describe.skipIf(!dbUp)("resolveZproSibling", () => {
     expect(sibling?.contactNumber).toBe("5511999990000");
     expect(sibling?.chatwootContactId).toBe(5001);
     expect(sibling?.instance.apiId).toBe("TEST_API_ID");
+    // Parte B (Fase 6): the 24h-window gate reads these two fields off the sibling directly.
+    expect(sibling?.instance.isOfficialWaba).toBe(true);
+    expect(sibling?.lastInboundAt?.getTime()).toBe(lastInboundAt.getTime());
 
     await cleanup(tenantId);
   });

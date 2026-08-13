@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildTemplatePayload,
+  channelHasServiceWindow,
   isWithinServiceWindow,
   proactiveSendMode,
   readServiceWindowConfig,
@@ -42,11 +43,14 @@ describe("isWithinServiceWindow", () => {
 describe("proactiveSendMode", () => {
   const base = { ...SERVICE_WINDOW_DEFAULTS };
   // Official WhatsApp providers (have a 24h window): Cloud API + 360dialog (provider "default").
-  const cloud = {
+  const cloud = channelHasServiceWindow({
     channelType: "Channel::Whatsapp",
     provider: "whatsapp_cloud",
-  };
-  const dialog360 = { channelType: "Channel::Whatsapp", provider: "default" };
+  });
+  const dialog360 = channelHasServiceWindow({
+    channelType: "Channel::Whatsapp",
+    provider: "default",
+  });
   test("gate disabled → freeform regardless", () => {
     expect(
       proactiveSendMode({ ...base, enabled: false }, hoursAgo(100), NOW, cloud),
@@ -67,31 +71,47 @@ describe("proactiveSendMode", () => {
   test("outside window + no template → note", () => {
     expect(proactiveSendMode(base, hoursAgo(48), NOW, cloud)).toBe("note");
   });
-  test("unofficial WhatsApp providers (baileys/zapi) → freeform even outside the window", () => {
-    // baileys/zapi arrive as Channel::Whatsapp too, but with no 24h window — channel_type alone would
-    // wrongly gate them; the provider is what excludes them. A template never overrides this.
+  test("hasWindow=false (e.g. a Z-PRO instance not flagged WABA official) → freeform even outside the window", () => {
     const withTpl = { ...base, templateName: "reengajamento" };
+    expect(proactiveSendMode(base, hoursAgo(100), NOW, false)).toBe("freeform");
+    expect(proactiveSendMode(withTpl, hoursAgo(100), NOW, false)).toBe(
+      "freeform",
+    );
+  });
+});
+
+describe("channelHasServiceWindow", () => {
+  test("official WhatsApp providers (Cloud API, 360dialog) have a window", () => {
+    expect(
+      channelHasServiceWindow({
+        channelType: "Channel::Whatsapp",
+        provider: "whatsapp_cloud",
+      }),
+    ).toBe(true);
+    expect(
+      channelHasServiceWindow({
+        channelType: "Channel::Whatsapp",
+        provider: "default",
+      }),
+    ).toBe(true);
+  });
+  test("unofficial WhatsApp providers (baileys/zapi) have no window", () => {
     for (const provider of ["baileys", "zapi"]) {
-      const ch = { channelType: "Channel::Whatsapp", provider };
-      expect(proactiveSendMode(base, hoursAgo(100), NOW, ch)).toBe("freeform");
-      expect(proactiveSendMode(withTpl, hoursAgo(100), NOW, ch)).toBe(
-        "freeform",
-      );
+      expect(
+        channelHasServiceWindow({ channelType: "Channel::Whatsapp", provider }),
+      ).toBe(false);
     }
   });
-  test("unknown/null provider or non-WhatsApp channel → freeform (no window)", () => {
+  test("unknown/null provider or non-WhatsApp channel → no window", () => {
     expect(
-      proactiveSendMode(base, hoursAgo(100), NOW, {
+      channelHasServiceWindow({
         channelType: "Channel::Whatsapp",
         provider: null,
       }),
-    ).toBe("freeform");
+    ).toBe(false);
     expect(
-      proactiveSendMode(base, hoursAgo(100), NOW, {
-        channelType: "Channel::Api",
-        provider: null,
-      }),
-    ).toBe("freeform");
+      channelHasServiceWindow({ channelType: "Channel::Api", provider: null }),
+    ).toBe(false);
   });
 });
 

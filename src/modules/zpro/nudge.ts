@@ -32,6 +32,10 @@ import type { NormalizedZproEvent } from "./types";
 
 export type RunZproAgentNudgeOutcome =
   | "messaged"
+  // The WhatsApp 24h window was closed on a WABA-official instance: delivered as an approved
+  // template, or (no template configured) as an explained private note — see docs/service-window.md.
+  | "templated"
+  | "noted-window"
   | "silent"
   | "human-owned"
   | "no-conversation"
@@ -64,14 +68,15 @@ export async function runZproAgentNudge(
         contactId: true,
         contactName: true,
         contactNumber: true,
+        lastInboundAt: true,
       },
     }),
   );
   if (!conv) return "no-conversation";
   // A human owns the conversation — never inject a proactive customer-facing message. Chatwoot's
-  // nudge posts a private note in this case; runLoadedZproTurn has no "note-only" delivery mode, so
-  // this stays simpler by design: skip the reminder entirely (a human is already engaged, so an
-  // automated attendance reminder is redundant, not missing).
+  // nudge posts a private note in this case; Z-PRO stays simpler by design: skip the reminder
+  // entirely (a human is already engaged, so an automated attendance reminder is redundant, not
+  // missing) rather than posting a note there too.
   if (!conv.agentActive) return "human-owned";
 
   const loaded = await loadZproAgent(base, tenantId, zproInstanceId);
@@ -108,6 +113,9 @@ export async function runZproAgentNudge(
     turnId: crypto.randomUUID(),
     userSentAudio: false,
     base,
+    // Proactive: gates the reply through the WhatsApp 24h window (loaded.serviceWindowConfig +
+    // instance.isOfficialWaba) instead of always sending free-form — see docs/service-window.md.
+    proactive: { lastInboundAt: conv.lastInboundAt },
   });
   logger.info(
     "zpro nudge: outcome=%s ticket=%s source=%s",
@@ -118,6 +126,10 @@ export async function runZproAgentNudge(
   switch (outcome) {
     case "posted":
       return "messaged";
+    case "posted-template":
+      return "templated";
+    case "posted-note-window":
+      return "noted-window";
     case "taken-over":
       return "human-owned";
     default:

@@ -31,6 +31,7 @@ import {
   ModalCancelButton,
   SelectableCard,
   Skeleton,
+  SwitchField,
   useModalController,
   useToast,
 } from "@/client/components";
@@ -193,6 +194,7 @@ export function ZproSection() {
     bearerToken: "",
     whatsappId: "",
     instanceName: "",
+    isOfficialWaba: false,
   });
   const [saving, setSaving] = useState(false);
   // Two-phase add-instance flow: "credentials" probes the connection and lists channels (default);
@@ -216,6 +218,7 @@ export function ZproSection() {
     bearerToken: "",
     instanceName: "",
     whatsappId: "",
+    isOfficialWaba: false,
   });
   const [editSaving, setEditSaving] = useState(false);
 
@@ -260,6 +263,7 @@ export function ZproSection() {
       bearerToken: "",
       whatsappId: "",
       instanceName: "",
+      isOfficialWaba: false,
     });
     setPhase("credentials");
     setManualFallback(false);
@@ -316,6 +320,7 @@ export function ZproSection() {
         bearerToken: form.bearerToken.trim(),
         whatsappId: channel.id,
         instanceName: form.instanceName.trim(),
+        isOfficialWaba: form.isOfficialWaba,
       });
       if (err || !data) throw err ?? new Error("no data");
       showToast(t("zpro.instanceAdded", "Z-PRO instance added."), "success");
@@ -349,6 +354,7 @@ export function ZproSection() {
         bearerToken: form.bearerToken.trim(),
         whatsappId: Number(form.whatsappId),
         instanceName: form.instanceName.trim(),
+        isOfficialWaba: form.isOfficialWaba,
       });
       if (err || !data) throw err ?? new Error("no data");
       showToast(t("zpro.instanceAdded", "Z-PRO instance added."), "success");
@@ -372,6 +378,7 @@ export function ZproSection() {
       bearerToken: "", // never pre-filled — the backend never returns the stored token
       instanceName: instance.instanceName,
       whatsappId: String(instance.whatsappId),
+      isOfficialWaba: instance.isOfficialWaba,
     });
     editModal.open();
   }
@@ -389,6 +396,9 @@ export function ZproSection() {
       }
       if (editForm.whatsappId !== String(editTarget.whatsappId)) {
         patch.whatsappId = Number(editForm.whatsappId);
+      }
+      if (editForm.isOfficialWaba !== editTarget.isOfficialWaba) {
+        patch.isOfficialWaba = editForm.isOfficialWaba;
       }
       if (editForm.bearerToken.trim())
         patch.bearerToken = editForm.bearerToken.trim();
@@ -500,7 +510,8 @@ export function ZproSection() {
       editForm.apiId !== editTarget.apiId ||
       editForm.bearerToken !== "" ||
       editForm.instanceName !== editTarget.instanceName ||
-      editForm.whatsappId !== String(editTarget.whatsappId));
+      editForm.whatsappId !== String(editTarget.whatsappId) ||
+      editForm.isOfficialWaba !== editTarget.isOfficialWaba);
 
   return (
     <section className="flex flex-col gap-3">
@@ -809,6 +820,24 @@ export function ZproSection() {
                     placeholder="TesteSindSeg"
                   />
                 </FormField>
+                <div className="flex flex-col gap-1.5">
+                  <SwitchField
+                    checked={form.isOfficialWaba}
+                    onCheckedChange={(v) =>
+                      setForm((f) => ({ ...f, isOfficialWaba: v }))
+                    }
+                    label={t(
+                      "zpro.isOfficialWaba",
+                      "Official WhatsApp Business API (WABA)",
+                    )}
+                  />
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "zpro.isOfficialWabaHint",
+                      "Enable only if this instance connects through the official WhatsApp Business API. It becomes subject to the 24h window and approved templates (HSM); an unofficial connection (Baileys, UazAPI, etc.) always sends free-form and should leave this off.",
+                    )}
+                  </p>
+                </div>
               </>
             )}
           </div>
@@ -854,6 +883,24 @@ export function ZproSection() {
                 }
               />
             </FormField>
+            <div className="flex flex-col gap-1.5">
+              <SwitchField
+                checked={form.isOfficialWaba}
+                onCheckedChange={(v) =>
+                  setForm((f) => ({ ...f, isOfficialWaba: v }))
+                }
+                label={t(
+                  "zpro.isOfficialWaba",
+                  "Official WhatsApp Business API (WABA)",
+                )}
+              />
+              <p className="text-text-muted text-xs">
+                {t(
+                  "zpro.isOfficialWabaHint",
+                  "Enable only if this instance connects through the official WhatsApp Business API. It becomes subject to the 24h window and approved templates (HSM); an unofficial connection (Baileys, UazAPI, etc.) always sends free-form and should leave this off.",
+                )}
+              </p>
+            </div>
             <button
               type="button"
               onClick={() => setPhase("credentials")}
@@ -965,6 +1012,24 @@ export function ZproSection() {
               }
             />
           </FormField>
+          <div className="flex flex-col gap-1.5">
+            <SwitchField
+              checked={editForm.isOfficialWaba}
+              onCheckedChange={(v) =>
+                setEditForm((f) => ({ ...f, isOfficialWaba: v }))
+              }
+              label={t(
+                "zpro.isOfficialWaba",
+                "Official WhatsApp Business API (WABA)",
+              )}
+            />
+            <p className="text-text-muted text-xs">
+              {t(
+                "zpro.isOfficialWabaHint",
+                "Enable only if this instance connects through the official WhatsApp Business API. It becomes subject to the 24h window and approved templates (HSM); an unofficial connection (Baileys, UazAPI, etc.) always sends free-form and should leave this off.",
+              )}
+            </p>
+          </div>
         </div>
       </Modal>
 

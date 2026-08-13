@@ -966,7 +966,7 @@
     "svcWindowTemplate": "Template name (HSM)",
     "svcWindowTemplateHint": "Approved template sent outside the window. Blank → skip (private note).",
     "svcWindowTemplatePick": "Choose an approved template…",
-    "svcWindowZproOnly": "Not available yet for a Z-PRO-only agent — every proactive message sends free-form regardless of this setting. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
+    "svcWindowZproHint": "For Z-PRO tickets, this only takes effect on instances explicitly marked as official WhatsApp Business API (WABA) in Channels → FusaoChatBot CRM. Other Z-PRO instances (Baileys, UazAPI, etc.) always send free-form.",
     "systemPrompt": "Agent instructions",
     "tab": {
       "behavior": "Behavior",
@@ -2240,6 +2240,8 @@
     "instanceName": "Instance name",
     "instanceUpdated": "Instance updated.",
     "instanceUpdateError": "Could not update the instance.",
+    "isOfficialWaba": "Official WhatsApp Business API (WABA)",
+    "isOfficialWabaHint": "Enable only if this instance connects through the official WhatsApp Business API. It becomes subject to the 24h window and approved templates (HSM); an unofficial connection (Baileys, UazAPI, etc.) always sends free-form and should leave this off.",
     "noAgent": "No agent",
     "noInstances": "No FusaoChatBot CRM instance",
     "noInstancesDesc": "Add a FusaoChatBot CRM instance and assign an agent to start answering on WhatsApp.",

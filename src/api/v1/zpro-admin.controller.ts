@@ -89,6 +89,7 @@ const INSTANCE_SELECT = {
   apiId: true,
   whatsappId: true,
   instanceName: true,
+  isOfficialWaba: true,
   disconnectedAt: true,
   createdAt: true,
   agentBindings: {
@@ -102,6 +103,7 @@ type InstanceRow = {
   apiId: string;
   whatsappId: number;
   instanceName: string;
+  isOfficialWaba: boolean;
   disconnectedAt: Date | null;
   createdAt: Date;
   agentBindings: Array<{ agentId: bigint; agent: { name: string } }>;
@@ -115,6 +117,7 @@ function instanceToDto(row: InstanceRow) {
     apiId: row.apiId,
     whatsappId: row.whatsappId,
     instanceName: row.instanceName,
+    isOfficialWaba: row.isOfficialWaba,
     active: row.disconnectedAt === null,
     createdAt: row.createdAt.toISOString(),
     agentBindings: row.agentBindings.map((b) => ({
@@ -181,6 +184,7 @@ export const zproAdminController = new Elysia({
           bearerToken: encryptJson(body.bearerToken),
           whatsappId: body.whatsappId,
           instanceName: body.instanceName,
+          isOfficialWaba: body.isOfficialWaba ?? false,
           disconnectedAt: null,
         };
         return existing
@@ -213,6 +217,12 @@ export const zproAdminController = new Elysia({
           minLength: 1,
           description: "Display name for the instance.",
         }),
+        isOfficialWaba: t.Optional(
+          t.Boolean({
+            description:
+              "Whether this instance is connected via official WhatsApp Business API (WABA) — subject to the 24h window/HSM templates. Manual (not auto-detected); defaults to false (freeform always).",
+          }),
+        ),
       }),
       detail: doc(
         "Create Z-PRO instance",
@@ -288,6 +298,8 @@ export const zproAdminController = new Elysia({
         if (body.instanceName !== undefined)
           data.instanceName = body.instanceName;
         if (body.whatsappId !== undefined) data.whatsappId = body.whatsappId;
+        if (body.isOfficialWaba !== undefined)
+          data.isOfficialWaba = body.isOfficialWaba;
         try {
           return await db.zproInstance.update({
             where: { id },
@@ -320,6 +332,7 @@ export const zproAdminController = new Elysia({
         bearerToken: t.Optional(t.String({ minLength: 1 })),
         instanceName: t.Optional(t.String({ minLength: 1 })),
         whatsappId: t.Optional(t.Integer()),
+        isOfficialWaba: t.Optional(t.Boolean()),
       }),
       detail: doc(
         "Update Z-PRO instance",

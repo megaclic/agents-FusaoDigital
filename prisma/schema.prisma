@@ -532,6 +532,12 @@ model ZproInstance {
   bearerToken    String    @map("bearer_token") // encrypted; Bearer token da API Z-PRO
   whatsappId     Int       @map("whatsapp_id") // whatsapp.id do payload do webhook
   instanceName   String    @map("instance_name") // whatsapp.name (ex: "TesteSindSeg")
+  // Manual (não auto-detectado — o vendor não expõe um shape confirmado pra isso, ver
+  // docs/service-window.md): true = esta instância está conectada via WhatsApp Business API
+  // oficial (WABA), sujeita à janela de 24h + templates HSM (ZproClient.sendTemplateWABABody).
+  // false (default) = conexão não-oficial (Baileys/UazAPI/etc.) sem janela — mensagens sempre
+  // livres, mesmo comportamento de antes desta coluna existir.
+  isOfficialWaba Boolean   @default(false) @map("is_official_waba")
   // Soft-disconnect igual ao Chatwoot: null = ativo.
   disconnectedAt DateTime? @map("disconnected_at")
   createdAt      DateTime  @default(now()) @map("created_at")

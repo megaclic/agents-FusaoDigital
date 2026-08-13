@@ -1,6 +1,7 @@
 // src/modules/zpro/messages.ts
 // Helpers de alto nível para o LangGraph enviar respostas via Z-PRO.
 
+import type { TemplatePayload } from "@/modules/service-window/service";
 import type { ZproClient } from "./client";
 import { ZPRO_PRESENCE_TYPING } from "./constants";
 import type { NormalizedZproEvent } from "./types";
@@ -60,6 +61,37 @@ export async function sendMediaReply(
   await client.sendMediaUrl(event.contactNumber, mediaUrl, caption, {
     externalKey: `media-${event.messageId}-${Date.now()}`,
     validateNumber: false,
+  });
+}
+
+/**
+ * Envia um template WABA aprovado (HSM) com os parâmetros do corpo já interpolados — usado apenas
+ * para o envio PROATIVO gated pela janela de 24h (ZproInstance.isOfficialWaba), ver
+ * docs/service-window.md. `components` segue o shape padrão da Cloud API da Meta (BODY-only,
+ * OPEN-VALIDATION: nunca confirmado contra uma instância real, mesmo nível de confiança que
+ * processed_params no lado Chatwoot).
+ */
+export async function sendZproTemplate(
+  client: ZproClient,
+  number: string,
+  payload: TemplatePayload,
+): Promise<void> {
+  const params = Object.keys(payload.processedParams.body)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((k) => payload.processedParams.body[k] as string);
+  await client.sendTemplateWABABody({
+    number,
+    templateName: payload.name,
+    languageCode: payload.language,
+    components:
+      params.length > 0
+        ? [
+            {
+              type: "body",
+              parameters: params.map((text) => ({ type: "text", text })),
+            },
+          ]
+        : undefined,
   });
 }
 

@@ -13,6 +13,7 @@ import {
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import {
   buildTemplatePayload,
+  channelHasServiceWindow,
   proactiveSendMode,
 } from "@/modules/service-window/service";
 import { resolveGraphThreadId, threadBelongsToTenant } from "./checkpointer";
@@ -620,7 +621,10 @@ export async function runAgentNudge(
       cfg.serviceWindowConfig,
       loaded.lastInboundAt,
       new Date(),
-      { channelType: loaded.channelType, provider: loaded.provider },
+      channelHasServiceWindow({
+        channelType: loaded.channelType,
+        provider: loaded.provider,
+      }),
     );
     if (mode === "freeform") {
       await client.sendMessage(conversationId, reply);
