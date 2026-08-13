@@ -47,6 +47,7 @@ import {
 } from "@/graph/trace";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { resolveAgentChannelBinding } from "@/modules/agents/service";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { type FlowContext, withFlowStage } from "@/modules/flowlog/service";
@@ -199,18 +200,14 @@ async function resolvePlaygroundChannel(
   tenantId: bigint,
   agentId: bigint,
 ): Promise<"zpro" | "chatwoot"> {
-  return runScopedOn(base, sysCtx(tenantId), async (db) => {
-    const zproBound = await db.zproAgentBinding.findFirst({
-      where: { agentId },
-      select: { id: true },
-    });
-    if (!zproBound) return "chatwoot";
-    const chatwootBound = await db.inbox.findFirst({
-      where: { agentId },
-      select: { id: true },
-    });
-    return chatwootBound ? "chatwoot" : "zpro";
-  });
+  // Chatwoot is the fallback for an unbound agent (and for one bound to BOTH) — see this function's
+  // callers for why (the playground has always defaulted to the Chatwoot-flavored native tools).
+  const { chatwoot, zpro } = await resolveAgentChannelBinding(
+    sysCtx(tenantId),
+    agentId,
+    base,
+  );
+  return zpro && !chatwoot ? "zpro" : "chatwoot";
 }
 
 // Builds the playground toolset: the CONVERSATION native tools SIMULATED (no real effect; a dummy

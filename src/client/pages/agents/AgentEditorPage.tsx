@@ -88,6 +88,7 @@ import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
 import { ToolsTab } from "./ToolsTab";
 import type {
+  ChannelBinding,
   GrantState,
   HandoffUiState,
   Hours,
@@ -688,6 +689,15 @@ export function AgentEditorPage() {
   // Pools
   const [hours, setHours] = useState<Hours[]>([]);
 
+  // Which transport(s) this agent is actually bound to — an Agent row has no channel discriminator
+  // of its own (chatwootBots/zproBindings just coexist). Used to hide/disable Behavior-tab controls
+  // that have no Z-PRO backend yet (WhatsApp 24h window, generic Follow-up) instead of silently
+  // letting an operator configure something with zero effect on a Z-PRO-only agent.
+  const [channelBinding, setChannelBinding] = useState<ChannelBinding>({
+    chatwoot: false,
+    zpro: false,
+  });
+
   const confirm = useModalController<ConfirmPayload>();
   const cloneModal = useModalController();
   // Fill a pending credential without leaving the editor (opened from a config-health warning).
@@ -827,10 +837,11 @@ export function AgentEditorPage() {
     setLoading(true);
     setError(false);
     try {
-      const [agentRes, tsRes, hoursRes] = await Promise.all([
+      const [agentRes, tsRes, hoursRes, channelRes] = await Promise.all([
         api.api.v1.agents({ id }).get(),
         api.api.v1.agents({ id })["tool-selections"].get(),
         api.api.v1["business-hours"].get(),
+        api.api.v1.agents({ id })["channel-binding"].get(),
       ]);
       if (agentRes.error || !agentRes.data || tsRes.error || !tsRes.data) {
         setError(true);
@@ -846,6 +857,9 @@ export function AgentEditorPage() {
       setStaleNotice(false);
       setConflictRetry(null);
       if (hoursRes.data) setHours([...hoursRes.data.businessHours]);
+      // Best-effort: a failure here just means the Behavior tab can't hide/disable the Z-PRO-inert
+      // controls this turn — it does not block the rest of the editor from loading.
+      if (channelRes.data) setChannelBinding(channelRes.data);
     } catch {
       setError(true);
     } finally {
@@ -2458,6 +2472,7 @@ export function AgentEditorPage() {
             {tab === "behavior" && (
               <BehaviorTab
                 agentId={id}
+                channelBinding={channelBinding}
                 hours={hours}
                 businessHoursId={businessHoursId}
                 setBusinessHoursId={setBusinessHoursId}

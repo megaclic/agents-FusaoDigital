@@ -20,6 +20,7 @@ import {
   getAgentToolSelections,
   listAgentsPaged,
   replaceAgentToolSelections,
+  resolveAgentChannelBinding,
   type ToolGrantInput,
   updateAgent,
 } from "@/modules/agents/service";
@@ -238,6 +239,24 @@ export const agentsController = new Elysia({
     {
       detail: doc("Get agent", "Returns a single agent by id."),
       response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  .get(
+    "/:id/channel-binding",
+    async ({ tenantContext, params }) =>
+      resolveAgentChannelBinding(ctxOrThrow(tenantContext), BigInt(params.id)),
+    {
+      detail: doc(
+        "Get agent channel binding",
+        "Whether the agent is bound to a Chatwoot inbox, a Z-PRO instance, both, or neither — an agent has no channel discriminator of its own. Used by the editor to hide/disable controls with no effect on a Z-PRO-only agent (e.g. the WhatsApp 24h window, which has no Z-PRO backend yet). Does not validate that the agent id exists — an unknown id resolves to {chatwoot:false, zpro:false}, same as a real, unbound agent.",
+      ),
+      response: errors(400, 401, 403),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({

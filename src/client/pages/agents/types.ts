@@ -30,6 +30,15 @@ type HoursData = Awaited<
 >["data"];
 export type Hours = NonNullable<HoursData>["businessHours"][number];
 
+// Eden-derived: which transport(s) the edited agent is actually bound to. An Agent row has no
+// channel discriminator of its own — used to hide/disable Behavior/Tools/Playground controls that
+// have no effect on a Z-PRO-only agent (see docs/zpro.md).
+export type ChannelBinding = NonNullable<
+  Awaited<
+    ReturnType<ReturnType<typeof api.api.v1.agents>["channel-binding"]["get"]>
+  >["data"]
+>;
+
 // UI-side handoff config (the editor's working copy). `target` encodes the pinned pick as
 // "agent:<id>" | "team:<id>" | "" so one <Select> offers both groups; AgentEditorPage splits it
 // back into targetAgentId/targetTeamId on save. Lives on the handoff_to_human tool (Tools tab).

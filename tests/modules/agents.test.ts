@@ -15,6 +15,7 @@ import {
   listAgentsPaged,
   PromptTooLongError,
   replaceAgentToolSelections,
+  resolveAgentChannelBinding,
   updateAgent,
 } from "@/modules/agents/service";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
@@ -753,5 +754,112 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       appDb,
     );
     expect(a.systemPrompt).toHaveLength(config.agent.promptMaxChars);
+  });
+});
+
+describe.skipIf(!dbUp)("resolveAgentChannelBinding", () => {
+  let tenantId = 0n;
+
+  afterAll(async () => {
+    if (tenantId) {
+      for (const table of [
+        "zpro_agent_bindings",
+        "zpro_instances",
+        "inboxes",
+        "chatwoot_instances",
+        "chatwoot_deployments",
+        "agents",
+      ]) {
+        await suDb.$executeRawUnsafe(
+          `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
+        );
+      }
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM tenants WHERE id = ${tenantId}`,
+      );
+    }
+  });
+
+  test("neither, Chatwoot-only, Z-PRO-only, both — resolves each combination correctly", async () => {
+    const t = await suDb.tenant.create({
+      data: { name: "ChanBind", slug: `chan-bind-${process.pid}` },
+    });
+    tenantId = t.id;
+
+    const neither = await suDb.agent.create({
+      data: { tenantId, name: "Neither", systemPrompt: "x" },
+    });
+    expect(
+      await resolveAgentChannelBinding(ctx(tenantId), neither.id, appDb),
+    ).toEqual({ chatwoot: false, zpro: false });
+
+    const cwOnly = await suDb.agent.create({
+      data: { tenantId, name: "ChatwootOnly", systemPrompt: "x" },
+    });
+    const cwInstance = await seedChatwootInstance(suDb, {
+      tenantId,
+      accountId: 1,
+    });
+    await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: cwInstance.id,
+        chatwootInboxId: 1,
+        name: "Inbox",
+        agentId: cwOnly.id,
+      },
+    });
+    expect(
+      await resolveAgentChannelBinding(ctx(tenantId), cwOnly.id, appDb),
+    ).toEqual({ chatwoot: true, zpro: false });
+
+    const zproOnly = await suDb.agent.create({
+      data: { tenantId, name: "ZproOnly", systemPrompt: "x" },
+    });
+    const zproInstance = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.fusaobotcrm.com.br",
+        apiId: "TEST_API_ID",
+        bearerToken: "enc",
+        whatsappId: 501,
+        instanceName: "ChanBindZpro",
+      },
+    });
+    await suDb.zproAgentBinding.create({
+      data: { tenantId, zproInstanceId: zproInstance.id, agentId: zproOnly.id },
+    });
+    expect(
+      await resolveAgentChannelBinding(ctx(tenantId), zproOnly.id, appDb),
+    ).toEqual({ chatwoot: false, zpro: true });
+
+    const both = await suDb.agent.create({
+      data: { tenantId, name: "Both", systemPrompt: "x" },
+    });
+    await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: cwInstance.id,
+        chatwootInboxId: 2,
+        name: "Inbox2",
+        agentId: both.id,
+      },
+    });
+    const zproInstance2 = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.fusaobotcrm.com.br",
+        apiId: "TEST_API_ID_2",
+        bearerToken: "enc",
+        whatsappId: 502,
+        instanceName: "ChanBindZpro2",
+      },
+    });
+    await suDb.zproAgentBinding.create({
+      data: { tenantId, zproInstanceId: zproInstance2.id, agentId: both.id },
+    });
+    expect(
+      await resolveAgentChannelBinding(ctx(tenantId), both.id, appDb),
+    ).toEqual({ chatwoot: true, zpro: true });
   });
 });

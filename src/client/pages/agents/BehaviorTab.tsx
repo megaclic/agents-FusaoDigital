@@ -45,7 +45,7 @@ import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
-import type { Hours, VaultEntry } from "./types";
+import type { ChannelBinding, Hours, VaultEntry } from "./types";
 
 // Transcription providers (mirror src/modules/stt/providers.ts).
 const STT_PROVIDERS = [
@@ -165,6 +165,9 @@ interface FollowUpState {
 
 interface BehaviorTabProps {
   agentId: string;
+  // Which transport(s) this agent is bound to — gates the WhatsApp 24h window and Follow-up
+  // sections below, neither of which has a Z-PRO backend yet (see docs/zpro.md).
+  channelBinding: ChannelBinding;
   hours: Hours[];
   businessHoursId: string;
   setBusinessHoursId: (v: string) => void;
@@ -722,6 +725,7 @@ function FollowUpStepsEditor({
 
 export function BehaviorTab({
   agentId,
+  channelBinding,
   hours,
   businessHoursId,
   setBusinessHoursId,
@@ -758,6 +762,12 @@ export function BehaviorTab({
   onOpenPlayground,
 }: BehaviorTabProps) {
   const { t, i18n } = useTranslation();
+
+  // No Z-PRO backend yet for the WhatsApp 24h window (HSM templates) or the generic inactivity
+  // follow-up sweep (docs/zpro.md's "Known, accepted gaps") — both only ever run for a Chatwoot-
+  // bound conversation. A dual-bound agent still gets full functionality on its Chatwoot side, so
+  // only a Z-PRO-ONLY agent needs the controls disabled.
+  const zproOnly = channelBinding.zpro && !channelBinding.chatwoot;
 
   const sttBaseUrlInvalid =
     stt.provider === "openai-compatible" &&
@@ -1498,7 +1508,21 @@ export function BehaviorTab({
                   )}
                 </p>
               </div>
-              {redirectSuppressesFollowUp && (
+              {zproOnly && (
+                <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
+                  <AlertTriangle
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning"
+                    aria-hidden="true"
+                  />
+                  <span>
+                    {t(
+                      "editor.followUpZproOnly",
+                      "Not available yet for a Z-PRO-only agent — the generic follow-up sweep only runs for Chatwoot-bound conversations. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
+                    )}
+                  </span>
+                </div>
+              )}
+              {redirectSuppressesFollowUp && !zproOnly && (
                 <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
                   <ArrowRightLeft
                     className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent"
@@ -1507,7 +1531,7 @@ export function BehaviorTab({
                   <span>
                     {t(
                       "editor.followUpRedirectSuppressed",
-                      "Redirect is on for this agent, so the follow-up below does not run for the WhatsApp entry inbox or the website-chat inbox. The redirect handles re-engagement there. It still applies to any other channel this agent answers.",
+                      "Redirect is on for this agent, so the follow-up below does not run for the WhatsApp/Z-PRO entry or the website-chat inbox. The redirect handles re-engagement there. It still applies to any other channel this agent answers.",
                     )}
                   </span>
                 </div>
@@ -1517,12 +1541,13 @@ export function BehaviorTab({
                 onCheckedChange={(v) =>
                   setFollowUp({ ...followUp, enabled: v })
                 }
+                disabled={zproOnly}
                 label={t(
                   "editor.followUpEnabled",
                   "Send a follow-up when the conversation goes silent",
                 )}
               />
-              {followUp.enabled && (
+              {followUp.enabled && !zproOnly && (
                 <>
                   <FormField
                     label={t("editor.followUpWindowField", "Allowed schedule")}
@@ -1611,17 +1636,32 @@ export function BehaviorTab({
                   )}
                 </p>
               </div>
+              {zproOnly && (
+                <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
+                  <AlertTriangle
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning"
+                    aria-hidden="true"
+                  />
+                  <span>
+                    {t(
+                      "editor.svcWindowZproOnly",
+                      "Not available yet for a Z-PRO-only agent — every proactive message sends free-form regardless of this setting. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
+                    )}
+                  </span>
+                </div>
+              )}
               <SwitchField
                 checked={serviceWindow.enabled}
                 onCheckedChange={(v) =>
                   setServiceWindow({ ...serviceWindow, enabled: v })
                 }
+                disabled={zproOnly}
                 label={t(
                   "editor.svcWindowEnabled",
                   "Enforce the 24h window for proactive messages",
                 )}
               />
-              {serviceWindow.enabled && (
+              {serviceWindow.enabled && !zproOnly && (
                 <>
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField

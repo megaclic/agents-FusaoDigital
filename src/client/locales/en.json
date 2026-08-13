@@ -782,6 +782,7 @@
     "followUpStep": "Step {{n}}",
     "followUpStepDelay": "Wait after previous step",
     "followUpWindowField": "Allowed schedule",
+    "followUpZproOnly": "Not available yet for a Z-PRO-only agent — the generic follow-up sweep only runs for Chatwoot-bound conversations. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
     "formatExamplesTitle": "Examples",
     "formatHelpAria": "Date and time format help",
     "formatHelpTitle": "Date and time format tokens",
@@ -960,6 +961,7 @@
     "svcWindowTemplate": "Template name (HSM)",
     "svcWindowTemplateHint": "Approved template sent outside the window. Blank → skip (private note).",
     "svcWindowTemplatePick": "Choose an approved template…",
+    "svcWindowZproOnly": "Not available yet for a Z-PRO-only agent — every proactive message sends free-form regardless of this setting. Your saved configuration is kept but has no effect until this agent also answers on Chatwoot.",
     "systemPrompt": "Agent instructions",
     "tab": {
       "behavior": "Behavior",

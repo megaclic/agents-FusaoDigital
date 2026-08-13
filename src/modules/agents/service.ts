@@ -227,6 +227,29 @@ export async function getAgent(
   return toDto(row);
 }
 
+// An agent has no channel discriminator (Agent doesn't know which transport it's bound to) —
+// chatwootBots/zproBindings just coexist. Several UI surfaces need to tell "Z-PRO-only" apart from
+// "Chatwoot-only"/"both"/"neither" to avoid presenting a control that has zero effect on the agent's
+// actual channel (e.g. the Behavior tab's WhatsApp 24h window / Follow-up sections, which have no
+// Z-PRO backend yet). Shared so src/modules/playground/service.ts's resolvePlaygroundChannel (the
+// same "which flavor of native tools" question) doesn't duplicate these two queries.
+export async function resolveAgentChannelBinding(
+  ctx: TenantContext,
+  agentId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<{ chatwoot: boolean; zpro: boolean }> {
+  return runScopedOn(base, ctx, async (db) => {
+    const [inbox, zproBinding] = await Promise.all([
+      db.inbox.findFirst({ where: { agentId }, select: { id: true } }),
+      db.zproAgentBinding.findFirst({
+        where: { agentId },
+        select: { id: true },
+      }),
+    ]);
+    return { chatwoot: !!inbox, zpro: !!zproBinding };
+  });
+}
+
 // NOTE: the cap is a deliberate checkpoint (oversized prompts usually hold knowledge-base
 // content and degrade instruction adherence), raised only via AGENT_PROMPT_MAX_CHARS — on
 // purpose, no UI affordance points at the override. Checked BEFORE the schema parse so every
