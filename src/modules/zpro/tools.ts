@@ -42,11 +42,14 @@ import {
   loadZproQueues,
   loadZproStages,
   loadZproTags,
+  resolveContactTagNames,
+  resolveQueueName,
   resolveZproPipelineId,
   type ZproKanbanContext,
 } from "./crm";
 import { sysCtx } from "./ctx";
 import { buildZproNativeTools, type TurnState } from "./native-tools";
+import type { ZproContactTagRef } from "./types";
 
 export interface ZproAgentTools {
   tools: StructuredToolInterface[];
@@ -88,6 +91,12 @@ export interface LoadZproAgentToolsParams {
   contactName?: string | null;
   contactNumber?: string | null;
   companyName?: string | null;
+  // The contact's saved memory (ticket.contact.extraInfo), already extracted onto the normalized
+  // event by normalize.ts — threaded straight through for get_contact_info instead of paying a
+  // second getContactExtraInfo round trip (this is only as fresh as the CURRENT webhook, unlike
+  // set_custom_attribute's own live read-before-write, but a few-second staleness window is a
+  // reasonable trade for a read-only "what do we already know" tool).
+  contactExtraInfo?: Array<{ name: string; value: string }>;
 }
 
 export async function loadZproAgentTools(
@@ -112,6 +121,8 @@ export async function loadZproAgentTools(
           opportunityStageId: true,
           opportunityStageName: true,
           opportunityTitle: true,
+          queueId: true,
+          contactTags: true,
         },
       });
       const selections = await loadToolSelections(db, agentId);
@@ -272,7 +283,13 @@ export async function loadZproAgentTools(
     const allow = selections.nativeToolsAllow;
     const cacheKey = `${tenantId}:${zproInstanceId}`;
 
-    const needsTags = !allow || allow.includes("assign_label");
+    // get_contact_info also needs both catalogs (to resolve the CURRENT queue/tag names, not just
+    // list the possible values) — sharing the same cached load as assign_label/route_to_queue rather
+    // than paying a second round trip.
+    const needsTags =
+      !allow ||
+      allow.includes("assign_label") ||
+      allow.includes("get_contact_info");
     const knownTags = needsTags
       ? await loadZproTags(client, cacheKey).catch((e) => {
           logger.warn(
@@ -289,7 +306,10 @@ export async function loadZproAgentTools(
         })
       : undefined;
 
-    const needsQueues = !allow || allow.includes("route_to_queue");
+    const needsQueues =
+      !allow ||
+      allow.includes("route_to_queue") ||
+      allow.includes("get_contact_info");
     const knownQueues = needsQueues
       ? await loadZproQueues(client, cacheKey).catch((e) => {
           logger.warn(
@@ -378,6 +398,15 @@ export async function loadZproAgentTools(
         toolInstructions: params.toolInstructions,
         knownTags,
         knownQueues,
+        currentQueueName: resolveQueueName(
+          conversation.queueId,
+          knownQueues ?? [],
+        ),
+        contactTagNames: resolveContactTagNames(
+          (conversation.contactTags as unknown as ZproContactTagRef[]) ?? [],
+          knownTags ?? [],
+        ),
+        contactExtraInfo: params.contactExtraInfo ?? [],
         kanban,
         onSideEffectError,
       },

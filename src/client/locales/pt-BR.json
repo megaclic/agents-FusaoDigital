@@ -1514,6 +1514,10 @@
       "desc": "Avalia expressões aritméticas com exatidão (+ - * / % ^ e parênteses).",
       "label": "Calculadora"
     },
+    "get_contact_info": {
+      "desc": "Consulta a fila atual, as etiquetas e a memória salva do contato antes de pedir ao cliente uma informação que já pode estar registrada.",
+      "label": "Consultar contato"
+    },
     "get_current_time": {
       "desc": "Obtém a data e a hora atuais no fuso horário do agente.",
       "label": "Hora atual"

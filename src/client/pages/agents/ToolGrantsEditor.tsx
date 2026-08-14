@@ -95,6 +95,12 @@ const REACT_TOOL = "react_to_message";
 // implemented in native-tools.ts, no entry in graph/tools/native.ts. Hidden when the agent has no
 // Z-PRO instance bound, instead of silently granting a no-op.
 const QUEUE_TOOL = "route_to_queue";
+// Z-PRO-only by DESIGN, not just unimplemented: Chatwoot already has an equivalent mechanism (the
+// Behavior tab's "Data in context" section, curated custom-attribute values auto-injected into every
+// prompt), so a Chatwoot-side get_contact_info tool would be a redundant second way to do the same
+// thing. Z-PRO has no such curated-context mechanism (its extraInfo/tags are free-form, no fixed
+// attribute-definition schema to build a picker UI from), hence an on-demand tool instead.
+const CONTACT_INFO_TOOL = "get_contact_info";
 
 interface Props {
   // The agent being edited — scopes the handoff target picker to the accounts it serves.
@@ -1186,7 +1192,8 @@ export function ToolGrantsEditor({
                 n.name !== LABEL_TOOL &&
                 n.name !== UPDATE_KANBAN_TOOL &&
                 (n.name !== REACT_TOOL || channelBinding.chatwoot) &&
-                (n.name !== QUEUE_TOOL || channelBinding.zpro),
+                (n.name !== QUEUE_TOOL || channelBinding.zpro) &&
+                (n.name !== CONTACT_INFO_TOOL || channelBinding.zpro),
             )
             .map((n) => {
               const meta = nativeToolMeta(n.name, t);

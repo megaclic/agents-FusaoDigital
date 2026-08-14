@@ -479,6 +479,7 @@ export async function runLoadedZproTurn(
       contactName: ev.contactName,
       contactNumber: ev.contactNumber,
       companyName: loaded.companyName,
+      contactExtraInfo: ev.extraInfo,
     });
     const tools = [...agentTools];
     // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},

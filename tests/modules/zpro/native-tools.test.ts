@@ -39,10 +39,11 @@ function baseCtx(overrides: Partial<ZproToolCtx> = {}): ZproToolCtx {
 }
 
 describe("buildZproNativeTools (no client/DB access)", () => {
-  test("returns all 10 tools when unfiltered, and NEVER react_to_message", () => {
+  test("returns all 11 tools when unfiltered, and NEVER react_to_message", () => {
     const tools = buildZproNativeTools(baseCtx());
     expect(tools.map((t) => t.name).sort()).toEqual([
       "assign_label",
+      "get_contact_info",
       "handoff_to_human",
       "kanban_move_card",
       "private_note",
@@ -251,6 +252,29 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     const out = await tools[0]?.invoke({ key: "orcamento", value: "9000" });
     expect(writeCalled).toBe(false);
     expect(String(out).toLowerCase()).toContain("failed to read");
+  });
+
+  test("get_contact_info: pure read from ctx, never touches the client", async () => {
+    const tools = buildZproNativeTools(
+      baseCtx({
+        currentQueueName: "Financeiro",
+        contactTagNames: ["vip", "lead"],
+        contactExtraInfo: [{ name: "orcamento", value: "5000" }],
+      }),
+      ["get_contact_info"],
+    );
+    const out = String(await tools[0]?.invoke({}));
+    expect(out).toContain("Queue: Financeiro");
+    expect(out).toContain("Tags: vip, lead");
+    expect(out).toContain("orcamento: 5000");
+  });
+
+  test("get_contact_info: absent context degrades to '(none)' placeholders, never throws", async () => {
+    const tools = buildZproNativeTools(baseCtx(), ["get_contact_info"]);
+    const out = String(await tools[0]?.invoke({}));
+    expect(out).toContain("Queue: (none)");
+    expect(out).toContain("Tags: (none)");
+    expect(out).toContain("Saved memory: (none)");
   });
 
   test("assign_label: reuses a known tag id (no createTag call)", async () => {

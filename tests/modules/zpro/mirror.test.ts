@@ -9,7 +9,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { markAgentSending } from "@/modules/zpro/agent-echo";
-import { mirrorZproMessage } from "@/modules/zpro/mirror";
+import { mirrorZproContact, mirrorZproMessage } from "@/modules/zpro/mirror";
 import type {
   ZproMsgTop,
   ZproTicket,
@@ -384,5 +384,145 @@ describe.skipIf(!dbUp)("mirrorZproMessage lastInboundAt watermark", () => {
     expect(afterAgentRow?.lastInboundAt?.getTime()).toBe(
       firstInboundAt?.getTime(),
     );
+  });
+});
+
+// DB-backed: ticket.queueId and ticket.contact.tags arrive on EVERY message webhook (confirmed on
+// real captured payloads) but were received and discarded — route_to_queue/assign_label could WRITE
+// but nothing could read back what a ticket/contact already had. get_contact_info (native-tools.ts)
+// and the conversation detail page both depend on these actually being mirrored.
+describe.skipIf(!dbUp)("mirrorZproMessage queue + contact tags", () => {
+  beforeAll(async () => {
+    const t = await suDb.tenant.create({
+      data: {
+        name: "ZproMirrorQueueTags",
+        slug: `zpro-mirror-queue-tags-${process.pid}`,
+      },
+    });
+    tenantId = t.id;
+    const inst = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.fusaobotcrm.com.br",
+        apiId: "TEST_API_ID",
+        bearerToken: encryptJson("test-token"),
+        whatsappId: 89,
+        instanceName: "TesteSindSeg3",
+      },
+    });
+    zproInstanceId = inst.id;
+  });
+
+  afterAll(async () => {
+    if (tenantId) {
+      for (const table of [
+        "zpro_messages",
+        "zpro_conversations",
+        "zpro_agent_bindings",
+        "zpro_instances",
+      ]) {
+        await suDb.$executeRawUnsafe(
+          `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
+        );
+      }
+      await suDb.tenant.delete({ where: { id: tenantId } });
+    }
+    await su?.$disconnect();
+    await app?.$disconnect();
+  });
+
+  test("mirrors ticket.queueId and ticket.contact.tags on the conversation row", async () => {
+    const ticket = baseTicket(9201, null);
+    ticket.queueId = 42;
+    ticket.contact.tags = [{ id: 1, name: "vip" }, "urgente"];
+    const result = await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-QT-1", "Oi")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(result).not.toBeNull();
+    const row = await suDb.zproConversation.findUnique({
+      where: { id: result?.conversationId as bigint },
+      select: { queueId: true, contactTags: true },
+    });
+    expect(row?.queueId).toBe(42);
+    expect(row?.contactTags).toEqual([
+      { id: 1, name: "vip" },
+      { id: null, name: "urgente" },
+    ]);
+  });
+
+  test("a later message with a different queueId/tags refreshes the mirror", async () => {
+    const ticket = baseTicket(9202, null);
+    ticket.queueId = 1;
+    ticket.contact.tags = [{ id: 1, name: "novo-lead" }];
+    const first = await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-QT-2a", "primeira")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    const moved = { ...ticket, queueId: 2 };
+    moved.contact = {
+      ...ticket.contact,
+      tags: [{ id: 2, name: "qualificado" }],
+    };
+    await mirrorZproMessage(
+      payloadFor(moved, inboundMsg("MSG-QT-2b", "segunda")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    const row = await suDb.zproConversation.findUnique({
+      where: { id: first?.conversationId as bigint },
+      select: { queueId: true, contactTags: true },
+    });
+    expect(row?.queueId).toBe(2);
+    expect(row?.contactTags).toEqual([{ id: 2, name: "qualificado" }]);
+  });
+
+  test("an unrecognized ticket.contact.tags shape degrades to [] instead of throwing", async () => {
+    const ticket = baseTicket(9203, null);
+    ticket.contact.tags = "not-an-array" as unknown as unknown[];
+    const result = await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-QT-3", "oi")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(result).not.toBeNull();
+    const row = await suDb.zproConversation.findUnique({
+      where: { id: result?.conversationId as bigint },
+      select: { contactTags: true },
+    });
+    expect(row?.contactTags).toEqual([]);
+  });
+
+  test("mirrorZproContact (contact-create-update) also refreshes contactTags", async () => {
+    const ticket = baseTicket(9204, null);
+    ticket.contact.tags = [{ id: 1, name: "vip" }];
+    const created = await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-QT-4", "oi")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    expect(created).not.toBeNull();
+
+    await mirrorZproContact(
+      {
+        method: "contact-create-update",
+        contact: { ...ticket.contact, tags: [{ id: 3, name: "renovado" }] },
+      },
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    const row = await suDb.zproConversation.findUnique({
+      where: { id: created?.conversationId as bigint },
+      select: { contactTags: true },
+    });
+    expect(row?.contactTags).toEqual([{ id: 3, name: "renovado" }]);
   });
 });

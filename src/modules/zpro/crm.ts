@@ -14,6 +14,7 @@
 
 import { readToolInstructions } from "@/modules/handoff/settings";
 import type { ZproClient } from "./client";
+import type { ZproContactTagRef } from "./types";
 
 export interface ZproCrmConfig {
   // The CRM Pipeline (funnel) kanban_move_card / update_kanban_task operate on. null ⇒ auto-detect:
@@ -196,6 +197,36 @@ export function matchZproStage(
   const lc = name.trim().toLowerCase();
   if (!lc) return null;
   return stages.find((s) => s.name.toLowerCase() === lc) ?? null;
+}
+
+// Resolves ONE piece of a queue/tag id+name pair the model can act on. queueId alone (from
+// ZproConversation.queueId, mirror.ts) has no name attached — this cross-references the already-
+// loaded catalog (loadZproQueues/loadZproTags). Pure; null when nothing matches.
+export function resolveQueueName(
+  queueId: number | null,
+  knownQueues: ZproPipeline[],
+): string | null {
+  if (queueId == null) return null;
+  return knownQueues.find((q) => q.id === queueId)?.name ?? null;
+}
+
+// mirror.ts's parseContactTags stores each tag as whichever half of {id,name} the webhook payload
+// actually had (shape unconfirmed) — this fills in the missing half against the tags catalog when
+// possible, and falls back to "tag #id" only when NEITHER the stored name nor a catalog match is
+// available (never silently drops a tag the customer/operator can see in the Z-PRO panel).
+export function resolveContactTagNames(
+  refs: ZproContactTagRef[],
+  knownTags: ZproPipeline[],
+): string[] {
+  return refs.map((ref) => {
+    if (ref.name) return ref.name;
+    if (ref.id != null) {
+      const match = knownTags.find((t) => t.id === ref.id);
+      if (match) return match.name;
+      return `tag #${ref.id}`;
+    }
+    return "?";
+  });
 }
 
 // Test-only: drop the module caches so cases don't leak TTL state into one another.

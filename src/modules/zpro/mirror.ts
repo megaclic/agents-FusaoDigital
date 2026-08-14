@@ -15,7 +15,7 @@ import { runScopedOn } from "@/lib/tenancy";
 import { wasAgentSending } from "./agent-echo";
 import { ZPRO_METHOD_CONTACT, ZPRO_METHOD_MESSAGE } from "./constants";
 import { sysCtx } from "./ctx";
-import { extractMedia, extractMessageBody } from "./parse";
+import { extractMedia, extractMessageBody, parseContactTags } from "./parse";
 import type { ZproWebhookPayload } from "./types";
 
 // Z-PRO redelivers the same webhook payload concurrently (network retry) often enough that two
@@ -76,6 +76,13 @@ export async function mirrorZproMessage(
   // CLIENT-only anchor for the generic follow-up sweep (isNewFollowUpEpisode), distinct from
   // lastMessageAt (any sender) — mirrors Conversation.lastInboundAt (chatwoot/mirror.ts).
   const lastInboundAt = senderType === "CLIENT" ? lastMessageAt : undefined;
+  // ticket.queueId + ticket.contact.tags arrive on EVERY message webhook (confirmed on real
+  // captured payloads, see types.ts's header) — previously received and discarded. Mirrored here so
+  // route_to_queue/assign_label's "what does this ticket/contact already have" question is
+  // answerable without a live API call (get_contact_info, the conversation detail page).
+  const contactTags = parseContactTags(
+    ticket.contact.tags,
+  ) as unknown as Prisma.InputJsonValue;
 
   let conversation: { id: bigint };
   try {
@@ -95,6 +102,8 @@ export async function mirrorZproMessage(
           contactName: ticket.contact.name || ticket.contact.number,
           agentActive: ticket.n8nStatus,
           humanUserId: ticket.userId,
+          queueId: ticket.queueId,
+          contactTags,
           lastMessageAt,
           lastMessageBody: body,
           ...(lastInboundAt ? { lastInboundAt } : {}),
@@ -110,6 +119,8 @@ export async function mirrorZproMessage(
           contactName: ticket.contact.name || ticket.contact.number,
           agentActive: ticket.n8nStatus,
           humanUserId: ticket.userId,
+          queueId: ticket.queueId,
+          contactTags,
           lastMessageAt,
           lastMessageBody: body,
           ...(lastInboundAt ? { lastInboundAt } : {}),
@@ -212,12 +223,16 @@ export async function mirrorZproContact(
   if (!contact) return;
 
   const name = contact.name || contact.number;
+  const contactTags = parseContactTags(
+    contact.tags,
+  ) as unknown as Prisma.InputJsonValue;
   await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.zproConversation.updateMany({
       where: { zproInstanceId, contactId: contact.id },
       data: {
         contactName: name,
         contactNumber: contact.number,
+        contactTags,
         ...(contact.profilePicUrl ? { avatarUrl: contact.profilePicUrl } : {}),
       },
     }),

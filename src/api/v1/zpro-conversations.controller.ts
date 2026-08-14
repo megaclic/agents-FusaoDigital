@@ -13,6 +13,7 @@ import { Elysia, t } from "elysia";
 import type { Prisma } from "@/../generated/prisma/client";
 import { broadcastZproAgentToggled } from "@/api/features/realtime/realtime.service";
 import { decryptJson } from "@/api/lib/crypto";
+import logger from "@/api/lib/logger";
 import { doc, errors } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
@@ -25,7 +26,14 @@ import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getZproFunnelMetrics } from "@/modules/zpro/analytics";
 import { ZproClient } from "@/modules/zpro/client";
+import {
+  loadZproQueues,
+  loadZproTags,
+  resolveContactTagNames,
+  resolveQueueName,
+} from "@/modules/zpro/crm";
 import { activateAgent, deactivateAgent } from "@/modules/zpro/handoff";
+import type { ZproContactTagRef } from "@/modules/zpro/types";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   if (!ctx) throw new ForbiddenError();
@@ -282,7 +290,19 @@ export const zproConversationsController = new Elysia({
       const row = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproConversation.findUnique({
           where: { id },
-          select: CONVERSATION_SELECT,
+          select: {
+            ...CONVERSATION_SELECT,
+            queueId: true,
+            contactTags: true,
+            zproInstance: {
+              select: {
+                instanceName: true,
+                baseUrl: true,
+                apiId: true,
+                bearerToken: true,
+              },
+            },
+          },
         }),
       );
       if (!row) {
@@ -291,7 +311,35 @@ export const zproConversationsController = new Elysia({
           "errors.zproConversationNotFound",
         );
       }
-      return { conversation: conversationToDto(row) };
+      // Queue/tag NAMES need the (cached) catalog, not just the mirrored id — best-effort: a listing
+      // failure degrades to showing raw ids/no queue rather than failing the whole page.
+      let queueName: string | null = null;
+      let tags: string[] = [];
+      try {
+        const client = new ZproClient(
+          row.zproInstance.baseUrl,
+          row.zproInstance.apiId,
+          decryptJson<string>(row.zproInstance.bearerToken),
+        );
+        const cacheKey = `${ctx.tenantId}:${row.zproInstanceId}`;
+        const [knownQueues, knownTags] = await Promise.all([
+          loadZproQueues(client, cacheKey),
+          loadZproTags(client, cacheKey),
+        ]);
+        queueName = resolveQueueName(row.queueId, knownQueues);
+        tags = resolveContactTagNames(
+          row.contactTags as unknown as ZproContactTagRef[],
+          knownTags,
+        );
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: params.id },
+          "zpro:conversations: queue/tag catalog resolution failed",
+        );
+      }
+      return {
+        conversation: { ...conversationToDto(row), queueName, tags },
+      };
     },
     {
       requireAuth: true,
@@ -300,7 +348,7 @@ export const zproConversationsController = new Elysia({
       }),
       detail: doc(
         "Get Z-PRO conversation",
-        "Returns a single mirrored Z-PRO conversation by primary key.",
+        "Returns a single mirrored Z-PRO conversation by primary key, plus its current queue name and contact tags (resolved live against the Z-PRO catalog).",
       ),
       response: errors(400, 401, 404),
     },

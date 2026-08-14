@@ -5,6 +5,7 @@ import {
   Calculator,
   CheckCircle2,
   Clock,
+  IdCard,
   LayoutGrid,
   ListTree,
   type LucideIcon,
@@ -25,6 +26,7 @@ export const NATIVE_TOOL_ICONS: Record<string, LucideIcon> = {
   handoff_to_human: ArrowRightLeft,
   private_note: StickyNote,
   set_custom_attribute: Tag,
+  get_contact_info: IdCard,
   assign_label: Tags,
   resolve_conversation: CheckCircle2,
   kanban_move_card: LayoutGrid,
@@ -73,6 +75,15 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
         description: t(
           "nativeTools.set_custom_attribute.desc",
           "Set a conversation custom attribute (e.g. lead stage, qualification flag).",
+        ),
+      };
+    case "get_contact_info":
+      return {
+        icon,
+        label: t("nativeTools.get_contact_info.label", "Look up contact"),
+        description: t(
+          "nativeTools.get_contact_info.desc",
+          "Look up the contact's current queue, tags, and saved memory before asking the customer for information that might already be on file.",
         ),
       };
     case "assign_label":

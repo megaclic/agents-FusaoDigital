@@ -610,6 +610,17 @@ model ZproConversation {
   contactName      String    @map("contact_name") // ticket.contact.name
   // ticket.contact.profilePicUrl, atualizado via payload contact-create-update (mirrorZproContact).
   avatarUrl        String?   @map("avatar_url")
+  // ticket.queueId — a fila/departamento atual do ticket. Já chegava em TODO webhook e era
+  // descartado (route_to_queue só escreve, nunca lia de volta). Nome resolvido sob demanda via
+  // crm.ts's loadZproQueues (mesmo catálogo cacheado, não persistido aqui — evita ficar stale se a
+  // fila for renomeada no painel).
+  queueId          Int?      @map("queue_id")
+  // Tags do CONTATO (a API não expõe tags a nível de ticket, só de contato — ticket.contact.tags) e
+  // memória (ticket.contact.extraInfo), espelhadas a cada mensagem. Shape de contact.tags é NÃO
+  // CONFIRMADO (Postman sem exemplo de resposta) — parseado defensivamente em mirror.ts's
+  // parseContactTags, cada item guardado como {id, name} com o que estiver disponível (um dos dois
+  // pode faltar; resolvido contra o catálogo de tags em leitura quando só o id sobrevive).
+  contactTags      Json      @default("[]") @map("contact_tags")
   // Preferência de resposta em áudio (TTS modo "preference"), mesma semântica de Contact.voiceReply:
   // true = quer áudio, false = quer texto, null = desconhecido (mirror do que o cliente mandou).
   // Setado pela tool set_voice_preference (src/modules/zpro/tts.ts) — não existe Contact no Z-PRO,

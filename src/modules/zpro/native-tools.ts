@@ -18,6 +18,14 @@
 //                         endpoint's replace-vs-merge semantics are unconfirmed (no example response
 //                         in the vendor's Postman collection), so we always read first and resend the
 //                         full array, never trusting a server-side merge.
+//   get_contact_info      → PURE read from ctx, no network call at tool-call time. The counterpart
+//                         to set_custom_attribute/assign_label's writes, which had no way to be read
+//                         back before this: currentQueueName/contactTagNames are resolved once at
+//                         turn prep (tools.ts) against the SAME cached catalogs route_to_queue/
+//                         assign_label already load; contactExtraInfo is threaded straight from
+//                         NormalizedZproEvent.extraInfo (normalize.ts already extracted it from
+//                         ticket.contact.extraInfo on every webhook — previously extracted and never
+//                         read by anything).
 //   assign_label         → Z-PRO tags (addTag/addTagContact), which are id-based unlike Chatwoot's
 //                         free-string labels — resolved by name against listTags at turn prep
 //                         (src/modules/zpro/tools.ts), auto-CREATING a new tag on a miss so the
@@ -124,6 +132,13 @@ export interface ZproToolCtx {
   // This conversation's CRM deal context (see crm.ts). Absent ⇒ kanban_move_card/update_kanban_task
   // were not granted this turn (their resolve is skipped to avoid the extra network calls).
   kanban?: ZproKanbanContext;
+  // get_contact_info's read-only snapshot, resolved once at turn prep (tools.ts) against the SAME
+  // knownQueues/knownTags catalogs route_to_queue/assign_label already load — no extra network call
+  // for this tool specifically. currentQueueName is null when the ticket has no queue (or it isn't
+  // in the catalog); contactTagNames/contactExtraInfo are [] when the mirror/webhook had none.
+  currentQueueName?: string | null;
+  contactTagNames?: string[];
+  contactExtraInfo?: Array<{ name: string; value: string }>;
   onSideEffectError?: SideEffectErrorReporter;
 }
 
@@ -302,6 +317,34 @@ function setCustomAttributeTool(ctx: ZproToolCtx) {
         "set_custom_attribute",
       ),
       schema: z.object({ key: z.string().min(1), value: z.string() }),
+    },
+  );
+}
+
+// ── get_contact_info (read-only — the counterpart to set_custom_attribute/assign_label's writes,
+// which had no way to be read back before this) ────────────────────────────
+
+function getContactInfoTool(ctx: ZproToolCtx) {
+  return tool(
+    async () => {
+      const lines: string[] = [];
+      lines.push(`Queue: ${ctx.currentQueueName ?? "(none)"}`);
+      const tags = ctx.contactTagNames ?? [];
+      lines.push(`Tags: ${tags.length > 0 ? tags.join(", ") : "(none)"}`);
+      const memory = ctx.contactExtraInfo ?? [];
+      if (memory.length > 0) {
+        lines.push("Saved memory:");
+        for (const m of memory) lines.push(`- ${m.name}: ${m.value}`);
+      } else {
+        lines.push("Saved memory: (none)");
+      }
+      return lines.join("\n");
+    },
+    {
+      name: "get_contact_info",
+      description:
+        "Look up what is already known about this contact/conversation: its current queue/department, its tags, and any saved memory (key/value attributes set earlier via set_custom_attribute or by a human). Use this BEFORE asking the customer for information that might already be on file, or when deciding whether a tag/attribute is already set.",
+      schema: z.object({}),
     },
   );
 }
@@ -809,7 +852,7 @@ function skipReplyTool(_ctx: ZproToolCtx) {
   );
 }
 
-// allowed = undefined → all 9 tools; otherwise only the named subset (fail-closed, mirrors
+// allowed = undefined → all 11 tools; otherwise only the named subset (fail-closed, mirrors
 // src/graph/tools/native.ts's buildNativeTools). react_to_message is never built (see module header).
 export function buildZproNativeTools(
   ctx: ZproToolCtx,
@@ -819,6 +862,7 @@ export function buildZproNativeTools(
     handoffTool(ctx),
     privateNoteTool(ctx),
     setCustomAttributeTool(ctx),
+    getContactInfoTool(ctx),
     assignLabelTool(ctx),
     resolveConversationTool(ctx),
     kanbanMoveTool(ctx),
@@ -834,7 +878,7 @@ export function buildZproNativeTools(
 
 // Playground variant: every Z-PRO conversation tool the agent could ever be granted is SIMULATED
 // (no real ZproClient call, no ZproConversation write) — mirrors src/graph/tools/native.ts's
-// buildSimulatedNativeTools, reusing its channel-agnostic simulatedTool() wrapper. Covers the 9
+// buildSimulatedNativeTools, reusing its channel-agnostic simulatedTool() wrapper. Covers the 11
 // tools above PLUS set_voice_preference (built separately in runtime.ts for real turns, gated on
 // ttsConfig.mode === "preference" — here it's shown unconditionally, same as Chatwoot's playground,
 // since the point is testing the agent's DECISION to call it, not the TTS mode gate). Z-PRO has no

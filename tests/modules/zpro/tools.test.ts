@@ -628,4 +628,58 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
     expect(queueTool?.description).toContain("Financeiro");
     expect(queuesCalled).toBe(1);
   });
+
+  test("NATIVE: get_contact_info resolves the CURRENT queue/tags from the mirror against the catalogs, plus extraInfo from the event", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native contact-info agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["get_contact_info"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2006,
+        status: "open",
+        contactId: 47,
+        contactNumber: "5511900000047",
+        contactName: "Cliente Info",
+        agentActive: true,
+        queueId: 9,
+        contactTags: [{ id: 3, name: "vip" }],
+      },
+    });
+    const client = {
+      listQueues: async () => [{ id: 9, name: "Financeiro" }],
+      listTags: async () => [{ id: 3, name: "vip" }],
+    } as unknown as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2006,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2006`,
+      client,
+      contactExtraInfo: [{ name: "orcamento", value: "5000" }],
+    });
+    const infoTool = result.tools.find((t) => t.name === "get_contact_info");
+    const out = String(await infoTool?.invoke({}));
+    expect(out).toContain("Queue: Financeiro");
+    expect(out).toContain("Tags: vip");
+    expect(out).toContain("orcamento: 5000");
+  });
 });

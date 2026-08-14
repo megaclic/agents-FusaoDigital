@@ -204,6 +204,14 @@ export interface ZproTenant {
 }
 
 // Evento normalizado — o que o LangGraph recebe do módulo zpro
+// A contact tag reference as stored on ZproConversation.contactTags (mirror.ts's parseContactTags)
+// — contact.tags's raw shape is UNCONFIRMED, so either half can be null; the missing half is
+// resolved against the tags catalog (crm.ts's loadZproTags) at read time.
+export interface ZproContactTagRef {
+  id: number | null;
+  name: string | null;
+}
+
 export interface NormalizedZproEvent {
   // Identificação da mensagem
   messageId: string;

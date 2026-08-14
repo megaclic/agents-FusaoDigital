@@ -13,6 +13,8 @@ import {
   loadZproTags,
   matchZproStage,
   readZproCrmConfig,
+  resolveContactTagNames,
+  resolveQueueName,
   resolveZproPipelineId,
 } from "@/modules/zpro/crm";
 
@@ -199,5 +201,72 @@ describe("loadZproStages / loadZproTags (defensive parsing)", () => {
     expect(await loadZproQueues(c, "t9")).toEqual([{ id: 5, name: "Suporte" }]);
     expect(await loadZproQueues(c, "t9")).toEqual([{ id: 5, name: "Suporte" }]);
     expect(calls).toBe(1);
+  });
+});
+
+describe("resolveQueueName", () => {
+  const known = [
+    { id: 5, name: "Suporte" },
+    { id: 6, name: "Financeiro" },
+  ];
+
+  test("null queueId → null", () => {
+    expect(resolveQueueName(null, known)).toBeNull();
+  });
+
+  test("a queueId present in the catalog → its name", () => {
+    expect(resolveQueueName(6, known)).toBe("Financeiro");
+  });
+
+  test("a queueId NOT in the catalog (deleted/renamed queue) → null, not a crash", () => {
+    expect(resolveQueueName(999, known)).toBeNull();
+  });
+});
+
+describe("resolveContactTagNames", () => {
+  const known = [
+    { id: 1, name: "vip" },
+    { id: 2, name: "lead" },
+  ];
+
+  test("empty refs → []", () => {
+    expect(resolveContactTagNames([], known)).toEqual([]);
+  });
+
+  test("a ref with a name already present is used as-is (no catalog lookup)", () => {
+    expect(
+      resolveContactTagNames([{ id: null, name: "urgente" }], known),
+    ).toEqual(["urgente"]);
+  });
+
+  test("a ref with only an id resolves against the catalog", () => {
+    expect(resolveContactTagNames([{ id: 2, name: null }], known)).toEqual([
+      "lead",
+    ]);
+  });
+
+  test("an id with no catalog match falls back to a labeled placeholder, never dropped", () => {
+    expect(resolveContactTagNames([{ id: 999, name: null }], known)).toEqual([
+      "tag #999",
+    ]);
+  });
+
+  test("neither id nor name resolvable → '?' placeholder", () => {
+    expect(resolveContactTagNames([{ id: null, name: null }], known)).toEqual([
+      "?",
+    ]);
+  });
+
+  test("mixed refs resolve independently, preserving order", () => {
+    expect(
+      resolveContactTagNames(
+        [
+          { id: 1, name: null },
+          { id: null, name: "custom" },
+          { id: 999, name: null },
+        ],
+        known,
+      ),
+    ).toEqual(["vip", "custom", "tag #999"]);
   });
 });

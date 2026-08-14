@@ -1509,6 +1509,10 @@
       "desc": "Evaluate arithmetic expressions exactly (+ - * / % ^ and parentheses).",
       "label": "Calculator"
     },
+    "get_contact_info": {
+      "desc": "Look up the contact's current queue, tags, and saved memory before asking the customer for information that might already be on file.",
+      "label": "Look up contact"
+    },
     "get_current_time": {
       "desc": "Get the current date and time in the agent's timezone.",
       "label": "Current time"

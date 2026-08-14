@@ -540,7 +540,17 @@ export function ZproConversationDetailPage() {
                     {conv.contactNumber}
                     {conv.ticketProtocol ? ` · #${conv.ticketProtocol}` : ""}
                     {` · ${conv.instanceName}`}
+                    {conv.queueName ? ` · ${conv.queueName}` : ""}
                   </p>
+                  {conv.tags.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {conv.tags.map((tag) => (
+                        <Badge key={tag} variant="secondary">
+                          {tag}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
               <Button
