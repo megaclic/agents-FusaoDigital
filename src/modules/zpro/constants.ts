@@ -29,6 +29,10 @@ export const ZPRO_PRESENCE_PAUSED = "paused" as const;
 export const ZPRO_IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
 
 // TTL da marca "agente está enviando" (agent-echo.ts) — janela em que um eco fromMe do webhook é
-// tratado como AGENT em vez de cair no heurístico ticket.userId. Cobre múltiplos balões (split por
-// \n\n em sendTextReply) + latência de rede/ida-volta do webhook.
-export const ZPRO_AGENT_ECHO_TTL_MS = 30 * 1000;
+// tratado como AGENT em vez de cair no heurístico ticket.userId (que classificaria como HUMAN e
+// dispararia o auto-handoff em zpro.controller.ts, desligando o agente sozinho). Cobre múltiplos
+// balões (split por \n\n em sendTextReply) + latência de rede/ida-volta do webhook + a variância de
+// um turno lento (guardrails + RAG/tool calls antes do envio). 2min dá bastante folga; o custo de
+// superestimar é pequeno (uma intervenção humana genuína dentro da janela raramente coincide com o
+// segundo exato de uma resposta do agente), enquanto subestimar desliga o agente sozinho.
+export const ZPRO_AGENT_ECHO_TTL_MS = 2 * 60 * 1000;
