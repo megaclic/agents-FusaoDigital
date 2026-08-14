@@ -92,6 +92,7 @@ import {
   startTypingHeartbeat,
 } from "./messages";
 import type { TurnState } from "./native-tools";
+import { withQuotedPrefix } from "./parse";
 import { deliverZproReply } from "./split";
 import { ZproAgentStatusReporter } from "./status";
 import { loadZproAgentTools } from "./tools";
@@ -804,8 +805,13 @@ export async function runZproAgentTurn(
   };
 
   // Texto da mensagem: body direto para texto, mediaCaption para mídias. Uma mídia sem caption e
-  // sem extração (STT/vision) não tem o que oferecer ao modelo — reconhece a entrega e sai.
-  const text = ev.body || ev.mediaCaption || "";
+  // sem extração (STT/vision) não tem o que oferecer ao modelo — reconhece a entrega e sai. Uma
+  // resposta a uma mensagem específica (WhatsApp reply) ganha o prefixo "<em resposta a: ...>" —
+  // sem isso o agente vê só o texto novo e perde de vista a pergunta original sendo retomada.
+  const text = withQuotedPrefix(
+    ev.body || ev.mediaCaption || "",
+    ev.quotedText,
+  );
   if (!text) {
     await markDelivery("PROCESSED");
     return "skipped";

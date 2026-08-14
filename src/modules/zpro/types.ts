@@ -74,6 +74,7 @@ export interface ZproMsgContent {
     directPath?: string;
     mediaKey?: unknown;
     mediaKeyTimestamp?: unknown;
+    contextInfo?: unknown;
   };
   // Imagem
   imageMessage?: {
@@ -84,6 +85,7 @@ export interface ZproMsgContent {
     width?: number;
     directPath?: string;
     mediaKey?: unknown;
+    contextInfo?: unknown;
   };
   // Vídeo
   videoMessage?: {
@@ -93,6 +95,7 @@ export interface ZproMsgContent {
     seconds?: number;
     directPath?: string;
     mediaKey?: unknown;
+    contextInfo?: unknown;
   };
   // Documento (inclui imagens enviadas via "Documento" no WhatsApp Web)
   documentMessage?: {
@@ -103,6 +106,7 @@ export interface ZproMsgContent {
     caption?: string; // texto enviado junto ao documento
     directPath?: string;
     mediaKey?: unknown;
+    contextInfo?: unknown;
   };
   // Sticker
   stickerMessage?: {
@@ -243,6 +247,9 @@ export interface NormalizedZproEvent {
   mediaCaption?: string; // caption/texto junto à mídia
   mediaMimetype?: string;
   mediaFileName?: string;
+  // WhatsApp "reply to a specific message" — the referenced message's own text/caption (see
+  // parse.ts's extractQuotedText). undefined when this message isn't a reply.
+  quotedText?: string;
   fromMe: boolean;
   timestamp: number;
   // Contexto do ticket

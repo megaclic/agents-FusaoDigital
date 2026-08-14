@@ -149,6 +149,21 @@ function MessageBubble({
             </>
           )}
         </p>
+        {m.quotedText && (
+          <div
+            className={cn(
+              "mb-1 rounded border-l-2 px-2 py-1 text-xs",
+              outgoing
+                ? "border-accent-foreground/50 bg-accent-foreground/10 text-accent-foreground/80"
+                : "border-border bg-bg-secondary text-text-muted",
+            )}
+          >
+            <p className="font-medium opacity-90">
+              {t("zpro.conversations.quotedReply", "Replying to")}
+            </p>
+            <p className="line-clamp-2 whitespace-pre-wrap">{m.quotedText}</p>
+          </div>
+        )}
         {m.mediaUrl && (
           <div className="mb-1">
             <ZproMessageMedia convId={convId} m={m} />

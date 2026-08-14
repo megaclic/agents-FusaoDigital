@@ -16,7 +16,12 @@ import { runScopedOn } from "@/lib/tenancy";
 import { wasAgentSending } from "./agent-echo";
 import { ZPRO_METHOD_CONTACT, ZPRO_METHOD_MESSAGE } from "./constants";
 import { sysCtx } from "./ctx";
-import { extractMedia, extractMessageBody, parseContactTags } from "./parse";
+import {
+  extractMedia,
+  extractMessageBody,
+  extractQuotedText,
+  parseContactTags,
+} from "./parse";
 import type { ZproWebhookPayload } from "./types";
 
 // Z-PRO redelivers the same webhook payload concurrently (network retry) often enough that two
@@ -84,6 +89,7 @@ export async function mirrorZproMessage(
   const isHumanIntervention = senderType === "HUMAN";
   const body = extractMessageBody(msg);
   const media = extractMedia(msg.data?.message);
+  const quotedText = extractQuotedText(msg) ?? null;
   const lastMessageAt = new Date(msg.timestamp);
   // CLIENT-only anchor for the generic follow-up sweep (isNewFollowUpEpisode), distinct from
   // lastMessageAt (any sender) — mirrors Conversation.lastInboundAt (chatwoot/mirror.ts).
@@ -187,6 +193,7 @@ export async function mirrorZproMessage(
           // private customer media, not just an opaque id.
           mediaKey: media.mediaKey ? encryptJson(media.mediaKey) : null,
           mediaMimetype: media.mediaMimetype ?? null,
+          quotedText,
           fromMe: msg.fromMe,
           timestamp: BigInt(msg.timestamp),
         },

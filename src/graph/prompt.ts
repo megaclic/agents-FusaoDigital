@@ -33,14 +33,29 @@ export const COMMITMENT_DIRECTIVE = [
   "- A confident promise you cannot keep is worse than admitting a limitation.",
 ].join("\n");
 
+// Always appended, like COMMITMENT_DIRECTIVE — exists because a customer's WhatsApp "reply to a
+// specific message" (rendered as a `<em resposta a: "...">` prefix on their message — both
+// channels: chatwoot/render.ts's in_reply_to and zpro/parse.ts's quotedText) was observed live
+// (2026-08-14) being effectively ignored: the marker WAS correctly delivered every turn (confirmed
+// via the persisted ZproMessage row), but the model kept resolving an ambiguous "isso"/"that"
+// against ITS OWN most recent question instead of the explicitly quoted — often much older and
+// unrelated — message. The marker alone, with no explanation of what it means, wasn't enough to
+// beat recency bias; this directive names the convention and states the priority explicitly.
+export const QUOTED_REPLY_DIRECTIVE = [
+  "Quoted-reply handling:",
+  '- A customer message prefixed `<em resposta a: "...">` means the customer used WhatsApp\'s own "reply" feature to point at that SPECIFIC earlier message — it may be much older than the current back-and-forth and unrelated to your last question.',
+  "- Treat the quoted text as the primary subject of their message, even when it conflicts with or has nothing to do with what you just asked.",
+  '- Do not assume a pronoun like "isso"/"that" refers to your own last turn just because it is more recent — resolve it against the quoted text first.',
+].join("\n");
+
 export function composeSystemPrompt(
   basePrompt: string,
   opts: { grounded: boolean },
 ): string {
   const base = basePrompt.trim();
   const directives = opts.grounded
-    ? [COMMITMENT_DIRECTIVE, GROUNDING_DIRECTIVE]
-    : [COMMITMENT_DIRECTIVE];
+    ? [COMMITMENT_DIRECTIVE, QUOTED_REPLY_DIRECTIVE, GROUNDING_DIRECTIVE]
+    : [COMMITMENT_DIRECTIVE, QUOTED_REPLY_DIRECTIVE];
   return [base, ...directives].filter(Boolean).join("\n\n");
 }
 

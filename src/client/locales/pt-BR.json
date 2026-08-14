@@ -2234,6 +2234,7 @@
       "messagesLoading": "Carregando mensagens…",
       "metaError": "Não foi possível carregar a conversa.",
       "noMessages": "Nenhuma mensagem ainda.",
+      "quotedReply": "Respondendo a",
       "search": "Buscar por contato ou # do ticket…",
       "status": {
         "closed": "Fechada",

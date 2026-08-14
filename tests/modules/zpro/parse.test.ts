@@ -7,10 +7,13 @@
 import { describe, expect, test } from "bun:test";
 import {
   extractMedia,
+  extractQuotedText,
   parseContactTags,
   parseMediaKey,
   resolveZproInstanceCandidate,
+  withQuotedPrefix,
 } from "@/modules/zpro/parse";
+import type { ZproMsgTop } from "@/modules/zpro/types";
 
 interface Candidate {
   id: number;
@@ -158,6 +161,191 @@ describe("parseMediaKey", () => {
     expect(parseMediaKey({ type: "Buffer" })).toBeUndefined();
     expect(parseMediaKey(42)).toBeUndefined();
     expect(parseMediaKey(["not", "numbers"])).toBeUndefined();
+  });
+});
+
+// contextInfo (WhatsApp "reply to a specific message") location CONFIRMED live (2026-08-14, 12
+// real captures via the ngrok inspector): it sits at the top-level data.contextInfo, a SIBLING of
+// `message` — a reply to plain text stays typed "conversation" on this wire format, never
+// upgraded to "extendedTextMessage" the way vanilla Baileys does. The extendedTextMessage/
+// media-type contextInfo candidates are still checked as defensive fallbacks (never observed, but
+// harmless) — must degrade to undefined on any mismatch rather than throwing, per
+// parseMediaKey/parseContactTags's precedent.
+function baseMsg(overrides: Partial<ZproMsgTop> = {}): ZproMsgTop {
+  return {
+    event: "messages.upsert",
+    instance: "test",
+    fromMe: false,
+    id: "msg1",
+    body: null,
+    type: "conversation",
+    timestamp: Date.now(),
+    from: "5511999999999",
+    read: false,
+    ack: 1,
+    ...overrides,
+  };
+}
+
+describe("extractQuotedText", () => {
+  test("extendedTextMessage.contextInfo.quotedMessage.conversation → the quoted text", () => {
+    const msg = baseMsg({
+      data: {
+        message: {
+          extendedTextMessage: {
+            text: "vc entendeu?",
+            contextInfo: {
+              stanzaId: "ABC123",
+              quotedMessage: {
+                conversation: "por enquanto nao. vamos aguardar",
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(extractQuotedText(msg)).toBe("por enquanto nao. vamos aguardar");
+  });
+
+  test("top-level data.contextInfo (sibling of message) is also checked", () => {
+    const msg = baseMsg({
+      data: {
+        contextInfo: {
+          quotedMessage: { conversation: "mensagem original" },
+        },
+        message: { conversation: "vc entendeu?" },
+      },
+    });
+    expect(extractQuotedText(msg)).toBe("mensagem original");
+  });
+
+  // Shape of a real captured reply (ngrok inspector, 2026-08-14): a plain-text message stays typed
+  // "conversation" (never upgraded to "extendedTextMessage"), and contextInfo carries the usual
+  // envelope siblings (mentionedJid/groupMentions/statusAttributions/ephemeralSettingTimestamp/
+  // disappearingMode) alongside stanzaId/participant/quotedMessage — the extra fields must not
+  // confuse extraction.
+  test("real captured shape: conversation type + full contextInfo envelope", () => {
+    const msg = baseMsg({
+      type: "conversation",
+      data: {
+        message: { conversation: "não, estou falando sobre isso." },
+        contextInfo: {
+          mentionedJid: [],
+          groupMentions: [],
+          statusAttributions: [],
+          stanzaId: "3EB0E4627F18062569E3A8",
+          participant: "217192838725774@lid",
+          quotedMessage: {
+            conversation: "O que ter à mão na consulta\n- Fotos do acidente;",
+          },
+          ephemeralSettingTimestamp: {
+            low: 1786560929,
+            high: 0,
+            unsigned: false,
+          },
+          disappearingMode: { initiator: 0, trigger: 1, initiatedByMe: false },
+        },
+      },
+    });
+    expect(extractQuotedText(msg)).toBe(
+      "O que ter à mão na consulta - Fotos do acidente;",
+    );
+  });
+
+  test("quoted media with no caption degrades to a type marker instead of disappearing", () => {
+    const msg = baseMsg({
+      data: {
+        message: {
+          extendedTextMessage: {
+            text: "e essa?",
+            contextInfo: { quotedMessage: { audioMessage: { url: "x" } } },
+          },
+        },
+      },
+    });
+    expect(extractQuotedText(msg)).toBe("<mensagem de áudio>");
+  });
+
+  test("collapses whitespace and truncates to 200 chars", () => {
+    const long = "a".repeat(250);
+    const msg = baseMsg({
+      data: {
+        message: {
+          extendedTextMessage: {
+            text: "oi",
+            contextInfo: {
+              quotedMessage: {
+                conversation: `  linha 1\n\n  linha  2  ${long}`,
+              },
+            },
+          },
+        },
+      },
+    });
+    const result = extractQuotedText(msg);
+    expect(result?.length).toBe(200);
+    expect(result?.startsWith("linha 1 linha 2 aaa")).toBe(true);
+  });
+
+  test("no contextInfo → undefined", () => {
+    const msg = baseMsg({ data: { message: { conversation: "oi" } } });
+    expect(extractQuotedText(msg)).toBeUndefined();
+  });
+
+  test("contextInfo present but no quotedMessage → undefined, never throws", () => {
+    const msg = baseMsg({
+      data: {
+        message: {
+          extendedTextMessage: { text: "oi", contextInfo: { stanzaId: "x" } },
+        },
+      },
+    });
+    expect(extractQuotedText(msg)).toBeUndefined();
+  });
+
+  test("malformed contextInfo shapes degrade to undefined instead of throwing", () => {
+    expect(
+      extractQuotedText(
+        baseMsg({
+          data: {
+            message: { extendedTextMessage: { contextInfo: "not an object" } },
+          },
+        }),
+      ),
+    ).toBeUndefined();
+    expect(
+      extractQuotedText(
+        baseMsg({
+          data: {
+            message: {
+              extendedTextMessage: {
+                contextInfo: { quotedMessage: "also not an object" },
+              },
+            },
+          },
+        }),
+      ),
+    ).toBeUndefined();
+    expect(extractQuotedText(baseMsg({ data: undefined }))).toBeUndefined();
+  });
+});
+
+describe("withQuotedPrefix", () => {
+  test("no quotedText → body unchanged", () => {
+    expect(withQuotedPrefix("oi", undefined)).toBe("oi");
+    expect(withQuotedPrefix("oi", null)).toBe("oi");
+  });
+
+  test("quotedText + body → prefixed with the reply marker", () => {
+    expect(withQuotedPrefix("vc entendeu?", "mensagem original")).toBe(
+      '<em resposta a: "mensagem original">\nvc entendeu?',
+    );
+  });
+
+  test("quotedText + empty body → marker-only line, not dropped", () => {
+    expect(withQuotedPrefix("", "mensagem original")).toBe(
+      '<em resposta a: "mensagem original">',
+    );
   });
 });
 

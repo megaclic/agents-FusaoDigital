@@ -710,6 +710,11 @@ model ZproMessage {
   // The WhatsApp-reported mimetype (e.g. "audio/ogg; codecs=opus") — needed post-decrypt, since
   // the CDN response's own Content-Type describes the encrypted transport, not the plaintext.
   mediaMimetype  String?        @map("media_mimetype")
+  // WhatsApp "reply to a specific message" — the referenced message's own text/caption, embedded
+  // inline in the reply's contextInfo.quotedMessage (WhatsApp protocol design, no lookup needed).
+  // Immutable snapshot taken at mirror time, unlike `body` (overwritten in place by the STT/vision
+  // write-back) — never updated afterward. null when this message isn't a reply.
+  quotedText     String?        @map("quoted_text")
   fromMe         Boolean        @map("from_me")
   timestamp      BigInt // msg.timestamp (unix ms)
   createdAt      DateTime       @default(now()) @map("created_at")

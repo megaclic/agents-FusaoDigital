@@ -2228,6 +2228,7 @@
       "messagesLoading": "Loading messages…",
       "metaError": "Could not load the conversation.",
       "noMessages": "No messages yet.",
+      "quotedReply": "Replying to",
       "search": "Search by contact or ticket #…",
       "status": {
         "closed": "Closed",

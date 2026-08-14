@@ -138,6 +138,10 @@ const MESSAGE_SELECT = {
   mediaUrl: true,
   mediaCaption: true,
   mediaFileName: true,
+  // The referenced message's own text/caption when this message is a WhatsApp reply — embedded
+  // inline at mirror time (parse.ts's extractQuotedText), no lookup-by-id needed unlike Chatwoot's
+  // in_reply_to (see docs/zpro.md's "Quoted-reply context").
+  quotedText: true,
   fromMe: true,
   timestamp: true,
   createdAt: true,
@@ -152,6 +156,7 @@ type MessageRow = {
   mediaUrl: string | null;
   mediaCaption: string | null;
   mediaFileName: string | null;
+  quotedText: string | null;
   fromMe: boolean;
   timestamp: bigint;
   createdAt: Date;
@@ -167,6 +172,7 @@ function messageToDto(row: MessageRow) {
     mediaUrl: row.mediaUrl,
     mediaCaption: row.mediaCaption,
     mediaFileName: row.mediaFileName,
+    quotedText: row.quotedText,
     fromMe: row.fromMe,
     timestamp: row.timestamp.toString(),
     createdAt: row.createdAt.toISOString(),

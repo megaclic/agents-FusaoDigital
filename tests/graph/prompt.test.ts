@@ -1,5 +1,43 @@
 import { describe, expect, test } from "bun:test";
-import { buildPromptVars, interpolatePromptVars } from "@/graph/prompt";
+import {
+  buildPromptVars,
+  COMMITMENT_DIRECTIVE,
+  composeSystemPrompt,
+  GROUNDING_DIRECTIVE,
+  interpolatePromptVars,
+  QUOTED_REPLY_DIRECTIVE,
+} from "@/graph/prompt";
+
+// QUOTED_REPLY_DIRECTIVE was added after a live observation (2026-08-14, Z-PRO): the
+// `<em resposta a: "...">` marker (both chatwoot/render.ts's in_reply_to and zpro/parse.ts's
+// quotedText) was being correctly delivered to the model every turn, but the model still resolved
+// an ambiguous pronoun against its OWN most recent question instead of the quoted text — the
+// marker alone, unexplained, wasn't enough to beat recency bias. Always appended, like
+// COMMITMENT_DIRECTIVE — a quoted reply can happen regardless of whether the agent has
+// knowledge-base grounding.
+describe("composeSystemPrompt", () => {
+  test("always appends COMMITMENT_DIRECTIVE and QUOTED_REPLY_DIRECTIVE, ungrounded", () => {
+    const out = composeSystemPrompt("Você é um assistente.", {
+      grounded: false,
+    });
+    expect(out).toContain("Você é um assistente.");
+    expect(out).toContain(COMMITMENT_DIRECTIVE);
+    expect(out).toContain(QUOTED_REPLY_DIRECTIVE);
+    expect(out).not.toContain(GROUNDING_DIRECTIVE);
+  });
+
+  test("grounded also appends GROUNDING_DIRECTIVE, after QUOTED_REPLY_DIRECTIVE", () => {
+    const out = composeSystemPrompt("Você é um assistente.", {
+      grounded: true,
+    });
+    expect(out).toContain(COMMITMENT_DIRECTIVE);
+    expect(out).toContain(QUOTED_REPLY_DIRECTIVE);
+    expect(out).toContain(GROUNDING_DIRECTIVE);
+    expect(out.indexOf(QUOTED_REPLY_DIRECTIVE)).toBeLessThan(
+      out.indexOf(GROUNDING_DIRECTIVE),
+    );
+  });
+});
 
 describe("interpolatePromptVars — {{ }} syntax", () => {
   const vars = buildPromptVars({

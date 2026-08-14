@@ -28,6 +28,7 @@ import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import type { JobResult } from "@/modules/scheduler/worker";
 import { sysCtx } from "./ctx";
+import { withQuotedPrefix } from "./parse";
 import { loadZproAgent, runLoadedZproTurn, zproThreadId } from "./runtime";
 import type { NormalizedZproEvent } from "./types";
 
@@ -158,7 +159,13 @@ export async function flushZproDebounceJob(
         ...(watermark != null ? { id: { gt: watermark } } : {}),
       },
       orderBy: { id: "asc" },
-      select: { id: true, body: true, messageType: true, messageId: true },
+      select: {
+        id: true,
+        body: true,
+        quotedText: true,
+        messageType: true,
+        messageId: true,
+      },
     }),
   );
   if (pendingAll.length === 0) return { outcome: "done" };
@@ -215,7 +222,7 @@ export async function flushZproDebounceJob(
   };
 
   const text = pending
-    .map((m) => m.body)
+    .map((m) => withQuotedPrefix(m.body, m.quotedText))
     .filter(Boolean)
     .join("\n");
   if (!text) {

@@ -8,6 +8,7 @@ import {
   extractInstanceName,
   extractMedia,
   extractMessageBody,
+  extractQuotedText,
   extractWhatsappId,
 } from "./parse";
 import type {
@@ -79,6 +80,7 @@ export function normalizeZproWebhook(
   const msgContent = msg.data?.message;
   const body = extractMessageBody(msg);
   const media = extractMedia(msgContent);
+  const quotedText = extractQuotedText(msg);
 
   return {
     messageId: msg.id,
@@ -95,6 +97,7 @@ export function normalizeZproWebhook(
     messageType,
     body,
     ...media,
+    ...(quotedText ? { quotedText } : {}),
     fromMe: msg.fromMe,
     timestamp: msg.timestamp,
     ticketStatus: ticket.status,

@@ -7,6 +7,7 @@ import type { WhatsappMediaType } from "./media-crypto";
 import type {
   ZproContactTagRef,
   ZproMsgContent,
+  ZproMsgData,
   ZproMsgTop,
   ZproWebhookPayload,
 } from "./types";
@@ -130,6 +131,82 @@ export function extractMessageBody(msg: ZproMsgTop): string {
     content?.documentMessage?.caption ??
     ""
   );
+}
+
+const QUOTE_MAX = 200;
+
+// contextInfo (WhatsApp's "reply to a specific message" metadata) location CONFIRMED live
+// (2026-08-14, 12 real captures via the ngrok inspector, 100% consistent): it lives at the
+// top-level `data.contextInfo`, a SIBLING of `message` — NOT nested under
+// extendedTextMessage.contextInfo as the standard Baileys convention would suggest. A reply to
+// plain text stays typed "conversation" on this wire format; it is never upgraded to
+// "extendedTextMessage" the way vanilla Baileys does. The extendedTextMessage/media-type
+// candidates are kept as defensive fallbacks (never observed, but harmless — same posture as
+// parseMediaKey/parseContactTags) in case some other channel or a future payload shape differs.
+function findContextInfo(
+  content: ZproMsgContent | undefined,
+  data: ZproMsgData | undefined,
+): Record<string, unknown> | undefined {
+  const candidates: unknown[] = [
+    content?.extendedTextMessage?.contextInfo,
+    content?.audioMessage?.contextInfo,
+    content?.imageMessage?.contextInfo,
+    content?.videoMessage?.contextInfo,
+    content?.documentMessage?.contextInfo,
+    data?.contextInfo,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object") {
+      return candidate as Record<string, unknown>;
+    }
+  }
+  return undefined;
+}
+
+// Same fallback chain as extractMessageBody, PLUS a type marker for uncaptioned media (the quoted
+// message is a frozen snapshot embedded in contextInfo — unlike a live inbound message it will
+// never get an STT/vision write-back, so "no text" needs its own signal instead of silently
+// disappearing from the reply's context).
+function describeQuotedContent(content: ZproMsgContent): string {
+  const text = (
+    content.conversation ??
+    content.extendedTextMessage?.text ??
+    content.imageMessage?.caption ??
+    content.videoMessage?.caption ??
+    content.documentMessage?.caption ??
+    ""
+  ).trim();
+  if (text) return text;
+  if (content.audioMessage) return "<mensagem de áudio>";
+  if (content.imageMessage) return "<imagem>";
+  if (content.videoMessage) return "<vídeo>";
+  if (content.documentMessage) return "<documento>";
+  return "";
+}
+
+// Extracts the referenced message's own text/caption when `msg` is a WhatsApp reply — WhatsApp
+// embeds the quoted message's content INLINE in contextInfo.quotedMessage (no lookup by stanzaId
+// needed, unlike Chatwoot's in_reply_to which points at an id resolved separately).
+export function extractQuotedText(msg: ZproMsgTop): string | undefined {
+  const ctxInfo = findContextInfo(msg.data?.message, msg.data);
+  const quotedMessage = ctxInfo?.quotedMessage;
+  if (!quotedMessage || typeof quotedMessage !== "object") return undefined;
+  const text = describeQuotedContent(quotedMessage as ZproMsgContent);
+  if (!text) return undefined;
+  return text.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX);
+}
+
+// Prefixes a message's text with a "replying to: ..." marker when it's a WhatsApp reply — same
+// `<em resposta a: "...">` convention chatwoot/render.ts uses for in_reply_to, so both channels
+// read identically to the agent. `quotedText` alone (empty body) renders as a marker-only line
+// rather than being dropped, so a bare reply to a prior message still carries its context.
+export function withQuotedPrefix(
+  body: string,
+  quotedText: string | null | undefined,
+): string {
+  if (!quotedText) return body;
+  const prefix = `<em resposta a: "${quotedText}">`;
+  return body ? `${prefix}\n${body}` : prefix;
 }
 
 // Nem todo canal do Z-PRO manda `whatsapp` na raiz do payload (confirmado: o canal "evo" manda;
