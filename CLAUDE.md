@@ -181,7 +181,7 @@ When adding external dependencies (analytics, captcha, CDN), extend the relevant
 - Husky pre-commit hooks run lint, type-check, and tests
 - Prefer `Bun.file(path).text()` / `Bun.file(path).json()` over `node:fs` for file reads. The Bun API is idiomatic in this runtime and supports both sync and async patterns cleanly.
 - Always run `bun check` after applying all code changes to ensure code quality and correctness
-- Only add comments when strictly necessary, never obvious/redundant ones. Comments must have a tag: `// TODO:`, `// NOTE:`, or `// FIXME:`
+- Only add comments when strictly necessary, never obvious/redundant ones. **Where the tag goes**: a comment that DOCUMENTS a symbol (the module header at the top of a file, or the docstring directly above a declaration, exported or not) carries **no** tag; a comment INSIDE a body must have one: `// TODO:`, `// NOTE:`, or `// FIXME:`. Spelled out because the shorter phrasing reads as "every comment needs a tag", which makes review tooling flag every docstring in the tree
 - **Cursor styles**: `cursor: pointer` is set globally on `button`, `select`, `[role="button"]` in `public/index.css`. Never use `cursor-pointer` on individual elements. Only use cursor utilities for overrides like `cursor-not-allowed` on disabled states
 - Use the `cn` utility for component classNames. For conditional classNames, use object syntax `cn("base", { "active": isActive })`, not ternary operators
 - Add `aria-*` attributes for accessibility on interactive elements
