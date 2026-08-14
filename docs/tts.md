@@ -2,7 +2,7 @@
 
 Optionally answer the customer with a WhatsApp voice note. Three operator-chosen modes (n8n parity), a generic provider registry, and an elegant per-contact preference stored on our own `Contact` row (not a Chatwoot custom attribute). Off by default (audio costs money and isn't always wanted).
 
-This file documents the **Chatwoot** channel. The independent **Z-PRO** ("FusaoChatBot CRM") channel reuses this same provider registry and `agent.settings.tts` config schema unchanged, but differs on sending (`ZproClient.sendVoice`/`sendBase64` instead of `client.sendAudioMessage`, branched by container) and preference storage (`ZproConversation.voiceReply`, since Z-PRO has no `Contact` table). See [`docs/zpro.md`](zpro.md#audio-replies-tts) for the full Z-PRO flow.
+This file documents the **Chatwoot** channel. The independent **Z-PRO** ("FusaoChatBot CRM") channel reuses this same provider registry and `agent.settings.tts` config schema unchanged, but differs on sending (`ZproClient.sendBase64` always — `sendVoice`, the vendor's native voice-note endpoint, needs a public URL we don't have, not inline base64; confirmed live 2026-08-14 that using it silently drops the message) and preference storage (`ZproConversation.voiceReply`, since Z-PRO has no `Contact` table). See [`docs/zpro.md`](zpro.md#audio-replies-tts) for the full Z-PRO flow.
 
 ## Decision + flow
 

@@ -103,17 +103,6 @@ export async function sendTextReply(
   }
 }
 
-/** Envia arquivo de áudio como mensagem de voz. */
-export async function sendVoiceReply(
-  client: ZproClient,
-  event: NormalizedZproEvent,
-  audioBase64: string,
-): Promise<void> {
-  await client.sendVoice(event.contactNumber, audioBase64, {
-    externalKey: `voice-${event.messageId}-${Date.now()}`,
-  });
-}
-
 /** Envia imagem ou documento via URL pública. */
 export async function sendMediaReply(
   client: ZproClient,

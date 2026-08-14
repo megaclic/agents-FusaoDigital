@@ -20,24 +20,24 @@ import type { ZproClient } from "./client";
 import { sysCtx } from "./ctx";
 import type { NormalizedZproEvent } from "./types";
 
-// OPEN-VALIDATION: ZproClient.sendVoice's own comment documents its `audio` param as "base64,
-// ogg/opus" — untested against a live Z-PRO instance with anything else, hence the sendBase64
-// fallback below for any other container (openai/elevenlabs always resolve to ogg_opus on a
-// WhatsApp-only channel; only openrouter's mp3-only output reaches the fallback branch).
+// The vendor's `/voice` endpoint (ZproClient.sendVoice) does NOT accept base64 — the official
+// Postman collection documents its `audio` field as a PUBLIC URL to an already-hosted audio file
+// ("https://fusaobot.com.br/wp-content/uploads/.../audio.ogg" in their own example), not inline
+// bytes. Confirmed live (2026-08-14): calling it with base64 in that field returns 200 (the API
+// doesn't validate the string looks like a URL) and every stage of OUR pipeline logs success, but
+// the voice note never reaches WhatsApp — a silent, unrecoverable delivery failure with zero
+// error signal anywhere. We synthesize audio in-memory and have no hosting step to turn it into a
+// URL first, so `/voice` is unusable for us without that extra infrastructure. sendBase64 (the
+// generic `/base64` file-attachment endpoint) DOES accept inline base64 data — used unconditionally
+// now, for every format. Trade-off: the reply arrives as a downloadable file attachment, not a
+// native playable voice-note bubble (no waveform/PTT rendering) — worse UX, but it actually arrives,
+// unlike the alternative.
 export async function sendZproVoiceReply(
   client: ZproClient,
   event: NormalizedZproEvent,
   result: TtsResult,
 ): Promise<void> {
   const base64 = Buffer.from(result.audio).toString("base64");
-  if (result.mime === "audio/ogg") {
-    await client.sendVoice(event.contactNumber, base64, {
-      externalKey: `voice-${event.messageId}-${Date.now()}`,
-    });
-    return;
-  }
-  // Not a native voice note (see the OPEN-VALIDATION note above): send as a generic file
-  // attachment instead of mis-tagging bytes ZproClient.sendVoice never claimed to support.
   await client.sendBase64(
     event.contactNumber,
     base64,

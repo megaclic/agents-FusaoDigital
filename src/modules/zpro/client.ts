@@ -86,13 +86,18 @@ export class ZproClient {
     return this.post("url", { number, mediaUrl, body, ...opts });
   }
 
-  /** Envia áudio como mensagem de voz (base64, ogg/opus). */
+  // `audio` is a PUBLIC URL to an already-hosted file, NOT base64 — confirmed against the vendor's
+  // own Postman example (docs/reference), and confirmed live (2026-08-14) the hard way: calling
+  // this with base64 in `audio` returns 200 but the voice note never reaches WhatsApp, no error
+  // anywhere. No caller in this codebase uses it — we synthesize audio in-memory with no hosting
+  // step to get a URL first, so tts.ts's sendZproVoiceReply uses sendBase64 (the generic
+  // `/base64` file endpoint, which DOES accept inline data) instead.
   async sendVoice(
     number: string,
-    audio: string /* base64 */,
+    audioUrl: string,
     opts?: { externalKey?: string; isClosed?: boolean },
   ) {
-    return this.post("voice", { number, audio, ...opts });
+    return this.post("voice", { number, audio: audioUrl, ...opts });
   }
 
   /** Envia mídia via base64 (genérico para qualquer tipo de arquivo). */

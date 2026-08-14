@@ -3,10 +3,11 @@
 // set_voice_preference but writes ZproConversation.voiceReply (Z-PRO has no Contact table). Also
 // tenant-isolation and a same-tenant collision-risk check, matching the convention established for
 // the other zpro columns (avatarUrl, zproConversationId).
-// sendZproVoiceReply: pure branch on the synthesized mime — Ogg/Opus goes through the native
-// voice-note endpoint, anything else through the generic file endpoint (see the OPEN-VALIDATION note
-// in src/modules/zpro/tts.ts). No network: ZproClient is duck-typed and cast, same pattern
-// tests/graph/runtime.test.ts uses for ChatwootClient.
+// sendZproVoiceReply: always goes through the generic /base64 file endpoint, regardless of format —
+// the vendor's native /voice endpoint needs a public URL, not inline base64 (confirmed live,
+// 2026-08-14: a base64 "audio" field silently never reaches WhatsApp despite a 200 response). No
+// network: ZproClient is duck-typed and cast, same pattern tests/graph/runtime.test.ts uses for
+// ChatwootClient.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -193,15 +194,20 @@ describe.skipIf(!dbUp)("zpro tts", () => {
     };
   }
 
-  test("sendZproVoiceReply sends Ogg/Opus through the native voice-note endpoint", async () => {
+  test("sendZproVoiceReply sends Ogg/Opus through the generic /base64 endpoint (never /voice)", async () => {
     const calls: Array<[string, unknown]> = [];
     const client = {
-      sendVoice: async (number: string, audio: string) => {
-        calls.push(["sendVoice", { number, audioLen: audio.length }]);
+      sendVoice: async () => {
+        calls.push(["sendVoice", null]);
         return {};
       },
-      sendBase64: async () => {
-        calls.push(["sendBase64", null]);
+      sendBase64: async (
+        number: string,
+        _base64Data: string,
+        mimeType: string,
+        fileName: string,
+      ) => {
+        calls.push(["sendBase64", { number, mimeType, fileName }]);
         return {};
       },
     } as unknown as ZproClient;
@@ -213,10 +219,14 @@ describe.skipIf(!dbUp)("zpro tts", () => {
     });
 
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.[0]).toBe("sendVoice");
+    expect(calls[0]?.[0]).toBe("sendBase64");
+    expect(calls[0]?.[1]).toMatchObject({
+      mimeType: "audio/ogg",
+      fileName: "reply.ogg",
+    });
   });
 
-  test("sendZproVoiceReply sends a non-Ogg/Opus result (e.g. openrouter's mp3) as a generic file", async () => {
+  test("sendZproVoiceReply sends a non-Ogg/Opus result (e.g. openrouter's mp3) the same way", async () => {
     const calls: Array<[string, unknown]> = [];
     const client = {
       sendVoice: async () => {
