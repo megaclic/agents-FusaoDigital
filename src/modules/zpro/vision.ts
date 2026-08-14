@@ -26,6 +26,7 @@ import {
 } from "@/modules/vision/providers";
 import { readVisionConfig, type VisionConfig } from "@/modules/vision/settings";
 import { sysCtx } from "./ctx";
+import { decryptWhatsappMedia, type WhatsappMediaType } from "./media-crypto";
 
 // Resolves the vision config for the agent bound to this Z-PRO instance (scoped read, no network).
 // null when unbound, disabled, or vision off — the caller then leaves the media undescribed.
@@ -61,6 +62,14 @@ export interface ExtractZproFileParams {
   // Optional execution-flow context: when present, the extraction is logged as a `vision` stage
   // (visible in /logs), same contract as the Chatwoot path.
   flow?: FlowContext;
+  // base64 WhatsApp media key + the ORIGINAL WhatsApp message type (parse.ts's extractMedia) — the
+  // downloaded blob is WhatsApp's own end-to-end-encrypted CDN link, not the plain file (see
+  // media-crypto.ts). `mediaType` must be the WhatsApp message type (image/document), not the
+  // vision `kind` computed below from the mimetype — those can disagree (e.g. an image sent "as
+  // document" is still HKDF-keyed as "WhatsApp Document Keys"). Optional and defensive: a payload
+  // that somehow lacks either falls back to the pre-decryption behavior.
+  mediaKey?: string;
+  mediaType?: WhatsappMediaType;
 }
 
 export interface ExtractZproFileResult {
@@ -138,6 +147,34 @@ export async function extractZproFile(
       err instanceof Error ? err.message : String(err),
     );
     return null;
+  }
+
+  // The downloaded blob is WhatsApp's own encrypted CDN payload, not the plain file the response
+  // Content-Type header would suggest — decrypt before classifying/handing anything to the
+  // provider. On failure, never fall back to feeding still-encrypted bytes downstream.
+  if (params.mediaKey && params.mediaType) {
+    try {
+      bytes = decryptWhatsappMedia(bytes, params.mediaKey, params.mediaType);
+      // Once decrypted, the CDN's Content-Type (of the *encrypted* transport) is no longer
+      // meaningful — trust the mimetype WhatsApp reported on the original message instead.
+      contentType = params.mediaMimetype;
+    } catch (err) {
+      if (params.flow) {
+        emitFlowEvent(params.flow, {
+          stage: "vision",
+          level: "warn",
+          status: "error",
+          provider: cfg.provider,
+          detail: { step: "decrypt" },
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logger.warn(
+        "zpro:vision: media decryption failed: %s",
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    }
   }
 
   const kind = visionKindForMime(contentType ?? params.mediaMimetype);

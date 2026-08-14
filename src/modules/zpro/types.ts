@@ -60,13 +60,15 @@ export interface ZproMsgContent {
     text?: string;
     contextInfo?: unknown;
   };
-  // Áudio (ptt ou gravado)
+  // Áudio (ptt ou gravado). `mediaKey`: base64, chave pra decriptar o blob de `url` — ver
+  // media-crypto.ts. Confirmado presente via diagnóstico ao vivo (2026-08-14).
   audioMessage?: {
     url?: string;
     mimetype?: string;
     seconds?: number;
     ptt?: boolean;
     directPath?: string;
+    mediaKey?: string;
     mediaKeyTimestamp?: unknown;
   };
   // Imagem
@@ -77,6 +79,7 @@ export interface ZproMsgContent {
     height?: number;
     width?: number;
     directPath?: string;
+    mediaKey?: string;
   };
   // Vídeo
   videoMessage?: {
@@ -85,6 +88,7 @@ export interface ZproMsgContent {
     caption?: string;
     seconds?: number;
     directPath?: string;
+    mediaKey?: string;
   };
   // Documento (inclui imagens enviadas via "Documento" no WhatsApp Web)
   documentMessage?: {
@@ -94,6 +98,7 @@ export interface ZproMsgContent {
     fileName?: string;
     caption?: string; // texto enviado junto ao documento
     directPath?: string;
+    mediaKey?: string;
   };
   // Sticker
   stickerMessage?: {

@@ -5,6 +5,7 @@
 // instead of an authenticated Chatwoot attachment.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createCipheriv, createHmac, hkdfSync, randomBytes } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
@@ -13,6 +14,35 @@ import {
   extractZproFile,
   resolveZproVisionConfig,
 } from "@/modules/zpro/vision";
+
+// Mirrors the encrypt-then-package half of the WhatsApp media protocol (see media-crypto.ts /
+// media-crypto.test.ts) so these tests can produce a fixture that extractZproFile's decryption
+// step is expected to unwrap.
+function encryptWhatsappImageForTest(plaintext: Buffer) {
+  const mediaKey = randomBytes(32);
+  const expanded = Buffer.from(
+    hkdfSync(
+      "sha256",
+      mediaKey,
+      Buffer.alloc(0),
+      Buffer.from("WhatsApp Image Keys"),
+      112,
+    ),
+  );
+  const iv = expanded.subarray(0, 16);
+  const cipherKey = expanded.subarray(16, 48);
+  const macKey = expanded.subarray(48, 80);
+  const cipher = createCipheriv("aes-256-cbc", cipherKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const mac = createHmac("sha256", macKey)
+    .update(Buffer.concat([iv, ciphertext]))
+    .digest()
+    .subarray(0, 10);
+  return {
+    packaged: Buffer.concat([ciphertext, mac]),
+    mediaKeyBase64: mediaKey.toString("base64"),
+  };
+}
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -195,6 +225,100 @@ describe.skipIf(!dbUp)("zpro vision", () => {
       deps: { fetchImpl: visionFetch("image/jpeg", DESCRIPTION) },
     });
     expect(result).toBeNull();
+  });
+
+  test("extractZproFile decrypts the WhatsApp media before extracting", async () => {
+    const cfg = (await resolveZproVisionConfig(
+      tenantId,
+      zproInstanceId,
+      appDb,
+    )) as VisionConfig;
+    const plaintext = Buffer.from([0xff, 0xd8, 0xff, 1, 2, 3]); // fake jpeg-ish bytes
+    const { packaged, mediaKeyBase64 } = encryptWhatsappImageForTest(plaintext);
+    let sentToProvider: Buffer | null = null;
+    const fetchImpl = (async (
+      url: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const href =
+        typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+      if (href.includes("/chat/completions")) {
+        const body = JSON.parse(String(init?.body)) as {
+          messages: Array<{
+            content: Array<{ image_url?: { url: string } }>;
+          }>;
+        };
+        const dataUri = body.messages[0]?.content.find((c) => c.image_url)
+          ?.image_url?.url;
+        const b64 = dataUri?.split(",")[1] ?? "";
+        sentToProvider = Buffer.from(b64, "base64");
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: DESCRIPTION } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      // The media-download leg: WhatsApp's CDN serves the ENCRYPTED bytes under a generic
+      // transport content-type, unrelated to the real (plaintext) mimetype.
+      return new Response(new Uint8Array(packaged), {
+        status: 200,
+        headers: { "content-type": "application/octet-stream" },
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await extractZproFile({
+      tenantId,
+      mediaUrl: IMAGE_URL,
+      mediaMimetype: "image/jpeg",
+      mediaKey: mediaKeyBase64,
+      mediaType: "image",
+      cfg,
+      base: appDb,
+      deps: { fetchImpl },
+    });
+
+    expect(result?.kind).toBe("image");
+    expect(result?.text).toBe(DESCRIPTION);
+    expect(sentToProvider).not.toBeNull();
+    expect((sentToProvider as unknown as Buffer).equals(plaintext)).toBe(true);
+  });
+
+  test("extractZproFile returns null (never calls the provider) when the mediaKey is wrong", async () => {
+    const cfg = (await resolveZproVisionConfig(
+      tenantId,
+      zproInstanceId,
+      appDb,
+    )) as VisionConfig;
+    const { packaged } = encryptWhatsappImageForTest(Buffer.from("hello"));
+    let providerCalled = false;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href =
+        typeof url === "string" ? url : url instanceof URL ? url.href : url.url;
+      if (href.includes("/chat/completions")) {
+        providerCalled = true;
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: DESCRIPTION } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(new Uint8Array(packaged), {
+        status: 200,
+        headers: { "content-type": "application/octet-stream" },
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await extractZproFile({
+      tenantId,
+      mediaUrl: IMAGE_URL,
+      mediaMimetype: "image/jpeg",
+      mediaKey: randomBytes(32).toString("base64"), // wrong key — MAC won't match
+      mediaType: "image",
+      cfg,
+      base: appDb,
+      deps: { fetchImpl },
+    });
+
+    expect(result).toBeNull();
+    expect(providerCalled).toBe(false);
   });
 
   test("an unsupported mime (e.g. svg) is skipped, not sent to the provider", async () => {

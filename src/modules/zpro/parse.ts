@@ -3,6 +3,7 @@
 // do agente, só roda para eventos que passam no gate) e mirror.ts (espelho de TODAS as mensagens,
 // inclusive as que o gate descarta), para não duplicar a mesma lógica de parsing duas vezes.
 
+import type { WhatsappMediaType } from "./media-crypto";
 import type {
   ZproContactTagRef,
   ZproMsgContent,
@@ -15,6 +16,11 @@ export interface MediaExtracted {
   mediaCaption?: string;
   mediaMimetype?: string;
   mediaFileName?: string;
+  // base64 WhatsApp media key + which WhatsApp message type it came from — both needed by
+  // media-crypto.ts's decryptWhatsappMedia (the HKDF info string is type-specific). Absent means
+  // either the content has no media, or (defensively) a payload shape without the field.
+  mediaKey?: string;
+  mediaType?: WhatsappMediaType;
 }
 
 export function extractMedia(
@@ -26,6 +32,8 @@ export function extractMedia(
     return {
       mediaUrl: content.audioMessage.url,
       mediaMimetype: content.audioMessage.mimetype,
+      mediaKey: content.audioMessage.mediaKey,
+      mediaType: "audio",
     };
   }
   if (content.imageMessage) {
@@ -33,6 +41,8 @@ export function extractMedia(
       mediaUrl: content.imageMessage.url,
       mediaCaption: content.imageMessage.caption,
       mediaMimetype: content.imageMessage.mimetype,
+      mediaKey: content.imageMessage.mediaKey,
+      mediaType: "image",
     };
   }
   if (content.videoMessage) {
@@ -40,6 +50,8 @@ export function extractMedia(
       mediaUrl: content.videoMessage.url,
       mediaCaption: content.videoMessage.caption,
       mediaMimetype: content.videoMessage.mimetype,
+      mediaKey: content.videoMessage.mediaKey,
+      mediaType: "video",
     };
   }
   if (content.documentMessage) {
@@ -49,9 +61,13 @@ export function extractMedia(
       mediaMimetype: content.documentMessage.mimetype,
       mediaFileName:
         content.documentMessage.fileName ?? content.documentMessage.title,
+      mediaKey: content.documentMessage.mediaKey,
+      mediaType: "document",
     };
   }
   if (content.stickerMessage) {
+    // Sem mediaKey no tipo — nada hoje decripta sticker (extractMedia's caller for STT/vision
+    // never matches stickerMessage), então não há necessidade de fiar isso ainda.
     return {
       mediaUrl: content.stickerMessage.url,
       mediaMimetype: content.stickerMessage.mimetype,

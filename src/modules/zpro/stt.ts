@@ -23,6 +23,7 @@ import { getSttProvider } from "@/modules/stt/providers";
 import { readSttConfig, type SttConfig } from "@/modules/stt/settings";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
 import { sysCtx } from "./ctx";
+import { decryptWhatsappMedia } from "./media-crypto";
 
 // Resolves the STT config for the agent bound to this Z-PRO instance (scoped read, no network).
 // null when unbound, disabled, or STT off — the caller then leaves audio untranscribed.
@@ -58,6 +59,11 @@ export interface TranscribeZproAudioParams {
   // Optional execution-flow context: when present, the transcription is logged as an `stt` stage
   // (visible in /logs), same contract as the Chatwoot path.
   flow?: FlowContext;
+  // base64 WhatsApp media key (parse.ts's extractMedia) — the downloaded blob is WhatsApp's own
+  // end-to-end-encrypted CDN link, not plain audio (see media-crypto.ts). Optional and defensive:
+  // a payload that somehow lacks it falls back to the pre-decryption behavior (feed raw bytes to
+  // the provider) rather than refusing to even try.
+  mediaKey?: string;
 }
 
 // Downloads (anti-SSRF checked) and transcribes a WhatsApp voice note. Returns the cleaned
@@ -138,6 +144,36 @@ export async function transcribeZproAudio(
       err instanceof Error ? err.message : String(err),
     );
     return null;
+  }
+
+  // The downloaded blob is WhatsApp's own encrypted CDN payload, not the plain audio the response
+  // Content-Type header would suggest — decrypt before handing anything to the provider. On
+  // failure (bad key / corrupted download) this is treated the same as a download failure: never
+  // fall back to feeding still-encrypted bytes to the provider, that just reproduces the same
+  // opaque "400" the diagnostic was chasing.
+  if (params.mediaKey) {
+    try {
+      bytes = decryptWhatsappMedia(bytes, params.mediaKey, "audio");
+      // Once decrypted, the CDN's Content-Type (of the *encrypted* transport) is no longer
+      // meaningful — trust the mimetype WhatsApp reported on the original message instead.
+      contentType = params.mediaMimetype;
+    } catch (err) {
+      if (params.flow) {
+        emitFlowEvent(params.flow, {
+          stage: "stt",
+          level: "warn",
+          status: "error",
+          provider: cfg.provider,
+          detail: { step: "decrypt" },
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
+      logger.warn(
+        "zpro:stt: audio decryption failed: %s",
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    }
   }
 
   let raw: string;

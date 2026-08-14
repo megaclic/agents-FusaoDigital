@@ -24,7 +24,7 @@ import {
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
 import { armDebounce } from "@/modules/debounce/service";
-import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import type { FlowContext } from "@/modules/flowlog/service";
 import { resolveZproAvailability } from "@/modules/zpro/availability";
 import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
@@ -160,19 +160,6 @@ export const zproController = new Elysia({
           String(ticket.id),
         ),
       };
-      // TODO: temporary diagnostic — STT is failing with "openai 400" on every voice note; the
-      // mediaUrl is WhatsApp's own encrypted CDN link (mmg.whatsapp.net/....enc), and our type for
-      // audioMessage has no mediaKey field, suggesting we may be forwarding still-encrypted bytes to
-      // the transcription provider. Logs ONLY the field NAMES present on the raw payload (never
-      // values), via the flow log (queryable through ExecutionLog, unlike stdout) to confirm whether
-      // mediaKey (or an equivalent) actually arrives before deciding whether WhatsApp media
-      // decryption needs to be implemented. Remove once confirmed either way.
-      emitFlowEvent(flow, {
-        stage: "stt",
-        level: "warn",
-        status: "skipped",
-        detail: { diagnosticAudioMessageKeys: Object.keys(audioContent) },
-      });
       const media = extractMedia(msg.data?.message);
       if (media.mediaUrl) {
         const sttCfg = await resolveZproSttConfig(
@@ -184,6 +171,7 @@ export const zproController = new Elysia({
             tenantId: instance.tenantId,
             mediaUrl: media.mediaUrl,
             mediaMimetype: media.mediaMimetype ?? null,
+            mediaKey: media.mediaKey,
             cfg: sttCfg,
             flow,
           });
@@ -242,6 +230,8 @@ export const zproController = new Elysia({
             tenantId: instance.tenantId,
             mediaUrl: media.mediaUrl,
             mediaMimetype: media.mediaMimetype ?? null,
+            mediaKey: media.mediaKey,
+            mediaType: media.mediaType,
             cfg: visionCfg,
             flow,
           });
