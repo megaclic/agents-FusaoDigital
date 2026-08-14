@@ -1,48 +1,171 @@
 // tests/modules/zpro/agent-echo.test.ts
-// Pure unit tests for markAgentSending/wasAgentSending — including the globalThis-singleton
-// storage itself, which is what makes the pending marker survive a `bun --hot` module reload
-// (a real incident: a hot-reload mid-window wiped a plain module-level Map, the agent's own reply
-// echo got misclassified as human intervention, and the auto-handoff handler deactivated the
-// agent). A test that only exercises the two functions wouldn't catch a regression back to a
-// plain `const _pending = new Map()` — it would still pass. Asserting the globalThis key directly
-// is what pins the fix.
+// DB-backed: markAgentSending/wasAgentSending are backed by ZproConversation.agentSendingUntil,
+// not an in-memory Map — chosen after TWO live failures the same day with in-memory approaches
+// (a plain module-level Map wiped by a `bun --hot` reload; then a globalThis singleton, which
+// survives hot-reload but not a full process restart). A DB column survives both. These tests
+// mirror mirror.test.ts's fixture pattern (a real ZproConversation row is required — the marker
+// is scoped to an existing conversation, same as production: a reply is only ever sent after the
+// inbound message that created the conversation was already mirrored).
 
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
 import { markAgentSending, wasAgentSending } from "@/modules/zpro/agent-echo";
 
-describe("agent-echo", () => {
-  test("wasAgentSending is false for a never-marked ticket", () => {
-    expect(wasAgentSending(999_001n, 1)).toBe(false);
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+let tenantId = 0n;
+let zproInstanceId = 0n;
+let nextTicketId = 80_000;
+
+async function makeConversation(): Promise<number> {
+  const ticketId = nextTicketId++;
+  await suDb.zproConversation.create({
+    data: {
+      tenantId,
+      zproInstanceId,
+      ticketId,
+      contactId: 1,
+      contactNumber: "5511900000000",
+      contactName: "Fixture Contact",
+    },
+  });
+  return ticketId;
+}
+
+describe.skipIf(!dbUp)("agent-echo", () => {
+  beforeAll(async () => {
+    const t = await suDb.tenant.create({
+      data: { name: "ZproAgentEcho", slug: `zpro-agent-echo-${process.pid}` },
+    });
+    tenantId = t.id;
+    const inst = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.fusaobotcrm.com.br",
+        apiId: "TEST_API_ID",
+        bearerToken: encryptJson("test-token"),
+        whatsappId: 93,
+        instanceName: "ZproAgentEchoInstance",
+      },
+    });
+    zproInstanceId = inst.id;
   });
 
-  test("markAgentSending then wasAgentSending on the SAME instance+ticket → true", () => {
-    markAgentSending(999_002n, 42);
-    expect(wasAgentSending(999_002n, 42)).toBe(true);
+  afterAll(async () => {
+    if (tenantId) {
+      for (const table of ["zpro_conversations", "zpro_instances"]) {
+        await suDb.$executeRawUnsafe(
+          `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
+        );
+      }
+      await suDb.tenant.delete({ where: { id: tenantId } });
+    }
+    await su?.$disconnect();
+    await app?.$disconnect();
   });
 
-  test("a different ticket or instance is NOT marked (keyed by both)", () => {
-    markAgentSending(999_003n, 1);
-    expect(wasAgentSending(999_003n, 2)).toBe(false);
-    expect(wasAgentSending(999_004n, 1)).toBe(false);
+  test("wasAgentSending is false for a conversation that was never marked", async () => {
+    const ticketId = await makeConversation();
+    expect(
+      await wasAgentSending(tenantId, zproInstanceId, ticketId, appDb),
+    ).toBe(false);
   });
 
-  test("the marker does not get consumed by a read (multi-balloon echoes)", () => {
-    markAgentSending(999_005n, 7);
-    expect(wasAgentSending(999_005n, 7)).toBe(true);
-    expect(wasAgentSending(999_005n, 7)).toBe(true);
+  test("markAgentSending then wasAgentSending on the SAME ticket → true", async () => {
+    const ticketId = await makeConversation();
+    await markAgentSending(tenantId, zproInstanceId, ticketId, appDb);
+    expect(
+      await wasAgentSending(tenantId, zproInstanceId, ticketId, appDb),
+    ).toBe(true);
   });
 
-  test("re-marking the same ticket resets the timer without throwing", () => {
-    markAgentSending(999_006n, 3);
-    markAgentSending(999_006n, 3);
-    expect(wasAgentSending(999_006n, 3)).toBe(true);
+  test("a different ticket or instance is NOT marked (keyed by both)", async () => {
+    const ticketId = await makeConversation();
+    const otherInstance = await suDb.zproInstance.create({
+      data: {
+        tenantId,
+        baseUrl: "https://api.fusaobotcrm.com.br",
+        apiId: "TEST_API_ID_2",
+        bearerToken: encryptJson("test-token"),
+        whatsappId: 94,
+        instanceName: "OtherInstance",
+      },
+    });
+    await markAgentSending(tenantId, zproInstanceId, ticketId, appDb);
+    expect(
+      await wasAgentSending(tenantId, otherInstance.id, ticketId, appDb),
+    ).toBe(false);
   });
 
-  test("the pending map is stored on globalThis (survives a bun --hot module reload)", () => {
-    markAgentSending(999_007n, 5);
-    const g = globalThis as unknown as Record<symbol, Map<string, unknown>>;
-    const holder = g[Symbol.for("secv4.zpro.agent-echo.pending")];
-    expect(holder).toBeInstanceOf(Map);
-    expect(holder?.has("999007:5")).toBe(true);
+  test("the marker is not consumed by a read (multi-balloon echoes)", async () => {
+    const ticketId = await makeConversation();
+    await markAgentSending(tenantId, zproInstanceId, ticketId, appDb);
+    expect(
+      await wasAgentSending(tenantId, zproInstanceId, ticketId, appDb),
+    ).toBe(true);
+    expect(
+      await wasAgentSending(tenantId, zproInstanceId, ticketId, appDb),
+    ).toBe(true);
+  });
+
+  test("re-marking the same ticket refreshes the deadline without throwing", async () => {
+    const ticketId = await makeConversation();
+    await markAgentSending(tenantId, zproInstanceId, ticketId, appDb);
+    await markAgentSending(tenantId, zproInstanceId, ticketId, appDb);
+    expect(
+      await wasAgentSending(tenantId, zproInstanceId, ticketId, appDb),
+    ).toBe(true);
+  });
+
+  test("an already-expired agentSendingUntil reads as false", async () => {
+    const ticketId = await makeConversation();
+    await suDb.zproConversation.updateMany({
+      where: { zproInstanceId, ticketId },
+      data: { agentSendingUntil: new Date(Date.now() - 1000) },
+    });
+    expect(
+      await wasAgentSending(tenantId, zproInstanceId, ticketId, appDb),
+    ).toBe(false);
+  });
+
+  test("marking a ticket with no ZproConversation row is a safe no-op", async () => {
+    const nonExistentTicketId = 999_999;
+    await markAgentSending(
+      tenantId,
+      zproInstanceId,
+      nonExistentTicketId,
+      appDb,
+    );
+    expect(
+      await wasAgentSending(
+        tenantId,
+        zproInstanceId,
+        nonExistentTicketId,
+        appDb,
+      ),
+    ).toBe(false);
   });
 });

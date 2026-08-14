@@ -383,7 +383,7 @@ export async function runLoadedZproTurn(
   // well past WhatsApp's own presence timeout, which reverted the old one-shot signal within a
   // few seconds — the reported "aparece e some" flicker). Stopped in the outer finally at the
   // bottom of this function, on every exit path (posted/blocked/taken-over/superseded/empty/thrown).
-  const stopTyping = startTypingHeartbeat(client, ticketId);
+  const stopTyping = startTypingHeartbeat(client, ticketId, undefined, flow);
   try {
     // Guardrails (input/output moderation): build the guardrails agent's OWN model (its own
     // resolved credential) once. Fail-open — disabled/unresolved ⇒ runGuardrail always returns
@@ -420,7 +420,7 @@ export async function runLoadedZproTurn(
         // gate: without this, two concurrent flushes that both trip the guardrail could each post.
         if (params.shouldPost && !(await params.shouldPost()))
           return "superseded";
-        markAgentSending(zproInstanceId, ticketId);
+        await markAgentSending(tenantId, zproInstanceId, ticketId, base);
         await sendTextReply(client, ev, inGuard.reply);
         logger.info(
           "zpro guardrail (input) replied: thread=%s ticket=%s",
@@ -628,7 +628,7 @@ export async function runLoadedZproTurn(
             null,
           );
           if (payload) {
-            markAgentSending(zproInstanceId, ticketId);
+            await markAgentSending(tenantId, zproInstanceId, ticketId, base);
             await sendZproTemplate(client, ev.contactNumber, payload);
             logger.info(
               "zpro agent replied (template, outside 24h window): thread=%s ticket=%s template=%s",
@@ -690,7 +690,7 @@ export async function runLoadedZproTurn(
             flow,
           });
           if (tts) {
-            markAgentSending(zproInstanceId, ticketId);
+            await markAgentSending(tenantId, zproInstanceId, ticketId, base);
             await sendZproVoiceReply(client, ev, tts);
             logger.info(
               "zpro agent replied (audio): thread=%s ticket=%s len=%d",
@@ -715,7 +715,7 @@ export async function runLoadedZproTurn(
       // segundos, deve ser classificado AGENT por mirror.ts em vez de seguir o heurístico
       // ticket.userId (ver agent-echo.ts). Split + typing pacing por balão (docs/split.md) —
       // deliverZproReply reaproveita os helpers puros do registry compartilhado.
-      markAgentSending(zproInstanceId, ticketId);
+      await markAgentSending(tenantId, zproInstanceId, ticketId, base);
       const balloons = await deliverZproReply(
         client,
         ev,

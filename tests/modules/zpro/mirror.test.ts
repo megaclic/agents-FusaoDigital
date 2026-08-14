@@ -178,7 +178,16 @@ describe.skipIf(!dbUp)("mirrorZproMessage sender-type classification", () => {
       "MSG-AGENT-1",
       "Olá, {{nome_contato}}! Como posso ajudá-lo?",
     );
-    markAgentSending(zproInstanceId, ticket.id);
+    // markAgentSending is DB-backed (ZproConversation.agentSendingUntil) — the row must already
+    // exist, same as in production (a reply is only ever sent after the inbound message that
+    // created the conversation was already mirrored). Mirror one inbound message first.
+    await mirrorZproMessage(
+      payloadFor(ticket, inboundMsg("MSG-INBOUND-1", "Oi, preciso de ajuda")),
+      tenantId,
+      zproInstanceId,
+      appDb,
+    );
+    await markAgentSending(tenantId, zproInstanceId, ticket.id, appDb);
 
     const result = await mirrorZproMessage(
       payloadFor(ticket, msg),

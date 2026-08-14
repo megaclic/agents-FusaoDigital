@@ -1374,6 +1374,7 @@
       "embed": "Embedding",
       "generate": "Geração",
       "handoff": "Transferência",
+      "presence": "Indicador de digitação",
       "split": "Entrega",
       "stt": "Transcrição",
       "tool": "Chamada de ferramenta",

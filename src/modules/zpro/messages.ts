@@ -1,6 +1,7 @@
 // src/modules/zpro/messages.ts
 // Helpers de alto nível para o LangGraph enviar respostas via Z-PRO.
 
+import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { TemplatePayload } from "@/modules/service-window/service";
 import type { ZproClient } from "./client";
 import { ZPRO_PRESENCE_PAUSED, ZPRO_PRESENCE_TYPING } from "./constants";
@@ -18,20 +19,61 @@ const TYPING_HEARTBEAT_MS = 1500;
  * an interval, until the returned function is called — call it as soon as the reply is ready to
  * send (or the turn ends without one), which also sends one "paused" so the indicator doesn't
  * linger. Best-effort throughout: a failed sendPresence never throws or stops the heartbeat.
+ *
+ * `flow`, when present, logs every tick (stage "presence") with its outcome + round-trip
+ * duration — the flicker complaint kept recurring after two interval tweaks (4000ms→1500ms) with
+ * no visibility into WHY: a call silently failing (rate limit, transient network) or silently
+ * taking longer than `intervalMs` (leaving a real gap in the signal WhatsApp's client sees) would
+ * look identical from the outside and were both previously invisible. This makes both diagnosable
+ * from /logs instead of guessing at a third interval value.
  */
 export function startTypingHeartbeat(
   client: ZproClient,
   ticketId: number,
   intervalMs: number = TYPING_HEARTBEAT_MS,
+  flow?: FlowContext,
 ): () => void {
   const tick = () => {
-    client.sendPresence(ticketId, ZPRO_PRESENCE_TYPING).catch(() => {});
+    const startedAt = Date.now();
+    client
+      .sendPresence(ticketId, ZPRO_PRESENCE_TYPING)
+      .then(() => {
+        if (flow) {
+          emitFlowEvent(flow, {
+            stage: "presence",
+            level: "info",
+            status: "ok",
+            detail: { state: "typing", durationMs: Date.now() - startedAt },
+          });
+        }
+      })
+      .catch((err) => {
+        if (flow) {
+          emitFlowEvent(flow, {
+            stage: "presence",
+            level: "warn",
+            status: "error",
+            detail: { state: "typing", durationMs: Date.now() - startedAt },
+            errorMessage: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
   };
   tick();
   const timer = setInterval(tick, intervalMs);
   return () => {
     clearInterval(timer);
-    client.sendPresence(ticketId, ZPRO_PRESENCE_PAUSED).catch(() => {});
+    client.sendPresence(ticketId, ZPRO_PRESENCE_PAUSED).catch((err) => {
+      if (flow) {
+        emitFlowEvent(flow, {
+          stage: "presence",
+          level: "warn",
+          status: "error",
+          detail: { state: "paused" },
+          errorMessage: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
   };
 }
 

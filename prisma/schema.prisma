@@ -628,6 +628,13 @@ model ZproConversation {
   voiceReply       Boolean?  @map("voice_reply")
   agentActive      Boolean   @default(false) @map("agent_active") // n8nStatus espelhado
   humanUserId      Int?      @map("human_user_id") // ticket.userId quando humano ativo
+  // Marca "esperamos o eco fromMe da NOSSA PRÓPRIA resposta até este instante" — mirror.ts's
+  // resolveSenderType confere isto ANTES do heurístico ticket.userId ao classificar uma mensagem
+  // fromMe (agent-echo.ts). DB-backed (não um Map em memória) DE PROPÓSITO: um Map em processo se
+  // perde tanto num `bun --hot` reload quanto num restart — ambos já causaram, ao vivo, uma falsa
+  // classificação HUMAN seguida de auto-desativação do agente (zpro.controller.ts's gate de
+  // auto-handoff). Uma coluna sobrevive aos dois.
+  agentSendingUntil DateTime? @map("agent_sending_until")
   // Watermark de debounce (src/modules/zpro/debounce.ts): id do último ZproMessage (CLIENT) já
   // respondido ou deliberadamente pulado. Mirrors Conversation.lastHandledMessageId (Chatwoot), mas
   // aponta pro NOSSO PK (ZproMessage.id) em vez de um id externo — o mirror do Z-PRO já persiste o

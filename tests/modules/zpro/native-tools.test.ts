@@ -800,5 +800,54 @@ describe.skipIf(!dbUp)(
       });
       expect(String(out)).toContain("Could not schedule");
     });
+
+    // handoff_to_human's customerMessage is a client.sendText call OUTSIDE runLoadedZproTurn's
+    // normal deliverZproReply path (the ONLY native tool that sends a customer-facing message
+    // directly) — confirmed live (2026-08-14) as a real cause of self-inflicted auto-deactivation:
+    // without marking first, the echo of THIS send gets misclassified HUMAN by mirror.ts, which
+    // trips zpro.controller.ts's auto-handoff-on-human-intervention gate.
+    test("handoff_to_human marks agent-sending BEFORE sending the customer message", async () => {
+      const ticketId = Math.floor(Math.random() * 1_000_000);
+      await suDb.zproConversation.create({
+        data: {
+          tenantId,
+          zproInstanceId,
+          ticketId,
+          status: "open",
+          contactId: 7,
+          contactNumber: "5511900000001",
+          contactName: "Cliente Teste",
+          agentActive: true,
+        },
+      });
+      const client = {
+        sendText: async () => ({}),
+        createNote: async () => ({}),
+        updateTicketInfo: async () => ({}),
+      } as unknown as ZproClient;
+      const tools = buildZproNativeTools(
+        {
+          client,
+          ticketId,
+          zproInstanceId,
+          contactId: 7,
+          contactNumber: "5511900000001",
+          contactName: "Cliente Teste",
+          tenantId,
+          base: appDb,
+          conversationDbId: conversationId,
+        },
+        ["handoff_to_human"],
+      );
+      await tools[0]?.invoke({ customerMessage: "Já te transfiro." });
+      const row = await suDb.zproConversation.findUniqueOrThrow({
+        where: { zproInstanceId_ticketId: { zproInstanceId, ticketId } },
+        select: { agentSendingUntil: true },
+      });
+      expect(row.agentSendingUntil).not.toBeNull();
+      expect((row.agentSendingUntil as Date).getTime()).toBeGreaterThan(
+        Date.now(),
+      );
+    });
   },
 );

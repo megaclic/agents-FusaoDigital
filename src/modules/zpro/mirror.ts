@@ -32,10 +32,12 @@ function isUniqueViolation(err: unknown): boolean {
   );
 }
 
-function resolveSenderType(
+async function resolveSenderType(
   payload: ZproWebhookPayload,
+  tenantId: bigint,
   zproInstanceId: bigint,
-): ZproSenderTypeValue {
+  base: PrismaClient,
+): Promise<ZproSenderTypeValue> {
   const fromMe = payload.msg?.fromMe ?? false;
   if (!fromMe) return "CLIENT";
   // ticket.userId é o atendente ATRIBUÍDO ao ticket (sticky), não o autor desta mensagem — uma vez
@@ -43,7 +45,11 @@ function resolveSenderType(
   // HUMAN. Checar primeiro se ESTA mensagem é o eco de um envio nosso (ver agent-echo.ts) resolve
   // isso: só cai no heurístico ticket.userId quando não fomos nós que enviamos.
   const ticket = payload.ticket;
-  if (ticket && wasAgentSending(zproInstanceId, ticket.id)) return "AGENT";
+  if (
+    ticket &&
+    (await wasAgentSending(tenantId, zproInstanceId, ticket.id, base))
+  )
+    return "AGENT";
   const userId = ticket?.userId;
   // fromMe + userId preenchido = atendente humano interveio; fromMe + sem userId = agente IA.
   return userId !== null && userId !== undefined ? "HUMAN" : "AGENT";
@@ -69,7 +75,12 @@ export async function mirrorZproMessage(
   const ticket = payload.ticket;
   if (!msg || !ticket) return null;
 
-  const senderType = resolveSenderType(payload, zproInstanceId);
+  const senderType = await resolveSenderType(
+    payload,
+    tenantId,
+    zproInstanceId,
+    base,
+  );
   const isHumanIntervention = senderType === "HUMAN";
   const body = extractMessageBody(msg);
   const media = extractMedia(msg.data?.message);

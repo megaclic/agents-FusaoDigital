@@ -83,6 +83,7 @@ import {
   clampDelayMinutes,
   scheduleMessage,
 } from "@/modules/scheduled-messages/service";
+import { markAgentSending } from "./agent-echo";
 import type { ZproClient } from "./client";
 import {
   matchZproStage,
@@ -204,6 +205,21 @@ function handoffTool(ctx: ZproToolCtx) {
     }) => {
       if (customerMessage?.trim()) {
         try {
+          // Marca ANTES de enviar — este é um send de mensagem pro CLIENTE fora do caminho normal
+          // (runtime.ts's deliverZproReply), então o eco fromMe dele não seria reconhecido como
+          // nosso sem isto: mirror.ts classificaria a resposta do próprio agente como HUMAN, o que
+          // dispara (redundantemente aqui, mas silenciosamente em qualquer tool futura que envie
+          // direto sem desativar) o gate de auto-handoff em zpro.controller.ts. Confirmado como uma
+          // causa real de auto-desativação ao vivo (2026-08-14): esta era a ÚNICA tool nativa com um
+          // client.sendText direto fora de runLoadedZproTurn.
+          if (ctx.zproInstanceId) {
+            await markAgentSending(
+              ctx.tenantId,
+              ctx.zproInstanceId,
+              ctx.ticketId,
+              ctx.base,
+            );
+          }
           await ctx.client.sendText(ctx.contactNumber, customerMessage.trim(), {
             validateNumber: false,
             externalKey: `handoff-${ctx.ticketId}-${Date.now()}`,

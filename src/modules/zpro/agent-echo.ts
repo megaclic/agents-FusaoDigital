@@ -9,55 +9,52 @@
 // do nosso código), marcamos aqui — ANTES de enviar — que um eco fromMe é esperado para este ticket
 // nos próximos segundos, e mirror.ts confere essa marca antes de cair no heurístico ticket.userId.
 //
-// Mesmo padrão do cache de idempotência em webhook.ts: Map em memória + TTL via setTimeout. O Map
-// mora no globalThis (mesmo padrão dos workers singleton, ver debounce/worker.ts) — NÃO um simples
-// module-level `const` — porque `bun --hot` (dev) recarrega este módulo a cada edição em QUALQUER
-// arquivo que o importe transitivamente, o que reexecutaria `new Map()` e apagaria toda marca
-// pendente. Isso já causou uma auto-desativação real em produção... quer dizer, em dev: um
-// `markAgentSending` chamado bem antes de um hot-reload no meio da janela de TTL perde a marca, o
-// eco da própria resposta do agente é lido como intervenção humana (mirror.ts), e o handler de
-// auto-handoff (zpro.controller.ts) desativa o agente sozinho. globalThis sobrevive ao reload; em
-// produção (sem --hot, processo único) o efeito é idêntico a um `const` module-level normal.
+// DB-backed (ZproConversation.agentSendingUntil), NÃO um Map em memória — de propósito, depois de
+// DUAS falhas ao vivo com abordagens em memória no mesmo dia: um `bun --hot` reload (que reexecuta
+// este módulo a cada edição em qualquer arquivo importado transitivamente, apagando um `const` de
+// módulo) e, mesmo depois de mover pra um singleton em `globalThis` (sobrevive hot-reload, mas não
+// um restart de processo), a marca ainda se perdeu — o processo provavelmente reiniciou entre o
+// mark e o eco. Uma coluna sobrevive aos dois. O custo é um round-trip a mais de DB por envio/
+// classificação, irrelevante frente aos vários outros round-trips já no caminho de cada turno.
 
+import type { PrismaClient } from "@/../generated/prisma/client";
+import basePrisma from "@/api/lib/prisma";
+import { runScopedOn } from "@/lib/tenancy";
 import { ZPRO_AGENT_ECHO_TTL_MS } from "./constants";
-
-const PENDING_KEY = Symbol.for("secv4.zpro.agent-echo.pending");
-
-function pending(): Map<string, ReturnType<typeof setTimeout>> {
-  const g = globalThis as unknown as Record<
-    symbol,
-    Map<string, ReturnType<typeof setTimeout>>
-  >;
-  g[PENDING_KEY] ??= new Map();
-  return g[PENDING_KEY];
-}
-
-function key(zproInstanceId: bigint, ticketId: number): string {
-  return `${zproInstanceId}:${ticketId}`;
-}
+import { sysCtx } from "./ctx";
 
 /** Chamado pelo runtime logo antes de enviar a resposta do agente para este ticket. */
-export function markAgentSending(
+export async function markAgentSending(
+  tenantId: bigint,
   zproInstanceId: bigint,
   ticketId: number,
-): void {
-  const k = key(zproInstanceId, ticketId);
-  const map = pending();
-  const existing = map.get(k);
-  if (existing) clearTimeout(existing);
-  map.set(
-    k,
-    setTimeout(() => map.delete(k), ZPRO_AGENT_ECHO_TTL_MS),
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  const until = new Date(Date.now() + ZPRO_AGENT_ECHO_TTL_MS);
+  await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.updateMany({
+      where: { zproInstanceId, ticketId },
+      data: { agentSendingUntil: until },
+    }),
   );
 }
 
 /**
  * Consultado por mirror.ts ao classificar uma mensagem fromMe. Não consome a marca (um envio com
- * múltiplos balões gera múltiplos ecos dentro da mesma janela) — expira sozinha via TTL.
+ * múltiplos balões gera múltiplos ecos dentro da mesma janela) — expira sozinha por comparação de
+ * horário, sem precisar de um "unmark".
  */
-export function wasAgentSending(
+export async function wasAgentSending(
+  tenantId: bigint,
   zproInstanceId: bigint,
   ticketId: number,
-): boolean {
-  return pending().has(key(zproInstanceId, ticketId));
+  base: PrismaClient = basePrisma,
+): Promise<boolean> {
+  const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.findUnique({
+      where: { zproInstanceId_ticketId: { zproInstanceId, ticketId } },
+      select: { agentSendingUntil: true },
+    }),
+  );
+  return (conv?.agentSendingUntil?.getTime() ?? 0) > Date.now();
 }
