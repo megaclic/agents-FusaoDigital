@@ -9,11 +9,28 @@
 // do nosso código), marcamos aqui — ANTES de enviar — que um eco fromMe é esperado para este ticket
 // nos próximos segundos, e mirror.ts confere essa marca antes de cair no heurístico ticket.userId.
 //
-// Mesmo padrão do cache de idempotência em webhook.ts: Map em memória + TTL via setTimeout.
+// Mesmo padrão do cache de idempotência em webhook.ts: Map em memória + TTL via setTimeout. O Map
+// mora no globalThis (mesmo padrão dos workers singleton, ver debounce/worker.ts) — NÃO um simples
+// module-level `const` — porque `bun --hot` (dev) recarrega este módulo a cada edição em QUALQUER
+// arquivo que o importe transitivamente, o que reexecutaria `new Map()` e apagaria toda marca
+// pendente. Isso já causou uma auto-desativação real em produção... quer dizer, em dev: um
+// `markAgentSending` chamado bem antes de um hot-reload no meio da janela de TTL perde a marca, o
+// eco da própria resposta do agente é lido como intervenção humana (mirror.ts), e o handler de
+// auto-handoff (zpro.controller.ts) desativa o agente sozinho. globalThis sobrevive ao reload; em
+// produção (sem --hot, processo único) o efeito é idêntico a um `const` module-level normal.
 
 import { ZPRO_AGENT_ECHO_TTL_MS } from "./constants";
 
-const _pending = new Map<string, ReturnType<typeof setTimeout>>();
+const PENDING_KEY = Symbol.for("secv4.zpro.agent-echo.pending");
+
+function pending(): Map<string, ReturnType<typeof setTimeout>> {
+  const g = globalThis as unknown as Record<
+    symbol,
+    Map<string, ReturnType<typeof setTimeout>>
+  >;
+  g[PENDING_KEY] ??= new Map();
+  return g[PENDING_KEY];
+}
 
 function key(zproInstanceId: bigint, ticketId: number): string {
   return `${zproInstanceId}:${ticketId}`;
@@ -25,11 +42,12 @@ export function markAgentSending(
   ticketId: number,
 ): void {
   const k = key(zproInstanceId, ticketId);
-  const existing = _pending.get(k);
+  const map = pending();
+  const existing = map.get(k);
   if (existing) clearTimeout(existing);
-  _pending.set(
+  map.set(
     k,
-    setTimeout(() => _pending.delete(k), ZPRO_AGENT_ECHO_TTL_MS),
+    setTimeout(() => map.delete(k), ZPRO_AGENT_ECHO_TTL_MS),
   );
 }
 
@@ -41,5 +59,5 @@ export function wasAgentSending(
   zproInstanceId: bigint,
   ticketId: number,
 ): boolean {
-  return _pending.has(key(zproInstanceId, ticketId));
+  return pending().has(key(zproInstanceId, ticketId));
 }
