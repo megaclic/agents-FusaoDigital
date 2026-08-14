@@ -847,7 +847,7 @@
     "handoffPinned": "Um agente ou time específico",
     "handoffPinnedMultiAccount": "Este agente atende caixas em contas diferentes do Chatwoot; use “Deixar a IA escolher”.",
     "handoffPinnedNoInbox": "Vincule ao menos uma caixa na aba Canais primeiro.",
-    "handoffRoute": "Roteamento do Chatwoot (padrão)",
+    "handoffRoute": "Padrão (sem alvo específico)",
     "handoffTarget": "Quem recebe a transferência",
     "handoffTeams": "Times",
     "identitySection": "Identidade",

@@ -845,7 +845,7 @@
     "handoffPinned": "A specific agent or team",
     "handoffPinnedMultiAccount": "This agent serves inboxes in different Chatwoot accounts; use “Let the AI choose”.",
     "handoffPinnedNoInbox": "Bind at least one inbox in the Channels tab first.",
-    "handoffRoute": "Chatwoot routing (default)",
+    "handoffRoute": "Default (no specific target)",
     "handoffTarget": "Who receives the handoff",
     "handoffTeams": "Teams",
     "identitySection": "Identity",

@@ -1245,9 +1245,13 @@ export function ToolGrantsEditor({
                 items={[
                   {
                     value: "route",
+                    // Channel-neutral on purpose: this mode is the only one that works on Z-PRO
+                    // (native-tools.ts's handoffTool has no target concept at all — see
+                    // docs/zpro.md), so labeling it "Chatwoot routing" told a Z-PRO-bound operator
+                    // their one working mode was Chatwoot-only, when it's the opposite.
                     label: t(
                       "editor.handoffRoute",
-                      "Chatwoot routing (default)",
+                      "Default (no specific target)",
                     ),
                   },
                   {

@@ -1436,21 +1436,28 @@ export function BehaviorTab({
             )}
           </Section>
 
-          <Section
-            id="attributeContext"
-            icon={ListChecks}
-            title={t("editor.attributeContext", "Data in context")}
-            description={t(
-              "editor.attributeContextHint",
-              'Chatwoot custom attributes whose CURRENT values the agent sees on every turn, so it knows what has already been collected and what is still missing. Pick only what matters to the conversation — everything selected goes into the prompt. The agent only writes them back when it has the "Set attribute" tool; without it they are read-only context.',
-            )}
-          >
-            <AttributeContextPickers
-              agentId={agentId}
-              attributeContext={attributeContext}
-              setAttributeContext={setAttributeContext}
-            />
-          </Section>
+          {/* Chatwoot-only: the mirrored Conversation/Contact custom-attribute values this reads
+              (src/modules/chatwoot/attributes.ts) never get populated by the Z-PRO mirror, which
+              writes ZproConversation instead. Hidden for a Z-PRO-only agent instead of letting the
+              operator select keys that render as `filled="no"` forever, burning prompt tokens with
+              zero effect. */}
+          {channelBinding.chatwoot && (
+            <Section
+              id="attributeContext"
+              icon={ListChecks}
+              title={t("editor.attributeContext", "Data in context")}
+              description={t(
+                "editor.attributeContextHint",
+                'Chatwoot custom attributes whose CURRENT values the agent sees on every turn, so it knows what has already been collected and what is still missing. Pick only what matters to the conversation — everything selected goes into the prompt. The agent only writes them back when it has the "Set attribute" tool; without it they are read-only context.',
+              )}
+            >
+              <AttributeContextPickers
+                agentId={agentId}
+                attributeContext={attributeContext}
+                setAttributeContext={setAttributeContext}
+              />
+            </Section>
+          )}
 
           <Section
             id="limits"
