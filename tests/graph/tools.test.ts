@@ -30,15 +30,14 @@ function byName(tools: StructuredToolInterface[], name: string) {
 }
 
 describe("native tools", () => {
-  test("exposes all tools by default EXCEPT route_to_queue (Z-PRO-only, no Chatwoot analog); the allowlist filters (fail-closed)", () => {
+  test("exposes all tools by default EXCEPT route_to_queue/get_contact_info (Z-PRO-only, no Chatwoot analog); the allowlist filters (fail-closed)", () => {
     const { client } = recordingClient();
+    const zproOnly = new Set(["route_to_queue", "get_contact_info"]);
     expect(
       buildNativeTools({ client, conversationId: 1 })
         .map((t) => t.name)
         .sort(),
-    ).toEqual(
-      [...NATIVE_TOOL_NAMES].filter((n) => n !== "route_to_queue").sort(),
-    );
+    ).toEqual([...NATIVE_TOOL_NAMES].filter((n) => !zproOnly.has(n)).sort());
 
     const only = buildNativeTools({ client, conversationId: 1 }, [
       "private_note",
@@ -46,10 +45,11 @@ describe("native tools", () => {
     expect(only.map((t) => t.name)).toEqual(["private_note"]);
   });
 
-  test("an allowlist naming route_to_queue still never builds it (no Chatwoot analog exists)", () => {
+  test("an allowlist naming route_to_queue/get_contact_info still never builds them (no Chatwoot analog exists)", () => {
     const { client } = recordingClient();
     const tools = buildNativeTools({ client, conversationId: 1 }, [
       "route_to_queue",
+      "get_contact_info",
       "skip_reply",
     ]);
     expect(tools.map((t) => t.name)).toEqual(["skip_reply"]);
