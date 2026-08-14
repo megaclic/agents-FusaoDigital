@@ -39,6 +39,14 @@
 //                         Opportunity is created LAZILY on first tool use in a conversation (Z-PRO,
 //                         unlike Chatwoot, has no operator-driven "attach an existing card" UI).
 //   skip_reply            → identical to Chatwoot's (pure — never touches a client).
+//   route_to_queue        → ZproClient.updateQueue (move the ticket to another department/queue).
+//                         Z-PRO-ONLY, the inverse asymmetry of react_to_message below: no Chatwoot
+//                         concept of "fila" exists (the closest analog, handoff_to_human's
+//                         targetTeamId, already covers routing on that channel), so this is never
+//                         built in src/graph/tools/native.ts. Unlike assign_label, resolution is
+//                         FAIL-CLOSED (no auto-create): a queue is operator-managed structure, not a
+//                         free-form tag, so an unrecognized name is reported back to the model
+//                         instead of silently creating a new department.
 //
 // react_to_message has NO analog: the external Z-PRO API exposes no message-reaction endpoint at
 // all (confirmed against the full vendor Postman collection, docs/zpro-api-reference.md). It is
@@ -79,6 +87,12 @@ export interface TurnState {
 export interface ZproToolCtx {
   client: ZproClient;
   ticketId: number;
+  // Canonical checkpointer/scheduler thread id (runtime.ts's zproThreadId) + the instance it belongs
+  // to — needed by schedule_message to enqueue a SCHEDULED_MESSAGE job dispatchable later without a
+  // live turn. Always present from loadZproAgentTools (runtime.ts's only real caller); optional here
+  // only so hand-built ctx in tests can omit it.
+  threadId?: string;
+  zproInstanceId?: bigint;
   contactId: number;
   contactNumber: string;
   contactName: string | null;
@@ -94,6 +108,9 @@ export interface ZproToolCtx {
   // Known tags (id+name), resolved once at turn prep — lets assign_label suggest existing tags AND
   // resolve a name to an id without a network call inside the tool body.
   knownTags?: ZproPipeline[];
+  // Known queues (id+name), same resolve-once pattern as knownTags — lets route_to_queue suggest
+  // existing queues AND resolve a name to an id without a network call inside the tool body.
+  knownQueues?: ZproPipeline[];
   // This conversation's CRM deal context (see crm.ts). Absent ⇒ kanban_move_card/update_kanban_task
   // were not granted this turn (their resolve is skipped to avoid the extra network calls).
   kanban?: ZproKanbanContext;
@@ -365,6 +382,71 @@ function assignLabelTool(ctx: ZproToolCtx) {
           .enum(["conversation", "contact"])
           .optional()
           .describe("Where to add it: 'conversation' (default) or 'contact'."),
+      }),
+    },
+  );
+}
+
+// ── route_to_queue (Z-PRO-only — no Chatwoot analog; see native.ts's handoff
+// targetTeamId for the closest Chatwoot equivalent) ────────────────────────
+
+function existingQueuesXml(names: string[]): string {
+  if (names.length === 0) return "";
+  const els = names.map((q) => `  <queue>${xmlEscape(q)}</queue>`);
+  return `<available_queues>\n${els.join("\n")}\n</available_queues>`;
+}
+
+function routeToQueueTool(ctx: ZproToolCtx) {
+  const known = ctx.knownQueues ?? [];
+  const queuesXml = existingQueuesXml(known.map((q) => q.name));
+  const baseDescription =
+    known.length > 0
+      ? "Route this conversation to a department/queue. Pass the target queue's name as `queue`, picking one from `<available_queues>` below."
+      : "Route this conversation to a department/queue. Not available right now: no queues are configured for this instance.";
+  return tool(
+    async ({ queue }: { queue: string }) => {
+      const clean = queue.trim();
+      if (!clean) return "No queue provided.";
+      // Fail closed, unlike assign_label: a queue is operator-managed structure (a department), not a
+      // free-form tag, so an unrecognized name must not silently create one.
+      const match = known.find(
+        (q) => q.name.toLowerCase() === clean.toLowerCase(),
+      );
+      if (!match) {
+        return known.length > 0
+          ? `Queue "${clean}" not found. Available: ${known.map((q) => q.name).join(", ")}.`
+          : `Queue "${clean}" not found. No queues are configured for this instance.`;
+      }
+      try {
+        await ctx.client.updateQueue(ctx.ticketId, match.id);
+      } catch (e) {
+        logger.warn(
+          "zpro route_to_queue failed (ticket=%s): %s",
+          String(ctx.ticketId),
+          e instanceof Error ? e.message : String(e),
+        );
+        ctx.onSideEffectError?.({
+          tool: "route_to_queue",
+          phase: "update_queue",
+          err: e,
+        });
+        return toolFailure("Could not route to that queue.");
+      }
+      return `Routed to the "${match.name}" queue.`;
+    },
+    {
+      name: "route_to_queue",
+      description: withOperatorNote(
+        baseDescription,
+        ctx,
+        "route_to_queue",
+        queuesXml,
+      ),
+      schema: z.object({
+        queue: z
+          .string()
+          .min(1)
+          .describe("The target queue/department name, exactly as listed."),
       }),
     },
   );
@@ -673,6 +755,7 @@ export function buildZproNativeTools(
     resolveConversationTool(ctx),
     kanbanMoveTool(ctx),
     updateKanbanTaskTool(ctx),
+    routeToQueueTool(ctx),
     skipReplyTool(ctx),
   ];
   if (!allowed) return all;

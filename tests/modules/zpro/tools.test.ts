@@ -576,4 +576,56 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
     expect(String(out)).toContain("Unknown stage");
     expect(String(out)).not.toContain("no CRM pipeline is configured");
   });
+
+  test("NATIVE: route_to_queue granted resolves the known-queues list; when omitted, it is skipped (no extra network call)", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native queue agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["route_to_queue"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2005,
+        status: "open",
+        contactId: 46,
+        contactNumber: "5511900000046",
+        contactName: "Cliente Fila",
+        agentActive: true,
+      },
+    });
+    let queuesCalled = 0;
+    const client = {
+      listQueues: async () => {
+        queuesCalled++;
+        return [{ id: 9, name: "Financeiro" }];
+      },
+    } as unknown as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2005,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2005`,
+      client,
+    });
+    const queueTool = result.tools.find((t) => t.name === "route_to_queue");
+    expect(queueTool?.description).toContain("Financeiro");
+    expect(queuesCalled).toBe(1);
+  });
 });

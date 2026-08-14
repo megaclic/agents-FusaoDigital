@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import type { ZproClient } from "@/modules/zpro/client";
 import {
   __resetZproCrmCaches,
+  loadZproQueues,
   loadZproStages,
   loadZproTags,
   matchZproStage,
@@ -80,6 +81,7 @@ function client(overrides: Partial<ZproClient> = {}): ZproClient {
     listPipelines: async () => [],
     listStages: async () => [],
     listTags: async () => [],
+    listQueues: async () => [],
     ...overrides,
   } as unknown as ZproClient;
 }
@@ -184,5 +186,18 @@ describe("loadZproStages / loadZproTags (defensive parsing)", () => {
   test("loadZproTags parses the same way", async () => {
     const c = client({ listTags: async () => [{ id: 3, name: "vip" }] });
     expect(await loadZproTags(c, "t8")).toEqual([{ id: 3, name: "vip" }]);
+  });
+
+  test("loadZproQueues parses the same way and caches per key", async () => {
+    let calls = 0;
+    const c = client({
+      listQueues: async () => {
+        calls++;
+        return [{ id: 5, name: "Suporte" }];
+      },
+    });
+    expect(await loadZproQueues(c, "t9")).toEqual([{ id: 5, name: "Suporte" }]);
+    expect(await loadZproQueues(c, "t9")).toEqual([{ id: 5, name: "Suporte" }]);
+    expect(calls).toBe(1);
   });
 });

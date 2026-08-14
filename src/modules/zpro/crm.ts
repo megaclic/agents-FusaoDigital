@@ -145,6 +145,26 @@ export async function loadZproTags(
   return value;
 }
 
+// Queues (departments/attendants) change rarely — same TTL cache as pipelines/stages/tags.
+// listQueues() has no captured real-payload sample either (same open-validation as the others in
+// this file), so it goes through the same defensive parseIdNamePairs.
+const queuesCache = new Map<
+  string,
+  { value: ZproPipeline[]; expires: number }
+>();
+
+export async function loadZproQueues(
+  client: ZproClient,
+  cacheKey: string,
+  now: number = Date.now(),
+): Promise<ZproPipeline[]> {
+  const hit = queuesCache.get(cacheKey);
+  if (hit && hit.expires > now) return hit.value;
+  const value = parseIdNamePairs(await client.listQueues());
+  queuesCache.set(cacheKey, { value, expires: now + CRM_TTL_MS });
+  return value;
+}
+
 // Resolves which pipeline kanban_move_card/update_kanban_task operate on. An explicit configured id
 // is trusted as-is (no live validation call — an invalid id surfaces as a tool-level error at
 // createOpportunity/updateOpportunity time instead of paying an extra round trip on every turn).
@@ -183,4 +203,5 @@ export function __resetZproCrmCaches(): void {
   pipelinesCache.clear();
   stagesCache.clear();
   tagsCache.clear();
+  queuesCache.clear();
 }

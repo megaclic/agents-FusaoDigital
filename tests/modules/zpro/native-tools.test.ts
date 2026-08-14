@@ -39,7 +39,7 @@ function baseCtx(overrides: Partial<ZproToolCtx> = {}): ZproToolCtx {
 }
 
 describe("buildZproNativeTools (no client/DB access)", () => {
-  test("returns all 8 tools when unfiltered, and NEVER react_to_message", () => {
+  test("returns all 9 tools when unfiltered, and NEVER react_to_message", () => {
     const tools = buildZproNativeTools(baseCtx());
     expect(tools.map((t) => t.name).sort()).toEqual([
       "assign_label",
@@ -47,6 +47,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
       "kanban_move_card",
       "private_note",
       "resolve_conversation",
+      "route_to_queue",
       "set_custom_attribute",
       "skip_reply",
       "update_kanban_task",
@@ -311,6 +312,57 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     const out = await tools[0]?.invoke({ label: "lead", scope: "contact" });
     expect(calls).toEqual([["addTagContact", { contactId: 7, tagId: 5 }]]);
     expect(String(out)).toContain("added to the contact");
+  });
+
+  test("route_to_queue: routes to a known queue by case-insensitive name match", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      updateQueue: async (ticketId: number, queueId: number) => {
+        calls.push({ ticketId, queueId });
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({ client, knownQueues: [{ id: 5, name: "Suporte" }] }),
+      ["route_to_queue"],
+    );
+    const out = await tools[0]?.invoke({ queue: "suporte" });
+    expect(calls).toEqual([{ ticketId: 42, queueId: 5 }]);
+    expect(String(out)).toContain('Routed to the "Suporte" queue');
+  });
+
+  test("route_to_queue: fails CLOSED on an unknown queue name — no auto-create, unlike assign_label", async () => {
+    let called = false;
+    const client = {
+      updateQueue: async () => {
+        called = true;
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({ client, knownQueues: [{ id: 5, name: "Suporte" }] }),
+      ["route_to_queue"],
+    );
+    const out = await tools[0]?.invoke({ queue: "Financeiro" });
+    expect(called).toBe(false);
+    expect(String(out)).toContain('Queue "Financeiro" not found');
+    expect(String(out)).toContain("Suporte");
+  });
+
+  test("route_to_queue: no queues configured reports it instead of attempting the call", async () => {
+    let called = false;
+    const client = {
+      updateQueue: async () => {
+        called = true;
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(baseCtx({ client, knownQueues: [] }), [
+      "route_to_queue",
+    ]);
+    const out = await tools[0]?.invoke({ queue: "Suporte" });
+    expect(called).toBe(false);
+    expect(String(out)).toContain("No queues are configured");
   });
 
   test("kanban_move_card / update_kanban_task report 'not configured' when no pipeline is resolved", async () => {

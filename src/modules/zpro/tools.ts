@@ -39,6 +39,7 @@ import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import { buildToolpackTools } from "@/modules/integrations/toolpacks";
 import type { ZproClient } from "./client";
 import {
+  loadZproQueues,
   loadZproStages,
   loadZproTags,
   resolveZproPipelineId,
@@ -288,6 +289,23 @@ export async function loadZproAgentTools(
         })
       : undefined;
 
+    const needsQueues = !allow || allow.includes("route_to_queue");
+    const knownQueues = needsQueues
+      ? await loadZproQueues(client, cacheKey).catch((e) => {
+          logger.warn(
+            "zpro route_to_queue: queue list failed (ticket=%s): %s",
+            String(ticketId),
+            e instanceof Error ? e.message : String(e),
+          );
+          onSideEffectError?.({
+            tool: "route_to_queue",
+            phase: "list_queues",
+            err: e,
+          });
+          return [];
+        })
+      : undefined;
+
     const needsKanban =
       !allow ||
       allow.includes("kanban_move_card") ||
@@ -347,6 +365,8 @@ export async function loadZproAgentTools(
       {
         client,
         ticketId,
+        threadId,
+        zproInstanceId,
         contactId: conversation.contactId,
         contactNumber: params.contactNumber ?? "",
         contactName: params.contactName ?? null,
@@ -357,6 +377,7 @@ export async function loadZproAgentTools(
         transferWithSummary: params.transferWithSummary,
         toolInstructions: params.toolInstructions,
         knownTags,
+        knownQueues,
         kanban,
         onSideEffectError,
       },

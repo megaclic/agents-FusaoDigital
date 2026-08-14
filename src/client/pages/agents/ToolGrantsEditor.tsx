@@ -85,6 +85,16 @@ const LABEL_TOOL = "assign_label";
 // update_kanban_task (edit the linked card's title/description/priority/dates) also takes optional
 // operator guidance, so it renders as a configurable card next to kanban_move_card.
 const UPDATE_KANBAN_TOOL = "update_kanban_task";
+// The external Z-PRO API exposes no message-reaction endpoint at all (docs/zpro-api-reference.md,
+// confirmed against the full vendor Postman collection) — the only native tool with ZERO Z-PRO
+// backing (every other one of the 12 has a real implementation in native-tools.ts). Hidden from the
+// grid below when the agent has no Chatwoot inbox, instead of silently granting a no-op.
+const REACT_TOOL = "react_to_message";
+// Inverse of REACT_TOOL: "fila" (department/queue) is a Z-PRO-only concept with no Chatwoot analog
+// (the closest Chatwoot equivalent, handoff_to_human's targetTeamId, already covers that case) — only
+// implemented in native-tools.ts, no entry in graph/tools/native.ts. Hidden when the agent has no
+// Z-PRO instance bound, instead of silently granting a no-op.
+const QUEUE_TOOL = "route_to_queue";
 
 interface Props {
   // The agent being edited — scopes the handoff target picker to the accounts it serves.
@@ -1174,7 +1184,9 @@ export function ToolGrantsEditor({
                 n.name !== KANBAN_TOOL &&
                 n.name !== ATTR_TOOL &&
                 n.name !== LABEL_TOOL &&
-                n.name !== UPDATE_KANBAN_TOOL,
+                n.name !== UPDATE_KANBAN_TOOL &&
+                (n.name !== REACT_TOOL || channelBinding.chatwoot) &&
+                (n.name !== QUEUE_TOOL || channelBinding.zpro),
             )
             .map((n) => {
               const meta = nativeToolMeta(n.name, t);

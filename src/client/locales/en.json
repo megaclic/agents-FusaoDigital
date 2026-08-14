@@ -1533,6 +1533,10 @@
       "desc": "Mark the conversation as resolved when the request is fully handled.",
       "label": "Resolve"
     },
+    "route_to_queue": {
+      "desc": "Route the conversation to another department/queue.",
+      "label": "Route to queue"
+    },
     "set_custom_attribute": {
       "desc": "Set a custom attribute on the conversation, the contact, or the kanban card (e.g. lead stage, qualification flag).",
       "label": "Set attribute"

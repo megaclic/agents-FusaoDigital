@@ -1538,6 +1538,10 @@
       "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",
       "label": "Resolver"
     },
+    "route_to_queue": {
+      "desc": "Encaminha a conversa para outra fila/departamento.",
+      "label": "Encaminhar para fila"
+    },
     "set_custom_attribute": {
       "desc": "Define um atributo personalizado na conversa, no contato ou no card do kanban (ex.: estágio do lead, qualificação).",
       "label": "Definir atributo"
