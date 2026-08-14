@@ -2,11 +2,17 @@
 // sendZproTemplate: builds the WABA components shape (Meta Cloud API standard, BODY-only —
 // OPEN-VALIDATION, see docs/service-window.md) from a TemplatePayload and posts it via
 // ZproClient.sendTemplateWABABody. Pure enough to test with a mock client (no DB, no network).
+// startTypingHeartbeat: re-sends "typing" presence on an interval instead of a single one-shot
+// signal (WhatsApp's own composing chatstate expires client-side if not refreshed) — real timers,
+// a tiny injected intervalMs keeps this fast.
 
 import { describe, expect, mock, test } from "bun:test";
 import type { TemplatePayload } from "@/modules/service-window/service";
 import type { ZproClient } from "@/modules/zpro/client";
-import { sendZproTemplate } from "@/modules/zpro/messages";
+import {
+  sendZproTemplate,
+  startTypingHeartbeat,
+} from "@/modules/zpro/messages";
 
 function fakeClient() {
   const calls: unknown[] = [];
@@ -92,5 +98,63 @@ describe("sendZproTemplate", () => {
       languageCode: "pt_BR",
       components: undefined,
     });
+  });
+});
+
+function fakePresenceClient() {
+  const calls: Array<"typing" | "paused"> = [];
+  const client = {
+    sendPresence: mock(
+      async (_ticketId: number, state: "typing" | "paused") => {
+        calls.push(state);
+        return {};
+      },
+    ),
+  } as unknown as ZproClient;
+  return { client, calls };
+}
+
+describe("startTypingHeartbeat", () => {
+  test("fires 'typing' immediately, then again on the interval", async () => {
+    const { client, calls } = fakePresenceClient();
+    const stop = startTypingHeartbeat(client, 42, 10);
+    expect(calls).toEqual(["typing"]);
+    await new Promise((r) => setTimeout(r, 35));
+    stop();
+    // At least the immediate tick plus 2-3 interval ticks within 35ms at a 10ms cadence.
+    expect(calls.filter((s) => s === "typing").length).toBeGreaterThanOrEqual(
+      3,
+    );
+  });
+
+  test("stop() sends one 'paused' and stops further ticks", async () => {
+    const { client, calls } = fakePresenceClient();
+    const stop = startTypingHeartbeat(client, 42, 10);
+    await new Promise((r) => setTimeout(r, 15));
+    stop();
+    const countAtStop = calls.length;
+    expect(calls[calls.length - 1]).toBe("paused");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(calls.length).toBe(countAtStop);
+  });
+
+  test("a failed sendPresence never throws or stops the heartbeat", async () => {
+    const calls: string[] = [];
+    let attempt = 0;
+    const client = {
+      sendPresence: mock(async (_ticketId: number, state: string) => {
+        attempt++;
+        calls.push(state);
+        if (attempt <= 2) throw new Error("transient 500");
+        return {};
+      }),
+    } as unknown as ZproClient;
+    const stop = startTypingHeartbeat(client, 42, 10);
+    await new Promise((r) => setTimeout(r, 25));
+    stop();
+    expect(calls.filter((s) => s === "typing").length).toBeGreaterThanOrEqual(
+      2,
+    );
+    expect(calls[calls.length - 1]).toBe("paused");
   });
 });

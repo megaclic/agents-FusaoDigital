@@ -86,7 +86,11 @@ import { readZproCrmConfig, type ZproCrmConfig } from "./crm";
 import { sysCtx } from "./ctx";
 import { makeZproGuardrailRunner } from "./guardrails";
 import { deactivateAgent } from "./handoff";
-import { sendTextReply, sendTyping, sendZproTemplate } from "./messages";
+import {
+  sendTextReply,
+  sendZproTemplate,
+  startTypingHeartbeat,
+} from "./messages";
 import type { TurnState } from "./native-tools";
 import { deliverZproReply } from "./split";
 import { ZproAgentStatusReporter } from "./status";
@@ -375,354 +379,365 @@ export async function runLoadedZproTurn(
     base,
   };
 
-  await sendTyping(client, ev).catch(() => {});
-
-  // Guardrails (input/output moderation): build the guardrails agent's OWN model (its own
-  // resolved credential) once. Fail-open — disabled/unresolved ⇒ runGuardrail always returns
-  // null — mirrors src/graph/runtime.ts exactly, just with ZproClient.createNote for the trip
-  // note (no Chatwoot private-note equivalent here).
-  const guardrailModel =
-    loaded.guardrails.enabled && loaded.guardrailsApiKey
-      ? createChatModel({
-          provider: loaded.guardrails.provider,
-          model: loaded.guardrails.model,
-          baseURL:
-            loaded.guardrailsCredentialBaseUrl ??
-            loaded.guardrails.baseURL ??
-            undefined,
-          apiKey: loaded.guardrailsApiKey,
-          temperature: 0,
-        })
-      : null;
-  const runGuardrail = makeZproGuardrailRunner({
-    gr: loaded.guardrails,
-    model: guardrailModel,
-    systemPrompt: loaded.systemPrompt,
-    flow,
-    client,
-    ticketId,
-  });
-
-  // INPUT guardrail: screen the customer message BEFORE the agent processes it. A violation
-  // either posts the configured template/generated reply (skipping the graph) or stays silent.
-  const inGuard = await runGuardrail("input", text);
-  if (inGuard) {
-    if (inGuard.reply !== null) {
-      // The guardrail reply is a post like any other, so it claims the trigger through the same
-      // gate: without this, two concurrent flushes that both trip the guardrail could each post.
-      if (params.shouldPost && !(await params.shouldPost()))
-        return "superseded";
-      markAgentSending(zproInstanceId, ticketId);
-      await sendTextReply(client, ev, inGuard.reply);
-      logger.info(
-        "zpro guardrail (input) replied: thread=%s ticket=%s",
-        threadId,
-        ev.threadId,
-      );
-      return "posted";
-    }
-    return "blocked";
-  }
-
-  const model = createChatModel({
-    ...loaded.mc,
-    apiKey: loaded.apiKey,
-    baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
-  });
-  const checkpointer = await getCheckpointer();
-  // Ferramentas concedidas ao agente vinculado a esta instância — RAG/HTTP/MCP/INTEGRATION +
-  // as 2 tools nativas utilitárias, mesma tela/aba de concessão do Chatwoot (ToolGrantsEditor),
-  // sem gate de canal. Vazio por padrão (agente sem nenhuma tool concedida além das utilitárias)
-  // — buildAgentGraph trata `tools` ausente/vazio como hoje (grafo linear, sem ToolNode).
-  // conversationId (ZproConversation.id) vem da mesma consulta e alimenta o UsageCapture abaixo —
-  // LlmUsage.zproConversationId, NUNCA LlmUsage.conversationId (ver docs/zpro.md: risco de
-  // colisão de id com Conversation/Chatwoot). Carregado ANTES do systemPrompt pra `grounded`
-  // (search_knowledge concedida) alimentar composeSystemPrompt abaixo, mesma ordem do Chatwoot.
-  // Mutable per-turn state shared with the native tools (deferred resolve intent) — mirrors
-  // src/graph/runtime.ts's own turnState exactly.
-  const turnState: TurnState = { resolveRequested: false };
-  // Operator guidance per tool (agent.settings.toolGuidance), plus the CRM funnel guidance
-  // (agent.settings.zproCrm.instructions) folded onto kanban_move_card specifically — mirrors
-  // src/graph/prepare.ts's exact merge (its own grouped configs win over the flat map for that tool).
-  const toolInstructions: Partial<Record<NativeToolName, string>> = {
-    ...loaded.toolGuidance,
-  };
-  if (loaded.crmConfig.instructions) {
-    toolInstructions.kanban_move_card = loaded.crmConfig.instructions;
-  }
-  const {
-    tools: agentTools,
-    conversationId,
-    grounded,
-  } = await loadZproAgentTools({
-    base,
-    tenantId,
-    agentId: loaded.agentId,
-    zproInstanceId,
-    ticketId,
-    threadId,
-    client,
-    turnState,
-    transferWithSummary: loaded.transferWithSummary,
-    toolInstructions,
-    pipelineId: loaded.crmConfig.pipelineId,
-    flow,
-    maxDistance: loaded.maxDistance,
-    contactName: ev.contactName,
-    contactNumber: ev.contactNumber,
-    companyName: loaded.companyName,
-  });
-  const tools = [...agentTools];
-  // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},
-  // {{nome_agente}} e as variáveis de hora/data — mesmo interpolador sanitizado (proteção contra
-  // prompt injection) que o Chatwoot usa via prepare.ts.
-  const systemPrompt = interpolatePromptVars(
-    composeSystemPrompt(loaded.systemPrompt, { grounded }),
-    buildPromptVars({
-      contactName: ev.contactName,
-      contactPhone: ev.contactNumber,
-      inboxName: ev.channelType,
-      companyName: loaded.companyName,
-      agentName: loaded.agentName,
-    }),
-    { timezone: DEFAULT_TIMEZONE },
-  );
-  // set_voice_preference (TTS "preference" mode only — no point exposing it when the agent always
-  // replies in text/mirror): unlike the other native tools (built inside loadZproAgentTools, gated
-  // by the SAME grant UI Chatwoot uses), this one needs currentVoiceReply (resolved below, after
-  // the tools call) so it is wired directly here rather than through buildZproNativeTools.
-  // voiceReplyNow further down re-reads it AFTER the invoke so a preference set THIS turn still
-  // governs THIS reply.
-  let currentVoiceReply: boolean | null = null;
-  if (loaded.ttsConfig.mode === "preference" && conversationId != null) {
-    const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
-      db.zproConversation.findUnique({
-        where: { id: conversationId },
-        select: { voiceReply: true },
-      }),
-    );
-    currentVoiceReply = conv?.voiceReply ?? null;
-    tools.push(
-      buildSetVoicePreferenceTool({
-        tenantId,
-        base,
-        conversationId,
-        currentVoiceReply,
-      }),
-    );
-  }
-  const graph = buildAgentGraph({
-    model,
-    systemPrompt,
-    checkpointer,
-    tools,
-  });
-
-  const usageCapture = new UsageCapture({
-    tenantId,
-    agentId: loaded.agentId,
-    zproConversationId: conversationId,
-    threadId,
-    model: loaded.mc.model,
-    node: "agent",
-    source: "inbox",
-    base,
-  });
-
-  // The live "agent is working" indicator on the per-tenant realtime channel — Z-PRO analogue of
-  // src/graph/runtime.ts's AgentStatusReporter wiring. `started` here (conversationId is only known
-  // once tools have loaded, unlike Chatwoot where it's known upfront) through a GUARANTEED
-  // `finished` in the finally below (every exit — posted, empty, taken-over, superseded, or thrown
-  // — clears it).
-  const status = new ZproAgentStatusReporter({
-    tenantId,
-    zproConversationId: conversationId,
-  });
-  status.started();
-  let deliveredBalloons: number | null = null;
+  // Keeps "digitando..." alive for the WHOLE turn (guardrails + generation + tool calls can run
+  // well past WhatsApp's own presence timeout, which reverted the old one-shot signal within a
+  // few seconds — the reported "aparece e some" flicker). Stopped in the outer finally at the
+  // bottom of this function, on every exit path (posted/blocked/taken-over/superseded/empty/thrown).
+  const stopTyping = startTypingHeartbeat(client, ticketId);
   try {
-    const result = await withFlowStage(
+    // Guardrails (input/output moderation): build the guardrails agent's OWN model (its own
+    // resolved credential) once. Fail-open — disabled/unresolved ⇒ runGuardrail always returns
+    // null — mirrors src/graph/runtime.ts exactly, just with ZproClient.createNote for the trip
+    // note (no Chatwoot private-note equivalent here).
+    const guardrailModel =
+      loaded.guardrails.enabled && loaded.guardrailsApiKey
+        ? createChatModel({
+            provider: loaded.guardrails.provider,
+            model: loaded.guardrails.model,
+            baseURL:
+              loaded.guardrailsCredentialBaseUrl ??
+              loaded.guardrails.baseURL ??
+              undefined,
+            apiKey: loaded.guardrailsApiKey,
+            temperature: 0,
+          })
+        : null;
+    const runGuardrail = makeZproGuardrailRunner({
+      gr: loaded.guardrails,
+      model: guardrailModel,
+      systemPrompt: loaded.systemPrompt,
       flow,
-      "generate",
-      { provider: loaded.mc.provider, model: loaded.mc.model },
-      () =>
-        graph.invoke(
-          { messages: [new HumanMessage(text)] },
-          {
-            configurable: { thread_id: threadId },
-            callbacks: [usageCapture, status],
-          },
-        ),
-    );
+      client,
+      ticketId,
+    });
 
-    let reply = lastAssistantText(result.messages).trim();
-
-    // Re-check AFTER the invoke: did a human take over WHILE the LLM call ran? Mirrors
-    // src/graph/runtime.ts's "taken-over" recheck (Chatwoot's assigneeType), keyed here on
-    // ZproConversation.agentActive — the same flag the auto-handoff-on-human-intervention gate in
-    // zpro.controller.ts flips. Same read also refreshes voiceReply (set_voice_preference may have
-    // written it DURING the invoke) so "prefiro texto" takes effect in THIS same turn.
-    let voiceReplyNow = currentVoiceReply;
-    if (conversationId != null) {
-      const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.zproConversation.findUnique({
-          where: { id: conversationId },
-          select: { agentActive: true, voiceReply: true },
-        }),
-      );
-      if (conv && !conv.agentActive) {
-        emitFlowEvent(flow, {
-          stage: "handoff",
-          status: "ok",
-          detail: { outcome: "taken_over" },
-        });
-        return "taken-over";
-      }
-      voiceReplyNow = conv?.voiceReply ?? voiceReplyNow;
-    }
-
-    // Last-moment supersede gate (debounce): a newer message arrived mid-turn → drop this reply
-    // (the re-armed flush answers the full burst).
-    if (params.shouldPost && !(await params.shouldPost())) return "superseded";
-
-    // Empty reply: nothing to post, but a deferred resolve intent still applies (resolve with no
-    // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
-    // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
-    if (!reply) {
-      await applyDeferredZproResolve(client, ticketId, turnState, flow);
-      return "empty";
-    }
-
-    // OUTPUT guardrail: screen the model's reply BEFORE delivery. A violation either replaces the
-    // reply (template / a guardrails-generated safe reply) or suppresses the send entirely.
-    const outGuard = await runGuardrail("output", reply);
-    if (outGuard) {
-      if (outGuard.reply === null) return "blocked";
-      reply = outGuard.reply;
-    }
-
-    // PROACTIVE-only WhatsApp 24h window gate (runZproAgentNudge sets `proactive`; the reactive
-    // webhook/debounce paths never do, so `mode` is always "freeform" there). Outside the window on
-    // a WABA-official instance: an approved template if configured, else an explained private note —
-    // text-only, so this branch SKIPS the TTS/text delivery below entirely on either sub-outcome.
-    if (params.proactive) {
-      const mode = proactiveSendMode(
-        loaded.serviceWindowConfig,
-        params.proactive.lastInboundAt,
-        new Date(),
-        loaded.instance.isOfficialWaba,
-      );
-      if (mode === "template") {
-        const payload = buildTemplatePayload(loaded.serviceWindowConfig, null);
-        if (payload) {
-          markAgentSending(zproInstanceId, ticketId);
-          await sendZproTemplate(client, ev.contactNumber, payload);
-          logger.info(
-            "zpro agent replied (template, outside 24h window): thread=%s ticket=%s template=%s",
-            threadId,
-            ev.threadId,
-            payload.name,
-          );
-          await applyDeferredZproResolve(client, ticketId, turnState, flow);
-          return "posted-template";
-        }
-        // No template configured → fall through to the explained note below (never a free-form
-        // send WhatsApp/the WABA provider would reject).
-      }
-      if (mode !== "freeform") {
-        await client.createNote(
-          ticketId,
-          `${OUTSIDE_WINDOW_NOTE_PREFIX}${reply}`,
-        );
+    // INPUT guardrail: screen the customer message BEFORE the agent processes it. A violation
+    // either posts the configured template/generated reply (skipping the graph) or stays silent.
+    const inGuard = await runGuardrail("input", text);
+    if (inGuard) {
+      if (inGuard.reply !== null) {
+        // The guardrail reply is a post like any other, so it claims the trigger through the same
+        // gate: without this, two concurrent flushes that both trip the guardrail could each post.
+        if (params.shouldPost && !(await params.shouldPost()))
+          return "superseded";
+        markAgentSending(zproInstanceId, ticketId);
+        await sendTextReply(client, ev, inGuard.reply);
         logger.info(
-          "zpro agent noted (outside 24h window, no template): thread=%s ticket=%s",
+          "zpro guardrail (input) replied: thread=%s ticket=%s",
           threadId,
           ev.threadId,
         );
-        await applyDeferredZproResolve(client, ticketId, turnState, flow);
-        return "posted-note-window";
+        return "posted";
       }
+      return "blocked";
     }
 
-    // Reply modality: audio (TTS) per the agent's mode + the customer's modality/preference, else
-    // text. TTS is best-effort — any synthesis failure falls back to a text reply.
-    const wantAudio = shouldReplyWithAudio(
-      loaded.ttsConfig.mode,
-      params.userSentAudio,
-      voiceReplyNow,
+    const model = createChatModel({
+      ...loaded.mc,
+      apiKey: loaded.apiKey,
+      baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
+    });
+    const checkpointer = await getCheckpointer();
+    // Ferramentas concedidas ao agente vinculado a esta instância — RAG/HTTP/MCP/INTEGRATION +
+    // as 2 tools nativas utilitárias, mesma tela/aba de concessão do Chatwoot (ToolGrantsEditor),
+    // sem gate de canal. Vazio por padrão (agente sem nenhuma tool concedida além das utilitárias)
+    // — buildAgentGraph trata `tools` ausente/vazio como hoje (grafo linear, sem ToolNode).
+    // conversationId (ZproConversation.id) vem da mesma consulta e alimenta o UsageCapture abaixo —
+    // LlmUsage.zproConversationId, NUNCA LlmUsage.conversationId (ver docs/zpro.md: risco de
+    // colisão de id com Conversation/Chatwoot). Carregado ANTES do systemPrompt pra `grounded`
+    // (search_knowledge concedida) alimentar composeSystemPrompt abaixo, mesma ordem do Chatwoot.
+    // Mutable per-turn state shared with the native tools (deferred resolve intent) — mirrors
+    // src/graph/runtime.ts's own turnState exactly.
+    const turnState: TurnState = { resolveRequested: false };
+    // Operator guidance per tool (agent.settings.toolGuidance), plus the CRM funnel guidance
+    // (agent.settings.zproCrm.instructions) folded onto kanban_move_card specifically — mirrors
+    // src/graph/prepare.ts's exact merge (its own grouped configs win over the flat map for that tool).
+    const toolInstructions: Partial<Record<NativeToolName, string>> = {
+      ...loaded.toolGuidance,
+    };
+    if (loaded.crmConfig.instructions) {
+      toolInstructions.kanban_move_card = loaded.crmConfig.instructions;
+    }
+    const {
+      tools: agentTools,
+      conversationId,
+      grounded,
+    } = await loadZproAgentTools({
+      base,
+      tenantId,
+      agentId: loaded.agentId,
+      zproInstanceId,
+      ticketId,
+      threadId,
+      client,
+      turnState,
+      transferWithSummary: loaded.transferWithSummary,
+      toolInstructions,
+      pipelineId: loaded.crmConfig.pipelineId,
+      flow,
+      maxDistance: loaded.maxDistance,
+      contactName: ev.contactName,
+      contactNumber: ev.contactNumber,
+      companyName: loaded.companyName,
+    });
+    const tools = [...agentTools];
+    // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},
+    // {{nome_agente}} e as variáveis de hora/data — mesmo interpolador sanitizado (proteção contra
+    // prompt injection) que o Chatwoot usa via prepare.ts.
+    const systemPrompt = interpolatePromptVars(
+      composeSystemPrompt(loaded.systemPrompt, { grounded }),
+      buildPromptVars({
+        contactName: ev.contactName,
+        contactPhone: ev.contactNumber,
+        inboxName: ev.channelType,
+        companyName: loaded.companyName,
+        agentName: loaded.agentName,
+      }),
+      { timezone: DEFAULT_TIMEZONE },
     );
-    if (wantAudio) {
-      try {
-        // Opt-in LLM speech normalization: a temp-0 model from the agent's own model config (no
-        // extra credential). Best-effort — synthesizeReply falls back to raw text if it throws.
-        let normalizeSpeech: ((t: string) => Promise<string>) | undefined;
-        if (loaded.ttsConfig.normalize) {
-          const normModel = createChatModel({
-            ...loaded.mc,
-            apiKey: loaded.apiKey,
-            baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
-            temperature: 0,
-          });
-          normalizeSpeech = (t) => llmNormalizeForSpeech(normModel, t);
-        }
-        const tts = await synthesizeReply({
+    // set_voice_preference (TTS "preference" mode only — no point exposing it when the agent always
+    // replies in text/mirror): unlike the other native tools (built inside loadZproAgentTools, gated
+    // by the SAME grant UI Chatwoot uses), this one needs currentVoiceReply (resolved below, after
+    // the tools call) so it is wired directly here rather than through buildZproNativeTools.
+    // voiceReplyNow further down re-reads it AFTER the invoke so a preference set THIS turn still
+    // governs THIS reply.
+    let currentVoiceReply: boolean | null = null;
+    if (loaded.ttsConfig.mode === "preference" && conversationId != null) {
+      const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.zproConversation.findUnique({
+          where: { id: conversationId },
+          select: { voiceReply: true },
+        }),
+      );
+      currentVoiceReply = conv?.voiceReply ?? null;
+      tools.push(
+        buildSetVoicePreferenceTool({
           tenantId,
-          cfg: loaded.ttsConfig,
-          text: reply,
-          // Z-PRO is WhatsApp-only (no Instagram-style channel split), so leave channelType unset —
-          // pickTtsFormat's default already resolves to Ogg/Opus (the WhatsApp voice-note format).
-          channelType: null,
           base,
-          deps: { normalizeSpeech },
-          flow,
-        });
-        if (tts) {
-          markAgentSending(zproInstanceId, ticketId);
-          await sendZproVoiceReply(client, ev, tts);
+          conversationId,
+          currentVoiceReply,
+        }),
+      );
+    }
+    const graph = buildAgentGraph({
+      model,
+      systemPrompt,
+      checkpointer,
+      tools,
+    });
+
+    const usageCapture = new UsageCapture({
+      tenantId,
+      agentId: loaded.agentId,
+      zproConversationId: conversationId,
+      threadId,
+      model: loaded.mc.model,
+      node: "agent",
+      source: "inbox",
+      base,
+    });
+
+    // The live "agent is working" indicator on the per-tenant realtime channel — Z-PRO analogue of
+    // src/graph/runtime.ts's AgentStatusReporter wiring. `started` here (conversationId is only known
+    // once tools have loaded, unlike Chatwoot where it's known upfront) through a GUARANTEED
+    // `finished` in the finally below (every exit — posted, empty, taken-over, superseded, or thrown
+    // — clears it).
+    const status = new ZproAgentStatusReporter({
+      tenantId,
+      zproConversationId: conversationId,
+    });
+    status.started();
+    let deliveredBalloons: number | null = null;
+    try {
+      const result = await withFlowStage(
+        flow,
+        "generate",
+        { provider: loaded.mc.provider, model: loaded.mc.model },
+        () =>
+          graph.invoke(
+            { messages: [new HumanMessage(text)] },
+            {
+              configurable: { thread_id: threadId },
+              callbacks: [usageCapture, status],
+            },
+          ),
+      );
+
+      let reply = lastAssistantText(result.messages).trim();
+
+      // Re-check AFTER the invoke: did a human take over WHILE the LLM call ran? Mirrors
+      // src/graph/runtime.ts's "taken-over" recheck (Chatwoot's assigneeType), keyed here on
+      // ZproConversation.agentActive — the same flag the auto-handoff-on-human-intervention gate in
+      // zpro.controller.ts flips. Same read also refreshes voiceReply (set_voice_preference may have
+      // written it DURING the invoke) so "prefiro texto" takes effect in THIS same turn.
+      let voiceReplyNow = currentVoiceReply;
+      if (conversationId != null) {
+        const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+          db.zproConversation.findUnique({
+            where: { id: conversationId },
+            select: { agentActive: true, voiceReply: true },
+          }),
+        );
+        if (conv && !conv.agentActive) {
+          emitFlowEvent(flow, {
+            stage: "handoff",
+            status: "ok",
+            detail: { outcome: "taken_over" },
+          });
+          return "taken-over";
+        }
+        voiceReplyNow = conv?.voiceReply ?? voiceReplyNow;
+      }
+
+      // Last-moment supersede gate (debounce): a newer message arrived mid-turn → drop this reply
+      // (the re-armed flush answers the full burst).
+      if (params.shouldPost && !(await params.shouldPost()))
+        return "superseded";
+
+      // Empty reply: nothing to post, but a deferred resolve intent still applies (resolve with no
+      // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
+      // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
+      if (!reply) {
+        await applyDeferredZproResolve(client, ticketId, turnState, flow);
+        return "empty";
+      }
+
+      // OUTPUT guardrail: screen the model's reply BEFORE delivery. A violation either replaces the
+      // reply (template / a guardrails-generated safe reply) or suppresses the send entirely.
+      const outGuard = await runGuardrail("output", reply);
+      if (outGuard) {
+        if (outGuard.reply === null) return "blocked";
+        reply = outGuard.reply;
+      }
+
+      // PROACTIVE-only WhatsApp 24h window gate (runZproAgentNudge sets `proactive`; the reactive
+      // webhook/debounce paths never do, so `mode` is always "freeform" there). Outside the window on
+      // a WABA-official instance: an approved template if configured, else an explained private note —
+      // text-only, so this branch SKIPS the TTS/text delivery below entirely on either sub-outcome.
+      if (params.proactive) {
+        const mode = proactiveSendMode(
+          loaded.serviceWindowConfig,
+          params.proactive.lastInboundAt,
+          new Date(),
+          loaded.instance.isOfficialWaba,
+        );
+        if (mode === "template") {
+          const payload = buildTemplatePayload(
+            loaded.serviceWindowConfig,
+            null,
+          );
+          if (payload) {
+            markAgentSending(zproInstanceId, ticketId);
+            await sendZproTemplate(client, ev.contactNumber, payload);
+            logger.info(
+              "zpro agent replied (template, outside 24h window): thread=%s ticket=%s template=%s",
+              threadId,
+              ev.threadId,
+              payload.name,
+            );
+            await applyDeferredZproResolve(client, ticketId, turnState, flow);
+            return "posted-template";
+          }
+          // No template configured → fall through to the explained note below (never a free-form
+          // send WhatsApp/the WABA provider would reject).
+        }
+        if (mode !== "freeform") {
+          await client.createNote(
+            ticketId,
+            `${OUTSIDE_WINDOW_NOTE_PREFIX}${reply}`,
+          );
           logger.info(
-            "zpro agent replied (audio): thread=%s ticket=%s len=%d",
+            "zpro agent noted (outside 24h window, no template): thread=%s ticket=%s",
             threadId,
             ev.threadId,
-            reply.length,
           );
-          deliveredBalloons = 1;
           await applyDeferredZproResolve(client, ticketId, turnState, flow);
-          return "posted";
+          return "posted-note-window";
         }
-      } catch (e) {
-        logger.warn(
-          "zpro tts failed (thread=%s), falling back to text: %s",
-          threadId,
-          e instanceof Error ? e.message : String(e),
-        );
       }
-    }
 
-    // Marca ANTES de enviar: um eco fromMe deste ticket, chegando pelo webhook nos próximos
-    // segundos, deve ser classificado AGENT por mirror.ts em vez de seguir o heurístico
-    // ticket.userId (ver agent-echo.ts). Split + typing pacing por balão (docs/split.md) —
-    // deliverZproReply reaproveita os helpers puros do registry compartilhado.
-    markAgentSending(zproInstanceId, ticketId);
-    const balloons = await deliverZproReply(
-      client,
-      ev,
-      reply,
-      loaded.splitConfig,
-      undefined,
-      flow,
-    );
-    logger.info(
-      "zpro agent replied: thread=%s ticket=%s len=%d balloons=%d",
-      threadId,
-      ev.threadId,
-      reply.length,
-      balloons,
-    );
-    deliveredBalloons = balloons;
-    await applyDeferredZproResolve(client, ticketId, turnState, flow);
-    return "posted";
+      // Reply modality: audio (TTS) per the agent's mode + the customer's modality/preference, else
+      // text. TTS is best-effort — any synthesis failure falls back to a text reply.
+      const wantAudio = shouldReplyWithAudio(
+        loaded.ttsConfig.mode,
+        params.userSentAudio,
+        voiceReplyNow,
+      );
+      if (wantAudio) {
+        try {
+          // Opt-in LLM speech normalization: a temp-0 model from the agent's own model config (no
+          // extra credential). Best-effort — synthesizeReply falls back to raw text if it throws.
+          let normalizeSpeech: ((t: string) => Promise<string>) | undefined;
+          if (loaded.ttsConfig.normalize) {
+            const normModel = createChatModel({
+              ...loaded.mc,
+              apiKey: loaded.apiKey,
+              baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
+              temperature: 0,
+            });
+            normalizeSpeech = (t) => llmNormalizeForSpeech(normModel, t);
+          }
+          const tts = await synthesizeReply({
+            tenantId,
+            cfg: loaded.ttsConfig,
+            text: reply,
+            // Z-PRO is WhatsApp-only (no Instagram-style channel split), so leave channelType unset —
+            // pickTtsFormat's default already resolves to Ogg/Opus (the WhatsApp voice-note format).
+            channelType: null,
+            base,
+            deps: { normalizeSpeech },
+            flow,
+          });
+          if (tts) {
+            markAgentSending(zproInstanceId, ticketId);
+            await sendZproVoiceReply(client, ev, tts);
+            logger.info(
+              "zpro agent replied (audio): thread=%s ticket=%s len=%d",
+              threadId,
+              ev.threadId,
+              reply.length,
+            );
+            deliveredBalloons = 1;
+            await applyDeferredZproResolve(client, ticketId, turnState, flow);
+            return "posted";
+          }
+        } catch (e) {
+          logger.warn(
+            "zpro tts failed (thread=%s), falling back to text: %s",
+            threadId,
+            e instanceof Error ? e.message : String(e),
+          );
+        }
+      }
+
+      // Marca ANTES de enviar: um eco fromMe deste ticket, chegando pelo webhook nos próximos
+      // segundos, deve ser classificado AGENT por mirror.ts em vez de seguir o heurístico
+      // ticket.userId (ver agent-echo.ts). Split + typing pacing por balão (docs/split.md) —
+      // deliverZproReply reaproveita os helpers puros do registry compartilhado.
+      markAgentSending(zproInstanceId, ticketId);
+      const balloons = await deliverZproReply(
+        client,
+        ev,
+        reply,
+        loaded.splitConfig,
+        undefined,
+        flow,
+      );
+      logger.info(
+        "zpro agent replied: thread=%s ticket=%s len=%d balloons=%d",
+        threadId,
+        ev.threadId,
+        reply.length,
+        balloons,
+      );
+      deliveredBalloons = balloons;
+      await applyDeferredZproResolve(client, ticketId, turnState, flow);
+      return "posted";
+    } finally {
+      status.finished(deliveredBalloons);
+    }
   } finally {
-    status.finished(deliveredBalloons);
+    stopTyping();
   }
 }
 

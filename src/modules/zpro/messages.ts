@@ -3,15 +3,35 @@
 
 import type { TemplatePayload } from "@/modules/service-window/service";
 import type { ZproClient } from "./client";
-import { ZPRO_PRESENCE_TYPING } from "./constants";
+import { ZPRO_PRESENCE_PAUSED, ZPRO_PRESENCE_TYPING } from "./constants";
 import type { NormalizedZproEvent } from "./types";
 
-/** Envia indicador de "digitando..." antes de responder. */
-export async function sendTyping(
+// WhatsApp's own "composing" presence chatstate is NOT persistent — clients revert it a few
+// seconds after the last signal if it isn't refreshed, well before a turn with guardrails/tool
+// calls/RAG typically finishes. Comfortably under the shortest observed timeout.
+const TYPING_HEARTBEAT_MS = 4000;
+
+/**
+ * Keeps the "digitando..." indicator alive for the whole turn instead of a single one-shot
+ * signal (which flickers on then off before a slow reply is ready). Fires immediately, then on
+ * an interval, until the returned function is called — call it as soon as the reply is ready to
+ * send (or the turn ends without one), which also sends one "paused" so the indicator doesn't
+ * linger. Best-effort throughout: a failed sendPresence never throws or stops the heartbeat.
+ */
+export function startTypingHeartbeat(
   client: ZproClient,
-  event: NormalizedZproEvent,
-): Promise<void> {
-  await client.sendPresence(Number(event.threadId), ZPRO_PRESENCE_TYPING);
+  ticketId: number,
+  intervalMs: number = TYPING_HEARTBEAT_MS,
+): () => void {
+  const tick = () => {
+    client.sendPresence(ticketId, ZPRO_PRESENCE_TYPING).catch(() => {});
+  };
+  tick();
+  const timer = setInterval(tick, intervalMs);
+  return () => {
+    clearInterval(timer);
+    client.sendPresence(ticketId, ZPRO_PRESENCE_PAUSED).catch(() => {});
+  };
 }
 
 /**
