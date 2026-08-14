@@ -30,18 +30,29 @@ function byName(tools: StructuredToolInterface[], name: string) {
 }
 
 describe("native tools", () => {
-  test("exposes all tools by default; the allowlist filters (fail-closed)", () => {
+  test("exposes all tools by default EXCEPT route_to_queue (Z-PRO-only, no Chatwoot analog); the allowlist filters (fail-closed)", () => {
     const { client } = recordingClient();
     expect(
       buildNativeTools({ client, conversationId: 1 })
         .map((t) => t.name)
         .sort(),
-    ).toEqual([...NATIVE_TOOL_NAMES].sort());
+    ).toEqual(
+      [...NATIVE_TOOL_NAMES].filter((n) => n !== "route_to_queue").sort(),
+    );
 
     const only = buildNativeTools({ client, conversationId: 1 }, [
       "private_note",
     ]);
     expect(only.map((t) => t.name)).toEqual(["private_note"]);
+  });
+
+  test("an allowlist naming route_to_queue still never builds it (no Chatwoot analog exists)", () => {
+    const { client } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 1 }, [
+      "route_to_queue",
+      "skip_reply",
+    ]);
+    expect(tools.map((t) => t.name)).toEqual(["skip_reply"]);
   });
 
   test("react_to_message reacts to the customer's last message when it is not a reaction", async () => {
@@ -446,6 +457,18 @@ describe("native tools", () => {
       '<attribute key="lead_stage" values="new|qualified"/>',
     );
     expect(attr).toContain('<attribute key="plano"/>');
+  });
+
+  test("schedule_message without threadId/base/tenantId in ctx → safe message, no throw", async () => {
+    const { client } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const out = String(
+      await byName(tools, "schedule_message").invoke({
+        instructions: "Send a follow-up",
+        delayMinutes: 5,
+      }),
+    );
+    expect(out.toLowerCase()).toContain("no conversation in scope");
   });
 
   test("set_custom_attribute contact scope without a contact in ctx → safe message", async () => {

@@ -27,6 +27,7 @@ import {
   registerFollowUpHandlers,
 } from "@/modules/followups/handlers";
 import { registerRagIngestHandler } from "@/modules/rag/documents";
+import { registerScheduledMessageHandler } from "@/modules/scheduled-messages/service";
 import { startScheduler, stopScheduler } from "@/modules/scheduler/worker";
 import { registerHeartbeatHandler } from "@/modules/webhooks/outbound/heartbeat";
 import {
@@ -159,6 +160,7 @@ if (config.schedulerWorker.enabled) {
   registerFlowlogRetentionHandler();
   registerAppointmentReminderHandler();
   registerRedirectFollowUpHandlers();
+  registerScheduledMessageHandler();
   startScheduler();
   // Arm the per-tenant execution-log retention sweep for every existing tenant (best-effort: a
   // boot-time DB outage just means the sweep arms on the next restart).

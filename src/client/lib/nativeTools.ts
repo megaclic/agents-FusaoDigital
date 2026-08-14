@@ -14,6 +14,7 @@ import {
   StickyNote,
   Tag,
   Tags,
+  Timer,
 } from "lucide-react";
 
 // Display metadata for the built-in native tools (icon + friendly label + one-line description),
@@ -31,6 +32,7 @@ export const NATIVE_TOOL_ICONS: Record<string, LucideIcon> = {
   set_voice_preference: Mic,
   react_to_message: Smile,
   route_to_queue: ListTree,
+  schedule_message: Timer,
   skip_reply: BellOff,
   calculator: Calculator,
   get_current_time: Clock,
@@ -134,6 +136,15 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
         description: t(
           "nativeTools.route_to_queue.desc",
           "Route the conversation to another department/queue.",
+        ),
+      };
+    case "schedule_message":
+      return {
+        icon,
+        label: t("nativeTools.schedule_message.label", "Schedule message"),
+        description: t(
+          "nativeTools.schedule_message.desc",
+          "Schedule a one-off message or action to happen later in this conversation (up to 24h ahead).",
         ),
       };
     case "skip_reply":

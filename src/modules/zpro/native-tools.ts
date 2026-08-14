@@ -47,6 +47,12 @@
 //                         FAIL-CLOSED (no auto-create): a queue is operator-managed structure, not a
 //                         free-form tag, so an unrecognized name is reported back to the model
 //                         instead of silently creating a new department.
+//   schedule_message      → scheduleMessage (src/modules/scheduled-messages/service.ts), a bare
+//                         scheduler job carrying free-form instructions, delivered via
+//                         runZproAgentNudge. Channel-agnostic capability (the Chatwoot twin lives in
+//                         src/graph/tools/native.ts) — exists because a delayed-send request used to
+//                         be pure hallucination: the model confirmed it in prose with no tool call
+//                         behind it, so nothing ever arrived.
 //
 // react_to_message has NO analog: the external Z-PRO API exposes no message-reaction endpoint at
 // all (confirmed against the full vendor Postman collection, docs/zpro-api-reference.md). It is
@@ -65,6 +71,10 @@ import { simulatedTool } from "@/graph/tools/native";
 import { runScopedOn } from "@/lib/tenancy";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
 import type { SideEffectErrorReporter } from "@/modules/integrations/toolpacks";
+import {
+  clampDelayMinutes,
+  scheduleMessage,
+} from "@/modules/scheduled-messages/service";
 import type { ZproClient } from "./client";
 import {
   matchZproStage,
@@ -716,6 +726,64 @@ function updateKanbanTaskTool(ctx: ZproToolCtx) {
   );
 }
 
+// ── schedule_message (channel-agnostic — same capability + backing as native.ts's) ────────────────
+
+function scheduleMessageTool(ctx: ZproToolCtx) {
+  return tool(
+    async ({
+      instructions,
+      delayMinutes,
+    }: {
+      instructions: string;
+      delayMinutes: number;
+    }) => {
+      if (!ctx.base || !ctx.threadId) {
+        return "Could not schedule the message (no conversation in scope).";
+      }
+      const delay = clampDelayMinutes(delayMinutes);
+      try {
+        const { runAt } = await scheduleMessage({
+          tenantId: ctx.tenantId,
+          threadId: ctx.threadId,
+          instructions,
+          delayMinutes: delay,
+          base: ctx.base,
+        });
+        return `Scheduled: I will act on this at ${runAt.toISOString()} (in ${delay} minute(s)).`;
+      } catch (e) {
+        logger.warn(
+          "zpro schedule_message failed (ticket=%s): %s",
+          String(ctx.ticketId),
+          e instanceof Error ? e.message : String(e),
+        );
+        ctx.onSideEffectError?.({
+          tool: "schedule_message",
+          phase: "enqueue",
+          err: e,
+        });
+        return toolFailure("Could not schedule the message.");
+      }
+    },
+    {
+      name: "schedule_message",
+      description:
+        "Schedule a one-off message or action to happen later in THIS conversation (e.g. 'remind me in 10 minutes', 'send me a motivational quote in an hour'). `instructions` is a brief for your FUTURE self describing what to do/say when it fires — write it as an instruction, not as the final customer-facing text. Only usable for delays up to 24h. Do NOT promise a delayed send in your reply without calling this tool — an unfulfilled promise is worse than declining.",
+      schema: z.object({
+        instructions: z
+          .string()
+          .min(1)
+          .describe(
+            'Brief for what to do when the timer fires, e.g. "Send a short motivational message and a thumbs-up emoji."',
+          ),
+        delayMinutes: z
+          .number()
+          .positive()
+          .describe("Minutes from now to wait before acting (max 1440 = 24h)."),
+      }),
+    },
+  );
+}
+
 // ── skip_reply (identical to Chatwoot's — pure, never touches a client) ────
 
 function skipReplyTool(_ctx: ZproToolCtx) {
@@ -741,7 +809,7 @@ function skipReplyTool(_ctx: ZproToolCtx) {
   );
 }
 
-// allowed = undefined → all 8 tools; otherwise only the named subset (fail-closed, mirrors
+// allowed = undefined → all 9 tools; otherwise only the named subset (fail-closed, mirrors
 // src/graph/tools/native.ts's buildNativeTools). react_to_message is never built (see module header).
 export function buildZproNativeTools(
   ctx: ZproToolCtx,
@@ -756,6 +824,7 @@ export function buildZproNativeTools(
     kanbanMoveTool(ctx),
     updateKanbanTaskTool(ctx),
     routeToQueueTool(ctx),
+    scheduleMessageTool(ctx),
     skipReplyTool(ctx),
   ];
   if (!allowed) return all;
@@ -765,7 +834,7 @@ export function buildZproNativeTools(
 
 // Playground variant: every Z-PRO conversation tool the agent could ever be granted is SIMULATED
 // (no real ZproClient call, no ZproConversation write) — mirrors src/graph/tools/native.ts's
-// buildSimulatedNativeTools, reusing its channel-agnostic simulatedTool() wrapper. Covers the 8
+// buildSimulatedNativeTools, reusing its channel-agnostic simulatedTool() wrapper. Covers the 9
 // tools above PLUS set_voice_preference (built separately in runtime.ts for real turns, gated on
 // ttsConfig.mode === "preference" — here it's shown unconditionally, same as Chatwoot's playground,
 // since the point is testing the agent's DECISION to call it, not the TTS mode gate). Z-PRO has no

@@ -1542,6 +1542,10 @@
       "desc": "Encaminha a conversa para outra fila/departamento.",
       "label": "Encaminhar para fila"
     },
+    "schedule_message": {
+      "desc": "Agenda uma mensagem ou ação pontual para acontecer mais tarde nesta conversa (até 24h à frente).",
+      "label": "Agendar mensagem"
+    },
     "set_custom_attribute": {
       "desc": "Define um atributo personalizado na conversa, no contato ou no card do kanban (ex.: estágio do lead, qualificação).",
       "label": "Definir atributo"

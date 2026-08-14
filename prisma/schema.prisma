@@ -64,6 +64,7 @@ enum SchedulerJobKind {
   FLOWLOG_SWEEP
   APPOINTMENT_REMINDER
   REDIRECT_FOLLOWUP
+  SCHEDULED_MESSAGE
 }
 
 enum SchedulerJobStatus {

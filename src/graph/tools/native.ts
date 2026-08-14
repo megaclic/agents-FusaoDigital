@@ -21,6 +21,10 @@ import {
   matchHandoffTarget,
 } from "@/modules/handoff/targets";
 import type { SideEffectErrorReporter } from "@/modules/integrations/toolpacks";
+import {
+  clampDelayMinutes,
+  scheduleMessage,
+} from "@/modules/scheduled-messages/service";
 import { emitOutbound } from "@/modules/webhooks/outbound/service";
 import {
   DEFAULT_TIMEZONE,
@@ -103,6 +107,11 @@ export interface ToolCtx {
   // `tool`-stage warn so the failure reaches the Logs page and alert channels; absent
   // (playground/tests) ⇒ the failure stays log-only. NEVER changes the tool's return value.
   onSideEffectError?: SideEffectErrorReporter;
+  // Canonical checkpointer/scheduler thread id (chatwootThreadId's tenant:instance:conversation),
+  // needed by schedule_message to enqueue a SCHEDULED_MESSAGE job dispatchable later without a live
+  // turn. Always present from buildToolset's real callers (runtime.ts/nudge.ts/playground); optional
+  // here only so hand-built ctx in tests can omit it.
+  threadId?: string;
 }
 
 // Assembles a tool's final model-facing description in a fixed order: the static capability text,
@@ -949,6 +958,58 @@ function reactToMessageTool(ctx: ToolCtx) {
   );
 }
 
+// Arms a one-off timer: at delayMinutes from now, a system turn is injected on THIS SAME thread with
+// `instructions` as the agent's brief, and it replies for real (reusing runAgentNudge, same as an
+// appointment reminder — full guardrails/tools/split/TTS/service-window). Exists because "send this
+// later" was previously pure hallucination: the model would confirm a delayed send in prose with no
+// tool call behind it, and nothing ever arrived. Channel-agnostic (Chatwoot here, the Z-PRO twin is
+// src/modules/zpro/native-tools.ts's own build) — same scheduleMessage backing both.
+function scheduleMessageTool(ctx: ToolCtx) {
+  return tool(
+    async ({
+      instructions,
+      delayMinutes,
+    }: {
+      instructions: string;
+      delayMinutes: number;
+    }) => {
+      if (!ctx.base || ctx.tenantId == null || !ctx.threadId) {
+        return "Could not schedule the message (no conversation in scope).";
+      }
+      const delay = clampDelayMinutes(delayMinutes);
+      try {
+        const { runAt } = await scheduleMessage({
+          tenantId: ctx.tenantId,
+          threadId: ctx.threadId,
+          instructions,
+          delayMinutes: delay,
+          base: ctx.base,
+        });
+        return `Scheduled: I will act on this at ${runAt.toISOString()} (in ${delay} minute(s)).`;
+      } catch {
+        return toolFailure("Could not schedule the message.");
+      }
+    },
+    {
+      name: "schedule_message",
+      description:
+        "Schedule a one-off message or action to happen later in THIS conversation (e.g. 'remind me in 10 minutes', 'send me a motivational quote in an hour'). `instructions` is a brief for your FUTURE self describing what to do/say when it fires — write it as an instruction, not as the final customer-facing text. Only usable for delays up to 24h. Do NOT promise a delayed send in your reply without calling this tool — an unfulfilled promise is worse than declining.",
+      schema: z.object({
+        instructions: z
+          .string()
+          .min(1)
+          .describe(
+            'Brief for what to do when the timer fires, e.g. "Send a short motivational message and a thumbs-up emoji."',
+          ),
+        delayMinutes: z
+          .number()
+          .positive()
+          .describe("Minutes from now to wait before acting (max 1440 = 24h)."),
+      }),
+    },
+  );
+}
+
 // Deliberately produce NO reply this turn. The agent calls this, then ends without any customer-facing
 // text, so the runtime posts nothing (it already skips an empty reply). The call is recorded in the
 // conversation timeline (via the tool flow log) as a "decided not to respond" marker.
@@ -1046,6 +1107,7 @@ export function buildNativeTools(
     updateKanbanTaskTool(ctx),
     setVoicePreferenceTool(ctx),
     reactToMessageTool(ctx),
+    scheduleMessageTool(ctx),
     skipReplyTool(ctx),
     calculatorTool(ctx),
     getCurrentTimeTool(ctx),

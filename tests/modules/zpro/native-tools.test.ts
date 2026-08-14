@@ -39,7 +39,7 @@ function baseCtx(overrides: Partial<ZproToolCtx> = {}): ZproToolCtx {
 }
 
 describe("buildZproNativeTools (no client/DB access)", () => {
-  test("returns all 9 tools when unfiltered, and NEVER react_to_message", () => {
+  test("returns all 10 tools when unfiltered, and NEVER react_to_message", () => {
     const tools = buildZproNativeTools(baseCtx());
     expect(tools.map((t) => t.name).sort()).toEqual([
       "assign_label",
@@ -48,6 +48,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
       "private_note",
       "resolve_conversation",
       "route_to_queue",
+      "schedule_message",
       "set_custom_attribute",
       "skip_reply",
       "update_kanban_task",
@@ -453,7 +454,7 @@ let zproInstanceId = 0n;
 let conversationId = 0n;
 
 describe.skipIf(!dbUp)(
-  "kanban_move_card / update_kanban_task (Opportunity upsert)",
+  "kanban_move_card / update_kanban_task (Opportunity upsert) + schedule_message",
   () => {
     beforeAll(async () => {
       const t = await suDb.tenant.create({
@@ -718,6 +719,62 @@ describe.skipIf(!dbUp)(
       );
       const out = await tools[0]?.invoke({});
       expect(String(out)).toContain("No fields provided");
+    });
+
+    test("schedule_message enqueues a SCHEDULED_MESSAGE job with runAt = now + delayMinutes", async () => {
+      const threadId = `zpro:${tenantId}:${zproInstanceId}:1`;
+      const tools = buildZproNativeTools(
+        {
+          client: {} as ZproClient,
+          ticketId: 1,
+          threadId,
+          contactId: 7,
+          contactNumber: "5511900000001",
+          contactName: "Cliente Teste",
+          tenantId,
+          base: appDb,
+          conversationDbId: conversationId,
+        },
+        ["schedule_message"],
+      );
+      const before = Date.now();
+      const out = await tools[0]?.invoke({
+        instructions: "Send a motivational quote and a thumbs-up emoji.",
+        delayMinutes: 5,
+      });
+      expect(String(out)).toContain("Scheduled");
+      const row = await suDb.schedulerJob.findFirstOrThrow({
+        where: { tenantId, kind: "SCHEDULED_MESSAGE" },
+      });
+      expect(row.dedupeKey).toContain(threadId);
+      expect(row.payload).toMatchObject({
+        threadId,
+        instructions: "Send a motivational quote and a thumbs-up emoji.",
+      });
+      const deltaMs = row.runAt.getTime() - before;
+      expect(deltaMs).toBeGreaterThan(4 * 60_000);
+      expect(deltaMs).toBeLessThan(6 * 60_000);
+    });
+
+    test("schedule_message without ctx.threadId reports it instead of throwing", async () => {
+      const tools = buildZproNativeTools(
+        {
+          client: {} as ZproClient,
+          ticketId: 1,
+          contactId: 7,
+          contactNumber: "5511900000001",
+          contactName: "Cliente Teste",
+          tenantId,
+          base: appDb,
+          conversationDbId: conversationId,
+        },
+        ["schedule_message"],
+      );
+      const out = await tools[0]?.invoke({
+        instructions: "x",
+        delayMinutes: 5,
+      });
+      expect(String(out)).toContain("Could not schedule");
     });
   },
 );

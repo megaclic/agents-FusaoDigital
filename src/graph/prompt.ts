@@ -20,13 +20,28 @@ export const GROUNDING_DIRECTIVE = [
   "- If the search returns nothing relevant, say plainly that you don't have that information and offer to connect the customer with a human — do NOT guess.",
 ].join("\n");
 
+// Always appended (unlike GROUNDING_DIRECTIVE, not gated on a tool grant). Exists because the model
+// twice confirmed a delayed action to a real customer — "I'll send that in 5 minutes", a Google
+// Calendar reminder — without calling ANY tool, and nothing ever arrived: a confident promise with no
+// tool call behind it. schedule_message (src/modules/scheduled-messages/service.ts) now exists for
+// the generic case, but the directive matters even where a real tool already existed (Calendar) and
+// the model still didn't call it — so this is a behavioral backstop, not just "add the missing tool."
+export const COMMITMENT_DIRECTIVE = [
+  "Commitment discipline:",
+  "- Never tell the customer you will do something later (send a message, a reminder, a callback, book/confirm an appointment) unless you actually call the tool that performs it IN THIS SAME RESPONSE.",
+  "- If no tool exists for what they're asking, say so plainly instead of confirming it will happen.",
+  "- A confident promise you cannot keep is worse than admitting a limitation.",
+].join("\n");
+
 export function composeSystemPrompt(
   basePrompt: string,
   opts: { grounded: boolean },
 ): string {
   const base = basePrompt.trim();
-  if (!opts.grounded) return base;
-  return base ? `${base}\n\n${GROUNDING_DIRECTIVE}` : GROUNDING_DIRECTIVE;
+  const directives = opts.grounded
+    ? [COMMITMENT_DIRECTIVE, GROUNDING_DIRECTIVE]
+    : [COMMITMENT_DIRECTIVE];
+  return [base, ...directives].filter(Boolean).join("\n\n");
 }
 
 // ── context variables ──

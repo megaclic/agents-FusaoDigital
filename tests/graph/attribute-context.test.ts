@@ -168,9 +168,10 @@ describe.skipIf(!dbUp)("attribute context in the system prompt", () => {
     expect(prompt).not.toContain("chamar de Maria");
   });
 
-  test("an agent without the setting gets no block at all", async () => {
+  test("an agent without the setting gets no attribute block (only the always-on commitment directive)", async () => {
     const loaded = await load(agentNone);
-    expect(loaded?.systemPrompt).toBe("Você é um assistente.");
+    expect(loaded?.systemPrompt).toContain("Você é um assistente.");
+    expect(loaded?.systemPrompt).not.toContain("<attribute");
   });
 
   test("concurrent set_custom_attribute writes keep every key (atomic jsonb merge)", async () => {

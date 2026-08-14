@@ -635,6 +635,7 @@ export interface ToolBuildDeps {
       kanban?: KanbanContext;
       toolInstructions?: Partial<Record<NativeToolName, string>>;
       onSideEffectError?: SideEffectErrorReporter;
+      threadId?: string;
     },
     allowed?: Iterable<string>,
   ) => StructuredToolInterface[];
@@ -921,6 +922,7 @@ export async function buildToolset(
         kanban,
         toolInstructions,
         onSideEffectError,
+        threadId: ctx.threadId,
       },
       cfg.nativeToolsAllow,
     ),
