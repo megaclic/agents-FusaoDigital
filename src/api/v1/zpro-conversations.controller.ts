@@ -416,15 +416,20 @@ export const zproConversationsController = new Elysia({
           "errors.zproConversationNotFound",
         );
       }
+      // `desc` + `take` gets the 200 MOST RECENT rows, then reversed back to oldest-first for
+      // display — `asc` + `take` (the previous shape) returned the 200 OLDEST rows instead, which
+      // silently froze the thread once a conversation passed 200 messages (confirmed live,
+      // 2026-08-14: a 235-message conversation's panel was stuck exactly at message #200, with
+      // every later message invisible no matter how many more arrived — not a caching issue).
       const messages = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproMessage.findMany({
           where: { conversationId: id },
-          orderBy: { timestamp: "asc" },
+          orderBy: { timestamp: "desc" },
           take: 200,
           select: MESSAGE_SELECT,
         }),
       );
-      return { messages: messages.map(messageToDto) };
+      return { messages: messages.reverse().map(messageToDto) };
     },
     {
       requireAuth: true,
@@ -433,7 +438,7 @@ export const zproConversationsController = new Elysia({
       }),
       detail: doc(
         "List Z-PRO messages",
-        "Lists mirrored messages for a Z-PRO conversation (oldest first).",
+        "Lists the 200 most recent mirrored messages for a Z-PRO conversation (oldest first).",
       ),
       response: errors(400, 401, 404),
     },
