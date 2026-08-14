@@ -6,7 +6,9 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  extractMedia,
   parseContactTags,
+  parseMediaKey,
   resolveZproInstanceCandidate,
 } from "@/modules/zpro/parse";
 
@@ -122,5 +124,75 @@ describe("parseContactTags", () => {
       { id: null, name: "vip" },
       { id: 2, name: "lead" },
     ]);
+  });
+});
+
+// audioMessage.mediaKey's wire shape is UNCONFIRMED and already changed once: the WhatsApp
+// protocol calls for base64, but a live capture (2026-08-14) showed a plain array-like object
+// instead — a Buffer/Uint8Array serialized without its `.toJSON()`, losing its array-ness over the
+// wire. parseMediaKey must tolerate both (plus a real byte array) without throwing, since
+// media-crypto.ts's decryptWhatsappMedia is the security-relevant step everything else feeds.
+describe("parseMediaKey", () => {
+  const key32 = Array.from({ length: 32 }, (_, i) => i);
+  const key32Base64 = Buffer.from(key32).toString("base64");
+
+  test("a plain base64 string passes through unchanged", () => {
+    expect(parseMediaKey(key32Base64)).toBe(key32Base64);
+  });
+
+  test("a real byte array is base64-encoded", () => {
+    expect(parseMediaKey(key32)).toBe(key32Base64);
+  });
+
+  test('an array-like object ({"0":n,...,"31":n}) is base64-encoded', () => {
+    const arrayLike = Object.fromEntries(key32.map((n, i) => [String(i), n]));
+    expect(parseMediaKey(arrayLike)).toBe(key32Base64);
+  });
+
+  test("undefined, null, empty string, or a non-numeric object → undefined, never throws", () => {
+    expect(parseMediaKey(undefined)).toBeUndefined();
+    expect(parseMediaKey(null)).toBeUndefined();
+    expect(parseMediaKey("")).toBeUndefined();
+    expect(parseMediaKey("   ")).toBeUndefined();
+    expect(parseMediaKey({})).toBeUndefined();
+    expect(parseMediaKey({ type: "Buffer" })).toBeUndefined();
+    expect(parseMediaKey(42)).toBeUndefined();
+    expect(parseMediaKey(["not", "numbers"])).toBeUndefined();
+  });
+});
+
+describe("extractMedia mediaKey normalization", () => {
+  const key32 = Array.from({ length: 32 }, (_, i) => i + 1);
+  const key32Base64 = Buffer.from(key32).toString("base64");
+  const arrayLikeKey = Object.fromEntries(key32.map((n, i) => [String(i), n]));
+
+  test("audioMessage: array-like mediaKey normalizes to base64 and tags mediaType 'audio'", () => {
+    const result = extractMedia({
+      audioMessage: {
+        url: "https://mmg.whatsapp.net/x.enc",
+        mediaKey: arrayLikeKey,
+      },
+    });
+    expect(result.mediaKey).toBe(key32Base64);
+    expect(result.mediaType).toBe("audio");
+  });
+
+  test("imageMessage: a real base64 string mediaKey passes through, mediaType 'image'", () => {
+    const result = extractMedia({
+      imageMessage: {
+        url: "https://mmg.whatsapp.net/y.enc",
+        mediaKey: key32Base64,
+      },
+    });
+    expect(result.mediaKey).toBe(key32Base64);
+    expect(result.mediaType).toBe("image");
+  });
+
+  test("no mediaKey on the message → mediaKey undefined, mediaType still set", () => {
+    const result = extractMedia({
+      documentMessage: { url: "https://mmg.whatsapp.net/z.enc" },
+    });
+    expect(result.mediaKey).toBeUndefined();
+    expect(result.mediaType).toBe("document");
   });
 });

@@ -60,15 +60,19 @@ export interface ZproMsgContent {
     text?: string;
     contextInfo?: unknown;
   };
-  // Áudio (ptt ou gravado). `mediaKey`: base64, chave pra decriptar o blob de `url` — ver
-  // media-crypto.ts. Confirmado presente via diagnóstico ao vivo (2026-08-14).
+  // Áudio (ptt ou gravado). `mediaKey`: chave pra decriptar o blob de `url` — ver media-crypto.ts.
+  // Confirmado presente via diagnóstico ao vivo (2026-08-14), mas NÃO como string base64 (a forma
+  // documentada pelo protocolo) — chega como um objeto array-like `{"0":n,...,"31":n}` (um
+  // Buffer/Uint8Array de 32 bytes serializado sem `.toJSON()`). `unknown` aqui pq a forma real é
+  // instável; parseMediaKey (parse.ts) normaliza os dois formatos (e o base64 puro, se um dia
+  // aparecer) pra base64 antes de chegar em media-crypto.ts.
   audioMessage?: {
     url?: string;
     mimetype?: string;
     seconds?: number;
     ptt?: boolean;
     directPath?: string;
-    mediaKey?: string;
+    mediaKey?: unknown;
     mediaKeyTimestamp?: unknown;
   };
   // Imagem
@@ -79,7 +83,7 @@ export interface ZproMsgContent {
     height?: number;
     width?: number;
     directPath?: string;
-    mediaKey?: string;
+    mediaKey?: unknown;
   };
   // Vídeo
   videoMessage?: {
@@ -88,7 +92,7 @@ export interface ZproMsgContent {
     caption?: string;
     seconds?: number;
     directPath?: string;
-    mediaKey?: string;
+    mediaKey?: unknown;
   };
   // Documento (inclui imagens enviadas via "Documento" no WhatsApp Web)
   documentMessage?: {
@@ -98,7 +102,7 @@ export interface ZproMsgContent {
     fileName?: string;
     caption?: string; // texto enviado junto ao documento
     directPath?: string;
-    mediaKey?: string;
+    mediaKey?: unknown;
   };
   // Sticker
   stickerMessage?: {

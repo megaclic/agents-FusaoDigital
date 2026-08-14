@@ -23,6 +23,26 @@ export interface MediaExtracted {
   mediaType?: WhatsappMediaType;
 }
 
+// `mediaKey`'s wire shape is UNCONFIRMED and has already changed once: the protocol calls for a
+// base64 string, but a live capture (2026-08-14) showed a plain array-like object instead
+// (`{"0":n,"1":n,...,"31":n}` — a Buffer/Uint8Array serialized without its `.toJSON()`, so it lost
+// its array-ness over the wire). Accepts either shape (plus a real byte array, for good measure)
+// and normalizes to base64 for media-crypto.ts. Returns undefined — never throws — on anything
+// else, so a THIRD future shape degrades to "can't decrypt" instead of crashing the webhook.
+export function parseMediaKey(raw: unknown): string | undefined {
+  if (typeof raw === "string" && raw.trim()) return raw;
+  if (Array.isArray(raw) && raw.every((n) => typeof n === "number")) {
+    return Buffer.from(raw as number[]).toString("base64");
+  }
+  if (raw && typeof raw === "object") {
+    const values = Object.values(raw as Record<string, unknown>);
+    if (values.length > 0 && values.every((n) => typeof n === "number")) {
+      return Buffer.from(values as number[]).toString("base64");
+    }
+  }
+  return undefined;
+}
+
 export function extractMedia(
   content: ZproMsgContent | undefined,
 ): MediaExtracted {
@@ -32,7 +52,7 @@ export function extractMedia(
     return {
       mediaUrl: content.audioMessage.url,
       mediaMimetype: content.audioMessage.mimetype,
-      mediaKey: content.audioMessage.mediaKey,
+      mediaKey: parseMediaKey(content.audioMessage.mediaKey),
       mediaType: "audio",
     };
   }
@@ -41,7 +61,7 @@ export function extractMedia(
       mediaUrl: content.imageMessage.url,
       mediaCaption: content.imageMessage.caption,
       mediaMimetype: content.imageMessage.mimetype,
-      mediaKey: content.imageMessage.mediaKey,
+      mediaKey: parseMediaKey(content.imageMessage.mediaKey),
       mediaType: "image",
     };
   }
@@ -50,7 +70,7 @@ export function extractMedia(
       mediaUrl: content.videoMessage.url,
       mediaCaption: content.videoMessage.caption,
       mediaMimetype: content.videoMessage.mimetype,
-      mediaKey: content.videoMessage.mediaKey,
+      mediaKey: parseMediaKey(content.videoMessage.mediaKey),
       mediaType: "video",
     };
   }
@@ -61,7 +81,7 @@ export function extractMedia(
       mediaMimetype: content.documentMessage.mimetype,
       mediaFileName:
         content.documentMessage.fileName ?? content.documentMessage.title,
-      mediaKey: content.documentMessage.mediaKey,
+      mediaKey: parseMediaKey(content.documentMessage.mediaKey),
       mediaType: "document",
     };
   }
