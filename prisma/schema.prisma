@@ -696,6 +696,13 @@ model ZproMessage {
   mediaUrl       String?        @map("media_url")
   mediaCaption   String?        @map("media_caption")
   mediaFileName  String?        @map("media_file_name")
+  // encryptJson blob — the WhatsApp media decryption key (media-crypto.ts), needed to serve a
+  // PLAYABLE file through the /media proxy (the CDN blob at mediaUrl is end-to-end encrypted).
+  // null for messages mirrored before this field existed, or for media with no key.
+  mediaKey       String?        @map("media_key")
+  // The WhatsApp-reported mimetype (e.g. "audio/ogg; codecs=opus") — needed post-decrypt, since
+  // the CDN response's own Content-Type describes the encrypted transport, not the plaintext.
+  mediaMimetype  String?        @map("media_mimetype")
   fromMe         Boolean        @map("from_me")
   timestamp      BigInt // msg.timestamp (unix ms)
   createdAt      DateTime       @default(now()) @map("created_at")

@@ -43,6 +43,28 @@ export function parseMediaKey(raw: unknown): string | undefined {
   return undefined;
 }
 
+// Maps ZproMessage.messageType (persisted verbatim from msg.type — "audioMessage"/"pttMessage"/
+// "imageMessage"/etc.) back to a WhatsappMediaType, for callers that only have the stored
+// messageType on hand (the /media proxy reads a persisted row, not a live webhook content object,
+// so it can't use extractMedia's `content.audioMessage`-shaped branching directly).
+export function whatsappMediaTypeForMessageType(
+  messageType: string,
+): WhatsappMediaType | null {
+  switch (messageType) {
+    case "audioMessage":
+    case "pttMessage":
+      return "audio";
+    case "imageMessage":
+      return "image";
+    case "videoMessage":
+      return "video";
+    case "documentMessage":
+      return "document";
+    default:
+      return null;
+  }
+}
+
 export function extractMedia(
   content: ZproMsgContent | undefined,
 ): MediaExtracted {

@@ -9,6 +9,7 @@ import {
   broadcastZproMessage,
   type ZproSenderTypeValue,
 } from "@/api/features/realtime/realtime.service";
+import { encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { runScopedOn } from "@/lib/tenancy";
@@ -169,6 +170,12 @@ export async function mirrorZproMessage(
           mediaUrl: media.mediaUrl,
           mediaCaption: media.mediaCaption,
           mediaFileName: media.mediaFileName,
+          // Needed by the /media proxy to serve a PLAYABLE file later — the CDN blob at mediaUrl
+          // is WhatsApp's own end-to-end-encrypted media (media-crypto.ts). Encrypted at rest like
+          // every other secret in this codebase (encryptJson) since it's a decryption key for
+          // private customer media, not just an opaque id.
+          mediaKey: media.mediaKey ? encryptJson(media.mediaKey) : null,
+          mediaMimetype: media.mediaMimetype ?? null,
           fromMe: msg.fromMe,
           timestamp: BigInt(msg.timestamp),
         },

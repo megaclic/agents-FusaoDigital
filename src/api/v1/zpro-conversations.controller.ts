@@ -33,6 +33,8 @@ import {
   resolveQueueName,
 } from "@/modules/zpro/crm";
 import { activateAgent, deactivateAgent } from "@/modules/zpro/handoff";
+import { decryptWhatsappMedia } from "@/modules/zpro/media-crypto";
+import { whatsappMediaTypeForMessageType } from "@/modules/zpro/parse";
 import type { ZproContactTagRef } from "@/modules/zpro/types";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -450,7 +452,12 @@ export const zproConversationsController = new Elysia({
             id: BigInt(params.messageId),
             conversationId: BigInt(params.id),
           },
-          select: { mediaUrl: true },
+          select: {
+            mediaUrl: true,
+            mediaKey: true,
+            mediaMimetype: true,
+            messageType: true,
+          },
         }),
       );
       if (!row?.mediaUrl) {
@@ -463,10 +470,33 @@ export const zproConversationsController = new Elysia({
         set.status = 404;
         return { error: "Not Found" };
       }
-      return new Response(await res.arrayBuffer(), {
+      let bytes = await res.arrayBuffer();
+      // The downloaded blob is WhatsApp's own encrypted CDN payload, not the file the response
+      // Content-Type header would suggest — decrypt before serving it to the browser (a raw
+      // encrypted blob just renders as a silent 0:00 player, never a decode error). Rows mirrored
+      // before this field existed (or media with no key) have no mediaKey — serve as before rather
+      // than 404ing a previously-working (if broken-sounding) link.
+      let contentType =
+        res.headers.get("content-type") ?? "application/octet-stream";
+      const mediaType = whatsappMediaTypeForMessageType(row.messageType);
+      if (row.mediaKey && mediaType) {
+        try {
+          bytes = decryptWhatsappMedia(
+            bytes,
+            decryptJson<string>(row.mediaKey),
+            mediaType,
+          );
+          contentType = row.mediaMimetype ?? contentType;
+        } catch (err) {
+          logger.warn(
+            { err, messageId: params.messageId },
+            "zpro: media proxy decryption failed — serving the raw (still-encrypted) blob",
+          );
+        }
+      }
+      return new Response(bytes, {
         headers: {
-          "content-type":
-            res.headers.get("content-type") ?? "application/octet-stream",
+          "content-type": contentType,
           "cache-control": "private, max-age=3600",
         },
       });
