@@ -6,10 +6,11 @@ import type { ZproClient } from "./client";
 import { ZPRO_PRESENCE_PAUSED, ZPRO_PRESENCE_TYPING } from "./constants";
 import type { NormalizedZproEvent } from "./types";
 
-// WhatsApp's own "composing" presence chatstate is NOT persistent — clients revert it a few
-// seconds after the last signal if it isn't refreshed, well before a turn with guardrails/tool
-// calls/RAG typically finishes. Comfortably under the shortest observed timeout.
-const TYPING_HEARTBEAT_MS = 4000;
+// WhatsApp's own "composing" presence chatstate is NOT persistent — a client (here, an Evolution
+// API-relayed multi-device WhatsApp Web session) reverts it well under the naive ~4s a "typing
+// indicator" timeout usually implies: observed live as a ~1s-on/few-s-off flicker at 4000ms, i.e.
+// the visible bubble times out closer to 1-2s. 1500ms comfortably outruns that.
+const TYPING_HEARTBEAT_MS = 1500;
 
 /**
  * Keeps the "digitando..." indicator alive for the whole turn instead of a single one-shot

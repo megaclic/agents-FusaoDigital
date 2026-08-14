@@ -1,7 +1,9 @@
 // tests/modules/zpro/split.test.ts
 // deliverZproReply wires the fully generic split helpers (splitReply/typingDelayMs, already
-// covered by tests/modules/split.test.ts) into the Z-PRO channel via ZproClient.sendText/
-// sendPresence in place of Chatwoot's client.sendMessage/toggleTyping. No network/DB: ZproClient is
+// covered by tests/modules/split.test.ts) into the Z-PRO channel via ZproClient.sendText, in place
+// of Chatwoot's client.sendMessage. Unlike Chatwoot's deliverReply, it does NOT toggle presence
+// itself — the caller's startTypingHeartbeat (messages.ts) covers the whole turn including this
+// delivery, see the module header in src/modules/zpro/split.ts. No network/DB: ZproClient is
 // duck-typed and cast, same pattern as tests/modules/zpro/tts.test.ts.
 
 import { describe, expect, test } from "bun:test";
@@ -62,7 +64,7 @@ describe("deliverZproReply", () => {
     expect(rec.presence).toEqual([]);
   });
 
-  test("enabled → one send per balloon, with typing/paused presence", async () => {
+  test("enabled → one send per balloon, no presence toggles (the caller's heartbeat owns those)", async () => {
     const rec = { sent: [] as string[], presence: [] as string[] };
     const n = await deliverZproReply(
       stub(rec),
@@ -73,7 +75,6 @@ describe("deliverZproReply", () => {
     );
     expect(n).toBe(2);
     expect(rec.sent).toEqual(["Olá!", "Como vai?"]);
-    // typing before each balloon + a final "paused"
-    expect(rec.presence).toEqual(["typing", "typing", "paused"]);
+    expect(rec.presence).toEqual([]);
   });
 });
