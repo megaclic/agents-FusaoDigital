@@ -691,7 +691,16 @@ export async function runLoadedZproTurn(
           });
           if (tts) {
             await markAgentSending(tenantId, zproInstanceId, ticketId, base);
-            await sendZproVoiceReply(client, ev, tts);
+            // Separate stage line from the "tts" synthesis one above — a throw here (the actual
+            // Z-PRO API call to deliver the voice note) was previously invisible in /logs, only a
+            // stdout-only logger.warn on the way to the text fallback below. withFlowStage's
+            // errorLevel:"warn" matches that recovered-by-fallback severity.
+            await withFlowStage(
+              flow,
+              "tts",
+              { detail: { step: "send" }, errorLevel: "warn" },
+              () => sendZproVoiceReply(client, ev, tts),
+            );
             logger.info(
               "zpro agent replied (audio): thread=%s ticket=%s len=%d",
               threadId,
