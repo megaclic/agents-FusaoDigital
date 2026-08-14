@@ -525,6 +525,19 @@ export async function runLoadedZproTurn(
       systemPrompt,
       checkpointer,
       tools,
+      // Mirrors src/graph/runtime.ts's onModelRetry wiring (upstream #68): a turn recovered from a
+      // provider answering 200 with no completion must not read like a clean one, or the fault rate
+      // is invisible. Z-PRO calls buildAgentGraph directly (not through prepare.ts's
+      // buildModelAndGraph), so this needs its own wiring rather than inheriting Chatwoot's.
+      onModelRetry: ({ attempt }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider: loaded.mc.provider,
+          model: loaded.mc.model,
+          detail: { retriedEmptyResponse: attempt },
+        }),
     });
 
     const usageCapture = new UsageCapture({
