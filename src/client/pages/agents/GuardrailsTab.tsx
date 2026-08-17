@@ -133,14 +133,36 @@ export function GuardrailsTab({
                   )}
                 />
                 {dir === "output" && (
-                  <SwitchField
-                    checked={d.checks.promptAdherence}
-                    onCheckedChange={(v) => setCheck(dir, "promptAdherence", v)}
-                    label={t(
-                      "editor.guardrails.checkAdherence",
-                      "Adherence to the agent's instructions",
-                    )}
-                  />
+                  <>
+                    <SwitchField
+                      checked={d.checks.promptAdherence}
+                      onCheckedChange={(v) =>
+                        setCheck(dir, "promptAdherence", v)
+                      }
+                      label={t(
+                        "editor.guardrails.checkAdherence",
+                        "Adherence to the agent's instructions",
+                      )}
+                    />
+                    <div className="flex flex-col gap-1">
+                      <SwitchField
+                        checked={d.checks.answerRelevance}
+                        onCheckedChange={(v) =>
+                          setCheck(dir, "answerRelevance", v)
+                        }
+                        label={t(
+                          "editor.guardrails.checkRelevance",
+                          "The reply answers what the customer asked",
+                        )}
+                      />
+                      <p className="text-text-muted text-xs">
+                        {t(
+                          "editor.guardrails.checkRelevanceHint",
+                          "Sends the customer's message to the guardrails agent so it can compare. Off by default: after a short message like “sim”, a correct answer can look like an answer to another question, and the action above would replace it.",
+                        )}
+                      </p>
+                    </div>
+                  </>
                 )}
               </div>
             </FormField>
@@ -164,9 +186,21 @@ export function GuardrailsTab({
                 ))}
               </Select>
             </FormField>
-            {d.action === "template" && (
+            {/* NOTE: Shown for "generated" too, because that action falls back to this text whenever no
+                replacement is written: when the model returns none, and always when the relevance
+                check is what tripped. Hiding it here left the operator unable to see or edit the
+                message their customers actually receive. */}
+            {d.action !== "silent" && (
               <FormField
                 label={t("editor.guardrails.template", "Template message")}
+                description={
+                  d.action === "generated"
+                    ? t(
+                        "editor.guardrails.templateFallbackHint",
+                        "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
+                      )
+                    : undefined
+                }
               >
                 <Textarea
                   value={d.templateMessage}
