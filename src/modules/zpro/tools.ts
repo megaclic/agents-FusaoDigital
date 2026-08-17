@@ -36,6 +36,7 @@ import {
 } from "@/modules/appointments/reminders";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import type { HandoffConfig } from "@/modules/handoff/settings";
 import type { SendImageConfig } from "@/modules/images/settings";
 import { buildToolpackTools } from "@/modules/integrations/toolpacks";
 import type { ZproClient } from "./client";
@@ -77,6 +78,9 @@ export interface LoadZproAgentToolsParams {
   turnState?: TurnState;
   transferWithSummary?: boolean;
   toolInstructions?: Partial<Record<NativeToolName, string>>;
+  // Handoff targeting (route | pinned | agent_choice) — see src/modules/handoff/settings.ts.
+  // "pinned"/"agent_choice" target a queue here (targetQueueId), not a Chatwoot agent/team.
+  handoffConfig?: HandoffConfig;
   // agent.settings.zproCrm.pipelineId (src/modules/zpro/crm.ts's readZproCrmConfig) — null ⇒
   // auto-detect the tenant's sole pipeline.
   pipelineId?: number | null;
@@ -310,10 +314,17 @@ export async function loadZproAgentTools(
         })
       : undefined;
 
+    // handoff_to_human also needs the catalog in "agent_choice" mode: it renders <available_queues>
+    // and resolves the model's chosen name, same as route_to_queue. "pinned" mode needs no catalog —
+    // it applies params.handoffConfig.targetQueueId (an id) directly, no name resolution.
+    const handoffNeedsQueues =
+      allow?.includes("handoff_to_human") &&
+      params.handoffConfig?.mode === "agent_choice";
     const needsQueues =
       !allow ||
       allow.includes("route_to_queue") ||
-      allow.includes("get_contact_info");
+      allow.includes("get_contact_info") ||
+      handoffNeedsQueues;
     const knownQueues = needsQueues
       ? await loadZproQueues(client, cacheKey).catch((e) => {
           logger.warn(
@@ -400,6 +411,7 @@ export async function loadZproAgentTools(
         turnState: params.turnState,
         transferWithSummary: params.transferWithSummary,
         toolInstructions: params.toolInstructions,
+        handoffCfg: params.handoffConfig,
         knownTags,
         knownQueues,
         currentQueueName: resolveQueueName(

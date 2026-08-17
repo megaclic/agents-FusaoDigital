@@ -74,6 +74,10 @@ import {
   readGuardrailsConfig,
 } from "@/modules/guardrails/settings";
 import {
+  type HandoffConfig,
+  readHandoffConfig,
+} from "@/modules/handoff/settings";
+import {
   readSendImageConfig,
   type SendImageConfig,
 } from "@/modules/images/settings";
@@ -174,6 +178,11 @@ export interface LoadedZproAgent {
   transferWithSummary: boolean;
   toolGuidance: Partial<Record<NativeToolName, string>>;
   crmConfig: ZproCrmConfig;
+  // Handoff targeting (route | pinned | agent_choice) — shared config with Chatwoot
+  // (src/modules/handoff/settings.ts), but "pinned"/"agent_choice" target a QUEUE here
+  // (targetQueueId) instead of a Chatwoot agent/team (targetAgentId/targetTeamId, ignored on this
+  // channel). See src/modules/zpro/native-tools.ts's handoffTool.
+  handoffConfig: HandoffConfig;
   // send_image's host allowlist (agent.settings.sendImage — upstream #76 parity, channel-agnostic,
   // same config Chatwoot's version reads). See docs/zpro.md's "send_image" section.
   sendImageConfig: SendImageConfig;
@@ -297,6 +306,7 @@ export async function loadZproAgent(
       transferWithSummary: agent.transferWithSummary,
       toolGuidance: readToolGuidance(agent.settings),
       crmConfig: readZproCrmConfig(agent.settings),
+      handoffConfig: readHandoffConfig(agent.settings),
       serviceWindowConfig: readServiceWindowConfig(agent.settings),
     };
   });
@@ -503,6 +513,7 @@ export async function runLoadedZproTurn(
       turnState,
       transferWithSummary: loaded.transferWithSummary,
       toolInstructions,
+      handoffConfig: loaded.handoffConfig,
       pipelineId: loaded.crmConfig.pipelineId,
       flow,
       maxDistance: loaded.maxDistance,

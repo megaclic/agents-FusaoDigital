@@ -20,6 +20,14 @@ export interface HandoffConfig {
   // (the editor blocks pinning when the agent spans multiple accounts, this covers later binding drift).
   // null ⇒ legacy/single-account pinned (applied as before).
   targetInstanceId: number | null;
+  // Z-PRO's own target: a queue (department) id, the closest Z-PRO concept to "who receives the
+  // handoff" (Z-PRO has no Chatwoot-style agent/team to pin). Independent of targetAgentId/
+  // targetTeamId/targetInstanceId (different id space, no cross-system collision risk) — a dual-bound
+  // agent can have BOTH a pinned Chatwoot target and a pinned Z-PRO queue at once, applied depending
+  // on which channel the specific conversation is on. For "agent_choice" on Z-PRO, the model picks a
+  // queue by name at call time instead (see src/modules/zpro/native-tools.ts's handoffTool) — this
+  // field only matters for "pinned". null ⇒ unset.
+  targetQueueId: number | null;
   // Optional operator-authored guidance, appended to the handoff_to_human tool description so the
   // transfer logic ("when / to whom to escalate") lives in one place instead of buried in the prompt.
   // null ⇒ no extra guidance. Trimmed + length-capped on read.
@@ -31,6 +39,7 @@ export const HANDOFF_DEFAULTS: HandoffConfig = {
   targetAgentId: null,
   targetTeamId: null,
   targetInstanceId: null,
+  targetQueueId: null,
   instructions: null,
 };
 
@@ -62,6 +71,7 @@ export function readHandoffConfig(settings: unknown): HandoffConfig {
     targetAgentId: posInt(bag.targetAgentId),
     targetTeamId: posInt(bag.targetTeamId),
     targetInstanceId: posInt(bag.targetInstanceId),
+    targetQueueId: posInt(bag.targetQueueId),
     instructions: readToolInstructions(bag.instructions),
   };
 }

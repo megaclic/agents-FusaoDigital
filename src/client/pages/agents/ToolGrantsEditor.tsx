@@ -613,20 +613,88 @@ export function ToolGrantsEditor({
             "This agent serves inboxes in different Chatwoot accounts; use “Let the AI choose”.",
           )
         : undefined;
-  // Auto-switch a stale "pinned" target to "agent_choice" once the fetched data shows the agent is no
-  // longer a single-account agent (its bindings changed in the Channels tab, or its inboxes dropped).
+
+  // Z-PRO's own pinned target: a queue (department), the closest Z-PRO concept to "who receives the
+  // handoff" (no Chatwoot-style agent/team there). Same single-instance-scoping rule as pinnedAvailable
+  // above, mirrored against Z-PRO instances instead of Chatwoot accounts. Fetched only for a
+  // Z-PRO-bound agent — pointless network call otherwise.
+  const [zproQueueData, setZproQueueData] = useState<{
+    queues: Array<{ id: number; name: string }>;
+    instanceCount: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!handoffEnabled || !channelBinding.zpro || zproQueueData) return;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.zpro.queues({ agentId }).get();
+        setZproQueueData(
+          data
+            ? { queues: data.queues, instanceCount: data.instanceCount }
+            : { queues: [], instanceCount: 0 },
+        );
+      } catch {
+        setZproQueueData({ queues: [], instanceCount: 0 });
+      }
+    })();
+  }, [handoffEnabled, channelBinding.zpro, zproQueueData, agentId]);
+  const queuePinnedAvailable =
+    !!zproQueueData && zproQueueData.instanceCount === 1;
+  const queuePinnedHint = !zproQueueData
+    ? t("common.loading", "Loading…")
+    : zproQueueData.instanceCount === 0
+      ? t(
+          "editor.handoffQueuePinnedNoInstance",
+          "Bind a Z-PRO instance in the Channels tab first.",
+        )
+      : zproQueueData.instanceCount > 1
+        ? t(
+            "editor.handoffQueuePinnedMultiInstance",
+            "This agent serves multiple Z-PRO instances; use “Let the AI choose”.",
+          )
+        : undefined;
+  // "Pinned" is offered whenever EITHER channel can supply a live list to pin from — the two targets
+  // are independent (see HandoffConfig's targetInstanceId vs targetQueueId), so a dual-bound agent can
+  // configure one, the other, or both. Chatwoot-only relies solely on pinnedAvailable (unchanged);
+  // Z-PRO-bound also checks queuePinnedAvailable.
+  const pinnedDisabled = channelBinding.zpro
+    ? !pinnedAvailable && !queuePinnedAvailable
+    : !pinnedAvailable;
+  const pinnedDisabledHint = !pinnedDisabled
+    ? undefined
+    : zproOnly
+      ? queuePinnedHint
+      : pinnedHint;
+
+  // Auto-switch a stale "pinned" target to "agent_choice" once the fetched data shows NEITHER channel
+  // can offer a picker anymore (bindings changed in the Channels tab, or inboxes/instances dropped).
   // Keeps the SAVED config consistent with what the UI shows and the runtime does; marks the Tools
   // section unsaved so the operator confirms the change. No loop: after the switch mode !== "pinned".
+  const chatwootHandoffReady = !channelBinding.chatwoot || !!handoffData;
+  const zproHandoffReady = !channelBinding.zpro || !!zproQueueData;
   useEffect(() => {
-    if (handoffData && !pinnedAvailable && handoff.mode === "pinned") {
+    if (
+      chatwootHandoffReady &&
+      zproHandoffReady &&
+      !pinnedAvailable &&
+      !queuePinnedAvailable &&
+      handoff.mode === "pinned"
+    ) {
       setHandoff((h) => ({
         ...h,
         mode: "agent_choice",
         target: "",
         targetInstanceId: null,
+        targetQueueId: null,
       }));
     }
-  }, [handoffData, pinnedAvailable, handoff.mode, setHandoff]);
+  }, [
+    chatwootHandoffReady,
+    zproHandoffReady,
+    pinnedAvailable,
+    queuePinnedAvailable,
+    handoff.mode,
+    setHandoff,
+  ]);
 
   // Apply the deferred auto-grant for a just-created integration once it appears in the refreshed
   // catalog (so we can enable its full tool set, like the manual toggle does).
@@ -1256,15 +1324,15 @@ export function ToolGrantsEditor({
                     target: value === "pinned" ? handoff.target : "",
                     targetInstanceId:
                       value === "pinned" ? pinnedInstanceId : null,
+                    targetQueueId:
+                      value === "pinned" ? handoff.targetQueueId : null,
                   })
                 }
                 items={[
                   {
                     value: "route",
-                    // Channel-neutral on purpose: this mode is the only one that works on Z-PRO
-                    // (native-tools.ts's handoffTool has no target concept at all — see
-                    // docs/zpro.md), so labeling it "Chatwoot routing" told a Z-PRO-bound operator
-                    // their one working mode was Chatwoot-only, when it's the opposite.
+                    // Channel-neutral on purpose: this mode is the only one that works with zero
+                    // config on every channel — see docs/zpro.md.
                     label: t(
                       "editor.handoffRoute",
                       "Default (no specific target)",
@@ -1272,97 +1340,133 @@ export function ToolGrantsEditor({
                   },
                   {
                     value: "pinned",
-                    label: t(
-                      "editor.handoffPinned",
-                      "A specific agent or team",
-                    ),
-                    disabled: !pinnedAvailable,
-                    disabledHint: pinnedHint,
+                    label: zproOnly
+                      ? t("editor.handoffPinnedQueue", "A specific queue")
+                      : channelBinding.zpro
+                        ? t(
+                            "editor.handoffPinnedBoth",
+                            "A specific agent/team and/or queue",
+                          )
+                        : t("editor.handoffPinned", "A specific agent or team"),
+                    disabled: pinnedDisabled,
+                    disabledHint: pinnedDisabledHint,
                   },
                   {
                     value: "agent_choice",
                     label: t("editor.handoffAgentChoice", "Let the AI choose"),
-                    disabled: zproOnly,
-                    disabledHint: zproOnly
-                      ? t(
-                          "editor.handoffAgentChoiceZproOnly",
-                          "Not available for a Z-PRO-only agent — targets Chatwoot's own agents/teams.",
-                        )
-                      : undefined,
                   },
                 ]}
               />
             </FormField>
-            {handoffData && !pinnedAvailable && (
+            {channelBinding.chatwoot && handoffData && !pinnedAvailable && (
               <p className="text-text-muted text-xs">{pinnedHint}</p>
             )}
-            {zproOnly && (
-              <p className="text-text-muted text-xs">
-                {t(
-                  "editor.handoffZproTargetHint",
-                  'Z-PRO has no concept of a specific agent/team to pin — route by department instead: grant "Route to queue" above and steer it from the instructions below (e.g. "route billing questions to the Finance queue before transferring").',
-                )}
-              </p>
+            {channelBinding.zpro && zproQueueData && !queuePinnedAvailable && (
+              <p className="text-text-muted text-xs">{queuePinnedHint}</p>
             )}
-            {zproOnly && handoff.mode === "agent_choice" && (
-              <p className="text-warning text-xs">
-                {t(
-                  "editor.handoffAgentChoiceZproOnlyActive",
-                  'This agent is Z-PRO-only — "Let the AI choose" has no effect here (it always behaves like Chatwoot routing on Z-PRO). Your saved setting is kept.',
-                )}
-              </p>
-            )}
-            {handoff.mode === "pinned" && pinnedAvailable && (
-              <FormField
-                label={t("editor.handoffPick", "Agent or team")}
-                group
-                description={t(
-                  "editor.handoffPickHint",
-                  "Loaded from your Chatwoot instance.",
-                )}
-              >
-                <Dropdown
-                  value={handoff.target || null}
-                  ariaLabel={t("editor.handoffPick", "Agent or team")}
-                  placeholder={t("editor.handoffNone", "Select…")}
-                  onChange={(value) =>
-                    setHandoff({
-                      ...handoff,
-                      target: value,
-                      targetInstanceId: pinnedInstanceId,
-                    })
-                  }
-                  items={[
-                    ...(handoffData?.agents ?? []).map((a) => ({
-                      value: `agent:${a.id}`,
-                      label: a.name,
-                      description: t("editor.handoffAgents", "Agents"),
-                    })),
-                    ...(handoffData?.teams ?? []).map((tm) => ({
-                      value: `team:${tm.id}`,
-                      label: tm.name,
-                      description: t("editor.handoffTeams", "Teams"),
-                    })),
-                  ]}
-                />
-                {handoffData &&
-                  handoffData.agents.length === 0 &&
-                  handoffData.teams.length === 0 && (
+            {handoff.mode === "pinned" &&
+              channelBinding.chatwoot &&
+              pinnedAvailable && (
+                <FormField
+                  label={t("editor.handoffPick", "Agent or team")}
+                  group
+                  description={t(
+                    "editor.handoffPickHint",
+                    "Loaded from your Chatwoot instance.",
+                  )}
+                >
+                  <Dropdown
+                    value={handoff.target || null}
+                    ariaLabel={t("editor.handoffPick", "Agent or team")}
+                    placeholder={t("editor.handoffNone", "Select…")}
+                    onChange={(value) =>
+                      setHandoff({
+                        ...handoff,
+                        target: value,
+                        targetInstanceId: pinnedInstanceId,
+                      })
+                    }
+                    items={[
+                      ...(handoffData?.agents ?? []).map((a) => ({
+                        value: `agent:${a.id}`,
+                        label: a.name,
+                        description: t("editor.handoffAgents", "Agents"),
+                      })),
+                      ...(handoffData?.teams ?? []).map((tm) => ({
+                        value: `team:${tm.id}`,
+                        label: tm.name,
+                        description: t("editor.handoffTeams", "Teams"),
+                      })),
+                    ]}
+                  />
+                  {handoffData &&
+                    handoffData.agents.length === 0 &&
+                    handoffData.teams.length === 0 && (
+                      <span className="text-text-muted text-xs">
+                        {t(
+                          "editor.handoffNoTargets",
+                          "No agents or teams found. Connect a Chatwoot instance first.",
+                        )}
+                      </span>
+                    )}
+                </FormField>
+              )}
+            {handoff.mode === "pinned" &&
+              channelBinding.zpro &&
+              queuePinnedAvailable && (
+                <FormField
+                  label={t("editor.handoffPickQueue", "Queue")}
+                  group
+                  description={t(
+                    "editor.handoffPickQueueHint",
+                    "Loaded from your Z-PRO instance.",
+                  )}
+                >
+                  <Dropdown
+                    value={
+                      handoff.targetQueueId != null
+                        ? String(handoff.targetQueueId)
+                        : null
+                    }
+                    ariaLabel={t("editor.handoffPickQueue", "Queue")}
+                    placeholder={t("editor.handoffNone", "Select…")}
+                    onChange={(value) =>
+                      setHandoff({
+                        ...handoff,
+                        targetQueueId: Number(value) || null,
+                      })
+                    }
+                    items={(zproQueueData?.queues ?? []).map((q) => ({
+                      value: String(q.id),
+                      label: q.name,
+                    }))}
+                  />
+                  {zproQueueData && zproQueueData.queues.length === 0 && (
                     <span className="text-text-muted text-xs">
                       {t(
-                        "editor.handoffNoTargets",
-                        "No agents or teams found. Connect a Chatwoot instance first.",
+                        "editor.handoffNoQueues",
+                        "No queues found. Create one in your Z-PRO panel first.",
                       )}
                     </span>
                   )}
-              </FormField>
-            )}
+                </FormField>
+              )}
             {handoff.mode === "agent_choice" && (
               <p className="text-text-muted text-xs">
-                {t(
-                  "editor.handoffAgentChoiceHint",
-                  "The AI automatically sees your Chatwoot agents and teams and picks one when handing off. Optionally steer it from the instructions (e.g. send billing questions to Finance).",
-                )}
+                {zproOnly
+                  ? t(
+                      "editor.handoffAgentChoiceHintZpro",
+                      "The AI automatically sees your Z-PRO queues and picks one when handing off. Optionally steer it from the instructions (e.g. route billing questions to the Finance queue).",
+                    )
+                  : channelBinding.zpro
+                    ? t(
+                        "editor.handoffAgentChoiceHintBoth",
+                        "The AI automatically sees your Chatwoot agents/teams and Z-PRO queues and picks one when handing off, depending on the channel. Optionally steer it from the instructions.",
+                      )
+                    : t(
+                        "editor.handoffAgentChoiceHint",
+                        "The AI automatically sees your Chatwoot agents and teams and picks one when handing off. Optionally steer it from the instructions (e.g. send billing questions to Finance).",
+                      )}
               </p>
             )}
             <FormField

@@ -12,7 +12,7 @@
 
 import { Elysia, t } from "elysia";
 import { Prisma } from "@/../generated/prisma/client";
-import { encryptJson } from "@/api/lib/crypto";
+import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import { doc, errors } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
@@ -26,6 +26,7 @@ import {
 } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { ZproClient } from "@/modules/zpro/client";
+import { loadZproQueues } from "@/modules/zpro/crm";
 import { zproWebhookUrl } from "@/modules/zpro/zpro-webhook-mount";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -460,5 +461,60 @@ export const zproAdminController = new Elysia({
         "Returns the webhook URL to configure in the Z-PRO panel.",
       ),
       response: errors(401, 403),
+    },
+  )
+  // Live queues for the "pinned" handoff target picker — Z-PRO's counterpart to /agents-teams above
+  // (chatwoot-admin.controller.ts). A pinned queue id only makes sense within ONE Z-PRO instance, so
+  // this degrades to an empty list + instanceCount when the agent is bound to zero or 2+ instances
+  // (ambiguous — the editor falls back to "Let the AI choose", same pattern as Chatwoot's
+  // multi-account case). "agent_choice" needs no editor-time fetch: it resolves its own queue catalog
+  // fresh per turn, already scoped to that turn's specific instance (src/modules/zpro/tools.ts).
+  .get(
+    "/queues/:agentId",
+    async ({ tenantContext, params }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const agentId = BigInt(params.agentId);
+      return runScopedOn(basePrisma, ctx, async (db) => {
+        const bindings = await db.zproAgentBinding.findMany({
+          where: { agentId },
+          select: {
+            zproInstance: {
+              select: {
+                id: true,
+                baseUrl: true,
+                apiId: true,
+                bearerToken: true,
+              },
+            },
+          },
+        });
+        if (bindings.length !== 1) {
+          return { queues: [], instanceCount: bindings.length };
+        }
+        const instance = bindings[0]?.zproInstance;
+        if (!instance) return { queues: [], instanceCount: 0 };
+        const client = new ZproClient(
+          instance.baseUrl,
+          instance.apiId,
+          decryptJson<string>(instance.bearerToken),
+        );
+        try {
+          const queues = await loadZproQueues(client, String(instance.id));
+          return { queues, instanceCount: 1 };
+        } catch {
+          return { queues: [], instanceCount: 1 };
+        }
+      });
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        agentId: t.String({ description: "Agent id (BigInt string)." }),
+      }),
+      detail: doc(
+        "List Z-PRO queues",
+        "Read live queues from the Z-PRO instance an agent is bound to (for handoff/route-to-queue targeting).",
+      ),
+      response: errors(400, 401, 403),
     },
   );

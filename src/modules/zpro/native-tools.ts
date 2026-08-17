@@ -93,6 +93,7 @@ import { toolFailure } from "@/graph/tools/failure";
 import { simulatedTool } from "@/graph/tools/native";
 import { runScopedOn } from "@/lib/tenancy";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
+import type { HandoffConfig } from "@/modules/handoff/settings";
 import {
   isAllowedImageHost,
   SEND_IMAGE_DEFAULTS,
@@ -145,6 +146,9 @@ export interface ZproToolCtx {
   // Per-agent toggle (default ON when undefined): mirrors ToolCtx.transferWithSummary.
   transferWithSummary?: boolean;
   toolInstructions?: Partial<Record<NativeToolName, string>>;
+  // Handoff targeting (route | pinned | agent_choice) — see handoffTool below. Absent ⇒ "route" (no
+  // queue routing on handoff, current/legacy behavior).
+  handoffCfg?: HandoffConfig;
   // Known tags (id+name), resolved once at turn prep — lets assign_label suggest existing tags AND
   // resolve a name to an id without a network call inside the tool body.
   knownTags?: ZproPipeline[];
@@ -216,17 +220,37 @@ function parseExtraInfo(raw: unknown): Array<{ name: string; value: string }> {
 }
 
 // ── handoff_to_human ────────────────────────────────────────────────────────
+// Targeting mirrors src/graph/tools/native.ts's handoffTool exactly (same HandoffMode), but Z-PRO's
+// target is a QUEUE (department) — the only Z-PRO concept close to "who receives the handoff", since
+// there is no Chatwoot-style agent/team here. "pinned" applies ctx.handoffCfg.targetQueueId directly
+// (an operator-configured id, no catalog needed). "agent_choice" lets the model pass `queue` — a name
+// resolved against ctx.knownQueues (same catalog route_to_queue uses), rendered as <available_queues>
+// in the description exactly like route_to_queue's own resolution. Routing is best-effort and runs
+// AFTER deactivateAgent: a queue-routing failure must never block the handoff itself — getting SOME
+// human on the line matters more than getting the RIGHT department.
 
 function handoffTool(ctx: ZproToolCtx) {
-  const baseDescription =
-    "Escalate the conversation to a human agent. Optionally include a short summary posted as an internal note before the handoff. Use when the customer needs human help or asks for it. Before transferring, set `customerMessage` to a brief reply to the customer (e.g. that a human will continue) so they are not left without an answer.";
+  const mode = ctx.handoffCfg?.mode ?? "route";
+  const queueChoice = mode === "agent_choice";
+  const known = ctx.knownQueues ?? [];
+  const queuesXml = queueChoice
+    ? existingQueuesXml(known.map((q) => q.name))
+    : "";
+  const coreDescription = queueChoice
+    ? queuesXml
+      ? "Escalate the conversation to a human agent. Set `queue` to one of the departments listed in `<available_queues>` below to route there before transferring; omit it to leave the ticket's current queue unchanged."
+      : "Escalate the conversation to a human agent. Optionally set `queue` — the name of the department to route to (use one of the names from your instructions); omit it to leave the ticket's current queue unchanged."
+    : "Escalate the conversation to a human agent.";
+  const baseDescription = `${coreDescription} Optionally include a short summary posted as an internal note before the handoff. Use when the customer needs human help or asks for it. Before transferring, set \`customerMessage\` to a brief reply to the customer (e.g. that a human will continue) so they are not left without an answer.`;
   return tool(
     async ({
       reason,
       customerMessage,
+      queue,
     }: {
       reason?: string;
       customerMessage?: string;
+      queue?: string;
     }) => {
       if (customerMessage?.trim()) {
         try {
@@ -279,11 +303,53 @@ function handoffTool(ctx: ZproToolCtx) {
         }
       }
       await deactivateAgent(ctx.client, ctx.ticketId);
-      return "Handed off to a human. The bot will stay silent now.";
+
+      let routed = "";
+      try {
+        if (mode === "pinned" && ctx.handoffCfg?.targetQueueId) {
+          await ctx.client.updateQueue(
+            ctx.ticketId,
+            ctx.handoffCfg.targetQueueId,
+          );
+          routed = " Routed to the configured queue.";
+        } else if (queueChoice && queue?.trim()) {
+          const clean = queue.trim();
+          const match = known.find(
+            (q) => q.name.toLowerCase() === clean.toLowerCase(),
+          );
+          if (match) {
+            await ctx.client.updateQueue(ctx.ticketId, match.id);
+            routed = ` Routed to the "${match.name}" queue.`;
+          } else {
+            await ctx.client.createNote(
+              ctx.ticketId,
+              `Tentei encaminhar para a fila "${clean}", mas não encontrei nenhuma fila com esse nome. O ticket ficou na fila atual.`,
+            );
+            routed = ` No queue named "${clean}" was found; left in the current queue.`;
+          }
+        }
+      } catch (e) {
+        logger.warn(
+          "zpro handoff queue route failed (ticket=%s): %s",
+          String(ctx.ticketId),
+          e instanceof Error ? e.message : String(e),
+        );
+        ctx.onSideEffectError?.({
+          tool: "handoff_to_human",
+          phase: "route_queue",
+          err: e,
+        });
+      }
+      return `Handed off to a human.${routed} The bot will stay silent now.`;
     },
     {
       name: "handoff_to_human",
-      description: withOperatorNote(baseDescription, ctx, "handoff_to_human"),
+      description: withOperatorNote(
+        baseDescription,
+        ctx,
+        "handoff_to_human",
+        queuesXml,
+      ),
       schema: z.object({
         reason: z
           .string()
@@ -294,6 +360,12 @@ function handoffTool(ctx: ZproToolCtx) {
           .optional()
           .describe(
             "A short message to the CUSTOMER, sent before the transfer (e.g. that a human will continue). Strongly recommended so they are not left without a reply.",
+          ),
+        queue: z
+          .string()
+          .optional()
+          .describe(
+            "The target queue/department name to route to before transferring, exactly as listed in `<available_queues>` (agent_choice targeting only; ignored otherwise).",
           ),
       }),
     },
@@ -495,7 +567,7 @@ function routeToQueueTool(ctx: ZproToolCtx) {
   const queuesXml = existingQueuesXml(known.map((q) => q.name));
   const baseDescription =
     known.length > 0
-      ? "Route this conversation to a department/queue. Pass the target queue's name as `queue`, picking one from `<available_queues>` below."
+      ? "Route this conversation to a department/queue. Pass the target queue's name as `queue`, picking one from `<available_queues>` below. This does NOT hand the conversation off to a human or stop you from replying — you keep answering normally after routing. To actually transfer to a human (e.g. the customer asks to talk to a person), use handoff_to_human instead, which can also route the queue for you in one step."
       : "Route this conversation to a department/queue. Not available right now: no queues are configured for this instance.";
   return tool(
     async ({ queue }: { queue: string }) => {

@@ -525,6 +525,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
     });
@@ -542,6 +543,7 @@ describe("handoff targeting", () => {
         targetAgentId: 7,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
     });
@@ -559,6 +561,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: 3,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
     });
@@ -579,6 +582,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
     });
@@ -599,6 +603,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
     });
@@ -616,6 +621,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
     });
@@ -635,6 +641,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
       handoffTargets: {
@@ -678,6 +685,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
       handoffTargets: { agents: [{ id: 9, name: "Maria" }], teams: [] },
@@ -696,6 +704,7 @@ describe("handoff targeting", () => {
         targetAgentId: null,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
       handoffTargets: { agents: [{ id: 9, name: "Maria" }], teams: [] },
@@ -809,6 +818,7 @@ describe("swallowed side effects reach onSideEffectError (issue #46)", () => {
         targetAgentId: 7,
         targetTeamId: null,
         targetInstanceId: null,
+        targetQueueId: null,
         instructions: null,
       },
       onSideEffectError: (e) => effects.push(e),

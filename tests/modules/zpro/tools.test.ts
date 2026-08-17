@@ -629,6 +629,116 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
     expect(queuesCalled).toBe(1);
   });
 
+  test("NATIVE: handoff_to_human in 'agent_choice' mode also resolves the known-queues list (no route_to_queue granted)", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native handoff queue-choice agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["handoff_to_human"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2007,
+        status: "open",
+        contactId: 48,
+        contactNumber: "5511900000048",
+        contactName: "Cliente Handoff",
+        agentActive: true,
+      },
+    });
+    let queuesCalled = 0;
+    const client = {
+      listQueues: async () => {
+        queuesCalled++;
+        return [{ id: 9, queue: "Financeiro" }];
+      },
+    } as unknown as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2007,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2007`,
+      client,
+      handoffConfig: {
+        mode: "agent_choice",
+        targetAgentId: null,
+        targetTeamId: null,
+        targetInstanceId: null,
+        targetQueueId: null,
+        instructions: null,
+      },
+    });
+    const handoffTool = result.tools.find((t) => t.name === "handoff_to_human");
+    expect(handoffTool?.description).toContain("Financeiro");
+    expect(queuesCalled).toBe(1);
+  });
+
+  test("NATIVE: handoff_to_human in 'route' mode does NOT trigger a queue-list call", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native handoff route agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["handoff_to_human"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2008,
+        status: "open",
+        contactId: 49,
+        contactNumber: "5511900000049",
+        contactName: "Cliente Handoff Route",
+        agentActive: true,
+      },
+    });
+    let queuesCalled = 0;
+    const client = {
+      listQueues: async () => {
+        queuesCalled++;
+        return [{ id: 9, queue: "Financeiro" }];
+      },
+    } as unknown as ZproClient;
+
+    await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2008,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2008`,
+      client,
+    });
+    expect(queuesCalled).toBe(0);
+  });
+
   test("NATIVE: get_contact_info resolves the CURRENT queue/tags from the mirror against the catalogs, plus extraInfo from the event", async () => {
     __resetZproCrmCaches();
     const agent = await suDb.agent.create({
