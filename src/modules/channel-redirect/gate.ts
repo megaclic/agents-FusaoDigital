@@ -231,11 +231,35 @@ export async function runZproRedirectGate(
   }
 
   let chatwootContactId = p.conv.redirectChatwootContactId;
+  const admin = await loadChatwootClient(tenantId, chatwootInstanceId, {
+    base,
+  });
+  // A reused id from a prior redirect can go stale (the contact was deleted/merged directly in
+  // Chatwoot since) — no reconciliation existed before this, so a resend just kept targeting the
+  // dead id forever. Confirmed-gone (404) falls through to the create-new-contact branch below,
+  // exactly like the first-redirect case; an UNCERTAIN check failure (network/auth/timeout) must
+  // NOT be read as "gone" — that would spuriously create a duplicate contact on a mere blip — so
+  // it proceeds with the stored id unchanged, same as the un-checked behavior before this fix.
+  if (chatwootContactId !== null) {
+    try {
+      if (!(await admin.contactExists(chatwootContactId))) {
+        logger.info(
+          "channel-redirect: stored Chatwoot contact %d no longer exists (ticket=%s), recreating",
+          chatwootContactId,
+          String(p.ticketId),
+        );
+        chatwootContactId = null;
+      }
+    } catch (err) {
+      logger.warn(
+        { err },
+        "channel-redirect: contact-existence check failed (ticket=%s), proceeding with stored id",
+        String(p.ticketId),
+      );
+    }
+  }
   if (chatwootContactId === null) {
     try {
-      const admin = await loadChatwootClient(tenantId, chatwootInstanceId, {
-        base,
-      });
       const created = await admin.createContact({
         name: p.conv.contactName || p.conv.contactNumber,
         phone_number: p.conv.contactNumber.startsWith("+")

@@ -29,6 +29,20 @@ mock.module("@/client/contexts/ThemeContext", () => ({
   ThemeProvider: ({ children }: { children: ReactNode }) => children,
 }));
 
+// SUPPORT_LINK.defaultEmail is intentionally "" (Sidebar.tsx renders no support block until the
+// operator configures a real address via Admin > Identidade Visual) — without a supportEmail the
+// footer's support button doesn't render at all, so the two tests below need one mocked in.
+mock.module("@/client/contexts/BrandingContext", () => ({
+  useBranding: () => ({
+    config: { supportEmail: "suporte@fazer.ai" },
+    logoUrl: null,
+    brandName: "fazer.ai",
+    ready: true,
+    refresh: async () => {},
+  }),
+  BrandingProvider: ({ children }: { children: ReactNode }) => children,
+}));
+
 import { Sidebar } from "@/client/components/Sidebar";
 import { SidebarProvider, useSidebar } from "@/client/contexts/SidebarContext";
 
@@ -64,8 +78,11 @@ describe("Sidebar", () => {
 
   test("renders Conversations link for regular users", () => {
     renderSidebar();
+    // Exact match, not a substring regex: the Z-PRO nav item ("Z-PRO conversations") also
+    // contains "conversations", so a loose /conversations/i match hits both and getByRole throws
+    // on multiple matches.
     expect(
-      screen.getByRole("link", { name: /conversations/i }),
+      screen.getByRole("link", { name: "Conversations" }),
     ).toBeInTheDocument();
   });
 

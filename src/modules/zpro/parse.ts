@@ -209,6 +209,34 @@ export function withQuotedPrefix(
   return body ? `${prefix}\n${body}` : prefix;
 }
 
+// Mirrors chatwoot/render.ts's audio/image/generic-file fallback markers (same Portuguese wording,
+// for consistency across channels) — a media message whose STT/vision extraction produced nothing
+// must not read as "nothing happened" to the agent. This closes the KNOWN GAP documented in
+// docs/zpro.md's "Audio transcription" section: before the WhatsApp media decrypt fix, EVERY voice
+// note hit this path (100% silent-drop rate, no reply and no visible error to the customer); now
+// it also covers the rarer genuine STT/vision hiccup, plus every OTHER type nothing ever extracts
+// from (video/sticker) and images when vision is off/unconfigured. `messageType` is the raw
+// ZproMsgTop.type string ("audioMessage"/"pttMessage"/"imageMessage"/…). A "conversation" (plain
+// text) message with a genuinely empty body still degrades to "" here — correctly: there is
+// nothing to answer, not a failed extraction.
+export function withMediaFallback(body: string, messageType: string): string {
+  const text = body.trim();
+  if (text) return text;
+  switch (messageType) {
+    case "audioMessage":
+    case "pttMessage":
+      return "<mensagem de áudio não audível; peça que o cliente reenvie por texto>";
+    case "imageMessage":
+      return "<usuário enviou uma imagem; peça que envie a informação por texto ou áudio>";
+    case "documentMessage":
+    case "videoMessage":
+    case "stickerMessage":
+      return `<usuário enviou um arquivo do tipo '${messageType}'; não foi possível extrair o conteúdo>`;
+    default:
+      return "";
+  }
+}
+
 // Nem todo canal do Z-PRO manda `whatsapp` na raiz do payload (confirmado: o canal "evo" manda;
 // o webhook global atual, para outros canais, só traz `ticket.whatsappId`). Tenta as fontes em
 // ordem de confiabilidade antes de desistir.

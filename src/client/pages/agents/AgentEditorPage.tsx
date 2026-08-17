@@ -285,6 +285,7 @@ function readBehaviorState(a: Agent) {
     transferWithSummary: a.transferWithSummary,
     kanbanInstructions: str(ka.instructions),
     zproCrmInstructions: str(zc.instructions),
+    zproCrmPipelineId: num(zc.pipelineId),
     customAttributeInstructions: str(tg.set_custom_attribute),
     labelInstructions: str(tg.assign_label),
     updateKanbanTaskInstructions: str(tg.update_kanban_task),
@@ -670,6 +671,11 @@ export function AgentEditorPage() {
   // Same as kanbanInstructions, but for Z-PRO's own CRM Pipeline funnel — a separate settings key
   // (agent.settings.zproCrm.instructions) since Z-PRO's kanban_move_card never reads .kanban.*.
   const [zproCrmInstructions, setZproCrmInstructions] = useState("");
+  // Which CRM Pipeline (agent.settings.zproCrm.pipelineId) kanban_move_card/update_kanban_task
+  // operate on for a Z-PRO-bound agent. Empty string = unset = auto-detect the tenant's sole
+  // pipeline (crm.ts's resolveZproPipelineId) — only matters for a multi-pipeline tenant, where
+  // the tools otherwise report "not configured" until this is set explicitly.
+  const [zproCrmPipelineId, setZproCrmPipelineId] = useState("");
   // Operator usage guidance for set_custom_attribute + assign_label (Tools-tab config, like kanban).
   // Persisted in agent.settings.toolGuidance; synced only by syncToolConfig.
   const [customAttributeInstructions, setCustomAttributeInstructions] =
@@ -780,6 +786,7 @@ export function AgentEditorPage() {
     setHandoff(b.handoff);
     setKanbanInstructions(b.kanbanInstructions);
     setZproCrmInstructions(b.zproCrmInstructions);
+    setZproCrmPipelineId(b.zproCrmPipelineId);
     setCustomAttributeInstructions(b.customAttributeInstructions);
     setLabelInstructions(b.labelInstructions);
     setUpdateKanbanTaskInstructions(b.updateKanbanTaskInstructions);
@@ -1164,6 +1171,7 @@ export function AgentEditorPage() {
       handoff,
       kanbanInstructions,
       zproCrmInstructions,
+      zproCrmPipelineId,
       customAttributeInstructions,
       labelInstructions,
       updateKanbanTaskInstructions,
@@ -1823,15 +1831,20 @@ export function AgentEditorPage() {
       const handoffJson = serializeHandoff(handoff);
       const kanbanJson = { instructions: kanbanInstructions.trim() || null };
       // zproCrm is a separate settings bag (independently namespaced from kanban.* — see
-      // docs/zpro.md) that may also carry pipelineId, set outside this editor (REST/MCP only, no
-      // dedicated picker yet) — preserve it, only touching instructions.
+      // docs/zpro.md), spread from the synced settings so any OTHER key this editor doesn't own
+      // (none today) survives untouched.
       const existingZproCrm = (syncedSettings.zproCrm ?? {}) as Record<
         string,
         unknown
       >;
+      const parsedPipelineId = Number.parseInt(zproCrmPipelineId, 10);
       const zproCrmJson = {
         ...existingZproCrm,
         instructions: zproCrmInstructions.trim() || null,
+        pipelineId:
+          zproCrmPipelineId.trim() && Number.isInteger(parsedPipelineId)
+            ? parsedPipelineId
+            : null,
       };
       // Merge the per-tool guidance map: preserve any entries for other tools, set/clear ours.
       const existingGuidance = (syncedSettings.toolGuidance ?? {}) as Record<
@@ -2493,6 +2506,8 @@ export function AgentEditorPage() {
                 setKanbanInstructions={setKanbanInstructions}
                 zproCrmInstructions={zproCrmInstructions}
                 setZproCrmInstructions={setZproCrmInstructions}
+                zproCrmPipelineId={zproCrmPipelineId}
+                setZproCrmPipelineId={setZproCrmPipelineId}
                 customAttributeInstructions={customAttributeInstructions}
                 setCustomAttributeInstructions={setCustomAttributeInstructions}
                 labelInstructions={labelInstructions}

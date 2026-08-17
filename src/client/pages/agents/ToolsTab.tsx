@@ -26,6 +26,8 @@ interface ToolsTabProps {
   setKanbanInstructions: (v: string) => void;
   zproCrmInstructions: string;
   setZproCrmInstructions: (v: string) => void;
+  zproCrmPipelineId: string;
+  setZproCrmPipelineId: (v: string) => void;
   customAttributeInstructions: string;
   setCustomAttributeInstructions: (v: string) => void;
   labelInstructions: string;
@@ -72,6 +74,8 @@ export function ToolsTab({
   setKanbanInstructions,
   zproCrmInstructions,
   setZproCrmInstructions,
+  zproCrmPipelineId,
+  setZproCrmPipelineId,
   customAttributeInstructions,
   setCustomAttributeInstructions,
   labelInstructions,
@@ -138,6 +142,8 @@ export function ToolsTab({
             setKanbanInstructions={setKanbanInstructions}
             zproCrmInstructions={zproCrmInstructions}
             setZproCrmInstructions={setZproCrmInstructions}
+            zproCrmPipelineId={zproCrmPipelineId}
+            setZproCrmPipelineId={setZproCrmPipelineId}
             customAttributeInstructions={customAttributeInstructions}
             setCustomAttributeInstructions={setCustomAttributeInstructions}
             labelInstructions={labelInstructions}

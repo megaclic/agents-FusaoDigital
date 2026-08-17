@@ -611,7 +611,7 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
     const client = {
       listQueues: async () => {
         queuesCalled++;
-        return [{ id: 9, name: "Financeiro" }];
+        return [{ id: 9, queue: "Financeiro" }];
       },
     } as unknown as ZproClient;
 
@@ -662,8 +662,8 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
       },
     });
     const client = {
-      listQueues: async () => [{ id: 9, name: "Financeiro" }],
-      listTags: async () => [{ id: 3, name: "vip" }],
+      listQueues: async () => [{ id: 9, queue: "Financeiro" }],
+      listTags: async () => [{ id: 3, tag: "vip" }],
     } as unknown as ZproClient;
 
     const result = await loadZproAgentTools({

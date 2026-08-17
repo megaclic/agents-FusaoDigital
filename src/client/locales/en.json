@@ -857,6 +857,7 @@
     "handoffRoute": "Default (no specific target)",
     "handoffTarget": "Who receives the handoff",
     "handoffTeams": "Teams",
+    "handoffZproTargetHint": "Z-PRO has no concept of a specific agent/team to pin — route by department instead: grant \"Route to queue\" above and steer it from the instructions below (e.g. \"route billing questions to the Finance queue before transferring\").",
     "identitySection": "Identity",
     "identitySectionHint": "Name, system prompt and whether the agent is active.",
     "importWarning": {
@@ -1065,7 +1066,10 @@
     "visionPrompt": "Extraction prompt",
     "visionPromptHint": "How the model should read the file.",
     "visionPromptReset": "Restore default",
-    "visionProvider": "Provider"
+    "visionProvider": "Provider",
+    "zproCrmPipelineId": "CRM Pipeline ID",
+    "zproCrmPipelineIdHint": "Optional. Only needed if this tenant has more than one Z-PRO Pipeline — leave blank to auto-detect the single one. Find the id in the Z-PRO panel's CRM section.",
+    "zproCrmPipelineIdPlaceholder": "Auto-detect"
   },
   "experiments": {
     "comingSoonDesc": "Run prompt variants side by side and compare outcomes. This feature is under construction.",

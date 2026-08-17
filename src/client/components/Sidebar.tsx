@@ -205,7 +205,12 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
   );
 
   let supportItem: ReactNode = null;
-  if (SUPPORT_LINK) {
+  // Gated on supportEmail, not just SUPPORT_LINK: the button opens SupportModal, which itself
+  // only renders when supportEmail is set (line below) — SUPPORT_LINK alone is always truthy
+  // (a static default with an intentionally empty defaultEmail), so gating on it left the button
+  // visible and clickable with nothing behind it whenever no support email was configured (the
+  // fresh-install default, before Admin > Identidade Visual sets one).
+  if (SUPPORT_LINK && supportEmail) {
     // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments in src/client/lib/navigation.tsx
     const label = t(SUPPORT_LINK.labelKey, SUPPORT_LINK.defaultLabel);
     const trigger = (

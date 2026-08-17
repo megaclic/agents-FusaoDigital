@@ -42,6 +42,42 @@ describe("behavior-settings — vision", () => {
   });
 });
 
+// zproCrm was REST-only before (PATCH /v1/agents/:id direct settings write, no MCP surface — see
+// docs/zpro.md's "agent.settings.zproCrm.pipelineId has no dedicated UI picker or MCP surface").
+// Riding the shared behavior surface gives it the MCP agent_settings_set partial-merge path for
+// free, same as vision/attributeContext above — no zproCrm-specific MCP wiring needed beyond the
+// schema field (src/modules/mcp/server.ts).
+describe("behavior-settings — zproCrm", () => {
+  test("zproCrm is an owned key and projects defaults when absent", () => {
+    expect(BEHAVIOR_SETTINGS_KEYS).toContain("zproCrm");
+    const b = readBehaviorSettings({});
+    expect(b.zproCrm.pipelineId).toBeNull();
+    expect(b.zproCrm.instructions).toBeNull();
+  });
+
+  test("a partial zproCrm patch merges + normalizes; unknown bag keys are preserved", () => {
+    const current = { foo: "keep", zproCrm: { instructions: "old note" } };
+    const next = mergeBehaviorSettings(current, {
+      zproCrm: { pipelineId: 16 },
+    });
+    const z = next.zproCrm as Record<string, unknown>;
+    expect(z.pipelineId).toBe(16);
+    // Untouched sub-keys within the SAME block survive the merge too (instructions wasn't in
+    // this patch), mirroring every other behavior block's partial-merge contract.
+    expect(z.instructions).toBe("old note");
+    expect(next.foo).toBe("keep");
+  });
+
+  test("a non-positive-integer pipelineId is clamped to null on write", () => {
+    const next = mergeBehaviorSettings(
+      {},
+      { zproCrm: { pipelineId: -3.5 } },
+    );
+    const z = next.zproCrm as Record<string, unknown>;
+    expect(z.pipelineId).toBeNull();
+  });
+});
+
 // NOTE: attributeContext rides the same surface, so REST/UI/MCP project the same normalized value.
 describe("behavior-settings — attributeContext", () => {
   test("it is an owned key and projects empty scopes when absent", () => {

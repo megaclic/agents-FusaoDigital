@@ -11,6 +11,7 @@ import {
   parseContactTags,
   parseMediaKey,
   resolveZproInstanceCandidate,
+  withMediaFallback,
   withQuotedPrefix,
 } from "@/modules/zpro/parse";
 import type { ZproMsgTop } from "@/modules/zpro/types";
@@ -346,6 +347,51 @@ describe("withQuotedPrefix", () => {
     expect(withQuotedPrefix("", "mensagem original")).toBe(
       '<em resposta a: "mensagem original">',
     );
+  });
+});
+
+// Closes the KNOWN GAP documented in docs/zpro.md: before the WhatsApp media decrypt fix, EVERY
+// voice note silently dropped (no reply, no visible error) because STT never produced a body and
+// the turn read as "nothing to answer". withMediaFallback (mirrors chatwoot/render.ts's audio/
+// image/generic-file markers, same wording) closes the general mechanism, not just the audio case
+// that triggered it — a failed/off vision extraction, or a type nothing ever extracts from
+// (video/sticker), degraded silently too.
+describe("withMediaFallback", () => {
+  test("non-empty body passes through untouched, regardless of messageType", () => {
+    expect(withMediaFallback("oi", "conversation")).toBe("oi");
+    expect(withMediaFallback("  transcrito  ", "audioMessage")).toBe(
+      "transcrito",
+    );
+  });
+
+  test("empty audio (STT off/failed) → the inaudible-audio marker", () => {
+    expect(withMediaFallback("", "audioMessage")).toBe(
+      "<mensagem de áudio não audível; peça que o cliente reenvie por texto>",
+    );
+    expect(withMediaFallback("   ", "pttMessage")).toBe(
+      "<mensagem de áudio não audível; peça que o cliente reenvie por texto>",
+    );
+  });
+
+  test("empty image (vision off/failed) → the ask-for-text/audio marker", () => {
+    expect(withMediaFallback("", "imageMessage")).toBe(
+      "<usuário enviou uma imagem; peça que envie a informação por texto ou áudio>",
+    );
+  });
+
+  test("empty document/video/sticker → a generic type-named marker", () => {
+    expect(withMediaFallback("", "documentMessage")).toContain(
+      "'documentMessage'",
+    );
+    expect(withMediaFallback("", "videoMessage")).toContain("'videoMessage'");
+    expect(withMediaFallback("", "stickerMessage")).toContain(
+      "'stickerMessage'",
+    );
+  });
+
+  test("empty plain text (conversation, or an unmapped type) → still empty, correctly", () => {
+    expect(withMediaFallback("", "conversation")).toBe("");
+    expect(withMediaFallback("", "somethingUnknown")).toBe("");
   });
 });
 

@@ -45,6 +45,12 @@ import {
   parseModelConfig,
 } from "@/graph/models";
 import { OUTSIDE_WINDOW_NOTE_PREFIX } from "@/graph/nudge";
+import {
+  buildLangfuseHandler,
+  buildToolTraceMetadata,
+  type LangfuseConfig,
+  resolveLangfuseConfig,
+} from "@/graph/observability";
 import { readMaxDistance } from "@/graph/prepare";
 import {
   buildPromptVars,
@@ -52,6 +58,7 @@ import {
   interpolatePromptVars,
 } from "@/graph/prompt";
 import { DEFAULT_TIMEZONE } from "@/graph/time";
+import { ToolFlowLogger } from "@/graph/tool-flowlog";
 import type { NativeToolName } from "@/graph/tools/catalog";
 import { UsageCapture } from "@/graph/usage";
 import { runScopedOn } from "@/lib/tenancy";
@@ -61,6 +68,7 @@ import {
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
+import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import {
   type GuardrailsConfig,
   readGuardrailsConfig,
@@ -96,7 +104,7 @@ import {
   startTypingHeartbeat,
 } from "./messages";
 import type { TurnState } from "./native-tools";
-import { withQuotedPrefix } from "./parse";
+import { withMediaFallback, withQuotedPrefix } from "./parse";
 import { deliverZproReply } from "./split";
 import { ZproAgentStatusReporter } from "./status";
 import { loadZproAgentTools } from "./tools";
@@ -169,6 +177,15 @@ export interface LoadedZproAgent {
   // send_image's host allowlist (agent.settings.sendImage — upstream #76 parity, channel-agnostic,
   // same config Chatwoot's version reads). See docs/zpro.md's "send_image" section.
   sendImageConfig: SendImageConfig;
+  // Whether a tool call's arguments/result are logged as sent (true) or just their shape (false,
+  // default — the documented, PII-free contract for ExecutionLog.detail). Same
+  // agent.settings.observability.logToolValues key + reader Chatwoot's ToolFlowLogger wiring uses
+  // (src/graph/prepare.ts) — see docs/zpro.md's "Tool-call flowlog" section.
+  logToolValues: boolean;
+  // Per-TENANT Langfuse config (Tenant.settings.langfuse + a vault key pair — src/graph/
+  // observability.ts's resolveLangfuseConfig, fully channel-agnostic). null when tracing is off/
+  // unconfigured for this tenant. See docs/zpro.md's "Langfuse tracing" section.
+  langfuseCfg: LangfuseConfig | null;
 }
 
 // Scoped read (no network): resolve the binding's Agent + its model credential. Returns null when
@@ -256,6 +273,8 @@ export async function loadZproAgent(
     // Nome da empresa para a variável {{nome_empresa}} — mesma fonte que prepare.ts usa para o
     // Chatwoot (tenant.name sob RLS).
     const tenant = await db.tenant.findFirst({ select: { name: true } });
+    // Per-tenant, channel-agnostic — same reader src/graph/prepare.ts's Chatwoot path uses.
+    const langfuseCfg = await resolveLangfuseConfig(db, tenantId);
 
     return {
       agentId: agent.id,
@@ -270,6 +289,8 @@ export async function loadZproAgent(
       splitConfig: readSplitConfig(agent.settings),
       maxDistance: readMaxDistance(agent.settings),
       sendImageConfig: readSendImageConfig(agent.settings),
+      logToolValues: readObservabilityConfig(agent.settings).logToolValues,
+      langfuseCfg,
       guardrails,
       guardrailsApiKey,
       guardrailsCredentialBaseUrl,
@@ -560,6 +581,29 @@ export async function runLoadedZproTurn(
       source: "inbox",
       base,
     });
+    // Logs each tool call (name/status/duration) under this turn's flow group — mirrors
+    // src/graph/runtime.ts's exact wiring. Fully channel-agnostic (no Chatwoot coupling in
+    // ToolFlowLogger itself), so this was only ever a missing CALL, not a missing capability.
+    const toolLogger = new ToolFlowLogger(flow, {
+      logValues: loaded.logToolValues,
+      tools,
+    });
+    // Per-tenant Langfuse trace (mirrors src/graph/prepare.ts's buildCallbacks — buildLangfuseHandler
+    // itself has no Chatwoot coupling, so this was only ever a missing CALL, same as ToolFlowLogger
+    // above). null when the tenant hasn't configured Langfuse; conversationId here is Z-PRO's own
+    // ZproConversation.id — a display-only trace metadata field, not a foreign key, so reusing the
+    // same field name across channels carries none of LlmUsage's cross-system collision risk.
+    const toolTrace = buildToolTraceMetadata(tools, loaded.langfuseCfg?.debug);
+    const langfuse = buildLangfuseHandler(loaded.langfuseCfg, {
+      tenantId,
+      threadId,
+      conversationId,
+      agentId: loaded.agentId,
+      userId: loaded.langfuseCfg?.tenantSlug,
+      turnId,
+      source: "inbox",
+      ...toolTrace,
+    });
 
     // The live "agent is working" indicator on the per-tenant realtime channel — Z-PRO analogue of
     // src/graph/runtime.ts's AgentStatusReporter wiring. `started` here (conversationId is only known
@@ -582,7 +626,9 @@ export async function runLoadedZproTurn(
             { messages: [new HumanMessage(text)] },
             {
               configurable: { thread_id: threadId },
-              callbacks: [usageCapture, status],
+              callbacks: langfuse
+                ? [usageCapture, status, toolLogger, langfuse]
+                : [usageCapture, status, toolLogger],
             },
           ),
       );
@@ -814,11 +860,13 @@ export async function runZproAgentTurn(
   };
 
   // Texto da mensagem: body direto para texto, mediaCaption para mídias. Uma mídia sem caption e
-  // sem extração (STT/vision) não tem o que oferecer ao modelo — reconhece a entrega e sai. Uma
-  // resposta a uma mensagem específica (WhatsApp reply) ganha o prefixo "<em resposta a: ...>" —
-  // sem isso o agente vê só o texto novo e perde de vista a pergunta original sendo retomada.
+  // sem extração (STT/vision) ganha um marcador de fallback (withMediaFallback, mirrors Chatwoot's
+  // render.ts) em vez de ficar muda — sem isso o turno era silenciosamente descartado e o cliente
+  // não recebia resposta nem erro visível (KNOWN GAP, ver docs/zpro.md). Uma resposta a uma
+  // mensagem específica (WhatsApp reply) ganha o prefixo "<em resposta a: ...>" — sem isso o
+  // agente vê só o texto novo e perde de vista a pergunta original sendo retomada.
   const text = withQuotedPrefix(
-    ev.body || ev.mediaCaption || "",
+    withMediaFallback(ev.body || ev.mediaCaption || "", ev.messageType),
     ev.quotedText,
   );
   if (!text) {

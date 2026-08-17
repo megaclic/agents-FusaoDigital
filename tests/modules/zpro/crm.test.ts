@@ -185,22 +185,44 @@ describe("loadZproStages / loadZproTags (defensive parsing)", () => {
     expect(await loadZproStages(c, 16, "t7")).toEqual([]);
   });
 
-  test("loadZproTags parses the same way", async () => {
-    const c = client({ listTags: async () => [{ id: 3, name: "vip" }] });
+  test("loadZproTags reads the 'tag' label field (confirmed live, not 'name')", async () => {
+    const c = client({ listTags: async () => [{ id: 3, tag: "vip" }] });
     expect(await loadZproTags(c, "t8")).toEqual([{ id: 3, name: "vip" }]);
   });
 
-  test("loadZproQueues parses the same way and caches per key", async () => {
+  test("loadZproQueues reads the 'queue' label field (confirmed live, not 'name') and caches per key", async () => {
     let calls = 0;
     const c = client({
       listQueues: async () => {
         calls++;
-        return [{ id: 5, name: "Suporte" }];
+        return [{ id: 5, queue: "Suporte" }];
       },
     });
     expect(await loadZproQueues(c, "t9")).toEqual([{ id: 5, name: "Suporte" }]);
     expect(await loadZproQueues(c, "t9")).toEqual([{ id: 5, name: "Suporte" }]);
     expect(calls).toBe(1);
+  });
+
+  test("loadZproQueues drops entries with a 'name' field but no 'queue' field (regression: this used to silently pass)", async () => {
+    const c = client({
+      listQueues: async () => [{ id: 5, name: "Suporte" }],
+    });
+    expect(await loadZproQueues(c, "t9b")).toEqual([]);
+  });
+
+  test("loadZproStages unwraps the real double-nested {data:{data:[],pagination}} envelope", async () => {
+    const c = client({
+      listStages: async () => ({
+        success: true,
+        data: {
+          data: [{ id: 1, name: "Novo" }],
+          pagination: { total: 1, page: 1, limit: 20, totalPages: 1 },
+        },
+      }),
+    });
+    expect(await loadZproStages(c, 16, "t10")).toEqual([
+      { id: 1, name: "Novo" },
+    ]);
   });
 });
 

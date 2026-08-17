@@ -19,8 +19,8 @@ export interface VisionRequest {
 
 export interface VisionProvider {
   defaultModel: string;
-  // Whether the provider can extract from PDFs (all support images). OpenAI chat vision is
-  // image-only; Gemini and Anthropic accept PDF documents inline.
+  // Whether the provider can extract from PDFs (all support images). OpenAI, Gemini and Anthropic
+  // all accept PDF documents inline; openrouter/openai-compatible stay image-only (unverified).
   supportsDocuments: boolean;
   extract(req: VisionRequest): Promise<string>;
 }
@@ -40,9 +40,15 @@ function base64(bytes: ArrayBuffer): string {
   return Buffer.from(bytes).toString("base64");
 }
 
-// Shared OpenAI-compatible chat-completions vision call (image_url data URI). Image-only — used by
-// both `openai` and `openrouter` (OpenRouter is the same chat-completions shape at a different base
-// URL, mirroring src/graph/models.ts's createChatModel).
+// Shared OpenAI-compatible chat-completions vision call. Used by `openai`, `openrouter` and
+// `openai-compatible` (same chat-completions shape at a different base URL, mirroring
+// src/graph/models.ts's createChatModel). Images always go through `image_url`. Documents go through
+// the `file`/`file_data` content block — confirmed live (2026-08-17, gpt-4o and o4-mini) to work on
+// the OFFICIAL OpenAI API, so only the `openai` provider below sets `supportsDocuments: true`;
+// `openrouter` (proxies arbitrary backend models, no uniform guarantee) and `openai-compatible`
+// (arbitrary self-hosted server) stay image-only until verified against a real endpoint — this
+// function accepts `req.kind === "document"` regardless, but the caller only ever reaches it for a
+// provider whose `supportsDocuments` is true (src/modules/vision/service.ts gates on it beforehand).
 async function chatCompletionsExtract(
   req: VisionRequest,
   providerName: string,
@@ -50,15 +56,16 @@ async function chatCompletionsExtract(
 ): Promise<string> {
   const base = (req.baseURL ?? defaultBase).replace(/\/+$/, "");
   const dataUri = `data:${req.mimeType};base64,${base64(req.bytes)}`;
+  const fileBlock =
+    req.kind === "document"
+      ? { type: "file", file: { filename: "document.pdf", file_data: dataUri } }
+      : { type: "image_url", image_url: { url: dataUri } };
   const body = {
     model: req.model,
     messages: [
       {
         role: "user",
-        content: [
-          { type: "text", text: req.prompt },
-          { type: "image_url", image_url: { url: dataUri } },
-        ],
+        content: [{ type: "text", text: req.prompt }, fileBlock],
       },
     ],
   };
@@ -188,7 +195,7 @@ async function anthropicExtract(req: VisionRequest): Promise<string> {
 const PROVIDERS: Record<string, VisionProvider> = {
   openai: {
     defaultModel: "gpt-4o",
-    supportsDocuments: false,
+    supportsDocuments: true,
     extract: openaiExtract,
   },
   gemini: {

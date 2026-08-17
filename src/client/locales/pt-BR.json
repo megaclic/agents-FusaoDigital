@@ -859,6 +859,7 @@
     "handoffRoute": "Padrão (sem alvo específico)",
     "handoffTarget": "Quem recebe a transferência",
     "handoffTeams": "Times",
+    "handoffZproTargetHint": "No Z-PRO não existe um agente/time específico para fixar — direcione por fila (departamento): conceda \"Encaminhar para fila\" acima e oriente pelas instruções abaixo (ex.: \"encaminhe dúvidas financeiras para a fila Financeiro antes de transferir\").",
     "identitySection": "Identidade",
     "identitySectionHint": "Nome, prompt do sistema e se o agente está ativo.",
     "importWarning": {
@@ -1068,7 +1069,10 @@
     "visionPrompt": "Prompt de extração",
     "visionPromptHint": "Como o modelo deve ler o arquivo.",
     "visionPromptReset": "Restaurar padrão",
-    "visionProvider": "Provedor"
+    "visionProvider": "Provedor",
+    "zproCrmPipelineId": "ID do Pipeline (CRM)",
+    "zproCrmPipelineIdHint": "Opcional. Só é necessário se este tenant tiver mais de um Pipeline no Z-PRO — deixe em branco para detectar automaticamente quando houver só um. Encontre o id no painel do Z-PRO, na seção de CRM.",
+    "zproCrmPipelineIdPlaceholder": "Detectar automaticamente"
   },
   "experiments": {
     "comingSoonDesc": "Rode variantes de prompt lado a lado e compare os resultados. Esta funcionalidade está em construção.",

@@ -515,9 +515,10 @@ export async function agentSettingsSet(
   if (args.attributeContext !== undefined)
     patch.attributeContext = args.attributeContext;
   if (args.sendImage !== undefined) patch.sendImage = args.sendImage;
+  if (args.zproCrm !== undefined) patch.zproCrm = args.zproCrm;
   if (Object.keys(patch).length === 0) {
     return err(
-      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, channelRedirect, attributeContext, sendImage, observability and/or grounding)",
+      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, channelRedirect, attributeContext, sendImage, zproCrm, observability and/or grounding)",
     );
   }
 

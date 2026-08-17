@@ -33,7 +33,7 @@ describe("vision providers", () => {
       "openai-compatible",
       "openrouter",
     ]);
-    expect(getVisionProvider("openai")?.supportsDocuments).toBe(false);
+    expect(getVisionProvider("openai")?.supportsDocuments).toBe(true);
     expect(getVisionProvider("openai-compatible")?.supportsDocuments).toBe(
       false,
     );
@@ -72,6 +72,38 @@ describe("vision providers", () => {
     expect(body.model).toBe("openai/gpt-4o");
     expect(body.messages[0].content[1].image_url.url).toContain(
       "data:image/png;base64,",
+    );
+  });
+
+  test("openai extract posts a document as a 'file'/'file_data' content block, confirmed live against gpt-4o/o4-mini", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fetchImpl = (async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "conteúdo do pdf" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    const text = await getVisionProvider("openai")?.extract({
+      bytes: new ArrayBuffer(4),
+      mimeType: "application/pdf",
+      kind: "document",
+      prompt: "Extraia o texto.",
+      model: "o4-mini",
+      apiKey: "sk-openai",
+      baseURL: null,
+      fetchImpl,
+    });
+
+    expect(text).toBe("conteúdo do pdf");
+    const body = JSON.parse(calls[0]?.init.body as string);
+    expect(body.messages[0].content[1].type).toBe("file");
+    expect(body.messages[0].content[1].file.filename).toBe("document.pdf");
+    expect(body.messages[0].content[1].file.file_data).toContain(
+      "data:application/pdf;base64,",
     );
   });
 });

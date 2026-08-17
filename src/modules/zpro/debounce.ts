@@ -33,7 +33,7 @@ import {
   clearZproConversationError,
   recordZproConversationError,
 } from "./failure";
-import { withQuotedPrefix } from "./parse";
+import { withMediaFallback, withQuotedPrefix } from "./parse";
 import { loadZproAgent, runLoadedZproTurn, zproThreadId } from "./runtime";
 import type { NormalizedZproEvent } from "./types";
 
@@ -227,12 +227,15 @@ export async function flushZproDebounceJob(
   };
 
   const text = pending
-    .map((m) => withQuotedPrefix(m.body, m.quotedText))
+    .map((m) =>
+      withQuotedPrefix(withMediaFallback(m.body, m.messageType), m.quotedText),
+    )
     .filter(Boolean)
     .join("\n");
   if (!text) {
-    // Nothing in the burst has renderable text (e.g. uncaptioned media with no STT/vision
-    // extraction) — advance so future flushes don't keep re-stopping on the same messages.
+    // Genuinely nothing to answer (e.g. a plain-text message somehow arrived empty) —
+    // withMediaFallback already covers every media type that could otherwise go silent. Advance
+    // so future flushes don't keep re-stopping on the same messages.
     await shouldPost();
     return { outcome: "done" };
   }

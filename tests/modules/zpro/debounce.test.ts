@@ -291,7 +291,13 @@ describe.skipIf(!dbUp)("zpro debounce (DB-backed)", () => {
     );
   });
 
-  test("a burst with only empty-body messages advances the watermark without crashing", async () => {
+  // withMediaFallback (parse.ts) now covers "uncaptioned media with no STT/vision extraction" —
+  // it degrades to a marker (e.g. "<mensagem de áudio não audível...>"), not silence, so a burst
+  // like that reaches runLoadedZproTurn for real instead of stopping here (see parse.test.ts's
+  // withMediaFallback suite for the marker coverage; a live turn is outside this file's testing
+  // boundary — no zpro runtime test invokes the live LLM graph). The one case that still has
+  // truly nothing to answer is a "conversation" (plain text) message that arrived empty.
+  test("a burst with only genuinely empty text (not media) advances the watermark without crashing", async () => {
     const conv = await suDb.zproConversation.create({
       data: {
         tenantId,
@@ -310,8 +316,8 @@ describe.skipIf(!dbUp)("zpro debounce (DB-backed)", () => {
         conversationId: conv.id,
         messageId: "m-empty-1",
         senderType: "CLIENT",
-        body: "", // e.g. an uncaptioned media message with no STT/vision extraction
-        messageType: "audioMessage",
+        body: "", // an empty-text webhook artifact — withMediaFallback has no marker for this type
+        messageType: "conversation",
         fromMe: false,
         timestamp: BigInt(Date.now()),
       },

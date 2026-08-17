@@ -17,6 +17,7 @@ import {
   Button,
   Dropdown,
   FormField,
+  Input,
   SelectableCard,
   SwitchField,
   Textarea,
@@ -132,6 +133,12 @@ interface Props {
   // inert for a Z-PRO-bound agent.
   zproCrmInstructions: string;
   setZproCrmInstructions: (v: string) => void;
+  // Which CRM Pipeline (agent.settings.zproCrm.pipelineId) kanban_move_card/update_kanban_task
+  // operate on. Empty string = unset = auto-detect the tenant's sole pipeline (crm.ts's
+  // resolveZproPipelineId) — only needs setting explicitly for a multi-pipeline tenant, where the
+  // tools otherwise report "not configured".
+  zproCrmPipelineId: string;
+  setZproCrmPipelineId: (v: string) => void;
   // Operator-authored guidance for set_custom_attribute + assign_label (when to use each scope/label/
   // attribute), appended to their model-facing descriptions. Persisted in agent.settings.toolGuidance.
   customAttributeInstructions: string;
@@ -463,6 +470,8 @@ export function ToolGrantsEditor({
   setKanbanInstructions,
   zproCrmInstructions,
   setZproCrmInstructions,
+  zproCrmPipelineId,
+  setZproCrmPipelineId,
   customAttributeInstructions,
   setCustomAttributeInstructions,
   labelInstructions,
@@ -1287,6 +1296,14 @@ export function ToolGrantsEditor({
             {handoffData && !pinnedAvailable && (
               <p className="text-text-muted text-xs">{pinnedHint}</p>
             )}
+            {zproOnly && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "editor.handoffZproTargetHint",
+                  'Z-PRO has no concept of a specific agent/team to pin — route by department instead: grant "Route to queue" above and steer it from the instructions below (e.g. "route billing questions to the Finance queue before transferring").',
+                )}
+              </p>
+            )}
             {zproOnly && handoff.mode === "agent_choice" && (
               <p className="text-warning text-xs">
                 {t(
@@ -1432,6 +1449,27 @@ export function ToolGrantsEditor({
                   placeholder={t(
                     "editor.kanbanInstructionsPlaceholder",
                     'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
+                  )}
+                />
+              </FormField>
+            )}
+            {channelBinding.zpro && (
+              <FormField
+                label={t("editor.zproCrmPipelineId", "CRM Pipeline ID")}
+                description={t(
+                  "editor.zproCrmPipelineIdHint",
+                  "Optional. Only needed if this tenant has more than one Z-PRO Pipeline — leave blank to auto-detect the single one. Find the id in the Z-PRO panel's CRM section.",
+                )}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={zproCrmPipelineId}
+                  onChange={(e) => setZproCrmPipelineId(e.target.value)}
+                  placeholder={t(
+                    "editor.zproCrmPipelineIdPlaceholder",
+                    "Auto-detect",
                   )}
                 />
               </FormField>

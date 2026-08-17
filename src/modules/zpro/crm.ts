@@ -6,11 +6,16 @@
 // updated on every successful move/update. Best-effort: it can drift if the deal is edited directly
 // in the Z-PRO panel. Documented as a known, accepted limitation (docs/zpro.md).
 //
-// Response shapes are UNCONFIRMED (the vendor's Postman collection ships no example responses for
-// pipeline/list, stage/list or listTags), so every parser here is defensive: accepts a bare array or
-// a common wrapper key, and drops any entry missing a positive integer id / non-empty name rather
-// than throwing. A shape drift degrades to an empty list (the tool then reports "not configured" /
-// "unknown step"), never a crash.
+// Response shapes were UNCONFIRMED for a while (the vendor's Postman collection ships no example
+// responses for pipeline/list, stage/list, listTags or listQueues), so every parser here stays
+// defensive: accepts a bare array or a one- or two-level wrapper key, and drops any entry missing a
+// positive integer id / non-empty label rather than throwing. A shape drift still degrades to an
+// empty list (the tool then reports "not configured" / "unknown step"), never a crash. Live capture
+// (2026-08-17, tenant 1's "TesteSindSeg" instance) confirmed the actual shapes and settled the
+// per-entity label field, which is NOT uniformly "name":
+//   - pipeline/list, stage/list: {success, data: {data: [...], pagination}} (double-nested), label "name"
+//   - listTags:                  bare array, label "tag" (matches createTag's body field)
+//   - listQueues:                bare array, label "queue" (matches createQueueData's body field)
 
 import { readToolInstructions } from "@/modules/handoff/settings";
 import type { ZproClient } from "./client";
@@ -73,25 +78,39 @@ export interface ZproKanbanContext {
   currentStageName: string | null;
 }
 
-// Accepts a bare array or a common wrapper key ({data:[]}/{payload:[]}/{rows:[]}) — see module header.
+// Accepts a bare array, a one-level wrapper key ({data:[]}/{payload:[]}/{rows:[]}), or the
+// double-nested {data:{data:[],pagination}} shape pipeline/list and stage/list actually return
+// (confirmed live, see module header) — one extra unwrap pass when the wrapper key holds an object
+// instead of an array.
 function unwrapZproList(raw: unknown): unknown[] {
   if (Array.isArray(raw)) return raw;
-  if (raw && typeof raw === "object") {
-    const o = raw as Record<string, unknown>;
-    if (Array.isArray(o.data)) return o.data;
-    if (Array.isArray(o.payload)) return o.payload;
-    if (Array.isArray(o.rows)) return o.rows;
+  if (!raw || typeof raw !== "object") return [];
+  const o = raw as Record<string, unknown>;
+  for (const key of ["data", "payload", "rows"]) {
+    const v = o[key];
+    if (Array.isArray(v)) return v;
+    if (v && typeof v === "object") {
+      const nested = unwrapZproList(v);
+      if (nested.length > 0) return nested;
+    }
   }
   return [];
 }
 
-function parseIdNamePairs(raw: unknown): { id: number; name: string }[] {
+// labelField defaults to "name" (pipelines/stages) but the actual key varies per Z-PRO entity —
+// listTags uses "tag" and listQueues uses "queue" (each matching that entity's create/update body
+// field name), confirmed live. See module header.
+function parseIdNamePairs(
+  raw: unknown,
+  labelField = "name",
+): { id: number; name: string }[] {
   const out: { id: number; name: string }[] = [];
   for (const item of unwrapZproList(raw)) {
     if (!item || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;
     const id = posInt(o.id);
-    const name = typeof o.name === "string" ? o.name.trim() : "";
+    const label = o[labelField];
+    const name = typeof label === "string" ? label.trim() : "";
     if (id != null && name) out.push({ id, name });
   }
   return out;
@@ -141,14 +160,12 @@ export async function loadZproTags(
 ): Promise<ZproPipeline[]> {
   const hit = tagsCache.get(cacheKey);
   if (hit && hit.expires > now) return hit.value;
-  const value = parseIdNamePairs(await client.listTags(true));
+  const value = parseIdNamePairs(await client.listTags(true), "tag");
   tagsCache.set(cacheKey, { value, expires: now + CRM_TTL_MS });
   return value;
 }
 
 // Queues (departments/attendants) change rarely — same TTL cache as pipelines/stages/tags.
-// listQueues() has no captured real-payload sample either (same open-validation as the others in
-// this file), so it goes through the same defensive parseIdNamePairs.
 const queuesCache = new Map<
   string,
   { value: ZproPipeline[]; expires: number }
@@ -161,7 +178,7 @@ export async function loadZproQueues(
 ): Promise<ZproPipeline[]> {
   const hit = queuesCache.get(cacheKey);
   if (hit && hit.expires > now) return hit.value;
-  const value = parseIdNamePairs(await client.listQueues());
+  const value = parseIdNamePairs(await client.listQueues(), "queue");
   queuesCache.set(cacheKey, { value, expires: now + CRM_TTL_MS });
   return value;
 }

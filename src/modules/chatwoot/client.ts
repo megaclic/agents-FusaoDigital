@@ -974,6 +974,26 @@ export class ChatwootClient {
     return { id };
   }
 
+  // GET /contacts/:id — used by the Z-PRO channel-redirect gate to detect a stale
+  // redirectChatwootContactId (the contact was deleted or merged away in Chatwoot after we
+  // stamped it, and nothing reconciles that on its own). Returns false ONLY on a confirmed 404;
+  // any other failure (network/auth/timeout) is uncertain and must propagate rather than being
+  // read as "gone" — treating an outage as "the contact is deleted" would recreate a duplicate
+  // contact and orphan the widget-side identity merge on a mere blip.
+  async contactExists(contactId: number): Promise<boolean> {
+    try {
+      await this.request(
+        this.config.adminToken,
+        "GET",
+        `/contacts/${contactId}`,
+      );
+      return true;
+    } catch (err) {
+      if (err instanceof ChatwootApiError && err.status === 404) return false;
+      throw err;
+    }
+  }
+
   // Merge two contacts (admin token): moves the mergee's conversations/contact_inboxes onto the base
   // and destroys the mergee. Fallback for the redirect flow when identity-validation did not unify the
   // widget visitor with the WhatsApp contact. Route is the singular action resource (NOT

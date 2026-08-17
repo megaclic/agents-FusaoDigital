@@ -498,4 +498,36 @@ describe("ChatwootClient", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
   });
+
+  // Used by the Z-PRO channel-redirect gate to detect a stale redirectChatwootContactId (the
+  // contact was deleted/merged away in Chatwoot after we stamped it — no reconciliation existed
+  // before this).
+  describe("contactExists", () => {
+    test("200 → true", async () => {
+      const { fetchImpl } = stub(200, { id: 42 });
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      expect(await client.contactExists(42)).toBe(true);
+    });
+
+    test("404 → false, not a throw", async () => {
+      const { fetchImpl } = stub(404, {});
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      expect(await client.contactExists(42)).toBe(false);
+    });
+
+    test("any other failure (500, network) rethrows — uncertain must never read as gone", async () => {
+      const { fetchImpl } = stub(500, {});
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      await expect(client.contactExists(42)).rejects.toThrow(ChatwootApiError);
+    });
+  });
 });

@@ -12,6 +12,7 @@ import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";
 import { readTtsConfig } from "@/modules/tts/settings";
 import { readVisionConfig } from "@/modules/vision/settings";
+import { readZproCrmConfig } from "@/modules/zpro/crm";
 
 // Normalized read of the per-agent BEHAVIOR config that lives in the free-form `agent.settings` bag
 // (debounce / stt / tts / split / serviceWindow + grounding + followUp). The same typed readers the
@@ -50,6 +51,10 @@ export interface BehaviorSettings {
   // NOTE: Which Chatwoot custom attributes (per scope) are injected into the system prompt.
   attributeContext: ReturnType<typeof readAttributeContextConfig>;
   observability: ReturnType<typeof readObservabilityConfig>;
+  // Which CRM Pipeline kanban_move_card/update_kanban_task operate on for a Z-PRO-bound agent
+  // (src/modules/zpro/crm.ts) — previously REST-only (PATCH /v1/agents/:id direct settings write),
+  // no MCP surface. Chatwoot-bound agents ignore this block entirely (no zproCrm concept there).
+  zproCrm: ReturnType<typeof readZproCrmConfig>;
 }
 
 // The keys this surface owns inside the settings bag. Any other key (future/unknown) is preserved
@@ -70,6 +75,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "guardrails",
   "attributeContext",
   "observability",
+  "zproCrm",
 ] as const;
 export type BehaviorSettingsKey = (typeof BEHAVIOR_SETTINGS_KEYS)[number];
 
@@ -91,6 +97,7 @@ export function readBehaviorSettings(settings: unknown): BehaviorSettings {
     guardrails: readGuardrailsConfig(settings),
     attributeContext: readAttributeContextConfig(settings),
     observability: readObservabilityConfig(settings),
+    zproCrm: readZproCrmConfig(settings),
   };
 }
 
@@ -112,6 +119,7 @@ export interface BehaviorSettingsPatch {
   guardrails?: Record<string, unknown>;
   attributeContext?: Record<string, unknown>;
   observability?: Record<string, unknown>;
+  zproCrm?: Record<string, unknown>;
 }
 
 // Merge a behavior patch into the existing raw settings bag, then RE-READ each touched block through
@@ -156,6 +164,7 @@ export function mergeBehaviorSettings(
   next.guardrails = normalized.guardrails;
   next.attributeContext = normalized.attributeContext;
   next.observability = normalized.observability;
+  next.zproCrm = normalized.zproCrm;
   // grounding: only persist when a valid distance is set; otherwise leave whatever was there
   // (a null maxDistance means "no grounding filter" — represent it explicitly when the patch
   // touched grounding so the operator can clear it).
