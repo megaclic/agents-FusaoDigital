@@ -374,7 +374,7 @@ function privateNoteTool(ctx: ToolCtx) {
     {
       name: "private_note",
       description:
-        "Leave an internal note for the human team (NOT visible to the customer). Use it to record context a human will need later — a special request, a caveat, something to follow up on. To escalate to a human right now, use handoff_to_human instead.",
+        "Leave an internal note for the human team (NOT visible to the customer), for a conversation that is NOT being escalated right now — a special request, a caveat, something to follow up on later. If you ARE handing off to a human right now, do NOT use this tool: call handoff_to_human instead and pass your summary as its `reason` argument, which posts that same summary as a note automatically in the same call that actually transfers.",
       schema: z.object({ content: z.string().min(1) }),
     },
   );

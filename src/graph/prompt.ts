@@ -36,14 +36,18 @@ export const COMMITMENT_DIRECTIVE = [
 // Gated on the handoff_to_human grant (like GROUNDING_DIRECTIVE on search_knowledge) — exists because
 // a live customer explicitly asked for a human, the model wrote a detailed private_note describing
 // the request and kept talking, but never called handoff_to_human: no deactivation, no queue routing,
-// nothing actually transferred (confirmed live, 2026-08-17, Z-PRO). private_note's own tool
-// description already says "to escalate right now, use handoff_to_human instead" — restating the rule
-// at the system-prompt level too, since the tool description alone did not stop the mistake, same
-// rationale as COMMITMENT_DIRECTIVE existing despite schedule_message's own description.
+// nothing actually transferred (confirmed live, 2026-08-17, Z-PRO). The summary itself was NOT the
+// problem (the human team does need one) — the model just never followed through with the tool call
+// that both delivers it AND transfers the conversation. private_note's own tool description already
+// points at handoff_to_human for this case, and handoff_to_human's `reason` argument already IS the
+// note; restating the full pattern (summary → reason arg → same call) at the system-prompt level too,
+// since the tool descriptions alone did not stop the mistake — same rationale as COMMITMENT_DIRECTIVE
+// existing despite schedule_message's own description.
 export const HANDOFF_DIRECTIVE = [
   "Handoff discipline:",
   "- When the customer asks to speak with a human, requests an escalation, or you determine human help is genuinely needed, you MUST call handoff_to_human in THIS SAME response.",
-  "- Writing a private note about it, or telling the customer you are transferring them, is NOT enough on its own — nothing actually happens until handoff_to_human is called.",
+  "- The human team DOES need a summary of the conversation so far — write one, but pass it as handoff_to_human's own `reason` argument. That single call posts your summary as a note for the human team AND actually transfers the conversation.",
+  "- Writing a private note by itself, or telling the customer you are transferring them, is NOT a substitute for calling handoff_to_human — nothing actually transfers until that call happens.",
 ].join("\n");
 
 // Always appended, like COMMITMENT_DIRECTIVE — exists because a customer's WhatsApp "reply to a
