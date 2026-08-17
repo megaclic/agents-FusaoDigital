@@ -527,8 +527,11 @@ export async function runLoadedZproTurn(
     // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},
     // {{nome_agente}} e as variáveis de hora/data — mesmo interpolador sanitizado (proteção contra
     // prompt injection) que o Chatwoot usa via prepare.ts.
+    const handoffGranted = agentTools.some(
+      (t) => t.name === "handoff_to_human",
+    );
     const systemPrompt = interpolatePromptVars(
-      composeSystemPrompt(loaded.systemPrompt, { grounded }),
+      composeSystemPrompt(loaded.systemPrompt, { grounded, handoffGranted }),
       buildPromptVars({
         contactName: ev.contactName,
         contactPhone: ev.contactNumber,

@@ -4,6 +4,7 @@ import {
   COMMITMENT_DIRECTIVE,
   composeSystemPrompt,
   GROUNDING_DIRECTIVE,
+  HANDOFF_DIRECTIVE,
   interpolatePromptVars,
   QUOTED_REPLY_DIRECTIVE,
 } from "@/graph/prompt";
@@ -24,6 +25,7 @@ describe("composeSystemPrompt", () => {
     expect(out).toContain(COMMITMENT_DIRECTIVE);
     expect(out).toContain(QUOTED_REPLY_DIRECTIVE);
     expect(out).not.toContain(GROUNDING_DIRECTIVE);
+    expect(out).not.toContain(HANDOFF_DIRECTIVE);
   });
 
   test("grounded also appends GROUNDING_DIRECTIVE, after QUOTED_REPLY_DIRECTIVE", () => {
@@ -36,6 +38,30 @@ describe("composeSystemPrompt", () => {
     expect(out.indexOf(QUOTED_REPLY_DIRECTIVE)).toBeLessThan(
       out.indexOf(GROUNDING_DIRECTIVE),
     );
+  });
+
+  // Added after a live observation (2026-08-17, Z-PRO): a customer explicitly asked for a human, the
+  // model wrote a detailed private_note describing the request and kept replying, but never called
+  // handoff_to_human — no deactivation, no queue routing, nothing actually transferred. Gated on the
+  // grant (like GROUNDING_DIRECTIVE on search_knowledge) since the instruction is meaningless when
+  // the agent has no handoff_to_human tool to call.
+  test("handoffGranted appends HANDOFF_DIRECTIVE; omitted/false does not", () => {
+    const withGrant = composeSystemPrompt("Você é um assistente.", {
+      grounded: false,
+      handoffGranted: true,
+    });
+    expect(withGrant).toContain(HANDOFF_DIRECTIVE);
+
+    const withoutGrant = composeSystemPrompt("Você é um assistente.", {
+      grounded: false,
+      handoffGranted: false,
+    });
+    expect(withoutGrant).not.toContain(HANDOFF_DIRECTIVE);
+
+    const omitted = composeSystemPrompt("Você é um assistente.", {
+      grounded: false,
+    });
+    expect(omitted).not.toContain(HANDOFF_DIRECTIVE);
   });
 });
 

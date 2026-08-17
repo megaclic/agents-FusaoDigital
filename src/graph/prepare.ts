@@ -450,6 +450,8 @@ export async function loadAgentConfig(
     const md = readMaxDistance(effSettings);
     if (md != null) sel.ragConfig.maxDistance = md;
   }
+  const handoffGranted =
+    !sel.nativeToolsAllow || sel.nativeToolsAllow.includes("handoff_to_human");
   // Interpolate allowlisted context variables ({{nome_contato}}, {{hora_atual}}, …) into the final
   // prompt, with the (customer-controlled) values sanitized. Applied here so BOTH the turn and the
   // nudge paths get identical, injection-bounded substitution. Time variables use the agent's tz.
@@ -459,6 +461,7 @@ export async function loadAgentConfig(
       ov?.systemPrompt ?? promptOverride ?? agent.systemPrompt,
       {
         grounded,
+        handoffGranted,
       },
     ),
     buildPromptVars({

@@ -33,6 +33,19 @@ export const COMMITMENT_DIRECTIVE = [
   "- A confident promise you cannot keep is worse than admitting a limitation.",
 ].join("\n");
 
+// Gated on the handoff_to_human grant (like GROUNDING_DIRECTIVE on search_knowledge) — exists because
+// a live customer explicitly asked for a human, the model wrote a detailed private_note describing
+// the request and kept talking, but never called handoff_to_human: no deactivation, no queue routing,
+// nothing actually transferred (confirmed live, 2026-08-17, Z-PRO). private_note's own tool
+// description already says "to escalate right now, use handoff_to_human instead" — restating the rule
+// at the system-prompt level too, since the tool description alone did not stop the mistake, same
+// rationale as COMMITMENT_DIRECTIVE existing despite schedule_message's own description.
+export const HANDOFF_DIRECTIVE = [
+  "Handoff discipline:",
+  "- When the customer asks to speak with a human, requests an escalation, or you determine human help is genuinely needed, you MUST call handoff_to_human in THIS SAME response.",
+  "- Writing a private note about it, or telling the customer you are transferring them, is NOT enough on its own — nothing actually happens until handoff_to_human is called.",
+].join("\n");
+
 // Always appended, like COMMITMENT_DIRECTIVE — exists because a customer's WhatsApp "reply to a
 // specific message" (rendered as a `<em resposta a: "...">` prefix on their message — both
 // channels: chatwoot/render.ts's in_reply_to and zpro/parse.ts's quotedText) was observed live
@@ -50,12 +63,15 @@ export const QUOTED_REPLY_DIRECTIVE = [
 
 export function composeSystemPrompt(
   basePrompt: string,
-  opts: { grounded: boolean },
+  opts: { grounded: boolean; handoffGranted?: boolean },
 ): string {
   const base = basePrompt.trim();
-  const directives = opts.grounded
-    ? [COMMITMENT_DIRECTIVE, QUOTED_REPLY_DIRECTIVE, GROUNDING_DIRECTIVE]
-    : [COMMITMENT_DIRECTIVE, QUOTED_REPLY_DIRECTIVE];
+  const directives = [
+    COMMITMENT_DIRECTIVE,
+    QUOTED_REPLY_DIRECTIVE,
+    ...(opts.handoffGranted ? [HANDOFF_DIRECTIVE] : []),
+    ...(opts.grounded ? [GROUNDING_DIRECTIVE] : []),
+  ];
   return [base, ...directives].filter(Boolean).join("\n\n");
 }
 
