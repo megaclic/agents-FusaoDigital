@@ -7,7 +7,7 @@ import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { cancelPendingJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
-import { tryResolveVaultSecret } from "@/modules/vault/service";
+import { resolveVaultRefState } from "@/modules/vault/service";
 import { chunkText } from "./chunk";
 import { type EmbeddingConfig, embedTexts } from "./embeddings";
 import { toVectorLiteral } from "./sql";
@@ -40,17 +40,27 @@ export async function resolveEmbeddingStatus(
 ): Promise<EmbeddingStatus> {
   const settings = await readEmbeddingSettings(db, tenantId);
   if (!settings.credentialRef) return { ok: false, reason: "not_configured" };
-  const raw = await tryResolveVaultSecret<
+  // NOTE: The three failures are distinguished from ONE read (see resolveVaultRefState). A ref whose
+  // row is gone is not "pending": telling the operator to fill a credential that no longer exists
+  // sends them looking for a row that is not there, so it falls back to the reason a workspace that
+  // never configured one gets. An ACTIVE row holding a blank secret is neither — it is `empty`, and
+  // that only stays distinguishable because the state and the value came from the same query.
+  const resolved = await resolveVaultRefState<
     string | { apiKey: string; baseURL?: string }
   >(db, settings.credentialRef);
-  if (!raw)
+  if (resolved.state === "not_found")
+    return { ok: false, reason: "not_configured" };
+  if (resolved.state === "pending")
     return {
       ok: false,
       reason: "credential_pending",
       credentialRef: settings.credentialRef,
     };
+  const raw = resolved.value;
   const { apiKey, baseURL: secretBaseURL } =
-    typeof raw === "string" ? { apiKey: raw, baseURL: undefined } : raw;
+    typeof raw === "string" || !raw
+      ? { apiKey: typeof raw === "string" ? raw : "", baseURL: undefined }
+      : raw;
   if (!apiKey)
     return {
       ok: false,
@@ -63,6 +73,20 @@ export async function resolveEmbeddingStatus(
   };
 }
 
+// NOTE: The English message carries the reason, and is not allowed to collapse into one generic
+// sentence. MCP hands `AppError.message` to the caller verbatim and the translation key has no
+// server-side locale entry, so outside the console the message is the only thing that says which of
+// the three happened.
+function embeddingBlockMessage(
+  status: Exclude<EmbeddingStatus, { ok: true }>,
+): string {
+  if (status.reason === "credential_pending")
+    return "embedding credential is not filled in yet";
+  if (status.reason === "credential_empty")
+    return "embedding credential is empty";
+  return "embedding credential not configured";
+}
+
 export async function resolveEmbeddingConfig(
   db: ScopedDb,
   tenantId: bigint,
@@ -70,16 +94,10 @@ export async function resolveEmbeddingConfig(
 ): Promise<EmbeddingConfig> {
   const status = await resolveEmbeddingStatus(db, tenantId, model);
   if (status.ok) return status.config;
-  if (status.reason === "credential_empty")
-    throw new AppError(
-      "embedding credential is empty",
-      400,
-      "errors.embeddingEmpty",
-    );
   throw new AppError(
-    "embedding credential not configured",
+    embeddingBlockMessage(status),
     400,
-    "errors.embeddingNotConfigured",
+    `errors.embedding.${embeddingBlock(status).reason}`,
   );
 }
 
@@ -348,30 +366,59 @@ export async function retryDocument(
 // tenant's embedding credential is unconfigured or its secret is not filled yet — so nothing is queued
 // and the docs are left where they are (a missing prerequisite is not an ingestion failure). Callers
 // surface the block at the KB/tenant level (config health / a fill deeplink), not as red documents.
+// The one vocabulary for "embedding is not usable", shared by the reindex result and by the live
+// read the console renders from. `credential_empty` joined it so all three resolvable reasons have a
+// name here instead of two of them collapsing into one.
+export interface EmbeddingBlock {
+  reason:
+    | "embedding_not_configured"
+    | "credential_pending"
+    | "credential_empty";
+  credentialRef?: string;
+  vaultId?: string;
+}
+
 export interface ReindexResult {
   queued: number;
-  blocked?: {
-    reason: "embedding_not_configured" | "credential_pending";
-    credentialRef?: string;
-    vaultId?: string;
-  };
+  blocked?: EmbeddingBlock;
 }
 
 // Maps a non-ok embedding status to the reindex `blocked` shape. A pending/empty credential parses the
 // `vault:<id>` ref into `vaultId` so a transport can build the fill deeplink.
 function embeddingBlock(
   status: Exclude<EmbeddingStatus, { ok: true }>,
-): NonNullable<ReindexResult["blocked"]> {
+): EmbeddingBlock {
   if (status.reason === "not_configured")
     return { reason: "embedding_not_configured" };
   const vaultId = status.credentialRef.startsWith("vault:")
     ? status.credentialRef.slice("vault:".length)
     : undefined;
   return {
-    reason: "credential_pending",
+    reason:
+      status.reason === "credential_empty"
+        ? "credential_empty"
+        : "credential_pending",
     credentialRef: status.credentialRef,
     vaultId,
   };
+}
+
+// The tenant's CURRENT embedding block, or null when indexing would work. Read at the moment the
+// console asks rather than stamped on a document when the block happened: one credential serves
+// every base, so this is a property of the configuration and it changes when the configuration
+// changes — the row that failed under it has no way to know.
+//
+// NOTE: No model argument. `resolveEmbeddingStatus` only echoes the model back on the OK path, so a
+// block never depends on which base is being looked at — which is also why the caller does not have
+// to load a knowledge base (and pay its chunk count) to ask this question.
+export async function readEmbeddingBlock(
+  tenantId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<EmbeddingBlock | null> {
+  const status = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    resolveEmbeddingStatus(db, tenantId, ""),
+  );
+  return status.ok ? null : embeddingBlock(status);
 }
 
 // Queues ingestion for every UNINDEXED document in a knowledge base — the bulk "index all" after an
@@ -480,6 +527,11 @@ async function runIngestJobForTenant(
     resolveEmbeddingStatus(db, tenantId, kb.embeddingModel),
   );
   if (!emb.ok) {
+    // NOTE: The reason is NOT written onto the document. The block is a property of the tenant's
+    // embedding configuration at a point in time — one credential serves every base — so a token
+    // stamped here would still be claiming "fill the credential" after the operator filled it, with
+    // nothing to recompute it (issue #80). `readEmbeddingBlock` answers the same question live, at
+    // the moment the console asks. The row stays what it is: not indexed, no failure of its own.
     await runScopedOn(base, sysCtx(tenantId), (db) =>
       db.knowledgeDocument.updateMany({
         where: { id: documentId, status: "PENDING" },

@@ -66,6 +66,10 @@ import {
   readGuardrailsConfig,
 } from "@/modules/guardrails/settings";
 import {
+  readSendImageConfig,
+  type SendImageConfig,
+} from "@/modules/images/settings";
+import {
   buildTemplatePayload,
   proactiveSendMode,
   readServiceWindowConfig,
@@ -162,6 +166,9 @@ export interface LoadedZproAgent {
   transferWithSummary: boolean;
   toolGuidance: Partial<Record<NativeToolName, string>>;
   crmConfig: ZproCrmConfig;
+  // send_image's host allowlist (agent.settings.sendImage — upstream #76 parity, channel-agnostic,
+  // same config Chatwoot's version reads). See docs/zpro.md's "send_image" section.
+  sendImageConfig: SendImageConfig;
 }
 
 // Scoped read (no network): resolve the binding's Agent + its model credential. Returns null when
@@ -262,6 +269,7 @@ export async function loadZproAgent(
       ttsConfig: readTtsConfig(agent.settings),
       splitConfig: readSplitConfig(agent.settings),
       maxDistance: readMaxDistance(agent.settings),
+      sendImageConfig: readSendImageConfig(agent.settings),
       guardrails,
       guardrailsApiKey,
       guardrailsCredentialBaseUrl,
@@ -481,6 +489,7 @@ export async function runLoadedZproTurn(
       contactNumber: ev.contactNumber,
       companyName: loaded.companyName,
       contactExtraInfo: ev.extraInfo,
+      sendImage: loaded.sendImageConfig,
     });
     const tools = [...agentTools];
     // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},

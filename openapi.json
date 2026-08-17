@@ -22,14 +22,14 @@
       "sessionCookie": {
         "type": "apiKey",
         "in": "cookie",
-        "name": "secretaria_v4_auth_token",
+        "name": "fazerai_auth_token",
         "description": "Session JWT set by /api/auth/login (HttpOnly cookie)."
       },
       "bearerToken": {
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT",
-        "description": "Bearer token for the API / MCP transport: an MCP OAuth access token, or a per-tenant API key (`secv4_…`) created at /api-keys."
+        "description": "Bearer token for the API / MCP transport: an MCP OAuth access token, or a per-tenant API key (`fazerai_…`) created at /api-keys."
       }
     },
     "schemas": {}
@@ -5132,7 +5132,7 @@
                     "type": "boolean"
                   },
                   "modelConfig": {
-                    "description": "Model settings (provider, model, credentialRef, etc.); secrets are referenced, never inlined.",
+                    "description": "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -5203,7 +5203,7 @@
                     "type": "boolean"
                   },
                   "modelConfig": {
-                    "description": "Model settings (provider, model, credentialRef, etc.); secrets are referenced, never inlined.",
+                    "description": "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -5274,7 +5274,7 @@
                     "type": "boolean"
                   },
                   "modelConfig": {
-                    "description": "Model settings (provider, model, credentialRef, etc.); secrets are referenced, never inlined.",
+                    "description": "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -5562,7 +5562,7 @@
                     "type": "boolean"
                   },
                   "modelConfig": {
-                    "description": "Model settings (provider, model, credentialRef, etc.); secrets are referenced, never inlined.",
+                    "description": "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -5634,7 +5634,7 @@
                     "type": "boolean"
                   },
                   "modelConfig": {
-                    "description": "Model settings (provider, model, credentialRef, etc.); secrets are referenced, never inlined.",
+                    "description": "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -5706,7 +5706,7 @@
                     "type": "boolean"
                   },
                   "modelConfig": {
-                    "description": "Model settings (provider, model, credentialRef, etc.); secrets are referenced, never inlined.",
+                    "description": "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
                     "type": "object",
                     "patternProperties": {
                       "^(.*)$": {}
@@ -9980,6 +9980,22 @@
                       "high"
                     ]
                   },
+                  "expectedStatuses": {
+                    "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "format": "integer",
+                          "default": 0,
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        }
+                      ]
+                    }
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -10100,6 +10116,22 @@
                       "high"
                     ]
                   },
+                  "expectedStatuses": {
+                    "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "format": "integer",
+                          "default": 0,
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        }
+                      ]
+                    }
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -10219,6 +10251,22 @@
                       "medium",
                       "high"
                     ]
+                  },
+                  "expectedStatuses": {
+                    "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "format": "integer",
+                          "default": 0,
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        }
+                      ]
+                    }
                   },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
@@ -10576,6 +10624,22 @@
                       "high"
                     ]
                   },
+                  "expectedStatuses": {
+                    "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "format": "integer",
+                          "default": 0,
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        }
+                      ]
+                    }
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -10696,6 +10760,22 @@
                       "high"
                     ]
                   },
+                  "expectedStatuses": {
+                    "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "format": "integer",
+                          "default": 0,
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        }
+                      ]
+                    }
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -10815,6 +10895,22 @@
                       "medium",
                       "high"
                     ]
+                  },
+                  "expectedStatuses": {
+                    "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "format": "integer",
+                          "default": 0,
+                          "type": "string"
+                        },
+                        {
+                          "type": "integer"
+                        }
+                      ]
+                    }
                   },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
@@ -21006,6 +21102,69 @@
           }
         },
         "operationId": "deleteV1KnowledgeBasesById"
+      }
+    },
+    "/v1/knowledge/embedding-block": {
+      "get": {
+        "tags": [
+          "Resources"
+        ],
+        "summary": "Read the embedding block",
+        "description": "Whether anything is preventing this workspace from indexing, and which of the reasons it is. Null when indexing would work.",
+        "responses": {
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1KnowledgeEmbedding-block",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
       }
     },
     "/v1/knowledge/bases/{id}/documents": {

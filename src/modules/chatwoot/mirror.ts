@@ -5,6 +5,7 @@ import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { emitOutbound } from "@/modules/webhooks/outbound/service";
 import { isNewIncomingMessage } from "./normalize";
+import { decideConversationWrites, type StatePayload } from "./state-order";
 import type { NormalizedChatwootEvent } from "./types";
 
 // Fire an outbound event from inside the mirror's scoped tx. Best-effort for the DOMAIN: a fan-out
@@ -30,8 +31,9 @@ async function emitMirrorEvent(
 // Mirror Chatwoot conversation/inbox/contact METADATA into our DB (no message body by default).
 // Powers the UI conversation list + read API; the runtime reads it for routing. Contact and
 // Inbox upserts are atomic (ON CONFLICT, safe under concurrency); the Conversation read-modify-
-// write is serialized per conversation by an advisory lock and guarded monotonically so an
-// out-of-order delivery (Chatwoot does not guarantee order) cannot regress status/assignee.
+// write is serialized per conversation by an advisory lock, and what each delivery is allowed to
+// write is decided by `state-order.ts` (Chatwoot does not guarantee order, and a message event
+// carries a frozen conversation snapshot that must not regress status/assignee).
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -80,8 +82,20 @@ export async function mirrorChatwootEvent(
     };
   }
   const convId = n.conversationId;
+  const now = new Date();
   const newLastEventAt =
     n.lastActivityAt != null ? new Date(n.lastActivityAt * 1000) : null;
+  // How this payload is positioned against what we already store. The rules, and the Chatwoot
+  // behaviour they are written against, live in `state-order.ts`.
+  const statePayload: StatePayload = {
+    version: n.conversationUpdatedAt ?? null,
+    activityAt: newLastEventAt,
+    fromConversationEvent: n.message === undefined,
+    reopensConversation: isNewIncomingMessage(n),
+    status: n.status ?? null,
+    assigneeStated: n.assigneeType !== undefined,
+    assigneeType: n.assigneeType ?? null,
+  };
   // The inbound watermark (`lastInboundAt`) advances only on a brand-new incoming customer message
   // (message_created), never on a message_updated — our own STT/vision write-back re-dispatches one
   // and must not push it forward. The caller also suppresses it for a consumed control command (see
@@ -89,7 +103,7 @@ export async function mirrorChatwootEvent(
   // window.
   const inboundAt =
     isNewIncomingMessage(n) && !opts.suppressInboundWatermark
-      ? (newLastEventAt ?? new Date())
+      ? (newLastEventAt ?? now)
       : null;
 
   return runScopedOn(base, sysCtx(tenantId), async (db) => {
@@ -109,6 +123,8 @@ export async function mirrorChatwootEvent(
         select: {
           id: true,
           lastEventAt: true,
+          chatwootStatusAt: true,
+          chatwootAssigneeAt: true,
           assigneeId: true,
           assigneeType: true,
           assigneeName: true,
@@ -116,18 +132,23 @@ export async function mirrorChatwootEvent(
         },
       });
       const prevAssigneeId = existing?.assigneeId ?? null;
-
-      // Monotonic guard: only when both timestamps are known. A null new timestamp applies
-      // best-effort (the next timestamped event reconciles).
-      const stale =
-        newLastEventAt != null &&
-        existing?.lastEventAt != null &&
-        existing.lastEventAt > newLastEventAt;
-      if (stale) {
+      const decision = decideConversationWrites(
+        statePayload,
+        existing
+          ? {
+              activityAt: existing.lastEventAt,
+              statusAt: existing.chatwootStatusAt,
+              assigneeAt: existing.chatwootAssigneeAt,
+              assigneeType: existing.assigneeType,
+            }
+          : null,
+        now,
+      );
+      if (existing && decision.stale) {
         return {
           conversationRowId: existing.id,
           prevAssigneeId,
-          // No transition applied — report status/prevStatus equal so a caller's diff sees "no change".
+          // NOTE: No transition applied — report status/prevStatus equal so a caller's diff sees "no change".
           prevStatus: existing.status,
           applied: false,
           status: existing.status,
@@ -138,8 +159,8 @@ export async function mirrorChatwootEvent(
       }
 
       if (!existing) {
-        const createdStatus = n.status ?? "open";
-        const createdLastEventAt = newLastEventAt ?? new Date();
+        const createdStatus = decision.status ?? "open";
+        const createdLastEventAt = decision.activityAt;
         const created = await db.conversation.create({
           data: {
             tenantId,
@@ -154,6 +175,8 @@ export async function mirrorChatwootEvent(
             assigneeName: n.assigneeName ?? null,
             threadId,
             lastEventAt: createdLastEventAt,
+            chatwootStatusAt: decision.statusAt,
+            chatwootAssigneeAt: decision.assigneeAt,
             lastInboundAt: inboundAt,
             ...(n.customAttributes
               ? {
@@ -177,7 +200,7 @@ export async function mirrorChatwootEvent(
         return {
           conversationRowId: created.id,
           prevAssigneeId,
-          // No prior row → no prior status (never a "transition" for a brand-new conversation).
+          // NOTE: No prior row → no prior status (never a "transition" for a brand-new conversation).
           prevStatus: null,
           applied: true,
           status: createdStatus,
@@ -187,30 +210,10 @@ export async function mirrorChatwootEvent(
         };
       }
 
-      const updatedLastEventAt = newLastEventAt ?? new Date();
-      // NOTE: A MESSAGE event's conversation snapshot is frozen at enqueue time (AgentBots::WebhookJob
-      // serializes the payload before delivery, and failed deliveries retry with the stale copy), so
-      // a message delivered AFTER the conversation_resolved must not drag the mirror back to
-      // pending/open — that stale "pending" is what made follow-ups fire on conversations the
-      // operator had already resolved. Only a BRAND-NEW incoming message (message_created) may
-      // reopen — Chatwoot's ReopenService reopens exclusively on new customer messages. A
-      // message_updated of an INCOMING message (our own STT/vision write-back re-dispatches one)
-      // carries the same frozen snapshot and must not reopen either; conversation_* events stay
-      // authoritative. The whole frozen snapshot is suspect, so the ASSIGNEE fields are preserved
-      // too (and the handoff edge below is suppressed) — a pre-resolve snapshot must not resurrect
-      // a cleared assignee.
-      const staleMessageReopen =
-        n.message !== undefined &&
-        !isNewIncomingMessage(n) &&
-        (existing.status === "resolved" || existing.status === "snoozed") &&
-        (n.status === "pending" || n.status === "open");
-      const appliedStatus = staleMessageReopen ? null : n.status;
+      const effectiveLastEventAt = decision.activityAt;
+      const appliedStatus = decision.status;
       const nextStatus = appliedStatus ?? existing.status;
-      // NOTE: The assignee trio travels together and applies only when BOTH hold: the payload
-      // actually spoke about the assignee (`meta` present — undefined means "said nothing", and a
-      // degraded event must NOT wipe a stored 'AgentBot'/'User', the intermittent self-wipe behind
-      // issue #27) AND the snapshot is not the frozen stale one fenced above.
-      const assigneeKnown = n.assigneeType !== undefined && !staleMessageReopen;
+      const assigneeKnown = decision.assignee;
       const nextAssigneeId = assigneeKnown
         ? (n.assigneeId ?? null)
         : existing.assigneeId;
@@ -220,11 +223,13 @@ export async function mirrorChatwootEvent(
       await db.conversation.update({
         where: { id: existing.id },
         data: {
-          ...(n.contactInboxId != null
+          ...(decision.unversioned && n.contactInboxId != null
             ? { contactInboxId: n.contactInboxId }
             : {}),
-          ...(inboxRowId != null ? { inboxId: inboxRowId } : {}),
-          ...(contactId != null ? { contactId } : {}),
+          ...(decision.unversioned && inboxRowId != null
+            ? { inboxId: inboxRowId }
+            : {}),
+          ...(decision.unversioned && contactId != null ? { contactId } : {}),
           ...(appliedStatus != null ? { status: appliedStatus } : {}),
           ...(assigneeKnown
             ? {
@@ -233,16 +238,20 @@ export async function mirrorChatwootEvent(
                 assigneeName: n.assigneeName ?? null,
               }
             : {}),
-          lastEventAt: updatedLastEventAt,
+          lastEventAt: effectiveLastEventAt,
+          ...(decision.statusAt != null
+            ? { chatwootStatusAt: decision.statusAt }
+            : {}),
+          ...(decision.assigneeAt != null
+            ? { chatwootAssigneeAt: decision.assigneeAt }
+            : {}),
           ...(inboundAt != null ? { lastInboundAt: inboundAt } : {}),
-          // NOTE: Attribute bags are ASSIGNED (the payload always ships the whole jsonb), but only
-          // when the event carried one — a payload without them must not wipe the stored snapshot.
-          // No watermark needed here: this runs inside the per-conversation lock, past the stale
-          // check, so a late delivery never reaches it.
-          ...(n.customAttributes
+          // NOTE: The bags are ASSIGNED (the payload always ships the whole jsonb), but only when the
+          // event carried one: a payload without them must not wipe the stored snapshot.
+          ...(decision.unversioned && n.customAttributes
             ? { customAttributes: n.customAttributes as Prisma.InputJsonValue }
             : {}),
-          ...(n.kanbanAttributes
+          ...(decision.unversioned && n.kanbanAttributes
             ? { kanbanAttributes: n.kanbanAttributes as Prisma.InputJsonValue }
             : {}),
         },
@@ -257,12 +266,12 @@ export async function mirrorChatwootEvent(
           assignee_type: nextAssigneeType,
         });
       }
-      // Handoff = the assignee transitions to a human (User). Detect the bot→human edge:
-      // prior assignee type was not User and the new one is User. A stale frozen snapshot never
-      // fires it — its assignee was not applied above. (An undefined trio — degraded payload —
-      // never equals "User" either, so it can neither fire nor mask the edge.)
+      // NOTE: Handoff = the assignee transitions to a human (User). Detect the bot→human edge:
+      // prior assignee type was not User and the new one is User. A snapshot older than the state
+      // we hold never fires it — its assignee was not applied above. (An undefined trio — degraded
+      // payload — never equals "User" either, so it can neither fire nor mask the edge.)
       if (
-        !staleMessageReopen &&
+        assigneeKnown &&
         existing.assigneeType !== "User" &&
         n.assigneeType === "User"
       ) {
@@ -274,14 +283,14 @@ export async function mirrorChatwootEvent(
       return {
         conversationRowId: existing.id,
         prevAssigneeId,
-        // The status as persisted BEFORE this update — the real transition source value.
+        // NOTE: The status as persisted BEFORE this update — the real transition source value.
         prevStatus: existing.status,
         applied: true,
         status: nextStatus,
-        // EFFECTIVE values (what is stored after this update), not the payload's silence.
+        // NOTE: EFFECTIVE values (what is stored after this update), not the payload's silence.
         assigneeId: nextAssigneeId,
         assigneeType: nextAssigneeType,
-        lastEventAt: updatedLastEventAt,
+        lastEventAt: effectiveLastEventAt,
       };
     });
   });

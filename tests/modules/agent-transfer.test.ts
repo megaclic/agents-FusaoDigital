@@ -145,6 +145,41 @@ describe.skipIf(!dbUp)("agent export/import", () => {
     expect(JSON.stringify(exp)).not.toContain("vault:");
   });
 
+  // A hand-written export is operator input like any other, and it lands through a third write path.
+  // The host list is reduced to hosts there too, or an imported bundle reintroduces exactly what the
+  // editor and the update path were taught not to store.
+  test("an imported host list is reduced to hosts before it is stored", async () => {
+    const exp = await exportAgent(ctx(), agentId, appDb);
+    const imported = {
+      ...exp,
+      agent: {
+        ...exp.agent,
+        name: "Vendedora importada",
+        settings: {
+          ...exp.agent.settings,
+          sendImage: {
+            allowedHosts: [
+              "https://usuario:senha-secreta@cdn.loja.com.br/x.png?sig=deadbeef",
+            ],
+          },
+        },
+      },
+    };
+    const { agent } = await importAgent(ctx(), imported, appDb);
+    const row = await suDb.agent.findFirstOrThrow({
+      where: { id: BigInt(agent.id) },
+      select: { settings: true },
+    });
+    expect(
+      (
+        (row.settings as Record<string, unknown>).sendImage as {
+          allowedHosts: string[];
+        }
+      ).allowedHosts,
+    ).toEqual(["cdn.loja.com.br"]);
+    expect(JSON.stringify(row.settings)).not.toContain("senha-secreta");
+  });
+
   test("round-trip import recreates the agent DISABLED with resolved refs", async () => {
     const exp = await exportAgent(ctx(), agentId, appDb);
     const imported = { ...exp, agent: { ...exp.agent, name: "Vendedora 2" } };
@@ -402,6 +437,9 @@ describe.skipIf(!dbUp)("agent export/import with components", () => {
         urlTemplate: "https://api.example.com/o/{{id}}",
         allowedHosts: ["api.example.com"],
         credentialRef: `vault:${key.id}`,
+        // A lookup that answers 404 for "no such order" is the canonical case of issue #59, and it
+        // is exactly the sort of tool an operator moves between instances.
+        expectedStatuses: [404],
       },
     });
     const mcp = await suDb.mcpServerConnection.create({
@@ -539,6 +577,9 @@ describe.skipIf(!dbUp)("agent export/import with components", () => {
       where: { tenantId: dstTenant, name: "lookup_order" },
     });
     expect(td?.label).toBe("Buscar pedido");
+    // Review finding, round 1: a declaration dropped in transfer makes the destination resume
+    // alerting on a status the operator had already ruled a result, with nothing to point at.
+    expect(td?.expectedStatuses).toEqual([404]);
     // credential absent on the destination ⇒ re-created as a PENDING entry with the ref kept wired
     // (the operator only fills the secret), not dropped.
     expect(td?.credentialRef).toMatch(/^vault:/);

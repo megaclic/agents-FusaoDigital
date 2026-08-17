@@ -1,10 +1,11 @@
 // tests/modules/zpro/native-tools.test.ts
-// buildZproNativeTools: the Z-PRO-specific implementation of the 8 conversation-scoped NATIVE tools
-// (handoff/note/attribute/label/resolve/funnel-move/funnel-update/skip), backed by ZproClient in
-// place of Chatwoot's client (src/graph/tools/native.ts). Most tools here never touch the DB
-// (they call the Z-PRO API only) so those cases run with a duck-typed ZproClient stub, no network/DB
-// — same pattern as tests/modules/zpro/split.test.ts. kanban_move_card/update_kanban_task DO persist
-// a snapshot onto ZproConversation, so those run DB-backed, mirroring tests/modules/zpro/tts.test.ts.
+// buildZproNativeTools: the Z-PRO-specific implementation of the 12 conversation-scoped NATIVE tools
+// (handoff/note/attribute/label/resolve/funnel-move/funnel-update/route-to-queue/schedule-message/
+// send-image/skip, plus get_contact_info), backed by ZproClient in place of Chatwoot's client
+// (src/graph/tools/native.ts). Most tools here never touch the DB (they call the Z-PRO API only) so
+// those cases run with a duck-typed ZproClient stub, no network/DB — same pattern as
+// tests/modules/zpro/split.test.ts. kanban_move_card/update_kanban_task DO persist a snapshot onto
+// ZproConversation, so those run DB-backed, mirroring tests/modules/zpro/tts.test.ts.
 
 import {
   afterAll,
@@ -39,7 +40,7 @@ function baseCtx(overrides: Partial<ZproToolCtx> = {}): ZproToolCtx {
 }
 
 describe("buildZproNativeTools (no client/DB access)", () => {
-  test("returns all 11 tools when unfiltered, and NEVER react_to_message", () => {
+  test("returns all 12 tools when unfiltered, and NEVER react_to_message", () => {
     const tools = buildZproNativeTools(baseCtx());
     expect(tools.map((t) => t.name).sort()).toEqual([
       "assign_label",
@@ -50,6 +51,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
       "resolve_conversation",
       "route_to_queue",
       "schedule_message",
+      "send_image",
       "set_custom_attribute",
       "skip_reply",
       "update_kanban_task",
@@ -388,6 +390,63 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     const out = await tools[0]?.invoke({ queue: "Suporte" });
     expect(called).toBe(false);
     expect(String(out)).toContain("No queues are configured");
+  });
+
+  test("send_image: no hosts configured refuses without ever touching the client", async () => {
+    let called = false;
+    const client = {
+      sendMediaUrl: async () => {
+        called = true;
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(baseCtx({ client }), ["send_image"]);
+    const out = await tools[0]?.invoke({
+      url: "https://cdn.loja.com.br/x.png",
+    });
+    expect(called).toBe(false);
+    expect(String(out)).toContain("nenhum host foi liberado");
+  });
+
+  test("send_image: a host outside the allowlist is refused, wildcard subdomain match works for an allowed one", async () => {
+    const calls: unknown[] = [];
+    const client = {
+      sendMediaUrl: async (number: string, mediaUrl: string, body?: string) => {
+        calls.push({ number, mediaUrl, body });
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({ client, sendImage: { allowedHosts: ["*.loja.com.br"] } }),
+      ["send_image"],
+    );
+    const refused = await tools[0]?.invoke({
+      url: "https://evil.com/x.png",
+    });
+    expect(String(refused)).toContain("não está na lista de hosts liberados");
+    expect(calls).toEqual([]);
+
+    const ok = await tools[0]?.invoke({
+      url: "https://cdn.loja.com.br/x.png",
+      caption: "Confira",
+    });
+    expect(calls).toEqual([
+      {
+        number: "5511900000001",
+        mediaUrl: "https://cdn.loja.com.br/x.png",
+        body: "Confira",
+      },
+    ]);
+    expect(String(ok)).toContain("Imagem enviada");
+  });
+
+  test("send_image: an invalid URL is refused before any host check", async () => {
+    const tools = buildZproNativeTools(
+      baseCtx({ sendImage: { allowedHosts: ["loja.com.br"] } }),
+      ["send_image"],
+    );
+    const out = await tools[0]?.invoke({ url: "not a url" });
+    expect(String(out)).toContain("não é válida");
   });
 
   test("kanban_move_card / update_kanban_task report 'not configured' when no pipeline is resolved", async () => {
@@ -840,6 +899,52 @@ describe.skipIf(!dbUp)(
         ["handoff_to_human"],
       );
       await tools[0]?.invoke({ customerMessage: "Já te transfiro." });
+      const row = await suDb.zproConversation.findUniqueOrThrow({
+        where: { zproInstanceId_ticketId: { zproInstanceId, ticketId } },
+        select: { agentSendingUntil: true },
+      });
+      expect(row.agentSendingUntil).not.toBeNull();
+      expect((row.agentSendingUntil as Date).getTime()).toBeGreaterThan(
+        Date.now(),
+      );
+    });
+
+    // Same direct-send pattern as handoff_to_human's customerMessage above (upstream #76 parity —
+    // sendMediaUrl needs no download/re-upload/queue, so this sends immediately inside the tool
+    // call instead of Chatwoot's turn-end queue) — must mark BEFORE sending for the same reason.
+    test("send_image marks agent-sending BEFORE sending the image", async () => {
+      const ticketId = Math.floor(Math.random() * 1_000_000);
+      await suDb.zproConversation.create({
+        data: {
+          tenantId,
+          zproInstanceId,
+          ticketId,
+          status: "open",
+          contactId: 7,
+          contactNumber: "5511900000001",
+          contactName: "Cliente Teste",
+          agentActive: true,
+        },
+      });
+      const client = {
+        sendMediaUrl: async () => ({}),
+      } as unknown as ZproClient;
+      const tools = buildZproNativeTools(
+        {
+          client,
+          ticketId,
+          zproInstanceId,
+          contactId: 7,
+          contactNumber: "5511900000001",
+          contactName: "Cliente Teste",
+          tenantId,
+          base: appDb,
+          conversationDbId: conversationId,
+          sendImage: { allowedHosts: ["loja.com.br"] },
+        },
+        ["send_image"],
+      );
+      await tools[0]?.invoke({ url: "https://loja.com.br/x.png" });
       const row = await suDb.zproConversation.findUniqueOrThrow({
         where: { zproInstanceId_ticketId: { zproInstanceId, ticketId } },
         select: { agentSendingUntil: true },

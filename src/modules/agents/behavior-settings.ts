@@ -2,9 +2,11 @@ import { readLimitsConfig } from "@/modules/agents/limits";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
 import { readDebounceConfig } from "@/modules/debounce/settings";
+import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import { readFollowUpConfig } from "@/modules/followups/settings";
 import { readGuardrailsConfig } from "@/modules/guardrails/settings";
 import { readHandoffConfig } from "@/modules/handoff/settings";
+import { readSendImageConfig } from "@/modules/images/settings";
 import { readServiceWindowConfig } from "@/modules/service-window/service";
 import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";
@@ -41,11 +43,13 @@ export interface BehaviorSettings {
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
   handoff: ReturnType<typeof readHandoffConfig>;
+  sendImage: ReturnType<typeof readSendImageConfig>;
   limits: ReturnType<typeof readLimitsConfig>;
   channelRedirect: ReturnType<typeof readChannelRedirectConfig>;
   guardrails: ReturnType<typeof readGuardrailsConfig>;
   // NOTE: Which Chatwoot custom attributes (per scope) are injected into the system prompt.
   attributeContext: ReturnType<typeof readAttributeContextConfig>;
+  observability: ReturnType<typeof readObservabilityConfig>;
 }
 
 // The keys this surface owns inside the settings bag. Any other key (future/unknown) is preserved
@@ -60,10 +64,12 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "grounding",
   "followUp",
   "handoff",
+  "sendImage",
   "limits",
   "channelRedirect",
   "guardrails",
   "attributeContext",
+  "observability",
 ] as const;
 export type BehaviorSettingsKey = (typeof BEHAVIOR_SETTINGS_KEYS)[number];
 
@@ -79,10 +85,12 @@ export function readBehaviorSettings(settings: unknown): BehaviorSettings {
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
     handoff: readHandoffConfig(settings),
+    sendImage: readSendImageConfig(settings),
     limits: readLimitsConfig(settings),
     channelRedirect: readChannelRedirectConfig(settings),
     guardrails: readGuardrailsConfig(settings),
     attributeContext: readAttributeContextConfig(settings),
+    observability: readObservabilityConfig(settings),
   };
 }
 
@@ -98,10 +106,12 @@ export interface BehaviorSettingsPatch {
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
+  sendImage?: Record<string, unknown>;
   limits?: Record<string, unknown>;
   channelRedirect?: Record<string, unknown>;
   guardrails?: Record<string, unknown>;
   attributeContext?: Record<string, unknown>;
+  observability?: Record<string, unknown>;
 }
 
 // Merge a behavior patch into the existing raw settings bag, then RE-READ each touched block through
@@ -140,10 +150,12 @@ export function mergeBehaviorSettings(
   next.serviceWindow = normalized.serviceWindow;
   next.followUp = normalized.followUp;
   next.handoff = normalized.handoff;
+  next.sendImage = normalized.sendImage;
   next.limits = normalized.limits;
   next.channelRedirect = normalized.channelRedirect;
   next.guardrails = normalized.guardrails;
   next.attributeContext = normalized.attributeContext;
+  next.observability = normalized.observability;
   // grounding: only persist when a valid distance is set; otherwise leave whatever was there
   // (a null maxDistance means "no grounding filter" — represent it explicitly when the patch
   // touched grounding so the operator can clear it).

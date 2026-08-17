@@ -13,7 +13,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { type ReactNode, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
@@ -34,6 +34,7 @@ import {
 import { Tooltip } from "@/client/components/Tooltip";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
+import { mergeDocumentEvent } from "@/client/lib/knowledgeDocs";
 import { cn } from "@/client/lib/utils";
 
 type BasesData = Awaited<
@@ -44,6 +45,8 @@ type DocumentsData = Awaited<
   ReturnType<ReturnType<typeof api.api.v1.knowledge.bases>["documents"]["get"]>
 >["data"];
 type KnowledgeDoc = NonNullable<DocumentsData>["documents"][number];
+type EmbeddingBlock = NonNullable<DocumentsData>["embeddingBlock"];
+type BlockReason = NonNullable<EmbeddingBlock>["reason"];
 type DocDetailData = Awaited<
   ReturnType<ReturnType<typeof api.api.v1.knowledge.documents>["get"]>
 >["data"];
@@ -53,6 +56,16 @@ type DocDetail = NonNullable<DocDetailData>["document"];
 type BaseRef = { id: string; name: string };
 
 type UploadStatus = "idle" | "uploading" | "done" | "error";
+
+// How long a burst of blocked documents is allowed to keep pushing the block re-read back. Short
+// enough that the banner corrects itself while the operator is still looking at it, long enough to
+// swallow a batch the scheduler is working through one job at a time.
+const BLOCK_RECHECK_MS = 500;
+
+// How often an open documents modal re-asks on its own, for the configuration changes no document
+// event announces (a credential filled, deleted or replaced in another tab). Slow on purpose: this
+// is a safety net for a screen someone left open, not the path that keeps the banner current.
+const BLOCK_POLL_MS = 30_000;
 
 // A file staged in the add-content modal. Carries its own upload status so a batch shows per-file
 // progress and a partial failure stays visible (the failed ones can be retried without re-picking).
@@ -179,6 +192,10 @@ export function useKnowledgeManager(opts: {
 
   // Docs list
   const [docs, setDocs] = useState<KnowledgeDoc[] | null>(null);
+  // The tenant's embedding block as of the last read, or null when indexing would work. Comes from
+  // the list response rather than from any document row: the block belongs to the configuration, so
+  // a value remembered per document would keep naming a credential the operator has since filled.
+  const [embeddingBlock, setEmbeddingBlock] = useState<EmbeddingBlock>(null);
 
   // Doc preview
   const [docPreview, setDocPreview] = useState<string | null>(null);
@@ -210,23 +227,109 @@ export function useKnowledgeManager(opts: {
   useTenantEvents({
     enabled: docsModal.isOpen,
     onKnowledgeDocument: (event) => {
-      if (event.knowledgeBaseId !== docsModal.payload?.id) return;
+      const baseId = docsModal.payload?.id;
+      if (event.knowledgeBaseId !== baseId) return;
       setDocs((prev) =>
         prev
           ? prev.map((d) =>
-              d.id === event.documentId
-                ? {
-                    ...d,
-                    status: event.status,
-                    chunkCount: event.chunkCount ?? d.chunkCount,
-                    error: event.error ?? d.error,
-                  }
-                : d,
+              d.id === event.documentId ? mergeDocumentEvent(d, event) : d,
             )
           : null,
       );
+      // Any of these events may mean the workspace's embedding configuration changed — another tab
+      // or another administrator can fill, delete or replace the credential while this modal stays
+      // open — and none of them says WHAT it changed to. UNINDEXED means the worker refused;
+      // PROCESSING means it did not; but each describes the configuration as that job found it, and
+      // the job runs on to READY without emitting anything else. So an event is a reason to ask,
+      // never an answer: the server is the only thing that knows the configuration as it is now.
+      scheduleBlockRecheck();
     },
   });
+
+  const blockRecheckTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Tickets order the answers about the block: two reads can be open at once (a burst re-arms the
+  // window while an earlier one is still travelling), and the older one landing last would undo the
+  // newer answer with nothing afterwards to correct it.
+  const blockAnswerSeq = useRef(0);
+  // The newest ticket that actually ARRIVED. Compared against this rather than against the newest
+  // ticket ISSUED, because a read that fails answers nothing: it must not disqualify a good response
+  // that was already travelling when it started.
+  const blockCommitted = useRef(0);
+
+  // Take the ticket BEFORE starting the request, never on arrival: a response that claims its number
+  // when it lands is by definition the newest one, so the ticket would certify exactly the write it
+  // exists to prevent — an answer something faster has already overtaken.
+  function claimBlockAnswer(): number {
+    blockAnswerSeq.current += 1;
+    return blockAnswerSeq.current;
+  }
+
+  // Writes the block only if no NEWER answer has already arrived.
+  function commitBlock(ticket: number, next: EmbeddingBlock) {
+    if (ticket <= blockCommitted.current) return;
+    blockCommitted.current = ticket;
+    setEmbeddingBlock(next);
+  }
+
+  // Which documents modal a list response belongs to. Separate from the block's clock on purpose:
+  // the two arrive in one response but answer different questions. The rows are this base's, and
+  // only a newer OPENING makes them wrong; the block is the workspace's, and a dedicated read that
+  // is faster than the list makes it wrong. Judging the rows by the block's clock let a list
+  // response be refused outright, which left the modal on its skeleton with nothing to retry it.
+  const docsSession = useRef(0);
+
+  // Trailing window rather than a suppress-while-in-flight guard: the scheduler awaits its claimed
+  // jobs one after another, so a batch produces events that need not overlap a short request at
+  // all, and a guard would let each one through — one request per document, from every open tab.
+  function scheduleBlockRecheck() {
+    if (blockRecheckTimer.current) clearTimeout(blockRecheckTimer.current);
+    blockRecheckTimer.current = setTimeout(() => {
+      blockRecheckTimer.current = null;
+      void recheckBlock();
+    }, BLOCK_RECHECK_MS);
+  }
+
+  // A pending window outlives the component otherwise, and fires a request for a screen that is
+  // gone.
+  useEffect(
+    () => () => {
+      if (blockRecheckTimer.current) clearTimeout(blockRecheckTimer.current);
+    },
+    [],
+  );
+
+  // The events above only fire when a job runs. Filling, deleting or replacing the credential is a
+  // configuration change with no job attached, so nothing would tell an open modal about it, and the
+  // banner would go on describing a block that was resolved — or stay silent about one that appeared
+  // — until the operator reopened it or tried to index. A slow poll closes that without a new
+  // realtime channel: the read is one workspace-scoped question, and the window above already
+  // collapses it against the event-driven reads.
+  // `recheckBlock` reads only refs and the api client, so the closure captured here behaves the same
+  // on every render; listing it would tear the interval down and rebuild it on each one, which never
+  // reaches 30s and so never polls at all.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: explained directly above
+  useEffect(() => {
+    if (!docsModal.isOpen) return;
+    const id = setInterval(() => void recheckBlock(), BLOCK_POLL_MS);
+    return () => clearInterval(id);
+  }, [docsModal.isOpen]);
+
+  // Asks the workspace-scoped endpoint, not a base's document list: the question has nothing to do
+  // with which base is open, and answering it by re-downloading a list was what forced every caller
+  // to remember that the answer's scope and the request's scope were different things.
+  async function recheckBlock() {
+    const ticket = claimBlockAnswer();
+    try {
+      const { data } = await api.api.v1.knowledge["embedding-block"].get();
+      if (data) commitBlock(ticket, data.block ?? null);
+    } catch {
+      // A failed read is not news about the configuration, so the last answer stands. Swallowed
+      // rather than surfaced: this runs on a timer, so an offline browser would otherwise raise the
+      // same rejection every 30s for as long as the modal is open, and the operator already has the
+      // console's own signals for being offline.
+    }
+  }
 
   useOnModalOpen(createModal, () => {
     setName("");
@@ -514,18 +617,30 @@ export function useKnowledgeManager(opts: {
   async function openDocs(b: BaseRef) {
     setDocs(null);
     docsModal.open({ id: b.id, name: b.name });
+    // Everything issued for the previous session is void, answered or not: this is a different
+    // modal now, possibly on a different base, and an old response landing into it would show the
+    // documents and the block of a screen the operator already closed (docs/modals.md).
+    blockCommitted.current = blockAnswerSeq.current;
+    const session = ++docsSession.current;
+    const ticket = claimBlockAnswer();
     const { data } = await api.api.v1.knowledge
       .bases({ id: b.id })
       .documents.get();
-    if (data) setDocs(data.documents);
+    if (!data || session !== docsSession.current) return;
+    setDocs(data.documents);
+    commitBlock(ticket, data.embeddingBlock ?? null);
   }
 
   // Refetch the open documents modal's list in place (after an edit, so the new title/status shows).
   async function reloadDocs(baseId: string) {
+    const session = docsSession.current;
+    const ticket = claimBlockAnswer();
     const { data } = await api.api.v1.knowledge
       .bases({ id: baseId })
       .documents.get();
-    if (data) setDocs(data.documents);
+    if (!data || session !== docsSession.current) return;
+    setDocs(data.documents);
+    commitBlock(ticket, data.embeddingBlock ?? null);
   }
 
   async function saveDocEdit() {
@@ -618,6 +733,7 @@ export function useKnowledgeManager(opts: {
           )
         : null,
     );
+    const ticket = claimBlockAnswer();
     try {
       const { data, error: err } = await api.api.v1.knowledge
         .bases({ id: baseId })
@@ -625,20 +741,20 @@ export function useKnowledgeManager(opts: {
       if (err) throw err;
       // A missing prerequisite (embedding not configured, or its credential not filled yet) queues
       // nothing and leaves the docs UNINDEXED. Surface the reason + the fix instead of faking progress.
+      // The reindex answer IS a fresh read of the block, and it may be newer than the one the modal
+      // opened with (a credential deleted, or filled, meanwhile). Adopt it in BOTH directions: with
+      // a block, or the toast fades and the badges go back to a neutral "Not indexed" the server
+      // just contradicted; without one, or the snapshot goes on explaining a block that the queued
+      // jobs just disproved.
+      commitBlock(
+        ticket,
+        data?.blocked ? { reason: data.blocked.reason } : null,
+      );
       if (data?.blocked) {
         revert();
-        showToast(
-          data.blocked.reason === "embedding_not_configured"
-            ? t(
-                "knowledge.indexBlockedNotConfigured",
-                "Embedding is not configured. Set the tenant's embedding (provider/model/credential) before indexing.",
-              )
-            : t(
-                "knowledge.indexBlockedCredentialPending",
-                "The embedding credential isn't filled yet. Fill its secret in the vault, then try again.",
-              ),
-          "warning",
-        );
+        // Same text as the banner, from the same function: two wordings for one reason is how the
+        // third one ended up described as the second (review finding, round 6).
+        showToast(blockTextFor(data.blocked.reason), "warning");
         return;
       }
       // Refetch the consumer's catalog so surfaces derived from unindexed counts
@@ -722,6 +838,36 @@ export function useKnowledgeManager(opts: {
     return error;
   }
 
+  // Operator-facing text for one block reason. The three need different instructions: create a
+  // credential, fill the one that exists, or replace one whose secret is blank — sending someone to
+  // the wrong one is the whole complaint. Exhaustive on purpose, with no `default`: the return type
+  // makes a fourth reason a compile error here rather than a branch that quietly falls into one of
+  // the other two.
+  function blockTextFor(reason: BlockReason): string {
+    switch (reason) {
+      case "embedding_not_configured":
+        return t(
+          "knowledge.embeddingBlock.notConfigured",
+          "The embedding credential is not configured for this workspace. Set it under Components, then index again.",
+        );
+      case "credential_pending":
+        return t(
+          "knowledge.embeddingBlock.pending",
+          "The embedding credential was never filled in. Fill it under Components, then index again.",
+        );
+      case "credential_empty":
+        return t(
+          "knowledge.embeddingBlock.empty",
+          "The embedding credential is empty. Fill it in, then index again.",
+        );
+    }
+  }
+
+  // The tenant's CURRENT block as text, or null when there is none.
+  function embeddingBlockText(): string | null {
+    return embeddingBlock ? blockTextFor(embeddingBlock.reason) : null;
+  }
+
   function docStatusBadge(doc: KnowledgeDoc) {
     if (doc.status === "READY") {
       return (
@@ -768,10 +914,32 @@ export function useKnowledgeManager(opts: {
     }
     if (doc.status === "UNINDEXED") {
       // Imported-but-never-indexed: a deliberate waiting state (warning tint), not an error (no red).
-      return (
-        <span className="rounded-full bg-warning-soft px-2 py-0.5 text-warning text-xs">
-          {t("knowledge.docStatus.UNINDEXED", "Not indexed")}
+      // While the workspace is blocked it is NOT merely waiting — nothing the operator does on this
+      // screen will index it until a credential is sorted out — so the badge says which of the two
+      // this is (issue #80) instead of reading identically in both cases. Keyed off the CURRENT
+      // block, so it stops saying "blocked" the moment the block is gone.
+      const blockText = embeddingBlockText();
+      const badge = (
+        <span
+          className={cn(
+            "rounded-full bg-warning-soft px-2 py-0.5 text-warning text-xs",
+            {
+              "cursor-help underline decoration-dotted underline-offset-2":
+                !!blockText,
+            },
+          )}
+        >
+          {blockText
+            ? t("knowledge.docStatus.UNINDEXED_BLOCKED", "Not indexed: blocked")
+            : t("knowledge.docStatus.UNINDEXED", "Not indexed")}
         </span>
+      );
+      return blockText ? (
+        <Tooltip content={blockText} side="top">
+          {badge}
+        </Tooltip>
+      ) : (
+        badge
       );
     }
     return (
@@ -1178,10 +1346,11 @@ export function useKnowledgeManager(opts: {
               {docs.some((d) => d.status === "UNINDEXED") && (
                 <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warning bg-warning-soft px-3 py-2">
                   <span className="text-text-secondary text-xs">
-                    {t(
-                      "knowledge.unindexedNote",
-                      "Some documents aren't indexed yet and won't be searchable until you index them.",
-                    )}
+                    {embeddingBlockText() ??
+                      t(
+                        "knowledge.unindexedNote",
+                        "Some documents aren't indexed yet and won't be searchable until you index them.",
+                      )}
                   </span>
                   <Button
                     size="sm"

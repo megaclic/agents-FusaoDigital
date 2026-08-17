@@ -145,6 +145,9 @@ export function normalizeChatwootEvent(
   // `channel` (channel_type) is exposed by EventDataPresenter on conversation events.
   normalized.channel = conv ? str(conv.channel) : null;
   normalized.lastActivityAt = conv ? num(conv.last_activity_at) : null;
+  // NOTE: float() and not num() — `updated_at` ships as `to_f`, so it carries a fraction, and num()
+  // parses ids (its string branch is integers only).
+  normalized.conversationUpdatedAt = conv ? float(conv.updated_at) : null;
   return normalized;
 }
 
@@ -164,6 +167,11 @@ export interface LiveConversationState {
   // `timestamp`, epoch seconds). Lets the live-probe reconcile compare freshness against the
   // mirror's monotonic lastEventAt. null when the payload omits both.
   lastActivityAt: Date | null;
+  // NOTE: The conversation's own version, the same `updated_at.to_f` the webhook carries — the REST
+  // show renders it too (`api/v1/conversations/partials/_conversation.json.jbuilder`). A reconcile
+  // that wrote newer state without it would leave the row ahead of its own marks, and the next
+  // delayed conversation event would look newer than them. null on a Chatwoot too old to send it.
+  updatedAt: number | null;
 }
 
 export function parseLiveConversation(
@@ -190,6 +198,7 @@ export function parseLiveConversation(
     assigneeId,
     assigneeName: assignee ? str(assignee.name) : null,
     lastActivityAt: activitySec !== null ? new Date(activitySec * 1000) : null,
+    updatedAt: num(raw.updated_at),
   };
 }
 

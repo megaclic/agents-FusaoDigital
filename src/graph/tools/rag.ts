@@ -36,8 +36,15 @@ const NO_GROUNDED_INFO =
 // length-bounded and the whole list capped, so a verbose KB description never bloats the prompt.
 const SEARCH_BASE_DESC =
   "Search the knowledge base for information to help answer the customer. Returns the most relevant passages.";
+// NOTE: The contract, not just the mechanics. Approval copies `content` into the knowledge base
+// verbatim, and a later answer is grounded ONLY on what search returns — so a hedge written into the
+// content ("solicita-se validação") is embedded and comes back as a hedge in every answer on that
+// subject, forever (issue #81). Told only "propose an entry for human review", a model reasonably
+// writes a message TO the reviewer, and hedging is the polite register for that. Naming the reader
+// (the future retrieval, not the reviewer) and pointing doubt at `rationale` is the fix at the
+// source, the same way grounding is a runtime invariant instead of a habit each tenant rediscovers.
 const SUGGEST_BASE_DESC =
-  "Propose a new knowledge-base entry for human review. It is queued for approval and is NOT used until a human approves it.";
+  "Propose a new knowledge-base entry for human review. It is queued for approval and is NOT used until a human approves it. On approval the `content` becomes the entry EXACTLY as you wrote it, and later answers are grounded on that text alone — so write it as a standalone statement that reads correctly with no conversation around it. Conditions, limits and exceptions that are PART OF THE FACT belong in the content and must be kept there ('free shipping above R$200', 'only for contracts signed after March'): dropping them would store a rule that is wrong outside its conditions. What does not belong is doubt ABOUT the fact — 'please confirm', 'subject to validation' — or any commentary about the suggestion itself, because approval turns that text into the answer the agent gives from then on. Uncertainty and provenance go in `rationale`, which the reviewer reads and which never enters the knowledge base.";
 
 // Compact, length-bounded XML of the selected bases, shared by the search and suggest tool
 // descriptions and appended at the END. The `name` attribute is the valid value for the
@@ -227,18 +234,30 @@ function suggestTool(ctx: RagToolCtx) {
   // entry belongs (otherwise it silently lands in the first base, and the reviewer can't tell intent
   // from accident). With one base (or none named) there is no choice, so the parameter is omitted.
   const requireBase = distinctNames.length >= 2;
+  const content = z
+    .string()
+    .min(1)
+    .describe(
+      "The entry itself, stored verbatim on approval. A standalone statement that stands on its own with no conversation around it. Keep the conditions and exceptions that make it true; leave out doubt about whether it is true, requests to validate it, and notes to the reviewer.",
+    );
+  const title = z
+    .string()
+    .optional()
+    .describe("Short label for the entry, for the reviewer and the listing.");
+  const rationale = z
+    .string()
+    .optional()
+    .describe(
+      "For the reviewer only, never stored in the knowledge base: where this came from and anything you could not confirm.",
+    );
   const schema = requireBase
     ? z.object({
-        content: z.string().min(1),
+        content,
         knowledge_base: z.enum(distinctNames as [string, ...string[]]),
-        title: z.string().optional(),
-        rationale: z.string().optional(),
+        title,
+        rationale,
       })
-    : z.object({
-        content: z.string().min(1),
-        title: z.string().optional(),
-        rationale: z.string().optional(),
-      });
+    : z.object({ content, title, rationale });
 
   return tool(
     async (args: {

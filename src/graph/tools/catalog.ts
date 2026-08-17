@@ -16,6 +16,7 @@ export const NATIVE_TOOL_NAMES = [
   "react_to_message",
   "route_to_queue",
   "schedule_message",
+  "send_image",
   "skip_reply",
   "calculator",
   "get_current_time",
@@ -41,6 +42,7 @@ export const NATIVE_TOOL_CATEGORY: Record<NativeToolName, NativeToolCategory> =
     react_to_message: "conversation",
     route_to_queue: "conversation",
     schedule_message: "conversation",
+    send_image: "conversation",
     skip_reply: "conversation",
     calculator: "utility",
     get_current_time: "utility",
@@ -78,6 +80,9 @@ export const NATIVE_TOOL_RISK: Record<NativeToolName, RiskTier> = {
   react_to_message: "low",
   route_to_queue: "medium",
   schedule_message: "medium",
+  // NOTE: The only native tool that reaches OUTSIDE, on a URL the model chose, and delivers the
+  // result to the customer. The operator's host allowlist is what bounds it.
+  send_image: "medium",
   skip_reply: "low",
   calculator: "low",
   get_current_time: "low",

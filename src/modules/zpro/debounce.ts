@@ -28,6 +28,11 @@ import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import type { JobResult } from "@/modules/scheduler/worker";
 import { sysCtx } from "./ctx";
+import {
+  announceZproFailedTurn,
+  clearZproConversationError,
+  recordZproConversationError,
+} from "./failure";
 import { withQuotedPrefix } from "./parse";
 import { loadZproAgent, runLoadedZproTurn, zproThreadId } from "./runtime";
 import type { NormalizedZproEvent } from "./types";
@@ -276,17 +281,40 @@ export async function flushZproDebounceJob(
     detail: { coalesced: pending.length },
   });
 
-  const outcome = await runLoadedZproTurn({
-    loaded,
-    tenantId,
-    zproInstanceId,
-    event,
-    text,
-    turnId,
-    userSentAudio,
-    base,
-    shouldPost,
-  });
+  // A thrown error (LLM/Z-PRO) bubbles to the worker → retry with backoff (watermark not advanced,
+  // so the retry re-answers the same burst). Also surfaced on the conversation (upstream #86 parity,
+  // src/modules/zpro/failure.ts) so the operator sees a badge; a successful answer clears it. The
+  // dead-letter announcement (the private note INSIDE the ticket) fires separately, only once the
+  // scheduler has definitively given up — see announceDeadZproDebounceFlush below.
+  let outcome: Awaited<ReturnType<typeof runLoadedZproTurn>>;
+  try {
+    outcome = await runLoadedZproTurn({
+      loaded,
+      tenantId,
+      zproInstanceId,
+      event,
+      text,
+      turnId,
+      userSentAudio,
+      base,
+      shouldPost,
+    });
+  } catch (err) {
+    await recordZproConversationError({
+      tenantId,
+      conversationDbId: ctx.convDbId,
+      error: err,
+      base,
+    });
+    throw err;
+  }
+  if (outcome === "posted") {
+    await clearZproConversationError({
+      tenantId,
+      conversationDbId: ctx.convDbId,
+      base,
+    });
+  }
   logger.info(
     "zpro debounce flush: conv=%s msgs=%d watermark→%s outcome=%s",
     String(ctx.convDbId),
@@ -313,4 +341,49 @@ export async function flushZproDebounceJob(
     );
   }
   return { outcome: "done" };
+}
+
+// The burst is definitively unanswered: the flush exhausted its attempts and the row is DEAD, so no
+// retry is coming — mirrors Chatwoot's announceDeadDebounceFlush (debounce/handler.ts), registered
+// as this SAME "DEBOUNCE" kind's dead-letter handler (dispatched by thread shape, see
+// deadDebounceFlushHandler in debounce/handler.ts).
+export async function announceDeadZproDebounceFlush(
+  job: ClaimedJob,
+  error: string,
+  base: PrismaClient,
+): Promise<void> {
+  const threadId =
+    typeof job.payload.threadId === "string" ? job.payload.threadId : null;
+  if (!threadId) return;
+  const parsed = parseZproThreadId(threadId);
+  if (!parsed || parsed.tenantId !== job.tenantId) return;
+  const { zproInstanceId, ticketId } = parsed;
+  const tenantId = job.tenantId;
+  const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.findUnique({
+      where: { zproInstanceId_ticketId: { zproInstanceId, ticketId } },
+      select: { id: true },
+    }),
+  );
+  if (!conv) return;
+  await announceZproFailedTurn({
+    tenantId,
+    zproInstanceId,
+    conversationDbId: conv.id,
+    ticketId,
+    // NOTE: Re-read rather than trust the dead-letter that got us here — armDebounce upserts this
+    // very row back to PENDING on the next inbound message, and a row that is queued again is a
+    // turn that is coming, mirrors Chatwoot's exact reasoning (debounce/handler.ts).
+    assess: async () => {
+      const row = await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.schedulerJob.findUnique({
+          where: { id: job.id },
+          select: { status: true },
+        }),
+      );
+      return { path: "job", deadLettered: row?.status === "DEAD" };
+    },
+    error,
+    base,
+  });
 }

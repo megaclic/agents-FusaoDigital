@@ -67,6 +67,7 @@ import {
   type ChannelRedirectConfig,
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
+import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import {
   GUARDRAILS_DEFAULTS,
@@ -74,7 +75,7 @@ import {
   readGuardrailsConfig,
 } from "@/modules/guardrails/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
-import { BehaviorTab } from "./BehaviorTab";
+import { BehaviorTab, type SendImageState } from "./BehaviorTab";
 import {
   type ChannelRedirectFormState,
   ChannelRedirectTab,
@@ -239,6 +240,7 @@ function readModelState(a: Agent) {
     credentialRef: str(mc.credentialRef),
     baseURL: str(mc.baseURL),
     temperature: num(mc.temperature),
+    reasoningEffort: str(mc.reasoningEffort),
   };
 }
 
@@ -274,6 +276,8 @@ function readBehaviorState(a: Agent) {
   const tg = (s.toolGuidance ?? {}) as Record<string, unknown>;
   const li = (s.limits ?? {}) as Record<string, unknown>;
   const ac = (s.attributeContext ?? {}) as Record<string, unknown>;
+  const si = (s.sendImage ?? {}) as Record<string, unknown>;
+
   // NOTE: Attribute keys per scope: plain string lists (the runtime reader trims/dedups/caps them).
   const attrKeys = (v: unknown): string[] =>
     Array.isArray(v) ? v.filter((k): k is string => typeof k === "string") : [];
@@ -361,6 +365,12 @@ function readBehaviorState(a: Agent) {
       contact: attrKeys(ac.contact),
       task: attrKeys(ac.task),
     },
+    sendImage: { allowedHosts: attrKeys(si.allowedHosts).join("\n") },
+    // NOTE: through the SAME reader the runtime uses, not a hand-rolled check: a bag that came from
+    // REST or an import can carry the string "true", which the runtime honors — reading it stricter
+    // here would show the switch off while values were being logged, and would then persist that lie
+    // on the next save.
+    observability: readObservabilityConfig(s),
   };
 }
 
@@ -612,6 +622,14 @@ export function AgentEditorPage() {
   });
   // Runtime limits. Mirrors agent.settings.limits (modules/agents/limits): the per-turn tool-call cap.
   const [limits, setLimits] = useState({ maxToolCalls: "10" });
+  // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
+  // agent.settings.observability (modules/flowlog/settings).
+  const [observability, setObservability] = useState({ logToolValues: false });
+  // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
+  // (modules/images/settings), edited as one host per line.
+  const [sendImage, setSendImage] = useState<SendImageState>({
+    allowedHosts: "",
+  });
   // NOTE: Which Chatwoot custom attributes are injected into the prompt as current values, per
   // scope. Mirrors agent.settings.attributeContext (modules/chatwoot/attributes).
   const [attributeContext, setAttributeContext] = useState<{
@@ -669,6 +687,7 @@ export function AgentEditorPage() {
     credentialRef: "",
     baseURL: "",
     temperature: "",
+    reasoningEffort: "",
   });
   // Base URL from the selected model credential (locks the input when set).
   const [modelCredBaseUrl, setModelCredBaseUrl] = useState<string | null>(null);
@@ -788,6 +807,8 @@ export function AgentEditorPage() {
     setFollowUp(b.followUp);
     setVision(b.vision);
     setLimits(b.limits);
+    setObservability(b.observability);
+    setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
     setGuardrails(readGuardrailsConfig(a.settings));
@@ -819,6 +840,8 @@ export function AgentEditorPage() {
     setFollowUp(b.followUp);
     setVision(b.vision);
     setLimits(b.limits);
+    setObservability(b.observability);
+    setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
 
@@ -960,6 +983,11 @@ export function AgentEditorPage() {
     if (model.credentialRef) cfg.credentialRef = model.credentialRef;
     if (model.baseURL.trim()) cfg.baseURL = model.baseURL.trim();
     if (model.temperature !== "") cfg.temperature = Number(model.temperature);
+    // Only openai has the endpoint that carries reasoning together with tools, and the backend
+    // schema rejects the field on every other provider — so a leftover value from a provider swap
+    // must not be serialized.
+    if (model.reasoningEffort && model.provider === "openai")
+      cfg.reasoningEffort = model.reasoningEffort;
     return cfg;
   }
 
@@ -1078,10 +1106,17 @@ export function AgentEditorPage() {
       limits: {
         maxToolCalls: Number(limits.maxToolCalls) || 10,
       },
+      observability: { logToolValues: observability.logToolValues },
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
         task: attributeContext.task,
+      },
+      sendImage: {
+        allowedHosts: sendImage.allowedHosts
+          .split("\n")
+          .map((h) => h.trim())
+          .filter(Boolean),
       },
     };
   }
@@ -1113,6 +1148,8 @@ export function AgentEditorPage() {
       vision,
       limits,
       attributeContext,
+      sendImage,
+      observability,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1605,6 +1642,8 @@ export function AgentEditorPage() {
     setFollowUp(b.followUp);
     setVision(b.vision);
     setLimits(b.limits);
+    setObservability(b.observability);
+    setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
   const revertChannelRedirect = () => {
@@ -2526,6 +2565,10 @@ export function AgentEditorPage() {
                 onVisionEntryChange={onVisionEntryChange}
                 limits={limits}
                 setLimits={setLimits}
+                observability={observability}
+                setObservability={setObservability}
+                sendImage={sendImage}
+                setSendImage={setSendImage}
                 attributeContext={attributeContext}
                 setAttributeContext={setAttributeContext}
                 onScheduleSaved={onScheduleSaved}

@@ -36,6 +36,7 @@ import {
 } from "@/modules/appointments/reminders";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import type { SendImageConfig } from "@/modules/images/settings";
 import { buildToolpackTools } from "@/modules/integrations/toolpacks";
 import type { ZproClient } from "./client";
 import {
@@ -97,6 +98,9 @@ export interface LoadZproAgentToolsParams {
   // set_custom_attribute's own live read-before-write, but a few-second staleness window is a
   // reasonable trade for a read-only "what do we already know" tool).
   contactExtraInfo?: Array<{ name: string; value: string }>;
+  // send_image's host allowlist (agent.settings.sendImage), resolved by the caller (runtime.ts's
+  // loadZproAgent) from the same settings bag pipelineId/maxDistance already come from.
+  sendImage?: SendImageConfig;
 }
 
 export async function loadZproAgentTools(
@@ -408,6 +412,7 @@ export async function loadZproAgentTools(
         ),
         contactExtraInfo: params.contactExtraInfo ?? [],
         kanban,
+        sendImage: params.sendImage,
         onSideEffectError,
       },
       allow,

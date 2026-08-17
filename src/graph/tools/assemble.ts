@@ -53,6 +53,12 @@ export interface LoadedHttpToolDef {
   query: unknown;
   // Request body shape: { mode: "kv", rows } | { mode: "raw", raw } | legacy { mode: "fields" }.
   body: unknown;
+  // HTTP statuses this tool declares as results rather than integration failures (issue #59).
+  // Required, unlike on `HttpToolDef`: a turn gets its definitions from `loadToolSelections`, whose
+  // Prisma `select` enumerates its columns, so an optional field here is one a future column can be
+  // forgotten in — silently, since a missing column reads as `undefined` and normalizes to "declare
+  // nothing". Keeping it required makes both the select and the mapping a compile error to skip.
+  expectedStatuses: number[];
 }
 
 export interface AgentToolSelections {
@@ -97,6 +103,7 @@ export async function loadToolSelections(
           enabled: true,
           ackEnabled: true,
           ackMessage: true,
+          expectedStatuses: true,
         },
       },
       mcpServerConnection: {
@@ -162,6 +169,7 @@ export async function loadToolSelections(
           ackMessage: td.ackMessage,
           query: td.query,
           body: td.body,
+          expectedStatuses: td.expectedStatuses,
         });
         break;
       }
@@ -314,6 +322,7 @@ export function buildHttpTools(
       ackMessage: d.ackEnabled ? d.ackMessage : null,
       query: d.query,
       body: d.body,
+      expectedStatuses: d.expectedStatuses,
     };
     return buildHttpTool(def, deps);
   });

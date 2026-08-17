@@ -232,6 +232,11 @@ export async function rescheduleJob(
 }
 
 // Failure: attempts++; retry with backoff until the cap, then DEAD.
+// Returns whether this call is the one that DEAD-LETTERED the job — the attempt count alone does not
+// say so. The CAS is on `status = 'CLAIMED'`, and a job re-armed mid-run (`armDebounce` upserts the
+// claimed row back to PENDING) no longer matches it: the row survives with another run already
+// queued, so a caller reading `attempts` would call a live job dead. Anything hanging off "this work
+// is definitively lost" has to hang off this, not off the failure (issue #71).
 export async function failJob(
   tenantId: bigint,
   id: bigint,
@@ -239,10 +244,10 @@ export async function failJob(
   error: string,
   base: PrismaClient = basePrisma,
   now: Date = new Date(),
-): Promise<void> {
+): Promise<{ deadLettered: boolean }> {
   const next = attempts + 1;
   const dead = next >= MAX_ATTEMPTS;
-  await runScopedOn(base, sysCtx(tenantId), (db) =>
+  const { count } = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.schedulerJob.updateMany({
       where: { id, status: "CLAIMED" },
       data: dead
@@ -255,29 +260,54 @@ export async function failJob(
           },
     }),
   );
+  return { deadLettered: dead && count > 0 };
 }
 
 // Reaper: a CLAIMED row older than `staleMs` is presumed crashed → back to PENDING (attempts++ so
 // poison eventually dies). Cross-tenant, so asSuperAdmin. `tenantId` is the same test-only fence as
 // the claim's: without it, a concurrent suite's reap bumps this run's attempts underneath it.
+// Returns every row it touched, because the reaper is the SECOND way a job reaches DEAD: a claim that
+// crashed or hung is killed here, not by `failJob`, and a caller that hangs its "this work is
+// definitively lost" reaction off failJob alone would never hear about those (issue #71 review).
+export interface ReapedJob extends ClaimedJob {
+  status: "PENDING" | "DEAD";
+}
+
 export async function reapStaleJobs(
   staleMs: number,
   base: PrismaClient = basePrisma,
   now: Date = new Date(),
   tenantId?: bigint,
-): Promise<number> {
+): Promise<ReapedJob[]> {
   const cutoff = new Date(now.getTime() - staleMs);
   const tenantClause =
     tenantId != null ? Prisma.sql`AND tenant_id = ${tenantId}` : Prisma.empty;
   return asSuperAdminOn(base, async (db) => {
-    const requeued = await db.$executeRaw(Prisma.sql`
+    const rows = await db.$queryRaw<
+      Array<{
+        id: bigint;
+        tenant_id: bigint;
+        kind: string;
+        payload: unknown;
+        attempts: number;
+        status: "PENDING" | "DEAD";
+      }>
+    >(Prisma.sql`
       UPDATE scheduler_jobs
       SET status = CASE WHEN attempts + 1 >= ${MAX_ATTEMPTS} THEN 'DEAD'::"SchedulerJobStatus" ELSE 'PENDING'::"SchedulerJobStatus" END,
           attempts = attempts + 1,
           claimed_at = NULL,
           updated_at = now()
-      WHERE status = 'CLAIMED' AND claimed_at < ${cutoff} ${tenantClause}`);
-    return requeued;
+      WHERE status = 'CLAIMED' AND claimed_at < ${cutoff} ${tenantClause}
+      RETURNING id, tenant_id, kind, payload, attempts, status`);
+    return rows.map((r) => ({
+      id: r.id,
+      tenantId: r.tenant_id,
+      kind: r.kind as ClaimedJob["kind"],
+      payload: (r.payload ?? {}) as ClaimedJob["payload"],
+      attempts: r.attempts,
+      status: r.status,
+    }));
   });
 }
 

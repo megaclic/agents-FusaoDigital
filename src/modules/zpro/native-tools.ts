@@ -61,6 +61,21 @@
 //                         src/graph/tools/native.ts) — exists because a delayed-send request used to
 //                         be pure hallucination: the model confirmed it in prose with no tool call
 //                         behind it, so nothing ever arrived.
+//   send_image             → ZproClient.sendMediaUrl (upstream #76 parity), reading the SAME
+//                         agent.settings.sendImage.allowedHosts config Chatwoot's version does
+//                         (src/modules/images/settings.ts, fully channel-agnostic — no UI change
+//                         needed). Deliberately SIMPLER than Chatwoot's: Chatwoot has no "send by
+//                         URL" primitive, so it downloads the image itself (byte cap, signature
+//                         sniff, a per-turn queue delivered after the graph's gates) before
+//                         re-uploading it as an attachment. Z-PRO's sendMediaUrl accepts the
+//                         operator-approved URL directly — no download, no re-upload, no queue —
+//                         so this sends immediately inside the tool call, same as every other
+//                         direct-send native tool here (marks agentSendingUntil first, like
+//                         handoff_to_human's customerMessage, to avoid the false-HUMAN echo
+//                         misclassification). The trade-off: an image sent this way does NOT pass
+//                         through the output guardrail (only its caption would have) — an accepted,
+//                         documented gap Chatwoot's own fuller implementation shares (its captions
+//                         are screened, the picture itself never is).
 //
 // react_to_message has NO analog: the external Z-PRO API exposes no message-reaction endpoint at
 // all (confirmed against the full vendor Postman collection, docs/zpro-api-reference.md). It is
@@ -78,6 +93,12 @@ import { toolFailure } from "@/graph/tools/failure";
 import { simulatedTool } from "@/graph/tools/native";
 import { runScopedOn } from "@/lib/tenancy";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
+import {
+  isAllowedImageHost,
+  SEND_IMAGE_DEFAULTS,
+  SEND_IMAGE_MAX_CAPTION_CHARS,
+  type SendImageConfig,
+} from "@/modules/images/settings";
 import type { SideEffectErrorReporter } from "@/modules/integrations/toolpacks";
 import {
   clampDelayMinutes,
@@ -140,6 +161,10 @@ export interface ZproToolCtx {
   currentQueueName?: string | null;
   contactTagNames?: string[];
   contactExtraInfo?: Array<{ name: string; value: string }>;
+  // send_image's host allowlist — same agent.settings.sendImage config Chatwoot's version reads
+  // (src/modules/images/settings.ts). Absent ⇒ SEND_IMAGE_DEFAULTS (empty allowlist, refuses every
+  // call).
+  sendImage?: SendImageConfig;
   onSideEffectError?: SideEffectErrorReporter;
 }
 
@@ -843,6 +868,102 @@ function scheduleMessageTool(ctx: ZproToolCtx) {
   );
 }
 
+// ── send_image (upstream #76 parity — see the module header for why this is simpler than
+// src/graph/tools/native.ts's version: sendMediaUrl needs no download/re-upload/queue) ────
+
+function sendImageRefusal(hostname: string | null, hosts: string[]): string {
+  if (hosts.length === 0) {
+    return "Não posso enviar imagens: nenhum host foi liberado para esta configuração. Responda com o link em texto.";
+  }
+  if (hostname === null) {
+    return "Essa URL não é válida para envio de imagem. Confira o endereço ou responda com o link em texto.";
+  }
+  // NOTE: The rejected host is deliberately NOT echoed — same reasoning as
+  // src/graph/tools/native.ts's sendImageRefusal (this string is the tool's OUTPUT, stored
+  // verbatim in ExecutionLog.detail by ToolFlowLogger; the model already knows which URL it asked
+  // for, and the hosts it MAY use are in the tool's own description).
+  return "Esse host não está na lista de hosts liberados, então a imagem não foi enviada. Responda com o link em texto.";
+}
+
+function sendImageTool(ctx: ZproToolCtx) {
+  const cfg = ctx.sendImage ?? SEND_IMAGE_DEFAULTS;
+  const hosts = cfg.allowedHosts;
+  const baseDescription =
+    "Send an IMAGE to the customer as an attachment, given its URL. Use it whenever you have the URL of a picture the customer would rather see than read about (a product photo, a plan, a receipt). The URL must come from data you actually received — another tool's result, the knowledge base, the conversation — never one you compose or guess. Optionally include a short caption. Only the hosts listed below can be reached; anything else is refused, so if the image you have is elsewhere, describe it or send the page link as text instead.";
+  const hostsXml = `<imagens-permitidas>${
+    hosts.length
+      ? hosts.map((h) => `\n  <host>${xmlEscape(h)}</host>`).join("")
+      : "\n  <nenhum>Nenhum host liberado: a ferramenta vai recusar qualquer URL até o operador configurar a lista.</nenhum>"
+  }\n</imagens-permitidas>`;
+  const description = withOperatorNote(
+    baseDescription,
+    ctx,
+    "send_image",
+    hostsXml,
+  );
+  return tool(
+    async ({ url, caption }: { url: string; caption?: string }) => {
+      let hostname: string | null;
+      try {
+        hostname = new URL(url).hostname;
+      } catch {
+        hostname = null;
+      }
+      if (!hostname || !isAllowedImageHost(hostname, hosts)) {
+        return sendImageRefusal(hostname, hosts);
+      }
+      // Direct send (no turn-end queue — see the module header): mark BEFORE sending, same as
+      // handoff_to_human's customerMessage, so the webhook echo of this fromMe message classifies
+      // as AGENT instead of a false HUMAN takeover.
+      if (ctx.zproInstanceId != null) {
+        await markAgentSending(
+          ctx.tenantId,
+          ctx.zproInstanceId,
+          ctx.ticketId,
+          ctx.base,
+        );
+      }
+      try {
+        await ctx.client.sendMediaUrl(
+          ctx.contactNumber,
+          url,
+          caption?.trim() || undefined,
+        );
+      } catch (e) {
+        logger.warn(
+          "zpro send_image failed (ticket=%s): %s",
+          String(ctx.ticketId),
+          e instanceof Error ? e.message : String(e),
+        );
+        ctx.onSideEffectError?.({ tool: "send_image", phase: "send", err: e });
+        return toolFailure(
+          "Não consegui enviar a imagem agora. Responda com o link em texto.",
+        );
+      }
+      return "Imagem enviada ao cliente.";
+    },
+    {
+      name: "send_image",
+      description,
+      schema: z.object({
+        url: z
+          .string()
+          .min(1)
+          .describe(
+            "Direct https URL of the image file itself (not the page that shows it). Its host must be one of the allowed ones.",
+          ),
+        caption: z
+          .string()
+          .max(SEND_IMAGE_MAX_CAPTION_CHARS)
+          .optional()
+          .describe(
+            "Optional short text delivered with the image, in the customer's language.",
+          ),
+      }),
+    },
+  );
+}
+
 // ── skip_reply (identical to Chatwoot's — pure, never touches a client) ────
 
 function skipReplyTool(_ctx: ZproToolCtx) {
@@ -885,6 +1006,7 @@ export function buildZproNativeTools(
     updateKanbanTaskTool(ctx),
     routeToQueueTool(ctx),
     scheduleMessageTool(ctx),
+    sendImageTool(ctx),
     skipReplyTool(ctx),
   ];
   if (!allowed) return all;

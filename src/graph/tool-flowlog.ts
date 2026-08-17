@@ -1,18 +1,49 @@
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { Serialized } from "@langchain/core/load/serializable";
+import type { StructuredToolInterface } from "@langchain/core/tools";
+import { toJsonSchema } from "@langchain/core/utils/json_schema";
 import { sanitizeErrorMessage } from "@/lib/redact";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import { type DeclaredKeys, describeShape } from "@/modules/flowlog/shape";
+
+// The parameter names each tool DECLARED, by tool name. `describeShape` names a top-level argument
+// only when it appears here, so a key the model or a provider invented is counted instead of logged.
+// Derived from the same schemas the model is given; a tool whose schema is not an object contributes
+// nothing, which means none of its keys are ever named.
+function declaredKeysByTool(
+  tools: readonly StructuredToolInterface[],
+): Map<string, ReadonlySet<string>> {
+  const map = new Map<string, ReadonlySet<string>>();
+  for (const t of tools) {
+    try {
+      const schema = toJsonSchema(t.schema) as {
+        properties?: Record<string, unknown>;
+      };
+      const props = schema?.properties;
+      if (props && typeof props === "object") {
+        map.set(t.name, new Set(Object.keys(props)));
+      }
+    } catch {
+      // NOTE: an unreadable schema simply contributes no names — the safe direction.
+    }
+  }
+  return map;
+}
 
 // LangChain passes the tool input as a string on the callback. Parse it back to the structured args
-// when possible (so key-based secret redaction on write can drop credential-named keys), else keep the
-// raw string. Empty → null.
-function parseToolInput(input: string): unknown {
+// when possible, so each declared argument can be described by name; an input that is not JSON is
+// described as the string it is. Empty → null.
+function parseToolInput(
+  input: string,
+  describe: (value: unknown, declared: DeclaredKeys) => unknown,
+  declared: DeclaredKeys,
+): unknown {
   const s = (input ?? "").trim();
   if (!s) return null;
   try {
-    return JSON.parse(s);
+    return describe(JSON.parse(s), declared);
   } catch {
-    return s;
+    return describe(s, declared);
   }
 }
 
@@ -47,17 +78,33 @@ function isErrorToolOutput(output: unknown): boolean {
 // keys dropped, secret-shaped strings scrubbed, everything truncated) before the write. Emits are
 // fire-and-forget (emitFlowEvent never throws into the turn).
 export class ToolFlowLogger extends BaseCallbackHandler {
-  name = "secv4-tool-flowlog";
+  name = "fazerai-tool-flowlog";
 
   private readonly flow: FlowContext;
+  // What a tool call leaves in `detail`: the shape of each value by default, which is what keeps the
+  // column's documented promise, or the value as sent when the agent has `observability.logToolValues`
+  // on. Resolved ONCE per logger, so a turn cannot log both ways.
+  private readonly describe: (
+    value: unknown,
+    declared: DeclaredKeys,
+  ) => unknown;
+  private readonly declaredKeys: Map<string, ReadonlySet<string>>;
   private readonly starts = new Map<
     string,
     { tool: string; at: number; args: unknown }
   >();
 
-  constructor(flow: FlowContext) {
+  constructor(
+    flow: FlowContext,
+    opts: {
+      logValues?: boolean;
+      tools?: readonly StructuredToolInterface[];
+    } = {},
+  ) {
     super();
     this.flow = flow;
+    this.describe = opts.logValues === true ? (value) => value : describeShape;
+    this.declaredKeys = declaredKeysByTool(opts.tools ?? []);
   }
 
   override handleToolStart(
@@ -69,10 +116,15 @@ export class ToolFlowLogger extends BaseCallbackHandler {
     _metadata?: Record<string, unknown>,
     runName?: string,
   ): void {
+    const tool = runName && runName.length > 0 ? runName : "tool";
     this.starts.set(runId, {
-      tool: runName && runName.length > 0 ? runName : "tool",
+      tool,
       at: Date.now(),
-      args: parseToolInput(input),
+      args: parseToolInput(
+        input,
+        this.describe,
+        this.declaredKeys.get(tool) ?? null,
+      ),
     });
   }
 
@@ -89,7 +141,11 @@ export class ToolFlowLogger extends BaseCallbackHandler {
       level: failed ? "warn" : "info",
       status: failed ? "error" : "ok",
       durationMs: Date.now() - s.at,
-      detail: { tool: s.tool, args: s.args, output: value },
+      detail: {
+        tool: s.tool,
+        args: s.args,
+        output: this.describe(value, null),
+      },
       ...(failed
         ? {
             errorMessage: sanitizeErrorMessage(

@@ -29,6 +29,12 @@ import { resolveZproAvailability } from "@/modules/zpro/availability";
 import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
 import { resolveZproDebounceConfig } from "@/modules/zpro/debounce";
+import {
+  announceZproFailedTurn,
+  clearZproConversationError,
+  readZproDirectFence,
+  recordZproConversationError,
+} from "@/modules/zpro/failure";
 import { deactivateAgent } from "@/modules/zpro/handoff";
 import { mirrorZproContact, mirrorZproMessage } from "@/modules/zpro/mirror";
 import {
@@ -583,6 +589,15 @@ export const zproController = new Elysia({
               String(delivery.id),
               outcome,
             );
+            // Recovered: a successful answer clears any previously surfaced turn error (upstream
+            // #86 parity, mirrors chatwoot/webhook.ts's item-6 clear).
+            if (outcome === "replied" && mirrored) {
+              void clearZproConversationError({
+                tenantId: instance.tenantId,
+                conversationDbId: mirrored.conversationId,
+                base: basePrisma,
+              });
+            }
           })
           .catch((err) => {
             logger.error(
@@ -594,6 +609,37 @@ export const zproController = new Elysia({
               },
               "zpro:async dispatch failed",
             );
+            // Surface the failure to the operator (sanitized) so they can re-engage, and — when
+            // nothing else is coming — say so INSIDE the ticket (upstream #71/#86 parity). There is
+            // no retry on this direct path, so the only thing that can still answer is a newer
+            // message's own turn — the same local fence the success path would apply.
+            if (mirrored) {
+              void recordZproConversationError({
+                tenantId: instance.tenantId,
+                conversationDbId: mirrored.conversationId,
+                error: err,
+                base: basePrisma,
+              });
+              const conversationDbId = mirrored.conversationId;
+              const triggerMessageDbId = mirrored.messageDbId;
+              void announceZproFailedTurn({
+                tenantId: instance.tenantId,
+                zproInstanceId: instance.id,
+                conversationDbId,
+                ticketId: Number(event.threadId),
+                assess: async () => ({
+                  path: "direct",
+                  fence: await readZproDirectFence({
+                    tenantId: instance.tenantId,
+                    conversationDbId,
+                    triggerMessageDbId,
+                    base: basePrisma,
+                  }),
+                }),
+                error: err,
+                base: basePrisma,
+              });
+            }
           });
       },
       logger,

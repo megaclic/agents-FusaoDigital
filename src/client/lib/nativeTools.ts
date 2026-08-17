@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Clock,
   IdCard,
+  Image as ImageIcon,
   LayoutGrid,
   ListTree,
   type LucideIcon,
@@ -35,6 +36,7 @@ export const NATIVE_TOOL_ICONS: Record<string, LucideIcon> = {
   react_to_message: Smile,
   route_to_queue: ListTree,
   schedule_message: Timer,
+  send_image: ImageIcon,
   skip_reply: BellOff,
   calculator: Calculator,
   get_current_time: Clock,
@@ -156,6 +158,15 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
         description: t(
           "nativeTools.schedule_message.desc",
           "Schedule a one-off message or action to happen later in this conversation (up to 24h ahead).",
+        ),
+      };
+    case "send_image":
+      return {
+        icon,
+        label: t("nativeTools.send_image.label", "Send image"),
+        description: t(
+          "nativeTools.send_image.desc",
+          "Deliver an image to the customer from its URL, limited to the hosts you allow.",
         ),
       };
     case "skip_reply":

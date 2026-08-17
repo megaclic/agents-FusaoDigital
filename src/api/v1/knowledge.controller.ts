@@ -7,8 +7,10 @@ import type { TenantContext } from "@/lib/tenancy";
 import {
   createDocument,
   deleteDocument,
+  type EmbeddingBlock,
   getDocument,
   listDocuments,
+  readEmbeddingBlock,
   reindexKnowledgeBase,
   retryDocument,
   updateDocument,
@@ -44,6 +46,17 @@ function tenantId(ctx: TenantContext | null): bigint {
   if (!ctx) throw new ForbiddenError();
   if (ctx.tenantId === null) throw new TenantTargetRequiredError();
   return ctx.tenantId;
+}
+
+// What the documents endpoint may say about an embedding block. `reason` ONLY: the block also
+// carries the credentialRef and its vault id, which the reindex endpoint returns so a TENANT_ADMIN
+// can be deeplinked to the entry to fill. This endpoint is open to ANY authenticated role, so
+// passing those through would tell an AGENT which vault record backs the workspace's embedding
+// settings. Nothing on the screen reads them.
+export function readerSafeBlock(
+  block: EmbeddingBlock | null,
+): { reason: EmbeddingBlock["reason"] } | null {
+  return block ? { reason: block.reason } : null;
 }
 
 export const knowledgeController = new Elysia({
@@ -211,14 +224,38 @@ export const knowledgeController = new Elysia({
     },
   )
   .get(
+    "/embedding-block",
+    async ({ tenantContext }) => ({
+      instance: instanceIdentity,
+      // The question is about the WORKSPACE — one embedding credential serves every base — so it
+      // gets an endpoint of its own rather than riding on a per-base document list. A console
+      // watching a live modal asks this repeatedly; making it re-download a base's documents to
+      // learn whether a credential is filled is the wrong trade, and pairing a workspace answer with
+      // a base-scoped request means every caller has to remember they are not the same scope.
+      block: readerSafeBlock(await readEmbeddingBlock(tenantId(tenantContext))),
+    }),
+    {
+      requireAuth: true,
+      detail: doc(
+        "Read the embedding block",
+        "Whether anything is preventing this workspace from indexing, and which of the reasons it is. Null when indexing would work.",
+      ),
+      response: errors(401, 403),
+    },
+  )
+  .get(
     "/bases/:id/documents",
     async ({ tenantContext, params }) => {
-      const docs = await listDocuments(
-        tenantId(tenantContext),
-        BigInt(params.id),
-      );
+      const tid = tenantId(tenantContext);
+      const docs = await listDocuments(tid, BigInt(params.id));
+      const block = await readEmbeddingBlock(tid);
       return {
         instance: instanceIdentity,
+        // The tenant's CURRENT embedding block (null when indexing would work). Resolved per read,
+        // not stamped on the rows when they were blocked: a token stored back then would still be
+        // telling the operator to fill a credential they have since filled (issue #80).
+        //
+        embeddingBlock: readerSafeBlock(block),
         documents: docs.map((d) => ({
           ...d,
           id: String(d.id),

@@ -4,6 +4,7 @@ import {
   CalendarClock,
   Gauge,
   Image,
+  ImagePlus,
   Info,
   Layers,
   ListChecks,
@@ -11,6 +12,7 @@ import {
   Mic,
   Plus,
   Scissors,
+  ScrollText,
   Trash2,
   Volume2,
 } from "lucide-react";
@@ -133,6 +135,13 @@ interface LimitsState {
   maxToolCalls: string;
 }
 
+// NOTE: The allowed-host list is edited as raw textarea text (one per line) and only turns into an
+// array on save — the runtime reader normalizes and drops what does not resolve to a hostname, so
+// the operator's half-typed line survives editing instead of vanishing under them.
+export interface SendImageState {
+  allowedHosts: string;
+}
+
 // NOTE: Which Chatwoot custom attributes the agent sees the CURRENT VALUES of (one key list per
 // scope). Mirrors agent.settings.attributeContext / readAttributeContextConfig.
 interface AttributeContextState {
@@ -190,7 +199,13 @@ interface BehaviorTabProps {
   visionCredBaseUrl: string | null;
   onVisionEntryChange: (entry: VaultEntry | null) => void;
   limits: LimitsState;
+  observability: { logToolValues: boolean };
+  setObservability: React.Dispatch<
+    React.SetStateAction<{ logToolValues: boolean }>
+  >;
   setLimits: React.Dispatch<React.SetStateAction<LimitsState>>;
+  sendImage: SendImageState;
+  setSendImage: React.Dispatch<React.SetStateAction<SendImageState>>;
   attributeContext: AttributeContextState;
   setAttributeContext: React.Dispatch<
     React.SetStateAction<AttributeContextState>
@@ -748,7 +763,11 @@ export function BehaviorTab({
   visionCredBaseUrl,
   onVisionEntryChange,
   limits,
+  observability,
+  setObservability,
   setLimits,
+  sendImage,
+  setSendImage,
   attributeContext,
   setAttributeContext,
   serviceWindow,
@@ -830,9 +849,19 @@ export function BehaviorTab({
       label: t("editor.attributeContext", "Data in context"),
     },
     {
+      id: "sendImage",
+      icon: ImagePlus,
+      label: t("editor.sendImage", "Sending images"),
+    },
+    {
       id: "limits",
       icon: Gauge,
       label: t("editor.limits", "Execution limits"),
+    },
+    {
+      id: "observability",
+      icon: ScrollText,
+      label: t("editor.observability", "Logs"),
     },
     {
       id: "proactive",
@@ -1460,6 +1489,31 @@ export function BehaviorTab({
           )}
 
           <Section
+            id="sendImage"
+            icon={ImagePlus}
+            title={t("editor.sendImage", "Sending images")}
+            description={t(
+              "editor.sendImageHint",
+              'Hosts the agent may fetch an image from when it uses the "Send image" tool. The agent chooses the URL, so this list is what decides where it can actually go: leave it empty and every attempt is refused. Output guardrails read text and never the picture itself, so this list is the only control over what an image may show. It has no effect unless the tool is granted on the Tools tab.',
+            )}
+          >
+            <FormField
+              label={t("editor.sendImageHosts", "Allowed hosts")}
+              description={t(
+                "editor.sendImageHostsHint",
+                'One per line, e.g. cdn.minhaloja.com.br. Start with "*." to cover a domain and its subdomains (*.minhaloja.com.br). Paste a full URL and only its host is kept.',
+              )}
+            >
+              <Textarea
+                value={sendImage.allowedHosts}
+                onChange={(e) => setSendImage({ allowedHosts: e.target.value })}
+                rows={4}
+                placeholder="cdn.minhaloja.com.br"
+              />
+            </FormField>
+          </Section>
+
+          <Section
             id="limits"
             icon={Gauge}
             title={t("editor.limits", "Execution limits")}
@@ -1487,6 +1541,25 @@ export function BehaviorTab({
                 />
               </FormField>
             </div>
+          </Section>
+
+          <Section
+            id="observability"
+            icon={ScrollText}
+            title={t("editor.observability", "Logs")}
+            description={t(
+              "editor.observabilityHint",
+              'By default a tool line on the Logs page records the SHAPE of each argument and result ({ cpf: "string(11)" }): enough to see which arguments the agent sent, which it left out and whether a format is wrong, with no customer data. Turning the switch on records the values themselves, which is what answers which record it actually looked up, and keeps those values for the whole log retention window, including in every log export. Turn it on while investigating, off afterwards.',
+            )}
+          >
+            <SwitchField
+              checked={observability.logToolValues}
+              onCheckedChange={(v) => setObservability({ logToolValues: v })}
+              label={t(
+                "editor.observabilityLogToolValues",
+                "Log the values sent to tools",
+              )}
+            />
           </Section>
 
           <Section
