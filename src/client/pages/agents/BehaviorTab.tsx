@@ -64,7 +64,7 @@ import {
   ttsNormalizerPickerSource,
   ttsNormalizerProviderChanged,
 } from "./ttsFormState";
-import type { ChannelBinding, Hours, VaultEntry } from "./types";
+import type { ChannelBinding, Hours } from "./types";
 
 // Transcription providers (mirror src/modules/stt/providers.ts).
 const STT_PROVIDERS = [
