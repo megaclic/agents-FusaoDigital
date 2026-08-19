@@ -69,6 +69,10 @@ describe.skipIf(!dbUp)("agent export/import", () => {
       data: { tenantId, name: "tts-key", secret: "x" },
       select: { id: true },
     });
+    const guardrailsKey = await suDb.vaultEntry.create({
+      data: { tenantId, name: "guardrails-key", secret: "x" },
+      select: { id: true },
+    });
     const agent = await suDb.agent.create({
       data: {
         tenantId,
@@ -81,6 +85,16 @@ describe.skipIf(!dbUp)("agent export/import", () => {
         },
         settings: {
           tts: { mode: "never", credentialRef: `vault:${ttsKey.id}` },
+          // Regression coverage: settings.guardrails.credentialRef (a direct field, not nested
+          // like stt/tts/vision's own sub-object shape it otherwise mirrors) used to be invisible
+          // to collectCredRefs/remapCredRefs, so it survived translation as a raw `vault:<id>` and
+          // tripped the export's own "unresolved vault reference" guard — export was impossible
+          // for every agent with guardrails configured.
+          guardrails: {
+            enabled: true,
+            provider: "openai",
+            credentialRef: `vault:${guardrailsKey.id}`,
+          },
         },
       },
     });
@@ -133,6 +147,12 @@ describe.skipIf(!dbUp)("agent export/import", () => {
     expect(exp.agent.name).toBe("Vendedora");
     // credentialRef is a NAME, not a secret
     expect(exp.agent.modelConfig.credentialRef).toBe("llm-key");
+    // settings.guardrails.credentialRef is also translated id → name (regression: used to survive
+    // as a raw `vault:<id>` and trip the export guard below).
+    const guardrails = exp.agent.settings.guardrails as {
+      credentialRef?: string;
+    };
+    expect(guardrails.credentialRef).toBe("guardrails-key");
     const http = exp.agent.tools.find((g) => g.source === "HTTP");
     expect(http && "tool" in http && http.tool).toBe("lookup_order");
     const rag = exp.agent.tools.find((g) => g.source === "RAG");
@@ -217,7 +237,7 @@ describe.skipIf(!dbUp)("agent export/import", () => {
       // A credential absent in the target tenant is no longer dropped: a reference-only PENDING entry
       // is created (name + kind) and the ref stays wired, so the operator only fills the secret. The
       // warning deep-links to the vault (where the pending secret is filled), not the editor field.
-      for (const name of ["llm-key", "tts-key"]) {
+      for (const name of ["llm-key", "tts-key", "guardrails-key"]) {
         const w = warnings.find(
           (x) => x.code === "credentialPending" && x.params?.name === name,
         );
@@ -233,6 +253,12 @@ describe.skipIf(!dbUp)("agent export/import", () => {
       });
       const mc = (row?.modelConfig ?? {}) as Record<string, unknown>;
       expect(mc.credentialRef as string).toMatch(/^vault:/);
+      // settings.guardrails.credentialRef is wired the same way (regression: this path used to be
+      // invisible to remapCredRefs, so it stayed the SOURCE tenant's `vault:<id>` — a cross-tenant
+      // id leak — instead of resolving to the destination's pending entry).
+      const settings = (row?.settings ?? {}) as Record<string, unknown>;
+      const gr = settings.guardrails as { credentialRef?: string };
+      expect(gr.credentialRef).toMatch(/^vault:/);
     } finally {
       for (const table of [
         "agent_tool_selections",
@@ -274,15 +300,16 @@ describe.skipIf(!dbUp)("agent export/import", () => {
     const exp = await exportAgent(ctx(), agentId, appDb);
     expect(exp.agent.credentials).toBeDefined();
     const creds = exp.agent.credentials ?? [];
-    // The agent has two credential refs: llm-key (modelConfig) and tts-key (settings.tts).
-    expect(creds).toHaveLength(2);
+    // The agent has three credential refs: llm-key (modelConfig), tts-key (settings.tts), and
+    // guardrails-key (settings.guardrails).
+    expect(creds).toHaveLength(3);
     expect(
       creds.every(
         (c) => typeof c.name === "string" && typeof c.kind === "string",
       ),
     ).toBe(true);
     const names = creds.map((c) => c.name).sort();
-    expect(names).toEqual(["llm-key", "tts-key"]);
+    expect(names).toEqual(["guardrails-key", "llm-key", "tts-key"]);
     // Default kind is "generic".
     expect(creds.every((c) => c.kind === "generic")).toBe(true);
   });

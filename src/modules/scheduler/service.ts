@@ -25,7 +25,8 @@ export type SchedulerJobKind =
   | "FLOWLOG_SWEEP"
   | "APPOINTMENT_REMINDER"
   | "REDIRECT_FOLLOWUP"
-  | "SCHEDULED_MESSAGE";
+  | "SCHEDULED_MESSAGE"
+  | "ZPRO_STATUS_CHECK";
 
 export interface ClaimedJob {
   id: bigint;

@@ -252,6 +252,10 @@ async function buildPlaygroundToolset(
         channel === "zpro"
           ? [
               // Conversation tools, Z-PRO-flavored + simulated (see buildSimulatedZproNativeTools).
+              // handoffCfg/toolInstructions mirror runtime.ts's fold so the playground's
+              // handoff_to_human description (and agent_choice queue targeting) match what a real
+              // Z-PRO turn would show the model — this was missing before 2026-08-18, so a Z-PRO
+              // agent's operator-authored handoff.instructions never reached the playground turn.
               ...buildSimulatedZproNativeTools(
                 {
                   client: {} as ZproClient,
@@ -262,6 +266,14 @@ async function buildPlaygroundToolset(
                   tenantId: params.tenantId,
                   base: params.base,
                   conversationDbId: 0n,
+                  transferWithSummary: loaded.transferWithSummary,
+                  toolInstructions: loaded.handoffConfig.instructions
+                    ? {
+                        ...loaded.toolGuidance,
+                        handoff_to_human: loaded.handoffConfig.instructions,
+                      }
+                    : loaded.toolGuidance,
+                  handoffCfg: loaded.handoffConfig,
                 },
                 allowed,
               ),

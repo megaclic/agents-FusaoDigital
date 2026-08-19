@@ -35,10 +35,19 @@ function event(): NormalizedZproEvent {
   };
 }
 
-function stub(rec: { sent: string[]; presence: string[] }) {
+function stub(rec: {
+  sent: string[];
+  presence: string[];
+  isClosed: (boolean | undefined)[];
+}) {
   return {
-    sendText: async (_number: string, body: string) => {
+    sendText: async (
+      _number: string,
+      body: string,
+      opts?: { isClosed?: boolean },
+    ) => {
       rec.sent.push(body);
+      rec.isClosed.push(opts?.isClosed);
       return {};
     },
     sendPresence: async (_ticketId: number, state: string) => {
@@ -51,7 +60,11 @@ const noSleep = async () => {};
 
 describe("deliverZproReply", () => {
   test("disabled → a single send, no presence toggles", async () => {
-    const rec = { sent: [] as string[], presence: [] as string[] };
+    const rec = {
+      sent: [] as string[],
+      presence: [] as string[],
+      isClosed: [] as (boolean | undefined)[],
+    };
     const n = await deliverZproReply(
       stub(rec),
       event(),
@@ -65,7 +78,11 @@ describe("deliverZproReply", () => {
   });
 
   test("enabled → one send per balloon, no presence toggles (the caller's heartbeat owns those)", async () => {
-    const rec = { sent: [] as string[], presence: [] as string[] };
+    const rec = {
+      sent: [] as string[],
+      presence: [] as string[],
+      isClosed: [] as (boolean | undefined)[],
+    };
     const n = await deliverZproReply(
       stub(rec),
       event(),
@@ -76,5 +93,65 @@ describe("deliverZproReply", () => {
     expect(n).toBe(2);
     expect(rec.sent).toEqual(["Olá!", "Como vai?"]);
     expect(rec.presence).toEqual([]);
+  });
+
+  // Regression (2026-08-18): a resolve_conversation intent used to close the ORIGINAL ticketId via
+  // a separate updateTicketInfo call, made AFTER this delivery. sendText addresses Z-PRO's
+  // send-message endpoint by contact NUMBER, not ticketId — the vendor's own API docs confirm a
+  // send can land on a ticket "criado ou reutilizado" (created or reused), so closing the id this
+  // turn started on could miss the ticket the reply actually landed on. Passing `isClosed` on the
+  // send itself (the LAST balloon only) closes whichever ticket that specific message lands on.
+  test("closeTicket=false (default) → no send carries isClosed", async () => {
+    const rec = {
+      sent: [] as string[],
+      presence: [] as string[],
+      isClosed: [] as (boolean | undefined)[],
+    };
+    await deliverZproReply(
+      stub(rec),
+      event(),
+      "Olá!\n\nComo vai?",
+      { ...SPLIT_DEFAULTS, enabled: true },
+      noSleep,
+    );
+    expect(rec.isClosed).toEqual([undefined, undefined]);
+  });
+
+  test("closeTicket=true, split disabled → the single send carries isClosed:true", async () => {
+    const rec = {
+      sent: [] as string[],
+      presence: [] as string[],
+      isClosed: [] as (boolean | undefined)[],
+    };
+    await deliverZproReply(
+      stub(rec),
+      event(),
+      "Disponha!",
+      { ...SPLIT_DEFAULTS, enabled: false },
+      noSleep,
+      undefined,
+      true,
+    );
+    expect(rec.isClosed).toEqual([true]);
+  });
+
+  test("closeTicket=true, split enabled → only the LAST balloon carries isClosed:true", async () => {
+    const rec = {
+      sent: [] as string[],
+      presence: [] as string[],
+      isClosed: [] as (boolean | undefined)[],
+    };
+    await deliverZproReply(
+      stub(rec),
+      event(),
+      "Olá!\n\nComo vai?\n\nTchau!",
+      { ...SPLIT_DEFAULTS, enabled: true },
+      noSleep,
+      undefined,
+      true,
+    );
+    expect(rec.sent.length).toBeGreaterThan(1);
+    expect(rec.isClosed.slice(0, -1).every((v) => v === undefined)).toBe(true);
+    expect(rec.isClosed.at(-1)).toBe(true);
   });
 });

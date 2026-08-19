@@ -195,7 +195,11 @@ export type ImportWarningTarget =
   | { kind: "vault" }
   // An agent-level credential field (model/stt/tts/vision): deep-links to the exact editor section
   // that references the missing credential, instead of the vault page.
-  | { kind: "agentField"; tab: "general" | "behavior"; sectionId: string }
+  | {
+      kind: "agentField";
+      tab: "general" | "behavior" | "guardrails";
+      sectionId: string;
+    }
   | { kind: "businessHours"; name: string }
   | { kind: "tool"; name: string }
   | { kind: "mcp"; name: string }
@@ -223,8 +227,9 @@ function dedupeWarnings(ws: ImportWarning[]): ImportWarning[] {
 }
 
 // Credentials live in several JSON paths on an agent: modelConfig.credentialRef and
-// settings.{stt,tts,vision}.credentialRef. Internally they are `vault:<id>` (tenant-local); export
-// translates them id→name and import translates name→id so the JSON stays portable.
+// settings.{stt,tts,vision,guardrails}.credentialRef. Internally they are `vault:<id>`
+// (tenant-local); export translates them id→name and import translates name→id so the JSON stays
+// portable.
 export function collectCredRefs(
   modelConfig: Record<string, unknown>,
   settings: Record<string, unknown>,
@@ -236,7 +241,7 @@ export function collectCredRefs(
   ) {
     refs.push(modelConfig.credentialRef);
   }
-  for (const key of ["stt", "tts", "vision"] as const) {
+  for (const key of ["stt", "tts", "vision", "guardrails"] as const) {
     const sub = settings[key];
     if (sub && typeof sub === "object") {
       const ref = (sub as Record<string, unknown>).credentialRef;
@@ -253,14 +258,17 @@ export function collectCredRefs(
 function credentialFieldTargets(
   modelConfig: Record<string, unknown>,
   settings: Record<string, unknown>,
-): Map<string, { tab: "general" | "behavior"; sectionId: string }> {
+): Map<
+  string,
+  { tab: "general" | "behavior" | "guardrails"; sectionId: string }
+> {
   const out = new Map<
     string,
-    { tab: "general" | "behavior"; sectionId: string }
+    { tab: "general" | "behavior" | "guardrails"; sectionId: string }
   >();
   const add = (
     ref: unknown,
-    tab: "general" | "behavior",
+    tab: "general" | "behavior" | "guardrails",
     sectionId: string,
   ): void => {
     if (typeof ref === "string" && ref && !isVaultIdRef(ref) && !out.has(ref)) {
@@ -273,6 +281,14 @@ function credentialFieldTargets(
     if (sub && typeof sub === "object") {
       add((sub as Record<string, unknown>).credentialRef, "behavior", key);
     }
+  }
+  const guardrails = settings.guardrails;
+  if (guardrails && typeof guardrails === "object") {
+    add(
+      (guardrails as Record<string, unknown>).credentialRef,
+      "guardrails",
+      "gr-model",
+    );
   }
   return out;
 }
@@ -291,7 +307,7 @@ export function remapCredRefs(
     else mc.credentialRef = mapped;
   }
   const st = { ...settings };
-  for (const key of ["stt", "tts", "vision"] as const) {
+  for (const key of ["stt", "tts", "vision", "guardrails"] as const) {
     const sub = st[key];
     if (sub && typeof sub === "object") {
       const subCopy = { ...(sub as Record<string, unknown>) };

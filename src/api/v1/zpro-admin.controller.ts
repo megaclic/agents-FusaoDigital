@@ -26,7 +26,7 @@ import {
 } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { ZproClient } from "@/modules/zpro/client";
-import { loadZproQueues } from "@/modules/zpro/crm";
+import { loadZproQueues, loadZproTags } from "@/modules/zpro/crm";
 import { zproWebhookUrl } from "@/modules/zpro/zpro-webhook-mount";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -514,6 +514,60 @@ export const zproAdminController = new Elysia({
       detail: doc(
         "List Z-PRO queues",
         "Read live queues from the Z-PRO instance an agent is bound to (for handoff/route-to-queue targeting).",
+      ),
+      response: errors(400, 401, 403),
+    },
+  )
+  // Live tags for the follow-up step's "assign label" picker — Z-PRO's counterpart to
+  // chatwoot-admin.controller.ts's /labels/:agentId. Same single-instance-only contract as /queues
+  // above: a tag catalog only makes sense within ONE Z-PRO instance, so this degrades to an empty
+  // list + instanceCount when the agent is bound to zero or 2+ instances (the editor keeps the
+  // free-text field either way — typing a new tag still works, Z-PRO auto-creates it).
+  .get(
+    "/tags/:agentId",
+    async ({ tenantContext, params }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const agentId = BigInt(params.agentId);
+      return runScopedOn(basePrisma, ctx, async (db) => {
+        const bindings = await db.zproAgentBinding.findMany({
+          where: { agentId },
+          select: {
+            zproInstance: {
+              select: {
+                id: true,
+                baseUrl: true,
+                apiId: true,
+                bearerToken: true,
+              },
+            },
+          },
+        });
+        if (bindings.length !== 1) {
+          return { tags: [], instanceCount: bindings.length };
+        }
+        const instance = bindings[0]?.zproInstance;
+        if (!instance) return { tags: [], instanceCount: 0 };
+        const client = new ZproClient(
+          instance.baseUrl,
+          instance.apiId,
+          decryptJson<string>(instance.bearerToken),
+        );
+        try {
+          const tags = await loadZproTags(client, String(instance.id));
+          return { tags, instanceCount: 1 };
+        } catch {
+          return { tags: [], instanceCount: 1 };
+        }
+      });
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        agentId: t.String({ description: "Agent id (BigInt string)." }),
+      }),
+      detail: doc(
+        "List Z-PRO tags",
+        "Read live tags from the Z-PRO instance an agent is bound to (for the follow-up label picker).",
       ),
       response: errors(400, 401, 403),
     },

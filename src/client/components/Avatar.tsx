@@ -1,5 +1,5 @@
-import { useState } from "react";
 import { cn } from "@/client/lib/utils";
+import { useMediaObjectUrl } from "./useMediaObjectUrl";
 
 interface AvatarProps {
   name?: string | null;
@@ -21,13 +21,17 @@ function initialsFor(name: string | null | undefined): string {
   return (first + last).toUpperCase() || "?";
 }
 
-// Contact/persona avatar: the photo when one resolved (proxied through our origin — see
-// docs/ui.md/getConversationAvatar — direct external image URLs are blocked by img-src CSP), a
-// fallback to initials otherwise (missing src, or the image failed to load — a dead/expired
-// external URL degrades silently to initials instead of a broken-image icon).
+// Contact/persona avatar: the photo when one resolved, a fallback to initials otherwise (missing
+// src, or the image failed to load — a dead/expired external URL degrades silently to initials
+// instead of a broken-image icon). `src` is always our own same-origin proxy (CSP's img-src is
+// 'self' only — see docs/ui.md/getConversationAvatar), fetched WITH the X-Tenant-Id header via
+// useMediaObjectUrl rather than set directly as <img src>: a raw <img> can't carry that header, so
+// a SUPER_ADMIN viewing another tenant got a 400 ("A target tenant is required") on every avatar —
+// silent before this, because avatarUrl was rarely populated; confirmed live 2026-08-18 once the
+// Z-PRO mirror started capturing it from every message instead of only contact-create-update.
 export function Avatar({ name, src, size = "md", className }: AvatarProps) {
-  const [errored, setErrored] = useState(false);
-  const showImage = !!src && !errored;
+  const { url, failed } = useMediaObjectUrl(src ?? "");
+  const showImage = !!url && !failed;
   return (
     <div
       className={cn(
@@ -39,10 +43,9 @@ export function Avatar({ name, src, size = "md", className }: AvatarProps) {
     >
       {showImage ? (
         <img
-          src={src}
+          src={url}
           alt=""
           className="h-full w-full object-cover"
-          onError={() => setErrored(true)}
           loading="lazy"
         />
       ) : (

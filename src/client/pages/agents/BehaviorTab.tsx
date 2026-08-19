@@ -567,26 +567,32 @@ function AttributeContextPickers({
 }
 
 // The multi-step follow-up editor: an ordered list of step cards (delay + instructions + optional
-// label, and a resolve toggle on the LAST step). Labels are fetched once per agent from the inbox.
+// label, and a resolve toggle on the LAST step). Labels/tags are fetched once per agent, from
+// whichever channel(s) it's bound to — Chatwoot labels and/or Z-PRO tags, merged into one picker
+// (same channelBinding-gated pattern as the handoff queue picker in ToolGrantsEditor.tsx).
 function FollowUpStepsEditor({
   agentId,
   followUp,
   setFollowUp,
+  channelBinding,
 }: {
   agentId: string;
   followUp: FollowUpState;
   setFollowUp: React.Dispatch<React.SetStateAction<FollowUpState>>;
+  channelBinding: ChannelBinding;
 }) {
   const { t } = useTranslation();
-  const [labels, setLabels] = useState<InboxLabelOption[]>([]);
+  const [chatwootLabels, setChatwootLabels] = useState<InboxLabelOption[]>([]);
+  const [zproTags, setZproTags] = useState<InboxLabelOption[]>([]);
   const [multiAccount, setMultiAccount] = useState(false);
   useEffect(() => {
+    if (!channelBinding.chatwoot) return;
     let cancelled = false;
     void (async () => {
       try {
         const { data } = await api.api.v1.chatwoot.labels({ agentId }).get();
         if (!cancelled && data) {
-          setLabels(data.labels);
+          setChatwootLabels(data.labels);
           setMultiAccount(data.accountCount > 1);
         }
       } catch {
@@ -596,7 +602,33 @@ function FollowUpStepsEditor({
     return () => {
       cancelled = true;
     };
-  }, [agentId]);
+  }, [agentId, channelBinding.chatwoot]);
+  useEffect(() => {
+    if (!channelBinding.zpro) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.zpro.tags({ agentId }).get();
+        if (!cancelled && data) {
+          setZproTags(
+            data.tags.map((tag) => ({ title: tag.name, color: null })),
+          );
+        }
+      } catch {
+        // best-effort: leave the free-text field as the fallback
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, channelBinding.zpro]);
+  // Deduped by title (a Chatwoot label and a Z-PRO tag sharing a name collapse to one entry), same
+  // as listInboxLabels does per Chatwoot account.
+  const labels = [
+    ...new Map(
+      [...chatwootLabels, ...zproTags].map((l) => [l.title, l]),
+    ).values(),
+  ];
 
   const steps = followUp.steps;
   const updateStep = (index: number, patch: Partial<FollowUpStepState>) =>
@@ -1658,6 +1690,7 @@ export function BehaviorTab({
                     agentId={agentId}
                     followUp={followUp}
                     setFollowUp={setFollowUp}
+                    channelBinding={channelBinding}
                   />
                   <div className="flex flex-col gap-1.5">
                     <SwitchField

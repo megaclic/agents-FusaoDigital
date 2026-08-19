@@ -114,6 +114,7 @@ import {
 } from "./crm";
 import { sysCtx } from "./ctx";
 import { deactivateAgent } from "./handoff";
+import { scheduleZproStatusCheck } from "./status-reconcile";
 import { buildSetVoicePreferenceTool } from "./tts";
 
 const DEFAULT_TAG_COLOR = "#6b7280";
@@ -339,6 +340,19 @@ function handoffTool(ctx: ZproToolCtx) {
           phase: "route_queue",
           err: e,
         });
+      }
+      // A human closing the ticket afterward from the Z-PRO panel — no message attached — never
+      // fires a webhook we'd otherwise learn it from (mirrorZproMessage only runs on
+      // method:"message"). One check 3 minutes out catches that and syncs the mirror; see
+      // status-reconcile.ts. Best-effort, and only for a real turn (not Playground, where
+      // zproInstanceId is absent).
+      if (ctx.zproInstanceId) {
+        await scheduleZproStatusCheck({
+          tenantId: ctx.tenantId,
+          zproInstanceId: ctx.zproInstanceId,
+          ticketId: ctx.ticketId,
+          base: ctx.base,
+        }).catch(() => {});
       }
       return `Handed off to a human.${routed} The bot will stay silent now.`;
     },

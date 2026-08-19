@@ -34,6 +34,7 @@ import {
   startOutboundWorker,
   stopOutboundWorker,
 } from "@/modules/webhooks/outbound/worker";
+import { registerZproStatusCheckHandler } from "@/modules/zpro/status-reconcile";
 
 const MAX_PORT_ATTEMPTS = 10;
 
@@ -161,6 +162,7 @@ if (config.schedulerWorker.enabled) {
   registerAppointmentReminderHandler();
   registerRedirectFollowUpHandlers();
   registerScheduledMessageHandler();
+  registerZproStatusCheckHandler();
   startScheduler();
   // Arm the per-tenant execution-log retention sweep for every existing tenant (best-effort: a
   // boot-time DB outage just means the sweep arms on the next restart).

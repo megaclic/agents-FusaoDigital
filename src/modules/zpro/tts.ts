@@ -32,10 +32,13 @@ import type { NormalizedZproEvent } from "./types";
 // now, for every format. Trade-off: the reply arrives as a downloadable file attachment, not a
 // native playable voice-note bubble (no waveform/PTT rendering) — worse UX, but it actually arrives,
 // unlike the alternative.
+// `closeTicket` mirrors deliverZproReply's own param (split.ts) — see its comment for why this is
+// passed on the send itself rather than a separate updateTicketInfo(ticketId, ...) afterward.
 export async function sendZproVoiceReply(
   client: ZproClient,
   event: NormalizedZproEvent,
   result: TtsResult,
+  closeTicket = false,
 ): Promise<void> {
   const base64 = Buffer.from(result.audio).toString("base64");
   await client.sendBase64(
@@ -44,7 +47,7 @@ export async function sendZproVoiceReply(
     result.mime,
     result.fileName,
     undefined,
-    { validateNumber: false },
+    { validateNumber: false, ...(closeTicket ? { isClosed: true } : {}) },
   );
 }
 

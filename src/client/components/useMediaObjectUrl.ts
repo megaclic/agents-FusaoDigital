@@ -6,6 +6,8 @@ import { mediaFetch } from "@/client/lib/media";
 // (see mediaFetch) and turned into an object URL, revoked on unmount. Shared by MediaAudio/MediaImage
 // and the playground file link so every media load carries the SUPER_ADMIN tenant selector and the
 // endpoint (no range support) gets the whole blob for playback/seeking.
+// An empty src means "no media" (e.g. Avatar's src prop is optional) — resolve to no url/no
+// failure rather than firing a doomed fetch("") the retry loop would chew through.
 export function useMediaObjectUrl(src: string): {
   url: string | undefined;
   failed: boolean;
@@ -16,6 +18,11 @@ export function useMediaObjectUrl(src: string): {
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
+    if (!src) {
+      setUrl(undefined);
+      setFailed(false);
+      return;
+    }
     if (src.startsWith("blob:")) {
       setUrl(src);
       setFailed(false);

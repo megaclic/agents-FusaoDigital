@@ -62,56 +62,60 @@ function previewText(
 
 function ZproConversationRow({ c }: { c: ZproConversation }) {
   const { t, i18n } = useTranslation();
+  // Short form here (list row: scannability over precision) — the detail page keeps the full
+  // toLocaleString for each message, where precision is what matters.
   const when = c.lastMessageAt
-    ? new Date(c.lastMessageAt).toLocaleString(i18n.language)
+    ? new Date(c.lastMessageAt).toLocaleString(i18n.language, {
+        dateStyle: "short",
+        timeStyle: "short",
+      })
     : null;
   return (
     <li>
       <Link
         to={`/zpro/conversations/${c.id}`}
-        className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-bg-hover"
+        className="flex items-center gap-3 rounded-lg px-3 py-3 transition-colors hover:bg-bg-hover"
       >
-        <div className="flex min-w-0 items-center gap-3">
-          <Avatar
-            name={c.contactName || c.contactNumber}
-            src={
-              c.avatarUrl ? `/api/v1/zpro/conversations/${c.id}/avatar` : null
-            }
-            size="sm"
-          />
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <span className="truncate font-medium text-text-primary">
-                {c.contactName || c.contactNumber}
-              </span>
+        <Avatar
+          name={c.contactName || c.contactNumber}
+          src={c.avatarUrl ? `/api/v1/zpro/conversations/${c.id}/avatar` : null}
+          size="md"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="truncate font-medium text-text-primary">
+              {c.contactName || c.contactNumber}
+            </span>
+            {when && (
+              <span className="shrink-0 text-text-muted text-xs">{when}</span>
+            )}
+          </div>
+          <div className="mt-1 flex items-center justify-between gap-2">
+            <p className="min-w-0 truncate text-sm text-text-muted">
+              {previewText(c, t)}
+            </p>
+            <div className="flex shrink-0 items-center gap-2">
               <Badge variant={STATUS_VARIANT[c.status] ?? "secondary"}>
                 {/* biome-ignore lint/plugin/no-dynamic-i18n-key: status keys extracted via magic comments above STATUS_VARIANT */}
                 {t(`zpro.conversations.status.${c.status}`, c.status)}
               </Badge>
+              <span className="flex items-center gap-1 text-text-secondary text-xs">
+                {c.agentActive ? (
+                  <Bot className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+                ) : (
+                  <User className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                {c.agentActive
+                  ? t("zpro.conversations.assignee.ai", "AI")
+                  : t("zpro.conversations.assignee.human", "Human")}
+              </span>
             </div>
-            <p className="mt-0.5 truncate text-text-muted text-xs">
-              {previewText(c, t)}
-              {when ? ` · ${when}` : ""}
-            </p>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 text-text-secondary text-xs">
-          {c.agentActive ? (
-            <>
-              <Bot className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
-              {t("zpro.conversations.assignee.ai", "AI")}
-            </>
-          ) : (
-            <>
-              <User className="h-3.5 w-3.5" aria-hidden="true" />
-              {t("zpro.conversations.assignee.human", "Human")}
-            </>
-          )}
-          <ChevronRight
-            className="h-4 w-4 text-text-muted"
-            aria-hidden="true"
-          />
-        </div>
+        <ChevronRight
+          className="h-4 w-4 shrink-0 text-text-muted"
+          aria-hidden="true"
+        />
       </Link>
     </li>
   );
@@ -129,24 +133,21 @@ const CONV_SKELETON_KEYS = [
 function ZproConversationsSkeleton() {
   return (
     <Card className="p-1.5">
-      <ul aria-hidden="true" className="flex flex-col gap-0.5">
+      <ul aria-hidden="true" className="divide-y divide-border/50">
         {CONV_SKELETON_KEYS.map((key) => (
-          <li
-            key={key}
-            className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5"
-          >
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <Skeleton className="h-4 w-40" />
+          <li key={key} className="flex items-center gap-3 px-3 py-3">
+            <Skeleton className="h-10 w-10 shrink-0 rounded-full" />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-2">
+                <Skeleton className="h-4 w-32" />
+                <Skeleton className="h-3 w-14" />
+              </div>
+              <div className="mt-1.5 flex items-center justify-between gap-2">
+                <Skeleton className="h-3.5 w-48" />
                 <Skeleton className="h-5 w-16" />
               </div>
-              <Skeleton className="mt-0.5 h-3 w-56" />
             </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-              <Skeleton className="h-3.5 w-3.5 rounded-full" />
-              <Skeleton className="h-3 w-12" />
-              <Skeleton className="h-4 w-4" />
-            </div>
+            <Skeleton className="h-4 w-4 shrink-0" />
           </li>
         ))}
       </ul>
@@ -331,7 +332,7 @@ export function ZproConversationsPage() {
       >
         <div className="flex flex-col gap-3">
           <Card className="p-1.5">
-            <ul className="flex flex-col gap-0.5">
+            <ul className="divide-y divide-border/50">
               {conversations.map((c) => (
                 <ZproConversationRow key={c.id} c={c} />
               ))}

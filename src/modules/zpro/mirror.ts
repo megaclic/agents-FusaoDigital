@@ -125,6 +125,14 @@ export async function mirrorZproMessage(
           lastMessageAt,
           lastMessageBody: body,
           ...(lastInboundAt ? { lastInboundAt } : {}),
+          // ticket.contact.profilePicUrl arrives on EVERY message webhook, same as queueId/tags
+          // above — previously only mirrorZproContact's dedicated contact-create-update event set
+          // this, so a contact whose first interaction was a message (not that event) showed no
+          // avatar until/unless it happened to fire later. Captured here too so the photo appears
+          // from the FIRST message instead of depending on a second event that may lag or never come.
+          ...(ticket.contact.profilePicUrl
+            ? { avatarUrl: ticket.contact.profilePicUrl }
+            : {}),
         },
         update: {
           status: ticket.status,
@@ -142,6 +150,9 @@ export async function mirrorZproMessage(
           lastMessageAt,
           lastMessageBody: body,
           ...(lastInboundAt ? { lastInboundAt } : {}),
+          ...(ticket.contact.profilePicUrl
+            ? { avatarUrl: ticket.contact.profilePicUrl }
+            : {}),
         },
         select: { id: true },
       }),

@@ -65,6 +65,7 @@ enum SchedulerJobKind {
   APPOINTMENT_REMINDER
   REDIRECT_FOLLOWUP
   SCHEDULED_MESSAGE
+  ZPRO_STATUS_CHECK
 }
 
 enum SchedulerJobStatus {

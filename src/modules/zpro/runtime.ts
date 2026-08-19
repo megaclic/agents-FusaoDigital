@@ -44,7 +44,11 @@ import {
   type ModelConfig,
   parseModelConfig,
 } from "@/graph/models";
-import { OUTSIDE_WINDOW_NOTE_PREFIX } from "@/graph/nudge";
+import {
+  FOLLOWUP_SKIP_SENTINEL,
+  isNudgeSilent,
+  OUTSIDE_WINDOW_NOTE_PREFIX,
+} from "@/graph/nudge";
 import {
   buildLangfuseHandler,
   buildToolTraceMetadata,
@@ -111,6 +115,7 @@ import type { TurnState } from "./native-tools";
 import { withMediaFallback, withQuotedPrefix } from "./parse";
 import { deliverZproReply } from "./split";
 import { ZproAgentStatusReporter } from "./status";
+import { scheduleZproStatusCheck } from "./status-reconcile";
 import { loadZproAgentTools } from "./tools";
 import { buildSetVoicePreferenceTool, sendZproVoiceReply } from "./tts";
 import type { NormalizedZproEvent } from "./types";
@@ -354,16 +359,40 @@ export type RunLoadedZproTurnOutcome =
 // toggling mid-turn would make the next webhook mirror read our own resolve as a human takeover and
 // discard the reply. Best-effort, never throws: the reply is already out, so a failed toggle only
 // leaves the ticket open (flow warn pages the operator).
+//
+// Also patches the LOCAL ZproConversation mirror (status/agentActive) — unlike Chatwoot (where the
+// conversation list can read live), our Z-PRO inbox UI is built entirely from this mirror
+// (mirrorZproMessage's "source of truth for the inbox UI"), and mirror.ts only ever writes
+// status/agentActive from an INBOUND webhook's ticket.status/n8nStatus. An outbound close we trigger
+// ourselves never loops back through a webhook, so without this the ticket stays "pending"/
+// agentActive:true in our own UI forever — confirmed live 2026-08-18: the real Z-PRO ticket was
+// genuinely closed, but our list kept showing it open with the IA badge on.
 async function applyDeferredZproResolve(
   client: ZproClient,
   ticketId: number,
   turnState: TurnState,
   flow: FlowContext,
+  mirror: { tenantId: bigint; zproInstanceId: bigint; base: PrismaClient },
 ): Promise<void> {
   if (!turnState.resolveRequested) return;
   turnState.resolveRequested = false;
   try {
     await deactivateAgent(client, ticketId, { closeTicket: true });
+    await runScopedOn(mirror.base, sysCtx(mirror.tenantId), (db) =>
+      db.zproConversation.updateMany({
+        where: { zproInstanceId: mirror.zproInstanceId, ticketId },
+        data: { status: "closed", agentActive: false },
+      }),
+    );
+    // Belt-and-suspenders: the close above sometimes doesn't stick on Z-PRO's side (confirmed live
+    // 2026-08-18 — our log reported success, the real ticket stayed "pending"). A one-shot check 3
+    // minutes out catches that case and re-syncs the mirror either way.
+    await scheduleZproStatusCheck({
+      tenantId: mirror.tenantId,
+      zproInstanceId: mirror.zproInstanceId,
+      ticketId,
+      base: mirror.base,
+    }).catch(() => {});
     emitFlowEvent(flow, {
       stage: "handoff",
       status: "ok",
@@ -489,12 +518,20 @@ export async function runLoadedZproTurn(
     // Mutable per-turn state shared with the native tools (deferred resolve intent) — mirrors
     // src/graph/runtime.ts's own turnState exactly.
     const turnState: TurnState = { resolveRequested: false };
-    // Operator guidance per tool (agent.settings.toolGuidance), plus the CRM funnel guidance
-    // (agent.settings.zproCrm.instructions) folded onto kanban_move_card specifically — mirrors
-    // src/graph/prepare.ts's exact merge (its own grouped configs win over the flat map for that tool).
+    // Operator guidance per tool (agent.settings.toolGuidance), plus the handoff transfer guidance
+    // (agent.settings.handoff.instructions) and the CRM funnel guidance (agent.settings.zproCrm.
+    // instructions) folded onto handoff_to_human/kanban_move_card specifically — mirrors
+    // src/graph/prepare.ts's exact merge (its own grouped configs win over the flat map for those
+    // two tools). NOTE: this fold was missing until 2026-08-18 — handoffConfig.instructions reached
+    // ctx.handoffCfg (routing still worked) but never ctx.toolInstructions, so the model never saw
+    // the operator's queue-selection guidance in the tool description, only in `agent_choice`'s bare
+    // <available_queues> list.
     const toolInstructions: Partial<Record<NativeToolName, string>> = {
       ...loaded.toolGuidance,
     };
+    if (loaded.handoffConfig.instructions) {
+      toolInstructions.handoff_to_human = loaded.handoffConfig.instructions;
+    }
     if (loaded.crmConfig.instructions) {
       toolInstructions.kanban_move_card = loaded.crmConfig.instructions;
     }
@@ -649,6 +686,19 @@ export async function runLoadedZproTurn(
 
       let reply = lastAssistantText(result.messages).trim();
 
+      // Proactive nudges (runZproAgentNudge, e.g. the inactivity follow-up sweep) instruct the
+      // model to reply with the exact FOLLOWUP_SKIP_SENTINEL token when no message is warranted.
+      // Chatwoot's own nudge path (src/graph/nudge.ts's runAgentNudge) detects/strips this BEFORE
+      // ever posting; this shared turn tail has no such check by default (a normal customer turn
+      // never rationally emits this token, since nothing prompts it to outside a nudge), so it's
+      // applied only when this turn IS a nudge. Missing this let a literal "[[SKIP]]" reach a real
+      // customer (confirmed live 2026-08-18) whenever the model chose silence on a follow-up.
+      if (params.proactive) {
+        reply = isNudgeSilent(reply)
+          ? ""
+          : reply.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
+      }
+
       // Re-check AFTER the invoke: did a human take over WHILE the LLM call ran? Mirrors
       // src/graph/runtime.ts's "taken-over" recheck (Chatwoot's assigneeType), keyed here on
       // ZproConversation.agentActive — the same flag the auto-handoff-on-human-intervention gate in
@@ -682,7 +732,11 @@ export async function runLoadedZproTurn(
       // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
       // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
       if (!reply) {
-        await applyDeferredZproResolve(client, ticketId, turnState, flow);
+        await applyDeferredZproResolve(client, ticketId, turnState, flow, {
+          tenantId,
+          zproInstanceId,
+          base,
+        });
         return "empty";
       }
 
@@ -719,7 +773,11 @@ export async function runLoadedZproTurn(
               ev.threadId,
               payload.name,
             );
-            await applyDeferredZproResolve(client, ticketId, turnState, flow);
+            await applyDeferredZproResolve(client, ticketId, turnState, flow, {
+              tenantId,
+              zproInstanceId,
+              base,
+            });
             return "posted-template";
           }
           // No template configured → fall through to the explained note below (never a free-form
@@ -735,7 +793,11 @@ export async function runLoadedZproTurn(
             threadId,
             ev.threadId,
           );
-          await applyDeferredZproResolve(client, ticketId, turnState, flow);
+          await applyDeferredZproResolve(client, ticketId, turnState, flow, {
+            tenantId,
+            zproInstanceId,
+            base,
+          });
           return "posted-note-window";
         }
       }
@@ -782,7 +844,8 @@ export async function runLoadedZproTurn(
               flow,
               "tts",
               { detail: { step: "send" }, errorLevel: "warn" },
-              () => sendZproVoiceReply(client, ev, tts),
+              () =>
+                sendZproVoiceReply(client, ev, tts, turnState.resolveRequested),
             );
             logger.info(
               "zpro agent replied (audio): thread=%s ticket=%s len=%d",
@@ -791,7 +854,11 @@ export async function runLoadedZproTurn(
               reply.length,
             );
             deliveredBalloons = 1;
-            await applyDeferredZproResolve(client, ticketId, turnState, flow);
+            await applyDeferredZproResolve(client, ticketId, turnState, flow, {
+              tenantId,
+              zproInstanceId,
+              base,
+            });
             return "posted";
           }
         } catch (e) {
@@ -815,6 +882,7 @@ export async function runLoadedZproTurn(
         loaded.splitConfig,
         undefined,
         flow,
+        turnState.resolveRequested,
       );
       logger.info(
         "zpro agent replied: thread=%s ticket=%s len=%d balloons=%d",
@@ -824,7 +892,11 @@ export async function runLoadedZproTurn(
         balloons,
       );
       deliveredBalloons = balloons;
-      await applyDeferredZproResolve(client, ticketId, turnState, flow);
+      await applyDeferredZproResolve(client, ticketId, turnState, flow, {
+        tenantId,
+        zproInstanceId,
+        base,
+      });
       return "posted";
     } finally {
       status.finished(deliveredBalloons);
