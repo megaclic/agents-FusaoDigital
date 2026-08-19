@@ -17,21 +17,13 @@ import { credentialCompat } from "@/client/lib/credentialCompat";
 import { providerLabel } from "@/client/lib/providerLabels";
 import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import { REASONING_EFFORTS } from "@/graph/openai-reasoning";
 import { CapabilityMap } from "./CapabilityMap";
 import { PromptPanel } from "./PromptPanel";
 import { TabActionBar } from "./TabActionBar";
-import type { GrantState, ToolCatalog, VaultEntry } from "./types";
-
-export const MODEL_PROVIDERS = [
-  "openai",
-  "openai-compatible",
-  "anthropic",
-  "google",
-  "deepseek",
-  "openrouter",
-] as const;
+import type { GrantState, ToolCatalog } from "./types";
 
 interface ModelState {
   provider: string;
@@ -55,7 +47,6 @@ interface GeneralTabProps {
   model: ModelState;
   setModel: React.Dispatch<React.SetStateAction<ModelState>>;
   modelCredBaseUrl: string | null;
-  onModelEntryChange: (entry: VaultEntry | null) => void;
   dirty: boolean;
   saving: boolean;
   onSave: () => void;
@@ -85,7 +76,6 @@ export function GeneralTab({
   model,
   setModel,
   modelCredBaseUrl,
-  onModelEntryChange,
   dirty,
   saving,
   onSave,
@@ -228,7 +218,6 @@ export function GeneralTab({
               defaultCreateType={credentialCompat.model(model.provider)[0]}
               testBaseUrl={modelCredBaseUrl ? undefined : model.baseURL}
               ariaLabel={t("editor.credential", "API key")}
-              onEntryChange={onModelEntryChange}
             />
           </FormField>
           <FormField

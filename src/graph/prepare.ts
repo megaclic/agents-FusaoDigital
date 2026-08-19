@@ -34,7 +34,11 @@ import {
   loadChatwootVocab,
 } from "@/modules/chatwoot/vocab";
 import { resolveVariantOverride } from "@/modules/experiments/service";
-import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import {
+  emitFlowEvent,
+  type FlowContext,
+  withFlowStage,
+} from "@/modules/flowlog/service";
 import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import {
   type GuardrailsConfig,
@@ -64,6 +68,8 @@ import {
   type ServiceWindowConfig,
 } from "@/modules/service-window/service";
 import { readSplitConfig, type SplitConfig } from "@/modules/split/service";
+import { llmNormalizeForSpeech } from "@/modules/tts/normalize";
+import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 import { readTtsConfig, type TtsConfig } from "@/modules/tts/settings";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
 import { ensureFreshMcpAccessToken } from "@/modules/vault/mcp-oauth";
@@ -225,6 +231,11 @@ export interface AgentConfig {
   langfuseCfg: LangfuseConfig | null;
   // TTS (audio reply) config + the contact's stored preference, for the reply-modality decision.
   ttsConfig: TtsConfig;
+  // The speech normalizer's OWN resolved key / baseURL, when the operator pointed it at a separate
+  // credential. Empty ⇒ it inherits the agent's (the default). Resolved here, next to the agent's and
+  // the guardrails agent's, so the audio path never opens a DB read of its own.
+  ttsNormalizeApiKey: string;
+  ttsNormalizeCredentialBaseUrl: string | null;
   contactVoiceReply: boolean | null;
   // Humanized text delivery (split into balloons + typing delay).
   splitConfig: SplitConfig;
@@ -368,6 +379,29 @@ export async function loadAgentConfig(
         "agent %s: guardrails credentialRef %s did not resolve — guardrails analysis is skipped",
         String(args.agentId),
         guardrails.credentialRef,
+      );
+    }
+  }
+  // Speech normalizer's own credential, when it runs on a separate model. Same fail-open shape as
+  // guardrails: an unresolvable ref leaves the key empty, and buildSpeechNormalizer then SKIPS the
+  // rewrite (visibly) rather than quietly falling back to the agent's key on a provider that may not
+  // accept it.
+  const ttsCfg = readTtsConfig(effSettings);
+  let ttsNormalizeApiKey = "";
+  let ttsNormalizeCredentialBaseUrl: string | null = null;
+  if (ttsCfg.normalize && ttsCfg.normalizeCredentialRef) {
+    const nEntry = await tryResolveVaultEntry<string>(
+      db,
+      ttsCfg.normalizeCredentialRef,
+    );
+    if (nEntry) {
+      ttsNormalizeApiKey = nEntry.secret;
+      ttsNormalizeCredentialBaseUrl = nEntry.baseUrl;
+    } else {
+      logger.warn(
+        "agent %s: tts normalize credentialRef %s did not resolve, so the speech rewrite is skipped",
+        String(args.agentId),
+        ttsCfg.normalizeCredentialRef,
       );
     }
   }
@@ -586,7 +620,9 @@ export async function loadAgentConfig(
     integrationSelections: sel.integrationSelections,
     ragConfig: sel.ragConfig,
     langfuseCfg,
-    ttsConfig: readTtsConfig(effSettings),
+    ttsConfig: ttsCfg,
+    ttsNormalizeApiKey,
+    ttsNormalizeCredentialBaseUrl,
     contactVoiceReply: conv?.contact?.voiceReply ?? null,
     splitConfig: readSplitConfig(effSettings),
     serviceWindowConfig: readServiceWindowConfig(effSettings),
@@ -1017,6 +1053,13 @@ export interface CallbacksArgs {
   base?: PrismaClient;
   persistUsage?: UsagePersist;
   node?: string;
+  // The model to LABEL the usage row with. Defaults to the agent's own model, which is right for the
+  // turn itself; a secondary call on a separately-configured model (the speech normalizer) must pass
+  // the model it actually billed, or the row attributes that spend to the wrong model.
+  model?: string;
+  // Passed through to the Langfuse handler: false for a secondary call sharing the turn's trace.
+  // See TraceContext.updateRoot.
+  updateRoot?: boolean;
   // Usage segmentation: "inbox" (real traffic, default) | "playground" (operator test turns).
   source?: UsageSource;
   // Per-turn id → the Langfuse trace id (correlates a trace with the ExecutionLog turn). Omitted
@@ -1036,7 +1079,7 @@ export function buildCallbacks(
     conversationId: cfg.conversationDbId,
     inboxId: cfg.inboxDbId,
     threadId: args.threadId,
-    model: cfg.mc.model,
+    model: args.model ?? cfg.mc.model,
     node: args.node ?? "agent",
     source: args.source,
     persist: args.persistUsage,
@@ -1053,8 +1096,131 @@ export function buildCallbacks(
     source: args.source,
     availableTools: toolTrace.availableTools,
     availableToolSchemas: toolTrace.availableToolSchemas,
+    updateRoot: args.updateRoot,
   });
   return langfuse ? [usage, langfuse] : [usage];
+}
+
+export interface SpeechNormalizerArgs {
+  makeModel?: (cfg: ResolvedModelConfig) => BaseChatModel;
+  // The turn's identity for the usage row and the trace. What makes this call READ as a secondary
+  // call (the node label, the model label, updateRoot) is fixed below, not by the caller: every
+  // transport that synthesizes audio has to record it the same way.
+  callbacks?: Omit<CallbacksArgs, "node" | "model" | "updateRoot" | "tools">;
+  // Its own `normalize` stage on the turn trail, NOT an event on the `tts` line: the provider/model
+  // columns of a tts row mean the voice engine, and folding a second timing into that row would make
+  // "how long does synthesis take" unanswerable.
+  flow?: FlowContext;
+}
+
+// The reply's own rewrite-for-speech pass, as a separate model call. The agent writes the answer; this
+// rewrites a COPY of it for the ear, so the agent's prompt never carries a delivery concern and the
+// customer's transcript keeps the original wording. Returns undefined when the agent opted out, which
+// is what tells synthesizeReply to send the raw text.
+export function buildSpeechNormalizer(
+  cfg: AgentConfig,
+  args: SpeechNormalizerArgs = {},
+): ((text: string) => Promise<string>) | undefined {
+  if (!cfg.ttsConfig.normalize) return undefined;
+  const resolved = resolveNormalizeModel(
+    cfg.ttsConfig,
+    {
+      provider: cfg.mc.provider,
+      model: cfg.mc.model,
+      baseURL: cfg.credentialBaseUrl ?? cfg.mc.baseURL,
+    },
+    { ownCredentialBaseURL: cfg.ttsNormalizeCredentialBaseUrl },
+  );
+  const own = resolved.credential === "own";
+  // Skipping the rewrite must never cost the customer the AUDIO: the caller wraps the whole TTS
+  // branch in one try/catch, so anything that throws out of here degrades the reply to text. Every
+  // way this builder can fail therefore returns undefined with a visible line instead.
+  const skip = (reason: string): undefined => {
+    if (args.flow) {
+      emitFlowEvent(args.flow, {
+        stage: "normalize",
+        level: "warn",
+        status: "skipped",
+        provider: resolved.provider,
+        model: resolved.model,
+        detail: { reason },
+      });
+    }
+    return undefined;
+  };
+  // Every configuration the resolver refuses: an unsupported provider name, a switched provider with
+  // no key of its own (running it on the AGENT's key would transmit one vendor's secret to another),
+  // and an openai-compatible endpoint that is missing. REST and MCP write the settings bag directly,
+  // so the editor's warning is not the guard here.
+  if (!resolved.runnable) return skip(resolved.reason ?? "not_runnable");
+  // Its own credential was configured and did not resolve. Falling back to the AGENT's key would be a
+  // silent substitution on a provider that may not even accept it.
+  if (own && !cfg.ttsNormalizeApiKey) return skip("credential_not_found");
+  const makeModel = args.makeModel ?? createChatModel;
+  // Built from the resolution alone, never spread from the agent's config: everything the rewrite
+  // is allowed to inherit came back through the resolver by name, and a spread would carry whatever
+  // else the agent's config holds (today its credentialRef, tomorrow any field the schema grows)
+  // across a provider switch, which is the one thing this whole resolution exists to refuse. The
+  // guardrails model is built the same way.
+  const mc: ResolvedModelConfig = {
+    provider: resolved.provider as ModelConfig["provider"],
+    model: resolved.model,
+    // WHOSE key travels, decided by the resolver rather than here: the agent's is reachable only
+    // while the provider is unchanged, and `none` is an openai-compatible endpoint that authenticates
+    // by its URL, where sending the agent's key would be the leak this whole rule exists to prevent.
+    apiKey:
+      resolved.credential === "own"
+        ? cfg.ttsNormalizeApiKey
+        : resolved.credential === "agent"
+          ? cfg.apiKey
+          : "",
+    baseURL: resolved.baseURL ?? undefined,
+    // Pinned, and the agent's reasoningEffort deliberately NOT carried: this pass rewrites an answer
+    // that already exists, and the effort the operator chose is about how the agent THINKS.
+    // Reasoning here would only add latency to an audio reply the customer is waiting on.
+    temperature: 0,
+  };
+  // createChatModel REJECTS some configurations synchronously (openai-compatible with no effective
+  // base URL throws a 400), and this normalizer config is separately editable, so that throw is
+  // reachable without the agent's own model being broken. Uncaught it would cost the audio reply.
+  let model: BaseChatModel;
+  try {
+    model = makeModel(mc);
+  } catch (err) {
+    logger.warn(
+      { err, agentId: String(cfg.agentId) },
+      "tts normalize: model config is not runnable, skipping the speech rewrite",
+    );
+    return skip("model_not_runnable");
+  }
+  const callbacks = args.callbacks
+    ? buildCallbacks(cfg, {
+        ...args.callbacks,
+        node: "tts_normalize",
+        model: mc.model,
+        // The turn's trace already exists under this turnId; this call is a generation INSIDE it.
+        updateRoot: false,
+      })
+    : undefined;
+  return (text) =>
+    withFlowStage(
+      args.flow,
+      "normalize",
+      {
+        provider: mc.provider,
+        model: mc.model,
+        detail: { inChars: text.length },
+        // NOTE: counts only. The rewritten text IS the customer's message, so no excerpt, prefix or
+        // hash of it may reach a row an operator exports.
+        detailOf: (out: string) => ({
+          outChars: out.length,
+          rewritten: out !== text,
+        }),
+        // Best-effort: synthesizeReply catches and synthesizes the raw text, so this is an advisory.
+        errorLevel: "warn",
+      },
+      () => llmNormalizeForSpeech(model, text, callbacks),
+    );
 }
 
 export interface GraphBuildDeps {

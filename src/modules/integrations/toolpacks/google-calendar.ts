@@ -5,7 +5,7 @@ import { failableTool, toolFailure } from "@/graph/tools/failure";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { xmlAttr } from "@/lib/xml";
 import { readAppointmentReminderConfig } from "@/modules/appointments/settings";
-import { computeAvailableSlots } from "./calendar-slots";
+import { type CalendarSource, computeAggregatedSlots } from "./calendar-slots";
 import {
   type IntegrationSelection,
   registerToolpack,
@@ -227,6 +227,26 @@ function pickCalendarId(
   };
 }
 
+// Which calendars an AVAILABILITY query covers (issue #100). Same fencing as pickCalendarId for an
+// explicit arg; the difference is the no-arg case, which used to be refused ("set calendarId") and
+// now means EVERY allowed calendar. That refusal is what forced a clinic's agent to call this tool
+// once per professional and merge the results itself, spending the turn's tool budget on arithmetic
+// the runtime does deterministically. Booking, rescheduling and cancelling deliberately keep the
+// old rule: those act on ONE calendar, chosen after the customer picks a professional.
+function pickAvailabilityCalendars(
+  allowed: string[],
+  labels: Record<string, string>,
+  requested: string | undefined,
+): { ids: string[] } | { error: string } {
+  // NOTE: An explicit arg, and the empty-allowlist refusal, resolve exactly as every other calendar
+  // tool resolves them; only the no-arg case below differs.
+  if (requested?.trim() || allowed.length === 0) {
+    const one = pickCalendarId(allowed, labels, requested);
+    return "error" in one ? one : { ids: [one.id] };
+  }
+  return { ids: allowed };
+}
+
 function resolveTimeZone(config: Record<string, unknown>): string {
   const v = config.timeZone;
   return typeof v === "string" && v.trim() ? v.trim() : DEFAULT_TIME_ZONE;
@@ -243,6 +263,27 @@ const MAX_GRANULARITY_MINUTES = 240;
 // Availability is queried one day at a time: cap the range so the (now unsampled) slot list stays small
 // and the model pages through longer searches itself, a day per call.
 const MAX_AVAILABILITY_RANGE_MS = 24 * 60 * 60 * 1000;
+// Calendars per freeBusy request. Two limits meet here and batching satisfies both. Google's
+// calendarExpansionMax caps ONE freebusy.query at 50 (past it, per-calendar
+// `tooManyCalendarsRequested`), and ours is the response: gcalFetch truncates a body at
+// MAX_RESPONSE_CHARS BEFORE parsing it, so an oversized answer parses to null and every calendar in
+// it reads as unreadable, which would surface as "the whole clinic is unreachable". Ten keeps a
+// worst-case batch far under both. Google's ceiling is PER REQUEST, so batching is what satisfies
+// it; what bounds the query as a whole is MAX_AGGREGATE_CALENDARS below.
+const FREEBUSY_BATCH_SIZE = 10;
+// How many calendars ONE aggregate query may cover. `calendarIds` is an arbitrary-length array that
+// nothing validates, and aggregation is where that array turns into outbound requests and into slot
+// entries at once, so the bound belongs here rather than on each consequence separately: at 50 the
+// fan-out is five batches, and the earliest start time (which is emitted whole, see
+// computeAggregatedSlots) cannot approach MAX_SLOT_ENTRIES. Above it the query is REFUSED, the same
+// fail-closed answer MAX_BLOCKING_CALENDARS gives to the same shape of problem, because an aggregate
+// answer over more calendars than this is not one a customer could be read anyway. An explicit
+// calendarId still reaches every calendar, at any allowlist size.
+const MAX_AGGREGATE_CALENDARS = 50;
+// Ceiling on slot entries in one tool result. One entry per (time, calendar) multiplies with the
+// calendar count; this bounds it without collapsing the range (see computeAggregatedSlots). Sized so
+// a realistic clinic (a handful of professionals over a working day) is never truncated at all.
+const MAX_SLOT_ENTRIES = 250;
 
 function clampMinutes(
   raw: unknown,
@@ -474,12 +515,21 @@ const NO_CONTACT =
 const FOREIGN_EVENT =
   "That appointment is not associated with this customer, so it cannot be read or changed here.";
 
-// NOTE: zod-optional but never optional in practice: the arg is only ever EXPOSED when the
-// integration allows several calendars (calendarArgSchema), and then one of them must be named or
-// pickCalendarId refuses. The trailing sentence is for the operator reading the arg list in the
-// console, which is per-catalog and therefore always shows this field.
+// NOTE: zod-optional but never optional in practice, for the tools that ACT on one calendar: the arg
+// is only ever EXPOSED when the integration allows several (calendarArgSchema), and then one of them
+// must be named or pickCalendarId refuses. The trailing sentence is for the operator reading the arg
+// list in the console, which is per-catalog and therefore always shows this field.
 const CALENDAR_ID_DESC =
   "Which calendar to act on: name or id of one of the calendars in `<allowed_calendars>`. This arg only appears when the integration allows several calendars; with a single one it is used automatically.";
+
+// NOTE: Availability is the ONE tool where omitting this is not a mistake but the default, and the
+// arg description is where that has to be said. The tool description already says so, but the model
+// decides whether to fill an optional field while reading the field, and "Which calendar to act on"
+// there reads as an instruction to pick one: the arg text would be arguing against the tool text,
+// with a list of valid values in sight (the inverse of the #98 failure, where an optional arg with
+// NO valid value in sight invited the model to invent one).
+const AVAILABILITY_CALENDAR_ID_DESC =
+  'OPTIONAL, and usually omitted. Leave it out to search EVERY calendar in `<allowed_calendars>` at once, which is what answers "who is free first?" or "any <specialty> tomorrow?" in one call; each returned slot names the calendar that can take it. Pass it (name or id) ONLY when the customer has already chosen a professional, or when they asked about that one specifically.';
 
 function projectEvent(ev: Record<string, unknown>) {
   return {
@@ -540,7 +590,7 @@ const CHECK_AVAILABILITY_SCHEMA = z.object({
     .describe(
       "Spacing between candidate start times, in minutes. Optional; defaults to the integration's setting (e.g. 15 ⇒ 09:00 and 09:15 are both offered).",
     ),
-  calendarId: z.string().optional().describe(CALENDAR_ID_DESC),
+  calendarId: z.string().optional().describe(AVAILABILITY_CALENDAR_ID_DESC),
 });
 
 const CREATE_EVENT_SCHEMA = z.object({
@@ -714,45 +764,130 @@ function buildCheckAvailabilityTool(
       }
       const token = await resolveToken(sel, ctx);
       if (!token) return toolFailure(NOT_CONNECTED);
-      const pick = pickCalendarId(allowed, labels, input.calendarId);
+      const pick = pickAvailabilityCalendars(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
-      const calendarId = pick.id;
-      const body = {
-        timeMin: input.timeMin,
-        timeMax: input.timeMax,
-        timeZone,
-        items: [{ id: calendarId }],
-      };
-      let res: GcalResponse;
-      try {
-        res = await gcalFetch(
-          "/freeBusy",
-          { method: "POST", token, body },
-          ctx,
+      const calendarIds = pick.ids;
+      if (calendarIds.length > MAX_AGGREGATE_CALENDARS) {
+        return `Too many calendars are configured to search at once (${calendarIds.length}; the limit is ${MAX_AGGREGATE_CALENDARS}). Pass calendarId to check one calendar, or reduce the calendars in the integration settings.`;
+      }
+      // NOTE: freeBusy takes N calendars per request and keys the answer by id, so the whole clinic
+      // costs at most five requests (see FREEBUSY_BATCH_SIZE and MAX_AGGREGATE_CALENDARS), not one
+      // per professional the way the model had to do it before.
+      const batches: string[][] = [];
+      for (let i = 0; i < calendarIds.length; i += FREEBUSY_BATCH_SIZE) {
+        batches.push(calendarIds.slice(i, i + FREEBUSY_BATCH_SIZE));
+      }
+      // NOTE: allSettled, not all: gcalFetch THROWS on a timeout or a network error, and a single
+      // rejection would discard every batch that answered fine. Non-2xx already degraded per batch;
+      // a thrown one has to degrade the same way or the contract is a coin flip on failure mode.
+      // Concurrency needs no separate bound: MAX_AGGREGATE_CALENDARS caps this at five requests.
+      const batchRes = await Promise.allSettled(
+        batches.map((ids) =>
+          gcalFetch(
+            "/freeBusy",
+            {
+              method: "POST",
+              token,
+              body: {
+                timeMin: input.timeMin,
+                timeMax: input.timeMax,
+                timeZone,
+                items: ids.map((id) => ({ id })),
+              },
+            },
+            ctx,
+          ),
+        ),
+      );
+      // NOTE: A batch that failed contributes no entries, so its calendars fall through the same
+      // "unreadable" path as a calendar Google refused individually. Only a total failure surfaces
+      // the HTTP status, which keeps the single-batch case answering exactly as it always did.
+      const calendars: Record<string, unknown> = {};
+      let lastStatus: number | null = null;
+      let threw = false;
+      for (const r of batchRes) {
+        if (r.status === "rejected") {
+          logger.warn({ err: r.reason }, "gcal: freeBusy batch failed");
+          threw = true;
+          continue;
+        }
+        if (r.value.status < 200 || r.value.status >= 300) {
+          lastStatus = r.value.status;
+          continue;
+        }
+        const d = (r.value.json ?? {}) as Record<string, unknown>;
+        Object.assign(
+          calendars,
+          (d.calendars ?? {}) as Record<string, unknown>,
         );
-      } catch (err) {
-        logger.warn({ err }, "gcal: freeBusy request failed");
+      }
+      // NOTE: Nothing came back at all, and the three ways that happens stay distinguishable, exactly
+      // as the single-batch path always reported them. The last one is a 2xx whose body was empty,
+      // malformed, or truncated by MAX_RESPONSE_CHARS before parsing: there is no status to quote
+      // (saying "HTTP null" is worse than saying nothing), and it is retriable, so it reads as such.
+      if (Object.keys(calendars).length === 0) {
+        if (lastStatus !== null) {
+          return toolFailure(`Google Calendar returned HTTP ${lastStatus}.`);
+        }
         return toolFailure(
-          "Failed to reach Google Calendar. Try again shortly.",
+          threw
+            ? "Failed to reach Google Calendar. Try again shortly."
+            : "Google Calendar's availability response could not be read. Try again shortly.",
         );
       }
-      if (res.status < 200 || res.status >= 300) {
-        return toolFailure(`Google Calendar returned HTTP ${res.status}.`);
+      // NOTE: Per-calendar outcome. freeBusy answers 200 and reports a calendar it could not read as a
+      // per-calendar `errors` array (a revoked share, a deleted calendar), so the failure is INSIDE a
+      // successful response. Such a calendar is dropped, never carried with an empty busy list: empty
+      // busy means "free all day", and offering a professional whose bookings we cannot see is a
+      // double booking. Dropping it only under-offers, and the caller is told which ones went missing
+      // so the reply can say so instead of pretending the clinic is smaller than it is.
+      const sources: CalendarSource[] = [];
+      const unreadable: string[] = [];
+      for (const id of calendarIds) {
+        const entry = (calendars[id] ?? null) as Record<string, unknown> | null;
+        const errors = entry && Array.isArray(entry.errors) ? entry.errors : [];
+        if (!entry || errors.length > 0) {
+          unreadable.push(labels[id] ?? id);
+          continue;
+        }
+        const busy = (Array.isArray(entry.busy) ? entry.busy : [])
+          .map((b) => (b ?? {}) as Record<string, unknown>)
+          .filter(
+            (b) => typeof b.start === "string" && typeof b.end === "string",
+          )
+          .map((b) => ({ start: b.start as string, end: b.end as string }));
+        sources.push({
+          calendarId: id,
+          calendarLabel: labels[id] ?? null,
+          busy,
+        });
       }
-      const data = (res.json ?? {}) as Record<string, unknown>;
-      const calendars = (data.calendars ?? {}) as Record<string, unknown>;
-      const entry = (calendars[calendarId] ?? {}) as Record<string, unknown>;
-      const busy = (Array.isArray(entry.busy) ? entry.busy : [])
-        .map((b) => (b ?? {}) as Record<string, unknown>)
-        .filter((b) => typeof b.start === "string" && typeof b.end === "string")
-        .map((b) => ({ start: b.start as string, end: b.end as string }));
+      // NOTE: Nothing readable at all: an empty slot list would read as "fully booked", which sends the
+      // customer away from a clinic that is open. Say we could not check instead.
+      if (sources.length === 0) {
+        return toolFailure(
+          `Availability cannot be verified right now: no configured calendar could be read (${unreadable.join(", ")}).`,
+        );
+      }
       // Blocking calendars (holidays, closures) count as busy too, read via events.list, NOT
       // freeBusy: all-day events (the typical holiday shape) default to transparency "transparent"
       // ("Free") and freeBusy silently ignores them, which is exactly the calendar the operator
       // expects to block. Only start/end are requested (no titles or attendees reach the model).
       // Fail-closed: a blocking calendar we cannot read could be hiding a closure, so refusing
       // beats offering a slot the operator explicitly blocked.
-      const blocking = blockingIds.filter((id) => id !== calendarId);
+      // Which blocking calendars have to be READ. A blocker is skipped only when the query covers
+      // nothing but that same calendar: its own bookings already arrive via freeBusy, and reading it
+      // as a blocker would turn its transparent events into blocks of itself. With siblings in the
+      // query it MUST be read, because a calendar can be operable and still carry closures its
+      // siblings have to respect. Dropping it whenever it appeared in the query (an earlier revision
+      // of this change) made an all-day closure on a doubly-listed calendar invisible to everyone.
+      const blockingWindows: Array<{
+        id: string;
+        windows: { start: string; end: string }[];
+      }> = [];
+      const blocking = blockingIds.filter((id) =>
+        sources.some((s) => s.calendarId !== id),
+      );
       if (blocking.length > MAX_BLOCKING_CALENDARS) {
         return `Too many blocking calendars are configured (${blocking.length}; the limit is ${MAX_BLOCKING_CALENDARS}), so availability cannot be verified. Reduce the blocking calendars in the integration settings.`;
       }
@@ -781,7 +916,7 @@ function buildCheckAvailabilityTool(
             "Failed to read a blocking calendar (holidays/closures), so availability cannot be verified right now. Try again shortly.",
           );
         }
-        for (const r of blockingRes) {
+        for (const [i, r] of blockingRes.entries()) {
           if (r.status < 200 || r.status >= 300) {
             return toolFailure(
               `Google Calendar returned HTTP ${r.status} for a blocking calendar, so availability cannot be verified right now.`,
@@ -794,13 +929,15 @@ function buildCheckAvailabilityTool(
             return "A blocking calendar has more events in this range than can be checked at once, so availability cannot be verified right now. Try a narrower range.";
           }
           const items = Array.isArray(evData.items) ? evData.items : [];
+          const windows: { start: string; end: string }[] = [];
           for (const ev of items) {
             const w = blockingBusyWindow(
               (ev ?? {}) as Record<string, unknown>,
               timeZone,
             );
-            if (w) busy.push(w);
+            if (w) windows.push(w);
           }
+          blockingWindows.push({ id: blocking[i] as string, windows });
         }
       }
       // The service hours bounding bookable slots: the integration's chosen BusinessHours (windows +
@@ -810,30 +947,49 @@ function buildCheckAvailabilityTool(
         businessHoursId && ctx.resolveBusinessHours
           ? await ctx.resolveBusinessHours(businessHoursId)
           : null;
-      const slots = computeAvailableSlots({
+      const slots = computeAggregatedSlots({
         timeMin: input.timeMin,
         timeMax: input.timeMax,
         now: new Date(),
         scheduleWindows: schedule?.windows ?? [],
         scheduleTz: schedule?.timezone ?? timeZone,
-        busy,
+        // NOTE: Each source's busy list is assembled HERE: its own bookings plus every blocking calendar
+        // except itself.
+        sources: sources.map((src) => ({
+          ...src,
+          busy: [
+            ...src.busy,
+            ...blockingWindows
+              .filter((b) => b.id !== src.calendarId)
+              .flatMap((b) => b.windows),
+          ],
+        })),
         slotMinutes: resolveSlotDuration(sel.config, input.slotDurationMinutes),
         granularityMinutes: resolveSlotGranularity(
           sel.config,
           input.granularityMinutes,
         ),
         minLeadMinutes,
+        // NOTE: Only when aggregating. The multiplication this bounds does not exist with one calendar,
+        // and what a single-calendar instance returns is not this change's to alter: capping it would
+        // shorten a list operators have been reading since before the feature existed.
+        maxSlots:
+          sources.length > 1 ? MAX_SLOT_ENTRIES : Number.POSITIVE_INFINITY,
       });
-      // A list of bookable start times (start/end ISO + a human label). Empty ⇒ nothing free in range.
+      // NOTE: A list of bookable start times (start/end ISO + a human label), each tagged with the calendar
+      // that can take it. Empty ⇒ nothing free in range. `coveredUntil` appears only when the entry
+      // ceiling stopped the search early, and is the timeMin to continue from.
       return JSON.stringify({
-        slots,
+        slots: slots.slots,
         timeZone: schedule?.timezone ?? timeZone,
+        ...(slots.coveredUntil ? { coveredUntil: slots.coveredUntil } : {}),
+        ...(unreadable.length > 0 ? { unavailableCalendars: unreadable } : {}),
       });
     },
     {
       name: "calendar_check_availability",
       description: withCalendarContext(
-        `Return ALL bookable appointment start times within a range, already honoring the service hours, existing bookings and any operator-designated blocking calendars such as holidays or closures (no appointment details are exposed). Each slot has start, end and a human-readable label. Offer these to the customer and confirm one before creating the appointment. Pass ISO 8601 timestamps for the range, and search AT MOST 24 hours per call (one day at a time — call again for other days). The configured appointment length is shown in \`<slot_duration>\` below — when preset="false", choose it yourself per request and pass slotDurationMinutes (e.g. 30 for a standard appointment, 60 for a longer one); when preset="true", pass slotDurationMinutes only to override it.`,
+        `Return ALL bookable appointment start times within a range, already honoring the service hours, existing bookings and any operator-designated blocking calendars such as holidays or closures (no appointment details are exposed). Each slot has start, end, a human-readable label, and the calendarId (plus calendarLabel) that can actually take it. With several calendars configured, OMIT calendarId to search all of them at once and answer "who is available first?" in a single call; pass calendarId only to restrict the search to one. Offer these to the customer and confirm one before creating the appointment, then pass that slot's calendarId when booking. If \`unavailableCalendars\` comes back, those calendars could not be read and their slots are missing from the list. If \`coveredUntil\` comes back, the search stopped early and that timestamp is the FIRST start time it did not cover: the list is NOT the whole range, so never conclude that later times are unavailable, and call again with timeMin set to that value to continue. Pass ISO 8601 timestamps for the range, and search AT MOST 24 hours per call (one day at a time — call again for other days). The configured appointment length is shown in \`<slot_duration>\` below — when preset="false", choose it yourself per request and pass slotDurationMinutes (e.g. 30 for a standard appointment, 60 for a longer one); when preset="true", pass slotDurationMinutes only to override it.`,
         slotDurationXml(sel.config),
         calendarContextXml(allowed, labels),
       ),

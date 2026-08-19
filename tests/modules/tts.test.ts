@@ -10,7 +10,7 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { synthesizeReply } from "@/modules/tts/service";
-import type { TtsConfig } from "@/modules/tts/settings";
+import { TTS_DEFAULTS, type TtsConfig } from "@/modules/tts/settings";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -233,6 +233,7 @@ describe.skipIf(!dbUp)("tts", () => {
 
   test("synthesizeReply resolves the credential and returns audio", async () => {
     const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
       mode: "mirror",
       provider: "openai",
       model: "",
@@ -256,6 +257,7 @@ describe.skipIf(!dbUp)("tts", () => {
     // ElevenLabs requires a voice; with none set the synth is not runnable → null, and (with a flow
     // context) a warn+skipped line so the operator sees WHY the audio reply didn't happen.
     const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
       mode: "mirror",
       provider: "elevenlabs",
       model: "",
@@ -298,6 +300,7 @@ describe.skipIf(!dbUp)("tts", () => {
   // provider's own machine-readable error code (never its free-text message).
   test("a provider failure logs the wire format and the provider's error code", async () => {
     const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
       mode: "mirror",
       provider: "elevenlabs",
       model: "",
@@ -365,6 +368,7 @@ describe.skipIf(!dbUp)("tts", () => {
 
   test("normalize=true rewrites the synth input via the injected normalizer", async () => {
     const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
       mode: "mirror",
       provider: "openai",
       model: "",
@@ -394,8 +398,64 @@ describe.skipIf(!dbUp)("tts", () => {
     expect(captured).toBe("cinquenta reais");
   });
 
+  // The rewrite is a BILLED call, and with it shipping on by default an agent set to mirror with no
+  // TTS credential would pay for one on every audio-triggering turn and still fall back to text. Every
+  // check that can abort the synthesis has to come first.
+  test("no credential → the paid rewrite is never called", async () => {
+    const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
+      mode: "mirror",
+      provider: "openai",
+      credentialRef: null,
+      normalize: true,
+    };
+    let called = 0;
+    const res = await synthesizeReply({
+      tenantId,
+      cfg,
+      text: "olá",
+      base: appDb,
+      deps: {
+        fetchImpl: audioFetch(),
+        normalizeSpeech: async (t) => {
+          called += 1;
+          return t;
+        },
+      },
+    });
+    expect(res).toBeNull();
+    expect(called).toBe(0);
+  });
+
+  test("a credential that no longer resolves → the paid rewrite is never called", async () => {
+    const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
+      mode: "mirror",
+      provider: "openai",
+      credentialRef: "vault:999999999999",
+      normalize: true,
+    };
+    let called = 0;
+    const res = await synthesizeReply({
+      tenantId,
+      cfg,
+      text: "olá",
+      base: appDb,
+      deps: {
+        fetchImpl: audioFetch(),
+        normalizeSpeech: async (t) => {
+          called += 1;
+          return t;
+        },
+      },
+    });
+    expect(res).toBeNull();
+    expect(called).toBe(0);
+  });
+
   test("normalize falls back to the raw text when the normalizer throws", async () => {
     const cfg: TtsConfig = {
+      ...TTS_DEFAULTS,
       mode: "mirror",
       provider: "openai",
       model: "",

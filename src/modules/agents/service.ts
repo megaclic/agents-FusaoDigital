@@ -17,6 +17,7 @@ import {
   TenantTargetRequiredError,
 } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import { isOutOfHoursNow, parseWindows } from "@/modules/business-hours/hours";
 import { renameAgentBots } from "@/modules/chatwoot/provisioning";
 import { ensureTenantSweep } from "@/modules/followups/handlers";
@@ -276,6 +277,36 @@ export function assertPromptSize(systemPrompt: string | undefined): void {
   }
 }
 
+// NOTE: the operator prose inside `settings` (tool guidance, guardrails policy, vision prompt,
+// follow-up steps) is clamped by the READERS, which is invisible to whoever wrote it: the row keeps
+// every character and only the model-facing copy is short. Refusing at the boundary is the same
+// checkpoint the system prompt gets — see text-caps.ts for why it is a refusal here and a clamp on
+// import. Checked BEFORE the schema parse so every transport surfaces this error instead of a raw
+// validation failure.
+export class SettingsTextTooLongError extends AppError {
+  constructor(field: string, length: number, max: number) {
+    super(
+      `settings text is too long: ${field} has ${length} characters (limit ${max})`,
+      400,
+      "errors.settingsTextTooLong",
+      { field, len: length, max },
+    );
+  }
+}
+
+// `stored` is the bag this write replaces, and it is what keeps the refusal answerable: only text the
+// write introduces or changes is refused. See collectOversizedTextChanges for why an already-stored
+// value cannot be one (the editor has no control for several of these fields).
+export function assertSettingsTextSizes(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const [first] = collectOversizedTextChanges(settings, stored);
+  if (first) {
+    throw new SettingsTextTooLongError(first.path, first.length, first.max);
+  }
+}
+
 // Allowlist of editable fields. tenantId/id are never touched; modelConfig/settings must be
 // objects (the runtime's own parser validates their inner shape at load time).
 // NOTE: The EFFECTIVE follow-up state: an ENABLED agent with followUp.enabled, in ANY mode — the
@@ -389,9 +420,33 @@ export async function updateAgent(
     // could land last after another save turned follow-up OFF, restoring ON with the STALE watermark
     // and re-exposing the pre-arm backlog to the sweep. RLS still applies to the raw read.
     const beforeRows = await db.$queryRaw<
-      Array<{ enabled: boolean; mode: string; settings: unknown }>
-    >`SELECT enabled, mode, settings FROM agents WHERE id = ${id} FOR UPDATE`;
+      Array<{
+        enabled: boolean;
+        mode: string;
+        settings: unknown;
+        updated_at: Date;
+      }>
+    >`SELECT enabled, mode, settings, updated_at FROM agents WHERE id = ${id} FOR UPDATE`;
     const before = beforeRows[0];
+    // NOTE: The optimistic-concurrency check comes FIRST, on the locked row. A stale editor resends
+    // the settings it loaded, so if the other writer edited a capped field our copy of it is an edit
+    // too — validating first would answer 400 "text too long" to what is really a 409, and the
+    // editor's conflict flow (reload, or save again to overwrite) would never run. A forced retry
+    // sends no precondition and still gets validated.
+    if (
+      before &&
+      opts.expectedUpdatedAt != null &&
+      before.updated_at.getTime() !== opts.expectedUpdatedAt.getTime()
+    ) {
+      throw new AppError(
+        "agent was modified elsewhere",
+        409,
+        "errors.agentModifiedElsewhere",
+      );
+    }
+    // NOTE: Inside the lock, against the row this write replaces — reading the stored bag separately
+    // would compare against a value another writer could have changed in between.
+    assertSettingsTextSizes(rest.settings, before?.settings);
     if (before) {
       const after = {
         enabled: rest.enabled !== undefined ? rest.enabled : before.enabled,
@@ -512,6 +567,7 @@ export async function createAgent(
 ): Promise<AgentDto> {
   const tenantId = requireTenant(ctx);
   assertPromptSize(input.systemPrompt);
+  assertSettingsTextSizes(input.settings, undefined);
   const data = agentCreateSchema.parse(input);
   validateModelConfigForWrite(data.modelConfig);
   const bhId =
@@ -626,6 +682,8 @@ export async function cloneAgent(
     if (!src) {
       throw new NotFoundError("agent not found", "errors.agentNotFound");
     }
+    // NOTE: The bag is copied verbatim, over-cap text included. A clone authors nothing, and refusing
+    // it would make a legacy agent unclonable while its own saves go through.
     const grants = await db.agentToolSelection.findMany({
       where: { agentId: id },
       select: {

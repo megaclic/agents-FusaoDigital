@@ -10,13 +10,18 @@ import {
 } from "@/client/components";
 import { credentialCompat } from "@/client/lib/credentialCompat";
 import { providerLabel } from "@/client/lib/providerLabels";
+import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
+import {
+  CUSTOM_POLICY_MAX,
+  GENERATION_PROMPT_MAX,
+  TEMPLATE_MESSAGE_MAX,
+} from "@/modules/agents/text-caps";
 import type {
   GuardrailAction,
   GuardrailChecks,
   GuardrailsConfig,
 } from "@/modules/guardrails/settings";
-import { MODEL_PROVIDERS } from "./GeneralTab";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
 
@@ -208,6 +213,7 @@ export function GuardrailsTab({
                     setDir(dir, { templateMessage: e.target.value })
                   }
                   rows={2}
+                  maxLength={TEMPLATE_MESSAGE_MAX}
                 />
               </FormField>
             )}
@@ -228,6 +234,7 @@ export function GuardrailsTab({
                     setDir(dir, { generationPrompt: e.target.value })
                   }
                   rows={3}
+                  maxLength={GENERATION_PROMPT_MAX}
                   placeholder={t(
                     "editor.guardrails.generationPromptPlaceholder",
                     "e.g. Politely decline, keep a warm tone, and offer to connect them with a human agent.",
@@ -371,6 +378,7 @@ export function GuardrailsTab({
                       setG((s) => ({ ...s, customPolicy: e.target.value }))
                     }
                     rows={3}
+                    maxLength={CUSTOM_POLICY_MAX}
                   />
                 </FormField>
               </Section>

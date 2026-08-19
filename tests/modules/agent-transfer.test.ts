@@ -3,6 +3,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
 import type { TenantContext } from "@/lib/tenancy";
+import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
 import {
   type AgentExport,
   exportAgent,
@@ -84,7 +85,16 @@ describe.skipIf(!dbUp)("agent export/import", () => {
           credentialRef: `vault:${llmKey.id}`,
         },
         settings: {
-          tts: { mode: "never", credentialRef: `vault:${ttsKey.id}` },
+          // TWO credentials in one block: the voice engine's and the speech rewrite's own model.
+          // The second one is the one a per-block loop misses, and then export refuses the whole
+          // agent (a tenant-local vault:<id> survives into the file) while import cannot rewire it.
+          tts: {
+            mode: "never",
+            credentialRef: `vault:${ttsKey.id}`,
+            normalize: true,
+            normalizeProvider: "openai",
+            normalizeCredentialRef: `vault:${llmKey.id}`,
+          },
           // Regression coverage: settings.guardrails.credentialRef (a direct field, not nested
           // like stt/tts/vision's own sub-object shape it otherwise mirrors) used to be invisible
           // to collectCredRefs/remapCredRefs, so it survived translation as a raw `vault:<id>` and
@@ -159,6 +169,12 @@ describe.skipIf(!dbUp)("agent export/import", () => {
     expect(rag && "knowledgeBases" in rag && rag.knowledgeBases).toEqual([
       "FAQ",
     ]);
+    // Both credentials of the tts block, by name — including the speech-rewrite model
+    // (normalizeCredentialRef), the field a per-block loop misses.
+    const tts = (exp.agent.settings as Record<string, Record<string, unknown>>)
+      .tts;
+    expect(tts?.credentialRef).toBe("tts-key");
+    expect(tts?.normalizeCredentialRef).toBe("llm-key");
     // No raw vault names leak as secrets; serialized form has no sk- material.
     expect(JSON.stringify(exp)).not.toMatch(/sk-[A-Za-z0-9]{16}/);
     // And no tenant-local `vault:<id>` survives translation (the export guard backstops this).
@@ -198,6 +214,76 @@ describe.skipIf(!dbUp)("agent export/import", () => {
       ).allowedHosts,
     ).toEqual(["cdn.loja.com.br"]);
     expect(JSON.stringify(row.settings)).not.toContain("senha-secreta");
+  });
+
+  // Direct writes REFUSE over-cap operator prose so nobody loses text without being told. An import
+  // is a payload authored somewhere else, and refusing the whole bundle over a long note would be a
+  // worse trade than the one this path already makes everywhere else: normalize, and say what was
+  // normalized. Clamping here is also what keeps the imported agent saveable afterwards.
+  test("an imported note over the cap is clamped before storage, with a warning naming the field", async () => {
+    const exp = await exportAgent(ctx(), agentId, appDb);
+    const imported = {
+      ...exp,
+      agent: {
+        ...exp.agent,
+        name: "Vendedora prolixa",
+        settings: {
+          ...exp.agent.settings,
+          handoff: {
+            mode: "route",
+            instructions: "i".repeat(TOOL_INSTRUCTIONS_MAX + 40),
+          },
+        },
+      },
+    };
+    const { agent, warnings } = await importAgent(ctx(), imported, appDb);
+    const row = await suDb.agent.findFirstOrThrow({
+      where: { id: BigInt(agent.id) },
+      select: { settings: true },
+    });
+    const ho = (row.settings as Record<string, unknown>).handoff as Record<
+      string,
+      unknown
+    >;
+    expect((ho.instructions as string).length).toBe(TOOL_INSTRUCTIONS_MAX);
+    expect(ho.mode).toBe("route");
+    const w = warnings.find((x) => x.code === "guidanceClipped");
+    expect(w?.params?.field).toBe("handoff.instructions");
+    expect(w?.params?.max).toBe(TOOL_INSTRUCTIONS_MAX);
+  });
+
+  // The sharp end of clipping by UTF-16 unit: an emoji straddling the cutoff leaves an unpaired
+  // surrogate, which Postgres refuses in jsonb, so the whole import would fail on a note that merely
+  // had an emoji at the wrong offset.
+  test("an imported note clipped mid-emoji still stores (no unpaired surrogate)", async () => {
+    const exp = await exportAgent(ctx(), agentId, appDb);
+    const imported = {
+      ...exp,
+      agent: {
+        ...exp.agent,
+        name: "Vendedora emoji",
+        settings: {
+          ...exp.agent.settings,
+          handoff: {
+            mode: "route",
+            instructions: `${"i".repeat(TOOL_INSTRUCTIONS_MAX - 1)}😀 e mais texto`,
+          },
+        },
+      },
+    };
+    const { agent } = await importAgent(ctx(), imported, appDb);
+    const row = await suDb.agent.findFirstOrThrow({
+      where: { id: BigInt(agent.id) },
+      select: { settings: true },
+    });
+    const stored = (
+      (row.settings as Record<string, unknown>).handoff as Record<
+        string,
+        unknown
+      >
+    ).instructions as string;
+    expect(stored.length).toBe(TOOL_INSTRUCTIONS_MAX - 1);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(stored)).toBe(false);
   });
 
   test("round-trip import recreates the agent DISABLED with resolved refs", async () => {

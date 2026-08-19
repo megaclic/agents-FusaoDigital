@@ -38,16 +38,32 @@ import {
   STT_DEFAULT_MODEL,
   TTS_DEFAULT_MODEL,
   TTS_DEFAULT_VOICE,
+  TTS_PROVIDERS,
   VISION_DEFAULT_MODEL,
 } from "@/client/lib/providerDefaults";
 import { providerLabel } from "@/client/lib/providerLabels";
 import { formatWindowsSummary } from "@/client/lib/schedulePreview";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { MODEL_PROVIDERS } from "@/graph/model-config";
+import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
+import {
+  EXTRACTION_PROMPT_MAX,
+  FOLLOW_UP_INSTRUCTIONS_MAX,
+} from "@/modules/agents/text-caps";
 import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
+import {
+  type TtsFormState,
+  ttsNormalizerBaseUrlInvalid,
+  ttsNormalizerBaseUrlUnsupported,
+  ttsNormalizerNeedsOwnCredential,
+  ttsNormalizerOverridePicked,
+  ttsNormalizerPickerSource,
+  ttsNormalizerProviderChanged,
+} from "./ttsFormState";
 import type { ChannelBinding, Hours, VaultEntry } from "./types";
 
 // Transcription providers (mirror src/modules/stt/providers.ts).
@@ -61,7 +77,6 @@ const STT_PROVIDERS = [
 
 // Audio-reply providers (mirror src/modules/tts/providers). The three reply modes are rendered
 // inline as <option>s below.
-const TTS_PROVIDERS = ["openai", "elevenlabs", "openrouter"] as const;
 
 // Image/document extraction providers (mirror src/modules/vision/providers).
 const VISION_PROVIDERS = [
@@ -104,15 +119,6 @@ interface SttState {
   language: string;
   credentialRef: string;
   baseURL: string;
-}
-
-interface TtsState {
-  mode: string;
-  provider: string;
-  model: string;
-  voice: string;
-  credentialRef: string;
-  normalize: boolean;
 }
 
 interface SplitState {
@@ -189,15 +195,21 @@ interface BehaviorTabProps {
   stt: SttState;
   setStt: React.Dispatch<React.SetStateAction<SttState>>;
   sttCredBaseUrl: string | null;
-  onSttEntryChange: (entry: VaultEntry | null) => void;
-  tts: TtsState;
-  setTts: React.Dispatch<React.SetStateAction<TtsState>>;
+  tts: TtsFormState;
+  setTts: React.Dispatch<React.SetStateAction<TtsFormState>>;
+  // The agent's own model, to render the speech rewrite's inherited default honestly (blank there
+  // means "the agent's model" while the provider is unchanged) and to let the rewrite's model picker
+  // authenticate with the key the rewrite will actually run on.
+  agentModelProvider: string;
+  agentModelName: string;
+  agentModelCredentialRef: string;
+  agentModelBaseUrl: string;
+  ttsNormalizeCredBaseUrl: string | null;
   split: SplitState;
   setSplit: React.Dispatch<React.SetStateAction<SplitState>>;
   vision: VisionState;
   setVision: React.Dispatch<React.SetStateAction<VisionState>>;
   visionCredBaseUrl: string | null;
-  onVisionEntryChange: (entry: VaultEntry | null) => void;
   limits: LimitsState;
   observability: { logToolValues: boolean };
   setObservability: React.Dispatch<
@@ -725,7 +737,7 @@ function FollowUpStepsEditor({
                 onChange={(e) =>
                   updateStep(index, { instructions: e.target.value })
                 }
-                maxLength={2000}
+                maxLength={FOLLOW_UP_INSTRUCTIONS_MAX}
                 rows={3}
                 placeholder={t(
                   "editor.followUpInstructionsPlaceholder",
@@ -785,15 +797,18 @@ export function BehaviorTab({
   stt,
   setStt,
   sttCredBaseUrl,
-  onSttEntryChange,
   tts,
   setTts,
+  agentModelProvider,
+  agentModelName,
+  agentModelCredentialRef,
+  agentModelBaseUrl,
+  ttsNormalizeCredBaseUrl,
   split,
   setSplit,
   vision,
   setVision,
   visionCredBaseUrl,
-  onVisionEntryChange,
   limits,
   observability,
   setObservability,
@@ -816,15 +831,50 @@ export function BehaviorTab({
 }: BehaviorTabProps) {
   const { t, i18n } = useTranslation();
 
+  // NOTE: the `enabled` guards are load-bearing, not defensive. Each block is HIDDEN when its
+  // feature is off, so a leftover openai-compatible provider with no endpoint would disable Save for
+  // the whole tab with nothing on screen to explain it — including the save that turns the feature
+  // off. A disabled feature cannot be misconfigured.
   const sttBaseUrlInvalid =
+    stt.enabled &&
     stt.provider === "openai-compatible" &&
     !sttCredBaseUrl &&
     !isValidHttpUrl(stt.baseURL);
 
   const visionBaseUrlInvalid =
+    vision.enabled &&
     vision.provider === "openai-compatible" &&
     !visionCredBaseUrl &&
     !isValidHttpUrl(vision.baseURL);
+
+  // The speech rewrite's model, resolved the way the RUNTIME will resolve it (inherited field by
+  // field while the provider is the agent's own), so the picker queries with a key that works and
+  // the endpoint check covers the inherited case too.
+  const agentModel = {
+    provider: agentModelProvider,
+    credentialRef: agentModelCredentialRef,
+    baseURL: agentModelBaseUrl,
+  };
+  const normalizeSource = ttsNormalizerPickerSource(
+    tts,
+    agentModel,
+    ttsNormalizeCredBaseUrl,
+  );
+  // Blank means "the agent's", both here and in the resolver, so the fields below follow THIS
+  // rather than the raw override: an openai-compatible agent whose rewrite inherits the provider
+  // still runs against an endpoint, and hiding that field made it un-inspectable.
+  const normalizeEffectiveProvider =
+    tts.normalizeProvider || agentModelProvider;
+  const normalizeBaseUrlInvalid = ttsNormalizerBaseUrlInvalid(
+    tts,
+    agentModel,
+    ttsNormalizeCredBaseUrl,
+  );
+  const normalizeBaseUrlUnsupported = ttsNormalizerBaseUrlUnsupported(
+    tts,
+    agentModel,
+    ttsNormalizeCredBaseUrl,
+  );
 
   // Transcription language: a curated dropdown with an "other" escape to a free-text ISO code.
   const sttLangKnown = (STT_LANGUAGES as readonly string[]).includes(
@@ -1054,7 +1104,6 @@ export function BehaviorTab({
                     <CredentialPicker
                       value={stt.credentialRef}
                       onChange={(v) => setStt({ ...stt, credentialRef: v })}
-                      onEntryChange={onSttEntryChange}
                       required={stt.provider !== "openai-compatible"}
                       compatibleTypes={credentialCompat.stt(stt.provider)}
                       defaultCreateType={credentialCompat.stt(stt.provider)[0]}
@@ -1193,7 +1242,6 @@ export function BehaviorTab({
                       onChange={(v) =>
                         setVision({ ...vision, credentialRef: v })
                       }
-                      onEntryChange={onVisionEntryChange}
                       required={vision.provider !== "openai-compatible"}
                       compatibleTypes={credentialCompat.vision(vision.provider)}
                       defaultCreateType={
@@ -1286,6 +1334,7 @@ export function BehaviorTab({
                       setVision({ ...vision, extractionPrompt: e.target.value })
                     }
                     rows={3}
+                    maxLength={EXTRACTION_PROMPT_MAX}
                     placeholder={DEFAULT_EXTRACTION_PROMPT}
                   />
                 </FormField>
@@ -1408,16 +1457,298 @@ export function BehaviorTab({
                     onCheckedChange={(v) => setTts({ ...tts, normalize: v })}
                     label={t(
                       "editor.ttsNormalize",
-                      "Improve pronunciation (read numbers, dates and amounts naturally)",
+                      "Rewrite the reply to be spoken, not read",
                     )}
                   />
                   <p className="text-text-muted text-xs">
                     {t(
                       "editor.ttsNormalizeHint",
-                      "Uses the agent's model to rewrite the reply for clearer speech before generating the audio.",
+                      "One extra model call per audio reply: numbers, dates and amounts come out in words, and a list of options becomes a sentence a person would say out loud. It appears on the Logs as its own step and on the dashboard as its own usage.",
                     )}
                   </p>
                 </div>
+                {tts.normalize && (
+                  <div className="flex flex-col gap-3">
+                    <div>
+                      <p className="font-medium text-sm">
+                        {t("editor.ttsNormalizeModel", "Rewrite model")}
+                      </p>
+                      <p className="text-text-muted text-xs">
+                        {t(
+                          "editor.ttsNormalizeModelHint",
+                          "Leave it on the agent's model to change nothing. Rewriting an answer that already exists is a simpler job than writing it, so a cheaper model usually does it just as well, on every audio reply.",
+                        )}
+                      </p>
+                    </div>
+                    <FormField label={t("editor.provider", "Provider")}>
+                      <Select
+                        value={tts.normalizeProvider}
+                        onChange={(e) =>
+                          setTts((prev) =>
+                            ttsNormalizerProviderChanged(prev, e.target.value),
+                          )
+                        }
+                      >
+                        <option value="">
+                          {t(
+                            "editor.ttsNormalizeSameAsAgent",
+                            "Same as the agent",
+                          )}
+                        </option>
+                        {MODEL_PROVIDERS.map((p) => (
+                          <option key={p} value={p}>
+                            {providerLabel(p, t)}
+                          </option>
+                        ))}
+                      </Select>
+                    </FormField>
+                    <FormField
+                      label={t("editor.credential", "API key")}
+                      description={t(
+                        "editor.ttsNormalizeCredentialHint",
+                        "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own the rewrite is skipped and the audio goes out unrewritten.",
+                      )}
+                      group
+                    >
+                      <CredentialPicker
+                        value={tts.normalizeCredentialRef}
+                        onChange={(v) =>
+                          setTts(
+                            ttsNormalizerOverridePicked(
+                              tts,
+                              "normalizeCredentialRef",
+                              v,
+                              agentModelProvider,
+                            ),
+                          )
+                        }
+                        required={ttsNormalizerNeedsOwnCredential(
+                          tts,
+                          agentModel,
+                          ttsNormalizeCredBaseUrl,
+                        )}
+                        compatibleTypes={credentialCompat.model(
+                          normalizeEffectiveProvider,
+                        )}
+                        defaultCreateType={
+                          credentialCompat.model(normalizeEffectiveProvider)[0]
+                        }
+                        ariaLabel={t("editor.credential", "API key")}
+                      />
+                    </FormField>
+                    <FormField label={t("editor.model", "Model")} group>
+                      <ModelPicker
+                        value={tts.normalizeModel}
+                        onChange={(v) =>
+                          setTts(
+                            ttsNormalizerOverridePicked(
+                              tts,
+                              "normalizeModel",
+                              v,
+                              agentModelProvider,
+                            ),
+                          )
+                        }
+                        provider={normalizeEffectiveProvider}
+                        // The picker lists models by CALLING the provider, so it has to use the
+                        // credential the rewrite will actually run on: the agent's own, while
+                        // the provider is unchanged and no dedicated key was picked.
+                        credentialRef={
+                          normalizeSource.credentialRef || undefined
+                        }
+                        baseURL={normalizeSource.baseURL || undefined}
+                        // NOTE: blank inherits the AGENT's model while the provider is unchanged,
+                        // and only falls back to the provider default once it differs (see
+                        // resolveNormalizeModel). The placeholder has to say the same thing, or
+                        // the operator reads one model here and another one runs.
+                        placeholder={
+                          normalizeEffectiveProvider === agentModelProvider
+                            ? agentModelName ||
+                              (PROVIDER_DEFAULT_MODEL[
+                                normalizeEffectiveProvider
+                              ] ??
+                                "")
+                            : (PROVIDER_DEFAULT_MODEL[
+                                normalizeEffectiveProvider
+                              ] ?? "")
+                        }
+                        aria-label={t("editor.model", "Model")}
+                      />
+                    </FormField>
+                    {(normalizeEffectiveProvider === "openai-compatible" ||
+                      !!ttsNormalizeCredBaseUrl ||
+                      !!tts.normalizeBaseURL.trim()) && (
+                      <FormField
+                        label={t("editor.baseURL", "Base URL")}
+                        description={
+                          ttsNormalizeCredBaseUrl
+                            ? t(
+                                "editor.baseURLFromCredential",
+                                "Defined by the selected credential.",
+                              )
+                            : t(
+                                "editor.ttsNormalizeBaseURLHint",
+                                "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
+                              )
+                        }
+                        error={
+                          normalizeBaseUrlUnsupported
+                            ? t(
+                                "editor.baseURLNotSentByProvider",
+                                "This provider does not send a base URL: the request would go to its own endpoint instead. Pick a credential without one, or use an OpenAI-compatible provider.",
+                              )
+                            : normalizeBaseUrlInvalid &&
+                                tts.normalizeBaseURL.trim()
+                              ? t(
+                                  "common.invalidUrl",
+                                  "Must be a valid http(s) URL.",
+                                )
+                              : null
+                        }
+                      >
+                        <Input
+                          value={
+                            ttsNormalizeCredBaseUrl ?? tts.normalizeBaseURL
+                          }
+                          onChange={(e) =>
+                            setTts({
+                              ...tts,
+                              normalizeBaseURL: e.target.value,
+                            })
+                          }
+                          disabled={!!ttsNormalizeCredBaseUrl}
+                          placeholder="https://api.groq.com/openai/v1"
+                        />
+                      </FormField>
+                    )}
+                  </div>
+                )}
+                {tts.provider === "elevenlabs" && (
+                  <div className="flex flex-col gap-3">
+                    <div>
+                      <p className="font-medium text-sm">
+                        {t("editor.ttsDelivery", "Voice delivery")}
+                      </p>
+                      <p className="text-text-muted text-xs">
+                        {t(
+                          "editor.ttsDeliveryHint",
+                          "Leave a field blank to use the voice's own saved setting. Lower stability makes the delivery more expressive; high stability sounds monotone.",
+                        )}
+                      </p>
+                    </div>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <FormField
+                        label={t("editor.ttsStability", "Stability")}
+                        description={t(
+                          "editor.ttsStabilityHint",
+                          "0 = expressive, 1 = monotone (0-1).",
+                        )}
+                      >
+                        <Input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={tts.stability}
+                          onChange={(e) =>
+                            setTts({ ...tts, stability: e.target.value })
+                          }
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.ttsSimilarity", "Similarity")}
+                        description={t(
+                          "editor.ttsSimilarityHint",
+                          "How closely to match the original voice (0-1).",
+                        )}
+                      >
+                        <Input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={tts.similarityBoost}
+                          onChange={(e) =>
+                            setTts({ ...tts, similarityBoost: e.target.value })
+                          }
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.ttsStyle", "Style")}
+                        description={t(
+                          "editor.ttsStyleHint",
+                          "Extra emphasis. Costs latency and can destabilize (0-1).",
+                        )}
+                      >
+                        <Input
+                          type="number"
+                          min={0}
+                          max={1}
+                          step={0.05}
+                          value={tts.style}
+                          onChange={(e) =>
+                            setTts({ ...tts, style: e.target.value })
+                          }
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.ttsSpeed", "Speed")}
+                        description={t(
+                          "editor.ttsSpeedHint",
+                          "Speaking rate, 1 being natural speed (0.25-4).",
+                        )}
+                      >
+                        <Input
+                          type="number"
+                          min={0.25}
+                          max={4}
+                          step={0.05}
+                          value={tts.speed}
+                          onChange={(e) =>
+                            setTts({ ...tts, speed: e.target.value })
+                          }
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.ttsSpeakerBoost", "Speaker boost")}
+                        description={t(
+                          "editor.ttsSpeakerBoostHint",
+                          "The provider enables it by default; pick a value only to override that.",
+                        )}
+                      >
+                        {/* NOTE: a Select, not a Switch: this knob has THREE states, and a switch
+                            would render the untouched "leave it to the voice" as visibly off while
+                            the provider actually turns it on. */}
+                        <Select
+                          value={
+                            tts.speakerBoost === null
+                              ? ""
+                              : String(tts.speakerBoost)
+                          }
+                          onChange={(e) =>
+                            setTts({
+                              ...tts,
+                              speakerBoost:
+                                e.target.value === ""
+                                  ? null
+                                  : e.target.value === "true",
+                            })
+                          }
+                        >
+                          <option value="">
+                            {t("editor.ttsVoiceDefault", "Voice default")}
+                          </option>
+                          <option value="true">
+                            {t("common.enabled", "Enabled")}
+                          </option>
+                          <option value="false">
+                            {t("common.disabled", "Disabled")}
+                          </option>
+                        </Select>
+                      </FormField>
+                    </div>
+                  </div>
+                )}
               </>
             )}
           </Section>
@@ -1827,7 +2158,12 @@ export function BehaviorTab({
         saving={saving}
         onSave={onSave}
         onDiscard={onDiscard}
-        saveDisabled={sttBaseUrlInvalid || visionBaseUrlInvalid}
+        saveDisabled={
+          sttBaseUrlInvalid ||
+          visionBaseUrlInvalid ||
+          normalizeBaseUrlInvalid ||
+          normalizeBaseUrlUnsupported
+        }
         onOpenPlayground={onOpenPlayground}
       />
     </div>

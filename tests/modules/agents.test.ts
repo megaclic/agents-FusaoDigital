@@ -4,6 +4,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
 import config from "@/config";
 import { buildNativeTools } from "@/graph/tools/native";
+import type { AppError } from "@/lib/errors";
 import type { TenantContext } from "@/lib/tenancy";
 import {
   cloneAgent,
@@ -16,8 +17,15 @@ import {
   PromptTooLongError,
   replaceAgentToolSelections,
   resolveAgentChannelBinding,
+  SettingsTextTooLongError,
   updateAgent,
 } from "@/modules/agents/service";
+import {
+  CUSTOM_POLICY_MAX,
+  EXTRACTION_PROMPT_MAX,
+  FOLLOW_UP_INSTRUCTIONS_MAX,
+  TOOL_INSTRUCTIONS_MAX,
+} from "@/modules/agents/text-caps";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { readHandoffConfig } from "@/modules/handoff/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
@@ -822,6 +830,213 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       appDb,
     );
     expect(a.systemPrompt).toHaveLength(config.agent.promptMaxChars);
+  });
+
+  // Operator prose inside `settings` is clamped by the READERS (readToolInstructions and friends), so
+  // an over-cap note used to save with a 200 and reach the model cut in half, with the console still
+  // showing the whole text it had hydrated from the row. The write boundary is where the operator can
+  // still act on it, and it is the only one every transport (console, REST, MCP) goes through.
+  test("update rejects over-cap tool guidance and leaves the stored value alone", async () => {
+    const a = await createAgent(
+      ctx(tenantC),
+      {
+        name: "GuidanceCap",
+        settings: { handoff: { mode: "route", instructions: "short" } },
+      },
+      appDb,
+    );
+    const boom = "g".repeat(TOOL_INSTRUCTIONS_MAX + 1);
+    try {
+      await updateAgent(
+        ctx(tenantC),
+        BigInt(a.id),
+        { settings: { handoff: { mode: "route", instructions: boom } } },
+        appDb,
+      );
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(SettingsTextTooLongError);
+      expect((e as SettingsTextTooLongError).statusCode).toBe(400);
+      expect((e as SettingsTextTooLongError).translationKey).toBe(
+        "errors.settingsTextTooLong",
+      );
+      expect((e as SettingsTextTooLongError).message).toContain(
+        "handoff.instructions",
+      );
+    }
+    const after = await getAgent(ctx(tenantC), BigInt(a.id), appDb);
+    expect(readHandoffConfig(after.settings).instructions).toBe("short");
+  });
+
+  test("the refusal covers every capped field, not just the handoff one", async () => {
+    const a = await createAgent(ctx(tenantC), { name: "GuidanceCap2" }, appDb);
+    const cases: Record<string, unknown>[] = [
+      { kanban: { instructions: "k".repeat(TOOL_INSTRUCTIONS_MAX + 1) } },
+      {
+        toolGuidance: {
+          assign_label: "l".repeat(TOOL_INSTRUCTIONS_MAX + 1),
+        },
+      },
+      { guardrails: { customPolicy: "p".repeat(CUSTOM_POLICY_MAX + 1) } },
+      {
+        vision: {
+          extractionPrompt: "v".repeat(EXTRACTION_PROMPT_MAX + 1),
+        },
+      },
+      {
+        followUp: {
+          steps: [{ instructions: "f".repeat(FOLLOW_UP_INSTRUCTIONS_MAX + 1) }],
+        },
+      },
+    ];
+    for (const settings of cases) {
+      await expect(
+        updateAgent(ctx(tenantC), BigInt(a.id), { settings }, appDb),
+      ).rejects.toBeInstanceOf(SettingsTextTooLongError);
+    }
+  });
+
+  // Only text the write introduces or changes is refused. A value stored before the caps existed
+  // cannot be one: several of these fields have no control in the editor at all (a note for a native
+  // tool like private_note) or only render once their section is switched on, so refusing it would
+  // block every save on every tab with nothing the operator could shorten.
+  test("a stored over-cap value does not block a save that leaves it alone", async () => {
+    const a = await createAgent(ctx(tenantC), { name: "LegacyCap" }, appDb);
+    const legacy = "c".repeat(TOOL_INSTRUCTIONS_MAX + 1);
+    await suDb.agent.update({
+      where: { id: BigInt(a.id) },
+      data: { settings: { handoff: { instructions: legacy } } },
+    });
+
+    const saved = await updateAgent(
+      ctx(tenantC),
+      BigInt(a.id),
+      {
+        settings: {
+          handoff: { instructions: legacy },
+          kanban: { instructions: "move it" },
+        },
+      },
+      appDb,
+    );
+    const bag = saved.settings as Record<
+      string,
+      Record<string, string> | undefined
+    >;
+    expect(bag.kanban?.instructions).toBe("move it");
+    // Untouched means untouched: the row keeps every character, and the reader is what keeps the
+    // model-facing copy short.
+    expect(bag.handoff?.instructions).toBe(legacy);
+
+    // Editing that same field is a write like any other, even to a shorter value that is still over.
+    await expect(
+      updateAgent(
+        ctx(tenantC),
+        BigInt(a.id),
+        { settings: { handoff: { instructions: `${legacy}!` } } },
+        appDb,
+      ),
+    ).rejects.toBeInstanceOf(SettingsTextTooLongError);
+  });
+
+  // A stale editor resends the settings it loaded. If the other writer edited a capped field, our
+  // copy of that field is an edit too — so validating before the version check would answer 400
+  // "text too long" to what is really a conflict, and the editor's reload-or-overwrite flow would
+  // never run for it.
+  test("a stale write gets the conflict, not the cap error", async () => {
+    const a = await createAgent(ctx(tenantC), { name: "StaleCap" }, appDb);
+    const legacy = "s".repeat(TOOL_INSTRUCTIONS_MAX + 1);
+    const seeded = await suDb.agent.update({
+      where: { id: BigInt(a.id) },
+      data: { settings: { handoff: { instructions: legacy } } },
+      select: { updatedAt: true },
+    });
+    // Someone else shortens it while this editor holds the old bag. The stamp is set explicitly
+    // because `updatedAt` is client-side and ms-resolution: two back-to-back writes land in the
+    // same millisecond often enough to matter (3 in 40 here), and when they do the held token
+    // still matches, no conflict is raised, and the cap check answers the 400 this test forbids.
+    await suDb.agent.update({
+      where: { id: BigInt(a.id) },
+      data: {
+        settings: { handoff: { instructions: "short now" } },
+        updatedAt: new Date(seeded.updatedAt.getTime() + 1000),
+      },
+    });
+    try {
+      await updateAgent(
+        ctx(tenantC),
+        BigInt(a.id),
+        { settings: { handoff: { instructions: legacy } } },
+        appDb,
+        { expectedUpdatedAt: seeded.updatedAt },
+      );
+      expect.unreachable();
+    } catch (e) {
+      expect(e).not.toBeInstanceOf(SettingsTextTooLongError);
+      expect((e as AppError).statusCode).toBe(409);
+      expect((e as AppError).translationKey).toBe(
+        "errors.agentModifiedElsewhere",
+      );
+    }
+    // The overwrite carries no precondition, and IS validated: this bag re-introduces the long note.
+    await expect(
+      updateAgent(
+        ctx(tenantC),
+        BigInt(a.id),
+        { settings: { handoff: { instructions: legacy } } },
+        appDb,
+      ),
+    ).rejects.toBeInstanceOf(SettingsTextTooLongError);
+  });
+
+  // A clone authors nothing — it replicates a row that already exists in this tenant. Refusing it
+  // would leave a legacy agent unclonable while its own saves go through.
+  test("cloning carries a stored over-cap value forward verbatim", async () => {
+    const a = await createAgent(ctx(tenantC), { name: "CloneSrc" }, appDb);
+    const legacy = "c".repeat(TOOL_INSTRUCTIONS_MAX + 1);
+    await suDb.agent.update({
+      where: { id: BigInt(a.id) },
+      data: { settings: { handoff: { instructions: legacy } } },
+    });
+    const clone = await cloneAgent(
+      ctx(tenantC),
+      BigInt(a.id),
+      "CloneDst",
+      appDb,
+    );
+    const bag = clone.settings as Record<
+      string,
+      Record<string, string> | undefined
+    >;
+    expect(bag.handoff?.instructions).toBe(legacy);
+  });
+
+  test("create rejects it too, and a value exactly at the cap is accepted", async () => {
+    expect(
+      createAgent(
+        ctx(tenantC),
+        {
+          name: "CreateTooBig",
+          settings: {
+            handoff: { instructions: "g".repeat(TOOL_INSTRUCTIONS_MAX + 1) },
+          },
+        },
+        appDb,
+      ),
+    ).rejects.toBeInstanceOf(SettingsTextTooLongError);
+    const ok = await createAgent(
+      ctx(tenantC),
+      {
+        name: "CreateAtCap",
+        settings: {
+          handoff: { instructions: "g".repeat(TOOL_INSTRUCTIONS_MAX) },
+        },
+      },
+      appDb,
+    );
+    expect(readHandoffConfig(ok.settings).instructions).toHaveLength(
+      TOOL_INSTRUCTIONS_MAX,
+    );
   });
 });
 

@@ -49,19 +49,19 @@ import { useBreadcrumbLabel } from "@/client/contexts/BreadcrumbContext";
 import { useNavGuard } from "@/client/contexts/NavGuardContext";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
-import { computeConfigIssues } from "@/client/lib/configHealth";
-import { shouldRestoreUserBaseUrl } from "@/client/lib/credentialBaseUrl";
-import type { ApiErrorPayload } from "@/client/lib/types";
+import { apiErrorMessage } from "@/client/lib/apiError";
+import { computeConfigIssues, issueHasAction } from "@/client/lib/configHealth";
 import { slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
-  loadVault,
-  VAULT_CHANGED_EVENT,
+  useVaultBaseUrls,
+  useVaultRefs,
 } from "@/client/lib/vaultCache";
 import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditModal";
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
+import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import {
   CHANNEL_REDIRECT_DEFAULTS,
   type ChannelRedirectConfig,
@@ -72,7 +72,6 @@ import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
-  readGuardrailsConfig,
 } from "@/modules/guardrails/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { BehaviorTab, type SendImageState } from "./BehaviorTab";
@@ -84,10 +83,12 @@ import { ChannelsTab } from "./ChannelsTab";
 import { ExportAgentModal } from "./ExportAgentModal";
 import { GeneralTab } from "./GeneralTab";
 import { GuardrailsTab } from "./GuardrailsTab";
+import { readGuardrailsFormState } from "./guardrailsFormState";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
 import { ToolsTab } from "./ToolsTab";
+import { readTtsFormState, ttsSettingsFrom } from "./ttsFormState";
 import type {
   ChannelBinding,
   GrantState,
@@ -308,14 +309,7 @@ function readBehaviorState(a: Agent) {
       credentialRef: str(st.credentialRef),
       baseURL: str(st.baseURL),
     },
-    tts: {
-      mode: str(tt.mode) || "never",
-      provider: str(tt.provider) || "openai",
-      model: str(tt.model),
-      voice: str(tt.voice),
-      credentialRef: str(tt.credentialRef),
-      normalize: typeof tt.normalize === "boolean" ? tt.normalize : false,
-    },
+    tts: readTtsFormState(tt),
     split: {
       enabled: typeof sp.enabled === "boolean" ? sp.enabled : true,
       maxChars: num(sp.maxChars) || "600",
@@ -512,7 +506,21 @@ function AgentEditorSkeleton() {
   );
 }
 
+// The route element is REUSED when `:id` changes — cloning an agent lands straight on the clone's
+// editor — and this page keeps state that only means anything for one record. `usePlaygroundChat`
+// reloads its saved simulation on that transition but not the conversation itself, so without this
+// the turns you had with one agent show up under the next.
+//
+// Keyed by the record rather than reset field by field: every one of those resets has to know when
+// the thing it clears will be repopulated, and answering that per field is how a discard ends up
+// stranding a value the form still needs. A different agent is a different form. `:tab` is NOT in
+// the key, so moving between tabs of the same agent keeps everything, which is what it is for.
 export function AgentEditorPage() {
+  const { id = "" } = useParams();
+  return <AgentEditor key={id} />;
+}
+
+function AgentEditor() {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const navigate = useNavigate();
@@ -575,25 +583,10 @@ export function AgentEditorPage() {
     credentialRef: "",
     baseURL: "",
   });
-  // Base URL from the selected STT credential (locks the input when set).
-  const [sttCredBaseUrl, setSttCredBaseUrl] = useState<string | null>(null);
-  // User's own STT base URL value preserved while a credential with baseUrl is selected.
-  const sttUserBaseUrlRef = useRef("");
-  // Base URL from the selected vision credential (locks the input when set).
-  const [visionCredBaseUrl, setVisionCredBaseUrl] = useState<string | null>(
-    null,
-  );
-  // User's own vision base URL value preserved while a credential with baseUrl is selected.
-  const visionUserBaseUrlRef = useRef("");
   // Text-to-speech (audio replies). Mode + provider mirror modules/tts.
-  const [tts, setTts] = useState({
-    mode: "never",
-    provider: "openai",
-    model: "",
-    voice: "",
-    credentialRef: "",
-    normalize: false,
-  });
+  // Same reader the saved agent goes through, so a new field can never exist in one and not the
+  // other: the Behavior save REPLACES this block wholesale.
+  const [tts, setTts] = useState(() => readTtsFormState({}));
   // Reply in multiple messages (split + typing delay). Mirrors modules/split
   // (on by default, wpm 250 — matches SPLIT_DEFAULTS).
   const [split, setSplit] = useState({
@@ -700,10 +693,16 @@ export function AgentEditorPage() {
     temperature: "",
     reasoningEffort: "",
   });
-  // Base URL from the selected model credential (locks the input when set).
-  const [modelCredBaseUrl, setModelCredBaseUrl] = useState<string | null>(null);
-  // User's own model base URL value preserved while a credential with baseUrl is selected.
-  const modelUserBaseUrlRef = useRef("");
+  // The endpoint each selected credential carries, which OUTRANKS the typed field wherever one is
+  // shown. Resolved from the vault, not from the pickers: the page judges these on every tab, and
+  // one tab's picker is unmounted while another is on screen. Only ever mirrored, never merged into
+  // the form — each field displays `credBaseUrl ?? form.baseURL` and is disabled while a credential
+  // provides it, so the operator's own value is never overwritten and never needs giving back.
+  const vaultBaseUrl = useVaultBaseUrls();
+  const modelCredBaseUrl = vaultBaseUrl(model.credentialRef);
+  const sttCredBaseUrl = vaultBaseUrl(stt.credentialRef);
+  const visionCredBaseUrl = vaultBaseUrl(vision.credentialRef);
+  const ttsNormalizeCredBaseUrl = vaultBaseUrl(tts.normalizeCredentialRef);
 
   // Tool selection
   const [grants, setGrants] = useState<GrantState[]>([]);
@@ -823,7 +822,7 @@ export function AgentEditorPage() {
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
-    setGuardrails(readGuardrailsConfig(a.settings));
+    setGuardrails(readGuardrailsFormState(a.settings));
   }, []);
 
   // Reset ONLY the general section (identity + model) from a synced agent — the post-save sync for the
@@ -866,7 +865,7 @@ export function AgentEditorPage() {
   // Reset ONLY the guardrails section from a synced agent — the post-save sync for the Guardrails tab.
   const applyGuardrails = useCallback((a: Agent) => {
     syncedAgentRef.current = a;
-    setGuardrails(readGuardrailsConfig(a.settings));
+    setGuardrails(readGuardrailsFormState(a.settings));
   }, []);
 
   const loadHours = useCallback(async () => {
@@ -1047,18 +1046,9 @@ export function AgentEditorPage() {
         credentialRef: stt.credentialRef || null,
         // When the credential has a baseUrl, the runtime uses it; don't overwrite with the
         // displayed (credential's) value — keep the user's own config or null.
-        baseURL: sttCredBaseUrl
-          ? sttUserBaseUrlRef.current.trim() || null
-          : stt.baseURL.trim() || null,
+        baseURL: stt.baseURL.trim() || null,
       },
-      tts: {
-        mode: tts.mode,
-        provider: tts.provider,
-        model: tts.model.trim(),
-        voice: tts.voice.trim(),
-        credentialRef: tts.credentialRef || null,
-        normalize: tts.normalize,
-      },
+      tts: ttsSettingsFrom(tts),
       split: {
         enabled: split.enabled,
         maxChars: Number(split.maxChars) || 600,
@@ -1104,9 +1094,7 @@ export function AgentEditorPage() {
         credentialRef: vision.credentialRef || null,
         // When the credential carries a baseUrl, the runtime uses it; keep the user's own value
         // (or null) instead of persisting the displayed credential URL (mirror STT).
-        baseURL: visionCredBaseUrl
-          ? visionUserBaseUrlRef.current.trim() || null
-          : vision.baseURL.trim() || null,
+        baseURL: vision.baseURL.trim() || null,
         // Store null when the prompt is empty or still the default (keeps storage
         // clean; the reader re-prefills the default on load — no false-dirty).
         extractionPrompt:
@@ -1222,26 +1210,16 @@ export function AgentEditorPage() {
     dirty.tools ||
     dirty.knowledge;
 
-  // Pending credentials (referenced but not filled yet — e.g. created via the MCP credential_create
-  // tool). A feature wired to one of these is configured but cannot run. Loaded from the shared vault
-  // cache and refreshed on any vault change (e.g. the operator fills the secret), so the warning
-  // clears without a manual reload.
-  const [pendingEntries, setPendingEntries] = useState<VaultEntry[]>([]);
-  useEffect(() => {
-    let alive = true;
-    const refresh = () =>
-      loadVault().then((entries) => {
-        if (!alive) return;
-        setPendingEntries(entries.filter((e) => e.status === "pending"));
-      });
-    refresh();
-    window.addEventListener(VAULT_CHANGED_EVENT, refresh);
-    return () => {
-      alive = false;
-      window.removeEventListener(VAULT_CHANGED_EVENT, refresh);
-    };
-  }, []);
-  const pendingRefs = new Set(pendingEntries.map((e) => `vault:${e.id}`));
+  // What the vault holds, for the two credential states the panel below can only see from the list:
+  // referenced but not filled yet (created via the MCP credential_create tool, say), and referenced
+  // but not there at all (deleted, or a name written over REST/MCP that no resolver matches). Both
+  // refresh on any vault change (e.g. the operator fills the secret), so a warning clears without a
+  // manual reload.
+  const {
+    known: knownRefs,
+    pending: pendingRefs,
+    pendingEntries,
+  } = useVaultRefs();
 
   // The tenant's embedding credential ref — a prerequisite for indexing knowledge bases. Loaded once so
   // config health can, when a base needs indexing, point at the real blocker (embedding unconfigured, or
@@ -1265,7 +1243,12 @@ export function AgentEditorPage() {
   // t('editor.configIssue.model', 'The model has no API key set, so the agent cannot reply.')
   // t('editor.configIssue.stt', 'Voice transcription is on but has no API key set.')
   // t('editor.configIssue.tts', 'Audio replies are on but have no API key set.')
+  // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
+  // t('editor.configIssuePending.ttsNormalize', 'The speech-rewrite credential is referenced but not filled in yet.')
   // t('editor.configIssue.vision', 'Image/document reading is on but has no API key set.')
+  // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
+  // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
+  // t('editor.configIssueUnresolved.guardrails', 'The guardrails credential no longer exists, so messages go out unscreened.')
   // t('editor.configIssuePending.model', 'The model credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.stt', 'The transcription credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.tts', 'The audio-reply credential is referenced but not filled in yet.')
@@ -1273,6 +1256,12 @@ export function AgentEditorPage() {
   // t('editor.configIssue.embedding', 'A knowledge base needs indexing, but the tenant embedding is not configured.')
   // t('editor.configIssuePending.embedding', 'A knowledge base needs indexing, but the embedding credential is not filled in yet.')
   // t('editor.configIssue.redirect', 'Redirect is on but a WhatsApp or website-chat inbox is not set, so it will not run.')
+  // t('editor.configIssueUnresolved.model', 'The model credential no longer exists, so the agent cannot reply. Pick another one.')
+  // t('editor.configIssueUnresolved.stt', 'The transcription credential no longer exists, so voice messages are not transcribed.')
+  // t('editor.configIssueUnresolved.tts', 'The audio-reply credential no longer exists, so replies are sent as text.')
+  // t('editor.configIssueUnresolved.ttsNormalize', 'The speech-rewrite credential no longer exists, so replies are spoken without the rewrite.')
+  // t('editor.configIssueUnresolved.vision', 'The image-reading credential no longer exists, so images and documents are not read.')
+  // t('editor.configIssueUnresolved.embedding', 'A knowledge base needs indexing, but the embedding credential no longer exists.')
   // Knowledge bases this agent uses (its RAG grant) that still have documents awaiting indexing —
   // surfaced as a config warning so a freshly-imported agent flags "index me" right in the editor.
   const ragGrant = grants.find((g) => g.source === "RAG");
@@ -1280,16 +1269,40 @@ export function AgentEditorPage() {
   const knowledgeBasesNeedingIndex = (catalog?.knowledgeBases ?? [])
     .filter((k) => selectedKbIds.has(k.id) && k.unindexedCount > 0)
     .map((k) => ({ id: k.id, name: k.name }));
+  // The agent's model as STORED, which is what the speech rewrite will inherit at runtime and is
+  // not the same thing as the model being edited on General. The tabs do not save together: a
+  // Behavior save carries none of General's pending edits, so judging the rewrite against them
+  // blesses a pairing that exists nowhere. Reproduced by review: switch the provider on General,
+  // configure the rewrite to inherit that provider's key, save Behavior, discard General. The bag
+  // now names a vendor the saved agent never had, and every audio reply skips the rewrite as
+  // `credential_required` while the editor called the configuration valid.
+  const savedModel = syncedAgentRef.current
+    ? readModelState(syncedAgentRef.current)
+    : model;
+  const savedModelBaseUrl =
+    vaultBaseUrl(savedModel.credentialRef) ?? savedModel.baseURL;
   const configIssues = computeConfigIssues({
+    settings: syncedAgentRef.current?.settings,
     modelProvider: model.provider,
     modelCredentialRef: model.credentialRef,
     sttEnabled: stt.enabled,
     sttCredentialRef: stt.credentialRef,
     ttsMode: tts.mode,
     ttsCredentialRef: tts.credentialRef,
+    savedModelProvider: savedModel.provider,
+    savedModelBaseURL: savedModelBaseUrl,
+    savedModelCredentialRef: savedModel.credentialRef,
+    ttsNormalize: tts.normalize,
+    ttsNormalizeProvider: tts.normalizeProvider,
+    ttsNormalizeModel: tts.normalizeModel,
+    ttsNormalizeCredentialRef: tts.normalizeCredentialRef,
+    ttsNormalizeBaseURL: ttsNormalizeCredBaseUrl ?? tts.normalizeBaseURL,
     visionEnabled: vision.enabled,
     visionCredentialRef: vision.credentialRef,
+    guardrailsEnabled: guardrails.enabled,
+    guardrailsCredentialRef: guardrails.credentialRef ?? "",
     pendingRefs,
+    knownRefs,
     knowledgeBasesNeedingIndex,
     embeddingCredentialRef,
     redirectEnabled: channelRedirect.enabled,
@@ -1340,9 +1353,33 @@ export function AgentEditorPage() {
     );
   }
 
-  // The human-facing line for a config issue: a "pending credential" variant vs the classic
-  // "missing credential" one. Kept out of the JSX so the dynamic-key biome-ignore sits on the t() call.
+  // The human-facing line for a config issue: "referenced but not filled in" and "referenced but
+  // gone" each read differently from the classic "no credential set", because the operator's next
+  // move differs (fill it, pick another, set one). Kept out of the JSX so the dynamic-key lint
+  // suppression sits on the t() call.
   function issueMessage(issue: (typeof configIssues)[number]): string {
+    // Text already in the row, over its cap: whatever passes the cap is dropped by the reader, which
+    // is invisible everywhere else. The message stops at that, without claiming the model receives
+    // the rest — with the section switched off it receives none of it. When the field has no control
+    // in the editor the message says so, instead of leaving the operator hunting for a tab.
+    if (issue.key === "textCap") {
+      const params = {
+        field: issue.field ?? "",
+        len: issue.length ?? 0,
+        max: issue.max ?? 0,
+      };
+      return issue.tab
+        ? t(
+            "editor.configIssueTextCap",
+            "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored.",
+            params,
+          )
+        : t(
+            "editor.configIssueTextCapNoField",
+            "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored. This note has no field in the console, so it can only be shortened through the API.",
+            params,
+          );
+    }
     if (issue.key === "knowledge") {
       return t(
         "editor.configIssueKnowledge",
@@ -1356,10 +1393,31 @@ export function AgentEditorPage() {
         defaultValue: "This credential is referenced but not filled in yet.",
       });
     }
+    if (issue.unresolved) {
+      // biome-ignore lint/plugin/no-dynamic-i18n-key: unresolved keys registered via magic comments above computeConfigIssues
+      return t(`editor.configIssueUnresolved.${issue.key}` as const, {
+        defaultValue: "This credential no longer exists. Pick another one.",
+      });
+    }
     // biome-ignore lint/plugin/no-dynamic-i18n-key: issue keys registered via magic comments above computeConfigIssues
     return t(`editor.configIssue.${issue.key}` as const, {
       defaultValue: "This feature is enabled but has no credential set.",
     });
+  }
+
+  // The write boundary refuses a settings bag whose operator prose is over its cap. A save that
+  // fires several calls (tools = grants PUT then agent PATCH) would otherwise persist the first and
+  // fail the second, leaving the grants saved, the toast saying it failed, and the local state stale.
+  // Same walker and same comparison the server runs — against the last-synced bag, so a value stored
+  // before the caps is not what stops a save that never touched it.
+  function settingsTextError(bag: unknown, stored: unknown): string | null {
+    const over = collectOversizedTextChanges(bag, stored)[0];
+    if (!over) return null;
+    return t(
+      "editor.settingsTextTooLong",
+      "The text in {{field}} is too long: {{len}} characters (limit {{max}}).",
+      { field: over.path, len: over.length, max: over.max },
+    );
   }
 
   // Localized text for a structured import warning. Static keys (one per code) keep it extract-safe;
@@ -1367,6 +1425,12 @@ export function AgentEditorPage() {
   function importWarningMessage(w: ImportWarning): string {
     const p = w.params ?? {};
     switch (w.code) {
+      case "guidanceClipped":
+        return t(
+          "editor.importWarning.guidanceClipped",
+          'The text in "{{field}}" was longer than {{max}} characters and was trimmed on import.',
+          p,
+        );
       case "credentialNotFound":
         return t(
           "editor.importWarning.credentialNotFound",
@@ -1667,7 +1731,7 @@ export function AgentEditorPage() {
   const revertGuardrails = () => {
     const a = syncedAgentRef.current;
     if (!a) return;
-    setGuardrails(readGuardrailsConfig(a.settings));
+    setGuardrails(readGuardrailsFormState(a.settings));
   };
   // Tools and Knowledge share one grant array but own disjoint slices (Tools =
   // non-RAG, Knowledge = RAG), so each discard restores only its slice and
@@ -1768,14 +1832,11 @@ export function AgentEditorPage() {
       bumpSync(section);
       showToast(t("editor.saved", "Agent saved."), "success");
     } catch (e) {
-      // NOTE: surface the backend's localized message when present (e.g. the prompt-size cap)
-      // instead of the generic failure toast.
-      const apiMsg =
-        e && typeof e === "object" && "value" in e
-          ? ((e as { value?: ApiErrorPayload }).value?.error ?? null)
-          : null;
+      // NOTE: surface the backend's localized message when present (the prompt-size cap, the
+      // settings text caps) instead of the generic failure toast.
       showToast(
-        apiMsg || t("editor.saveError", "Could not save the agent."),
+        apiErrorMessage(e) ||
+          t("editor.saveError", "Could not save the agent."),
         "error",
       );
     } finally {
@@ -1803,8 +1864,12 @@ export function AgentEditorPage() {
       markSynced(data.agentUpdatedAt ? String(data.agentUpdatedAt) : null);
       bumpSync("tools", "knowledge");
       showToast(t("editor.grantsSaved", "Tools updated."), "success");
-    } catch {
-      showToast(t("editor.grantsError", "Could not update tools."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.grantsError", "Could not update tools."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingGrants(false);
@@ -1820,15 +1885,8 @@ export function AgentEditorPage() {
     savingRef.current += 1;
     setSavingGrants(true);
     try {
-      const expected = expectedFor(force);
-      const grantsRes = await api.api.v1.agents({ id })["tool-selections"].put({
-        grants,
-        ...(expected ? { expectedUpdatedAt: expected } : {}),
-      });
-      if (handleConflict(grantsRes.error, () => void saveTools(true))) return;
-      if (grantsRes.error || !grantsRes.data) {
-        throw grantsRes.error ?? new Error("no data");
-      }
+      // Everything the PATCH will send, built BEFORE the grants PUT so the whole bag can be checked
+      // against the write boundary's own rule first. None of it depends on the PUT's result.
       const syncedSettings = (syncedAgentRef.current?.settings ?? {}) as Record<
         string,
         unknown
@@ -1867,6 +1925,39 @@ export function AgentEditorPage() {
       if (updateKanbanNote)
         toolGuidanceJson.update_kanban_task = updateKanbanNote;
       else delete toolGuidanceJson.update_kanban_task;
+      const toolsSettings = {
+        ...syncedSettings,
+        handoff: handoffJson,
+        kanban: kanbanJson,
+        zproCrm: zproCrmJson,
+        toolGuidance: toolGuidanceJson,
+      };
+      // The WHOLE bag, not just this tab's fields: the PATCH resends every block, so text typed on
+      // another tab would refuse it just the same — after the grants had already been written.
+      //
+      // On a forced overwrite the last-synced bag is stale by definition (the 409 says someone else
+      // wrote), so it is re-read first: if the other writer shortened a legacy over-cap note, our
+      // copy is now an EDIT of it, the server would refuse the PATCH, and the grants PUT would
+      // already have persisted. A failed re-read falls back to the synced bag rather than blocking
+      // the save on it.
+      const storedSettings = force
+        ? ((await api.api.v1.agents({ id }).get()).data?.agent.settings ??
+          syncedSettings)
+        : syncedSettings;
+      const toolsText = settingsTextError(toolsSettings, storedSettings);
+      if (toolsText) {
+        showToast(toolsText, "error");
+        return;
+      }
+      const expected = expectedFor(force);
+      const grantsRes = await api.api.v1.agents({ id })["tool-selections"].put({
+        grants,
+        ...(expected ? { expectedUpdatedAt: expected } : {}),
+      });
+      if (handleConflict(grantsRes.error, () => void saveTools(true))) return;
+      if (grantsRes.error || !grantsRes.data) {
+        throw grantsRes.error ?? new Error("no data");
+      }
       // Chain the PATCH precondition to the token the grant write just produced.
       const afterGrants = grantsRes.data.agentUpdatedAt
         ? String(grantsRes.data.agentUpdatedAt)
@@ -1878,13 +1969,7 @@ export function AgentEditorPage() {
       const patchExpected = force ? undefined : afterGrants;
       const agentRes = await api.api.v1.agents({ id }).patch({
         transferWithSummary,
-        settings: {
-          ...syncedSettings,
-          handoff: handoffJson,
-          kanban: kanbanJson,
-          zproCrm: zproCrmJson,
-          toolGuidance: toolGuidanceJson,
-        },
+        settings: toolsSettings,
         ...(patchExpected ? { expectedUpdatedAt: patchExpected } : {}),
       });
       if (handleConflict(agentRes.error, () => void saveTools(true))) return;
@@ -1909,8 +1994,12 @@ export function AgentEditorPage() {
       markSynced(String(agentRes.data.agent.updatedAt));
       bumpSync("tools", "knowledge");
       showToast(t("editor.grantsSaved", "Tools updated."), "success");
-    } catch {
-      showToast(t("editor.grantsError", "Could not update tools."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.grantsError", "Could not update tools."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingGrants(false);
@@ -1944,8 +2033,12 @@ export function AgentEditorPage() {
       markSynced(String(data.agent.updatedAt));
       bumpSync("channelRedirect");
       showToast(t("editor.saved", "Agent saved."), "success");
-    } catch {
-      showToast(t("editor.saveError", "Could not save the agent."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.saveError", "Could not save the agent."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingChannelRedirect(false);
@@ -1975,8 +2068,12 @@ export function AgentEditorPage() {
       markSynced(String(data.agent.updatedAt));
       bumpSync("guardrails");
       showToast(t("editor.saved", "Agent saved."), "success");
-    } catch {
-      showToast(t("editor.saveError", "Could not save the agent."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.saveError", "Could not save the agent."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingGuardrails(false);
@@ -1992,8 +2089,14 @@ export function AgentEditorPage() {
       cloneModal.close();
       showToast(t("editor.cloned", "Agent cloned (disabled)."), "success");
       navigate(`/agents/${data.agent.id}`);
-    } catch {
-      showToast(t("editor.cloneError", "Could not clone."), "error");
+    } catch (e) {
+      // The clone carries the source agent's settings verbatim, so a source written before the text
+      // caps is refused by name — the generic message would leave the operator with a button that
+      // fails and no field to shorten.
+      showToast(
+        apiErrorMessage(e) || t("editor.cloneError", "Could not clone."),
+        "error",
+      );
     }
   }
 
@@ -2099,55 +2202,6 @@ export function AgentEditorPage() {
       },
     });
   }
-
-  // NOTE: Closed-over callback for model credential entry change (preserves ref across tab
-  // unmounts). The `else if` is load-bearing: on mount the picker reports the resolved entry, and a
-  // credential WITHOUT a baseUrl must leave the persisted field alone (shouldRestoreUserBaseUrl).
-  const onModelEntryChange = (entry: VaultEntry | null) => {
-    const credUrl = entry?.baseUrl ?? null;
-    const restore = shouldRestoreUserBaseUrl(modelCredBaseUrl, credUrl);
-    setModelCredBaseUrl(credUrl);
-    if (credUrl) {
-      modelUserBaseUrlRef.current = model.baseURL;
-    } else if (restore) {
-      setModel((prev) => ({
-        ...prev,
-        baseURL: modelUserBaseUrlRef.current,
-      }));
-    }
-  };
-
-  // Closed-over callback for STT credential entry change (preserves sttUserBaseUrlRef across tab unmounts).
-  const onSttEntryChange = (entry: VaultEntry | null) => {
-    const credUrl = entry?.baseUrl ?? null;
-    const restore = shouldRestoreUserBaseUrl(sttCredBaseUrl, credUrl);
-    setSttCredBaseUrl(credUrl);
-    if (credUrl) {
-      // Lock: preserve the user's own value while locked.
-      sttUserBaseUrlRef.current = stt.baseURL;
-    } else if (restore) {
-      // Unlock: restore the user's own value.
-      setStt((prev) => ({
-        ...prev,
-        baseURL: sttUserBaseUrlRef.current,
-      }));
-    }
-  };
-
-  // Closed-over callback for vision credential entry change (mirror of onSttEntryChange).
-  const onVisionEntryChange = (entry: VaultEntry | null) => {
-    const credUrl = entry?.baseUrl ?? null;
-    const restore = shouldRestoreUserBaseUrl(visionCredBaseUrl, credUrl);
-    setVisionCredBaseUrl(credUrl);
-    if (credUrl) {
-      visionUserBaseUrlRef.current = vision.baseURL;
-    } else if (restore) {
-      setVision((prev) => ({
-        ...prev,
-        baseURL: visionUserBaseUrlRef.current,
-      }));
-    }
-  };
 
   // Shared onScheduleSaved handler: re-fetches hours then sets the saved id.
   const onScheduleSaved = (savedId: string, setter: (v: string) => void) => {
@@ -2430,23 +2484,25 @@ export function AgentEditorPage() {
                 <ul className="flex flex-col gap-1">
                   {configIssues.map((issue) => (
                     <li
-                      key={issue.knowledgeBaseId ?? issue.key}
+                      key={issue.field ?? issue.knowledgeBaseId ?? issue.key}
                       className="flex items-baseline justify-between gap-3 pl-6"
                     >
                       <span className="min-w-0 text-text-secondary text-xs">
                         {issueMessage(issue)}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => goToIssue(issue)}
-                        className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
-                      >
-                        {issue.key === "knowledge"
-                          ? t("editor.indexKnowledge", "Index")
-                          : issue.pending
-                            ? t("editor.fillCredential", "Fill")
-                            : t("editor.goToIssue", "Fix")}
-                      </button>
+                      {issueHasAction(issue) && (
+                        <button
+                          type="button"
+                          onClick={() => goToIssue(issue)}
+                          className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
+                        >
+                          {issue.key === "knowledge"
+                            ? t("editor.indexKnowledge", "Index")
+                            : issue.pending
+                              ? t("editor.fillCredential", "Fill")
+                              : t("editor.goToIssue", "Fix")}
+                        </button>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -2466,7 +2522,6 @@ export function AgentEditorPage() {
                 model={model}
                 setModel={setModel}
                 modelCredBaseUrl={modelCredBaseUrl}
-                onModelEntryChange={onModelEntryChange}
                 dirty={dirty.general}
                 saving={savingAgent}
                 onSave={() => {
@@ -2565,9 +2620,16 @@ export function AgentEditorPage() {
                 stt={stt}
                 setStt={setStt}
                 sttCredBaseUrl={sttCredBaseUrl}
-                onSttEntryChange={onSttEntryChange}
                 tts={tts}
                 setTts={setTts}
+                // The SAVED model, not the one being edited on General (see savedModel above), and
+                // its EFFECTIVE endpoint: a credential that carries its own wins over the typed
+                // field, exactly as the runtime resolves it.
+                agentModelProvider={savedModel.provider}
+                agentModelName={savedModel.model}
+                agentModelCredentialRef={savedModel.credentialRef}
+                agentModelBaseUrl={savedModelBaseUrl}
+                ttsNormalizeCredBaseUrl={ttsNormalizeCredBaseUrl}
                 split={split}
                 setSplit={setSplit}
                 serviceWindow={serviceWindow}
@@ -2582,7 +2644,6 @@ export function AgentEditorPage() {
                 vision={vision}
                 setVision={setVision}
                 visionCredBaseUrl={visionCredBaseUrl}
-                onVisionEntryChange={onVisionEntryChange}
                 limits={limits}
                 setLimits={setLimits}
                 observability={observability}

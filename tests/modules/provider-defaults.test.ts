@@ -3,6 +3,7 @@ import {
   STT_DEFAULT_MODEL,
   TTS_DEFAULT_MODEL,
   TTS_DEFAULT_VOICE,
+  TTS_PROVIDERS,
   VISION_DEFAULT_MODEL,
 } from "@/client/lib/providerDefaults";
 import { getSttProvider, STT_PROVIDER_NAMES } from "@/modules/stt/providers";
@@ -35,5 +36,15 @@ describe("provider defaults mirror", () => {
       expect(TTS_DEFAULT_MODEL[name]).toBe(getTtsProvider(name)?.defaultModel);
       expect(TTS_DEFAULT_VOICE[name]).toBe(getTtsProvider(name)?.defaultVoice);
     }
+  });
+
+  // Equality in BOTH directions, unlike the loops above: this list is not only what the editor
+  // offers, it is what the form reader accepts from a stored bag. An entry the registry does not
+  // have would be waved through here and then fall back to openai at synthesis time, which is a
+  // voice note that never arrives.
+  test("the editor's TTS provider list is exactly the registry's", () => {
+    expect([...TTS_PROVIDERS].sort().join(",")).toBe(
+      [...TTS_PROVIDER_NAMES].sort().join(","),
+    );
   });
 });

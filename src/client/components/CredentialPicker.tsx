@@ -20,7 +20,7 @@ import {
 import { ServiceLogo } from "@/client/components/icons/ServiceLogo";
 import { Modal, useModalController } from "@/client/components/Modal";
 import { api } from "@/client/lib/api";
-import { formatVaultRef } from "@/client/lib/credentialRef";
+import { canonicalVaultRef, formatVaultRef } from "@/client/lib/credentialRef";
 import {
   isTestableSecretType,
   secretTypeService,
@@ -124,7 +124,8 @@ export function CredentialPicker({
   useEffect(() => {
     if (!loaded) return;
     const selected =
-      entries.find((e) => formatVaultRef(e.id) === value) ?? null;
+      entries.find((e) => formatVaultRef(e.id) === canonicalVaultRef(value)) ??
+      null;
     const notifyKey = value + (selected?.id ?? "__none__");
     if (prevNotifiedRef.current === notifyKey) return;
     prevNotifiedRef.current = notifyKey;
@@ -165,8 +166,17 @@ export function CredentialPicker({
 
   // Stored refs are always `vault:<id>`; a value with no matching entry (after load) points at a
   // removed credential → flagged "unavailable" in the trigger (never the raw id).
-  const selected = entries.find((e) => formatVaultRef(e.id) === value) ?? null;
+  const selected =
+    entries.find((e) => formatVaultRef(e.id) === canonicalVaultRef(value)) ??
+    null;
   const unresolved = !selected && !!value;
+  // The entry is there and its secret is not: `credential_create` (MCP) and the vault's own "add a
+  // reference now, fill it later" both produce this, deliberately: resolveSecretRef says so and
+  // points at the alert that would surface it. That alert only ever existed for the agent's own
+  // credentials (configHealth), so every other field wired to a pending entry failed with nothing
+  // said anywhere: an integration's inbound secret failed as a bare 401 (issue #124). Saying it in
+  // the picker says it once, for every field that references a credential.
+  const unfilled = selected?.status === "pending";
   const canTest = !!selected && isTestableSecretType(selected.kind);
   // Same compatibility rule as the list ranking: flags a selection left behind after the
   // context changed (e.g. the provider switched while an old credential stayed selected).
@@ -200,9 +210,12 @@ export function CredentialPicker({
   ]);
 
   async function testExisting() {
-    if (!value) return;
-    // value is `vault:<id>`; extract the id to call POST /:id/test.
-    const id = value.slice("vault:".length);
+    // The ENTRY's id, never the ref's own spelling: the route takes `^\d+$`, and a ref reaches this
+    // field unvalidated (`PATCH /v1/agents/:id` stores what it is handed), so `vault: 7 ` — which
+    // resolves everywhere else, including the selection above — would be refused here and the
+    // credential reported as unreachable.
+    if (!selected) return;
+    const id = selected.id;
     setTesting(true);
     setTestResult(null);
     try {
@@ -255,7 +268,7 @@ export function CredentialPicker({
             {t(`vault.secretType.${e.kind}`, e.kind)}
           </span>
         )}
-        {value === formatVaultRef(e.id) && (
+        {canonicalVaultRef(value) === formatVaultRef(e.id) && (
           <Check className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         )}
       </DropdownMenuPrimitive.Item>
@@ -473,6 +486,25 @@ export function CredentialPicker({
         </span>
       )}
 
+      {unfilled && (
+        <span
+          className="flex flex-wrap items-center gap-2 text-warning text-xs"
+          role="status"
+        >
+          {t(
+            "credentialPicker.pendingUnfilled",
+            "This credential has no value yet, so anything using it cannot run.",
+          )}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => editModal.open()}
+          >
+            {t("vault.fill", "Fill")}
+          </button>
+        </span>
+      )}
+
       {loaded && required && !value && (
         <span className="text-warning text-xs" role="status">
           {t(
@@ -495,15 +527,27 @@ export function CredentialPicker({
           onSaved={(ref) => {
             createModal.close();
             onChange(ref);
-            void refreshVault();
+            // A failed refresh leaves the previous list in place rather than throwing into the
+            // void: the entry was already saved, and the vault-changed listeners re-read anyway.
+            refreshVault().catch(() => undefined);
           }}
           onCancel={() => createModal.close()}
         />
       </Modal>
 
-      <Modal modal={editModal} title={t("vault.updateTitle", "Update secret")}>
+      <Modal
+        modal={editModal}
+        title={
+          unfilled
+            ? t("vault.fillTitle", "Fill pending credential")
+            : t("vault.updateTitle", "Update secret")
+        }
+      >
         <CredentialForm
           mode="update"
+          // Filling here has to demand a real value, exactly as the vault panel does: a rename-only
+          // save would close the form and leave the entry just as unfilled as it was.
+          requireValue={unfilled}
           initialId={selected?.id}
           initialName={selected?.name}
           initialKind={selected?.kind ?? "generic"}
@@ -514,7 +558,9 @@ export function CredentialPicker({
             // Clear the notify guard so onEntryChange re-fires with the updated entry once the
             // refreshed list arrives (via the vault-changed listener above).
             prevNotifiedRef.current = null;
-            void refreshVault();
+            // A failed refresh leaves the previous list in place rather than throwing into the
+            // void: the entry was already saved, and the vault-changed listeners re-read anyway.
+            refreshVault().catch(() => undefined);
           }}
           onCancel={() => editModal.close()}
         />

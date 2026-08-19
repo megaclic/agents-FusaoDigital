@@ -3,6 +3,7 @@ import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { SETTINGS_CREDENTIAL_PATHS } from "@/modules/agents/credential-paths";
 import {
   runSecretTest,
   type SecretTestDeps,
@@ -216,6 +217,62 @@ export async function resolveVaultRefByName(
     const kinds = [...new Set(rows.map((r) => r.kind))].sort();
     return { status: "ambiguous", kinds } as const;
   });
+}
+
+// A ref on its way INTO a column, checked against the tenant's vault and returned in the one
+// spelling every resolver agrees on. Two values are refused here rather than stored:
+//
+//   * anything that is not `vault:<id>`. A bare NAME is the one that happens (the REST schemas
+//     asked for one in so many words), and `vaultRefWhere` turns it into a filter that matches
+//     nothing, so the column holds a value no resolver can ever answer and the feature behaves as
+//     if nothing were configured (issue #124: an inbound webhook 401s with the token correct on
+//     both ends). MCP never hits this because it resolves names to refs before it gets here.
+//   * a well-formed ref whose row is not in this tenant.
+//
+// A PENDING entry passes on purpose: wiring config to a reference whose secret is not filled yet is
+// the point of credential_create, and the picker is where that gets surfaced.
+//
+// Canonicalizing is not cosmetic. `vault:007` resolves server-side (BigInt tolerates padding) but
+// compares unequal against a list built from ids, so the picker reports a working credential as
+// unavailable. See canonicalVaultRef in src/client/lib/credentialRef.ts.
+//
+// Deleting an entry still strands every ref that named it. That is a different cause for the same
+// state, answered by the vault list and the picker, not here.
+const VAULT_ID_RE = /^\d+$/;
+const MAX_VAULT_ID = 9223372036854775807n;
+
+export async function requireVaultRef(
+  db: ScopedDb,
+  ref: string,
+): Promise<string> {
+  const malformed = () =>
+    new AppError(
+      `"${ref}" is not a vault reference (expected vault:<id>)`,
+      400,
+      "errors.invalidVaultRef",
+    );
+  if (!ref.startsWith(VAULT_REF_PREFIX)) throw malformed();
+  const raw = ref.slice(VAULT_REF_PREFIX.length);
+  // Decimal digits only, within what a Postgres `bigint` column holds. BigInt is arbitrary precision
+  // and lenient: `0x7`, `+7` and ` 7 ` all parse, and an id past 2^63-1 parses too and is refused by
+  // the DATABASE instead, as a 500 for what is plainly a malformed field. Readers tolerate the
+  // lenient spellings on purpose (canonicalVaultRef); a column takes ONE, so the rest are refused
+  // here rather than normalized, and "stored canonically" stops depending on the writer.
+  if (!VAULT_ID_RE.test(raw)) throw malformed();
+  const id = BigInt(raw);
+  if (id > MAX_VAULT_ID) throw malformed();
+  const entry = await db.vaultEntry.findFirst({
+    where: { id },
+    select: { id: true },
+  });
+  if (!entry) {
+    throw new AppError(
+      `vault secret "${ref}" not found`,
+      400,
+      "errors.vaultRefNotFound",
+    );
+  }
+  return formatVaultRef(entry.id);
 }
 
 export async function vaultNameByRef(
@@ -799,6 +856,9 @@ export interface VaultReferences {
   mcpConnections: string[];
   integrations: string[];
   webhooks: string[];
+  // Alert channels sign their deliveries with a vault secret too. This one was missing, so the
+  // vault offered to delete a key an alert channel was using without a word about it.
+  alertChannels: string[];
   // Agents carry their id so the UI can deep-link to the editor (/agents/:id); the others have no
   // per-item route and link to their closest panel.
   agents: { id: string; name: string }[];
@@ -820,6 +880,7 @@ export async function vaultReferences(
     mcpConnections: [],
     integrations: [],
     webhooks: [],
+    alertChannels: [],
     agents: [],
     tenantSettings: [],
   };
@@ -831,40 +892,49 @@ export async function vaultReferences(
     if (!entry) return empty;
     const idRef = formatVaultRef(entry.id);
 
-    const [tds, mcps, ints, whs, agentRows, tenantRow] = await Promise.all([
-      db.toolDefinition.findMany({
-        where: { credentialRef: idRef },
-        select: { name: true },
-      }),
-      db.mcpServerConnection.findMany({
-        where: { credentialRef: idRef },
-        select: { name: true },
-      }),
-      db.integrationInstance.findMany({
-        where: {
-          OR: [{ credentialRef: idRef }, { inboundSecretRef: idRef }],
-        },
-        select: { name: true },
-      }),
-      db.webhookSubscription.findMany({
-        where: { secretRef: idRef },
-        select: { url: true },
-      }),
-      db.agent.findMany({
-        where: {
-          OR: [
-            { modelConfig: { path: ["credentialRef"], equals: idRef } },
-            { settings: { path: ["stt", "credentialRef"], equals: idRef } },
-            { settings: { path: ["tts", "credentialRef"], equals: idRef } },
-          ],
-        },
-        select: { id: true, name: true },
-      }),
-      // Tenant settings (embedding/langfuse) are JSON-embedded singletons. Read the raw JSON and
-      // compare the path directly — importing tenant-settings parsers here would cycle (that module
-      // imports from this one).
-      db.tenant.findFirst({ select: { settings: true } }),
-    ]);
+    const [tds, mcps, ints, whs, alerts, agentRows, tenantRow] =
+      await Promise.all([
+        db.toolDefinition.findMany({
+          where: { credentialRef: idRef },
+          select: { name: true },
+        }),
+        db.mcpServerConnection.findMany({
+          where: { credentialRef: idRef },
+          select: { name: true },
+        }),
+        db.integrationInstance.findMany({
+          where: {
+            OR: [{ credentialRef: idRef }, { inboundSecretRef: idRef }],
+          },
+          select: { name: true },
+        }),
+        db.webhookSubscription.findMany({
+          where: { secretRef: idRef },
+          select: { url: true },
+        }),
+        db.alertChannel.findMany({
+          where: { secretRef: idRef },
+          select: { name: true },
+        }),
+        db.agent.findMany({
+          where: {
+            // NOTE: every settings path that can hold a credential, from the one list all three
+            // consumers of that fact share. A path absent here reads as "this key is unused", and the
+            // vault UI then offers to delete a key the runtime is about to need.
+            OR: [
+              { modelConfig: { path: ["credentialRef"], equals: idRef } },
+              ...SETTINGS_CREDENTIAL_PATHS.map(({ block, field }) => ({
+                settings: { path: [block, field], equals: idRef },
+              })),
+            ],
+          },
+          select: { id: true, name: true },
+        }),
+        // Tenant settings (embedding/langfuse) are JSON-embedded singletons. Read the raw JSON and
+        // compare the path directly — importing tenant-settings parsers here would cycle (that module
+        // imports from this one).
+        db.tenant.findFirst({ select: { settings: true } }),
+      ]);
     const tenantSettings: string[] = [];
     const settings = (tenantRow?.settings ?? {}) as {
       embedding?: { credentialRef?: unknown };
@@ -879,6 +949,7 @@ export async function vaultReferences(
       mcpConnections: mcps.map((m) => m.name),
       integrations: ints.map((i) => i.name),
       webhooks: whs.map((w) => w.url),
+      alertChannels: alerts.map((a) => a.name),
       agents: agentRows.map((a) => ({ id: String(a.id), name: a.name })),
       tenantSettings,
     };

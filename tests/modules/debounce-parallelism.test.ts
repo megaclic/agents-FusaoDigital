@@ -52,9 +52,65 @@ function threadOf(convId: number) {
   return `${tenantId}:${instanceId}:${convId}`;
 }
 
-// Fake chat model: sleeps `delayMs` (LLM latency) and tracks concurrent in-flight calls via a shared
-// meter. bindTools returns self so it works whether or not the runtime binds native tools.
-function sleepyModel(delayMs: number, meter: { active: number; max: number }) {
+// NOTE: turns reach the model at their own pace, because each one does real DB work first. Measured
+// on this suite: 20 turns spread their arrivals over 91-147ms while the fake latency was 100ms, so
+// the first turn regularly released its permit before the last one arrived and the observed peak
+// landed at 15-19 instead of 20. The test failed ~13% of local runs, isolated, with nothing wrong in
+// the code under test.
+//
+// The gate turns that race into a rendezvous: every call parks until `quorum` are in flight at once,
+// so the peak becomes a property of the SEMAPHORE rather than of how loaded the machine is. What it
+// deliberately does not do is weaken the assertion — a semaphore that admits more than the cap still
+// pushes the peak above it, and one that admits fewer never reaches quorum, waits out the grace
+// window and fails on the same `toBe(cap)`. Both directions are covered by mutation.
+//
+// The grace window is ONE shared clock started by the first arrival, not a per-call timeout: a
+// broken semaphore that serializes the calls then costs the test one window in total instead of one
+// per call, which keeps a real failure fast and readable instead of a test-timeout.
+const QUORUM_GRACE_MS = 1_000;
+
+// NOTE: reaching quorum only settles the LOWER half of `toBe(cap)`. Releasing there would let the
+// parked calls drain within `delayMs` while an over-admitted call was still doing its own DB work,
+// and the peak would read exactly `cap` on a semaphore that admits more than one. So quorum does not
+// release: everyone stays parked through this window, where an extra arrival still counts. Sized
+// from the measured tail (the 5 surplus turns arrive within ~25ms of the 20th) at 3x the fake
+// latency, so it is not a stopwatch on the same scale as the thing it observes.
+//
+// It is a window, not a proof: no finite wait can rule out an admission that comes later still. The
+// deterministic upper bound lives in tests/lib/semaphore.test.ts and tests/graph/model-limit.test.ts,
+// where every caller acquires synchronously in one tick and no timing is involved. What this buys is
+// that the INTEGRATION path can see over-admission at all, which it could not before.
+const OVERFLOW_PROBE_MS = 300;
+
+function quorumGate(quorum: number, meter: { active: number }) {
+  let reached: () => void = () => {};
+  const atQuorum = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  let quorumMet = false;
+  let grace: Promise<unknown> | undefined;
+  return async () => {
+    if (meter.active >= quorum) {
+      quorumMet = true;
+      reached();
+    }
+    grace ??= sleep(QUORUM_GRACE_MS);
+    await Promise.race([atQuorum, grace]);
+    // Skipped when the gate opened on the grace clock instead: a semaphore that admits FEWER than
+    // the cap never reaches quorum, and charging it the probe per serialized call would end the
+    // test on the clock rather than on the assertion that names the defect.
+    if (quorumMet) await sleep(OVERFLOW_PROBE_MS);
+  };
+}
+
+// Fake chat model: waits for the rendezvous, then sleeps `delayMs` (LLM latency), tracking concurrent
+// in-flight calls via a shared meter. bindTools returns self so it works whether or not the runtime
+// binds native tools.
+function sleepyModel(
+  delayMs: number,
+  meter: { active: number; max: number },
+  gate: () => Promise<void>,
+) {
   const model = {
     bindTools() {
       return model;
@@ -63,6 +119,7 @@ function sleepyModel(delayMs: number, meter: { active: number; max: number }) {
       meter.active += 1;
       meter.max = Math.max(meter.max, meter.active);
       try {
+        await gate();
         await sleep(delayMs);
         return new AIMessage(REPLY);
       } finally {
@@ -209,6 +266,7 @@ describe.skipIf(!dbUp)("debounce parallelism", () => {
     for (const id of convIds) await seedConversation(id);
 
     const meter = { active: 0, max: 0 };
+    const gate = quorumGate(cap, meter);
     const sent: Array<[number, string]> = [];
     const jobs = convIds.map((id) => jobFor(id));
 
@@ -220,7 +278,7 @@ describe.skipIf(!dbUp)("debounce parallelism", () => {
           job,
           base: appDb,
           deps: {
-            makeModel: () => sleepyModel(delayMs, meter),
+            makeModel: () => sleepyModel(delayMs, meter, gate),
             makeClient: parallelStub(sent),
             checkpointer: new MemorySaver(),
           },
@@ -235,11 +293,16 @@ describe.skipIf(!dbUp)("debounce parallelism", () => {
     expect(out.claimed).toBe(M);
     // Every conversation answered exactly once (no turn stuck/dropped under concurrency).
     expect(sent.length).toBe(M);
-    // Concurrency reached the model cap — proves parallel (serial would peak at 1) AND that the
-    // semaphore holds the line at config.agent.modelConcurrency.
+    // Concurrency reached the model cap: proves parallel (serial would peak at 1) AND that the
+    // semaphore holds the line at config.agent.modelConcurrency. Deterministic thanks to the
+    // rendezvous above, which is why this is `toBe` and not a range.
     expect(meter.max).toBe(cap);
-    // Anti-serial guard, generous to avoid timing flakiness: serial would be ~M*delayMs (the real
-    // number is in the log). meter.max === cap above is the strong, deterministic proof of parallelism.
-    expect(elapsed).toBeLessThan(M * delayMs);
+    // NOTE: the wall-clock anti-serial guard that used to sit here is gone. It bounded `elapsed`
+    // below M*delayMs, but the rendezvous adds fixed harness time (grace clock, probe window) that
+    // has nothing to do with the code under test, so the bound had drifted into measuring this
+    // file's own overhead: 1428ms observed against a 2500ms threshold. It also bought nothing.
+    // Serializing the worker's own `Promise.allSettled` over the jobs is caught above with a peak of
+    // 1, before the timing assertion is ever reached. `elapsed` stays in the log, where a human
+    // reading a failure wants it, and asserts nothing.
   });
 });

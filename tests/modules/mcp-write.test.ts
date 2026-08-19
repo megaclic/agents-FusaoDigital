@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
+import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import {
   agentList,
@@ -320,6 +321,9 @@ function blk(settings: unknown, key: string): Record<string, unknown> {
 describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
   let tenantA = 0n;
   let tenantB = 0n;
+  // Its own tenant for the legacy-cap case: a sibling test counts every agent_settings_set audit row
+  // in tenantA, so an apply landing there would break it.
+  let tenantLegacy = 0n;
   let agentA = 0n;
   // Vault entry ids for credential ref tests.
   let credGenericId = 0n;
@@ -334,6 +338,10 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
       data: { name: "WB", slug: `w-b-${process.pid}` },
     });
     tenantB = b.id;
+    const l = await suDb.tenant.create({
+      data: { name: "WLegacy", slug: `w-legacy-${process.pid}` },
+    });
+    tenantLegacy = l.id;
     const ag = await suDb.agent.create({
       data: { tenantId: tenantA, name: "Bot", systemPrompt: "old prompt" },
     });
@@ -362,7 +370,7 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
   });
 
   afterAll(async () => {
-    for (const tid of [tenantA, tenantB]) {
+    for (const tid of [tenantA, tenantB, tenantLegacy]) {
       if (!tid) continue;
       await suDb.$executeRawUnsafe(
         `DELETE FROM audit_logs WHERE tenant_id = ${tid}`,
@@ -558,6 +566,69 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     expect(audits).toBe(0);
   });
 
+  // Operator prose (handoff/kanban/tool guidance, guardrails policy, vision prompt, follow-up steps)
+  // is clamped by the readers, so an over-cap note used to come back as a SUCCESSFUL diff already
+  // showing the shortened value, which reads as "applied" rather than "cut". The dry run is checked
+  // too: a preview that promises a write the apply would refuse is worse than no preview.
+  test("agent_settings_set refuses over-cap guidance, on the preview and on the apply", async () => {
+    const p = principal({ tenantId: tenantA });
+    const boom = "h".repeat(TOOL_INSTRUCTIONS_MAX + 1);
+    const preview = await agentSettingsSet(
+      p,
+      { agent_id: String(agentA), handoff: { instructions: boom } },
+      { base: appDb },
+    );
+    expect(preview.ok).toBe(false);
+    if (!preview.ok) {
+      expect(preview.error).toContain("handoff.instructions");
+      expect(preview.error).toContain(String(TOOL_INSTRUCTIONS_MAX));
+    }
+    const applied = await agentSettingsSet(
+      p,
+      {
+        agent_id: String(agentA),
+        handoff: { instructions: boom },
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(applied.ok).toBe(false);
+    const row = await suDb.agent.findUnique({ where: { id: agentA } });
+    expect(JSON.stringify(row?.settings)).not.toContain(boom.slice(0, 200));
+  });
+
+  // The refusal is about what the write CHANGES: a caller that reads the agent, edits one block and
+  // sends the bag back has to be able to send the rest of it unchanged, over-cap legacy text included.
+  test("agent_settings_set accepts a stored over-cap value it does not change", async () => {
+    const legacy = "h".repeat(TOOL_INSTRUCTIONS_MAX + 1);
+    const legacyAgent = await suDb.agent.create({
+      data: {
+        tenantId: tenantLegacy,
+        name: "LegacyCap",
+        systemPrompt: "p",
+        settings: { handoff: { instructions: legacy } },
+      },
+    });
+    const res = await agentSettingsSet(
+      principal({ tenantId: tenantLegacy }),
+      {
+        agent_id: String(legacyAgent.id),
+        handoff: { instructions: legacy },
+        split: { enabled: true, maxChars: 400 },
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(res.ok).toBe(true);
+    const row = await suDb.agent.findUnique({ where: { id: legacyAgent.id } });
+    expect(blk(row?.settings, "split").maxChars).toBe(400);
+    // MCP normalizes each touched block through its reader, so the handoff note it re-sent is stored
+    // clamped. That is the pre-existing behavior of this transport, not the refusal doing it.
+    expect(String(blk(row?.settings, "handoff").instructions)).toHaveLength(
+      TOOL_INSTRUCTIONS_MAX,
+    );
+  });
+
   test("agent_settings_set apply merges + clamps + audits, preserving other keys", async () => {
     // Seed an unrelated key (grounding) to prove the merge preserves untouched keys.
     await suDb.agent.update({
@@ -732,6 +803,43 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     const row = await suDb.agent.findUnique({ where: { id: agentA } });
     const stt = blk(row?.settings, "stt");
     expect(stt.credentialRef).toBe(`vault:${credGenericId}`);
+  });
+
+  // The tts block carries TWO credentials (the voice engine's, and the speech normalizer's own
+  // model). The name→ref translation is keyed by (block, field), so a loop that only knew
+  // "credentialRef" would store this one as a raw NAME, which resolves nowhere at turn time, and
+  // the operator would only find out from a missing rewrite in production.
+  test("agent_settings_set translates the tts normalizer credential name too, and get projects it back", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await agentSettingsSet(
+      p,
+      {
+        agent_id: String(agentA),
+        tts: {
+          normalize: true,
+          normalizeCredentialRef: `vault:${credGenericId}`,
+        },
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    const row = await suDb.agent.findUnique({ where: { id: agentA } });
+    expect(blk(row?.settings, "tts").normalizeCredentialRef).toBe(
+      `vault:${credGenericId}`,
+    );
+    const got = await agentSettingsGet(
+      p,
+      { agent_id: String(agentA) },
+      { base: appDb },
+    );
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      const tts = (got.data.settings as Record<string, Record<string, unknown>>)
+        .tts;
+      // Back to the NAME, like every other credential the MCP contract exposes.
+      expect(tts?.normalizeCredentialRef).toBe("shared-cred");
+    }
   });
 
   test("agent_settings_set with vault:<id> not in tenant returns not-found error", async () => {

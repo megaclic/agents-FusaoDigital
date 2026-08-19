@@ -1285,3 +1285,451 @@ describe("google calendar toolpack — integration failures are marked (issue #4
     expect(String(out.content).toLowerCase()).toContain("at most 24 hours");
   });
 });
+
+// Issue #100: a clinic with one calendar per professional. "Who can see me first?" used to force the
+// model to call this tool once per calendar and merge the results itself, burning the turn's tool
+// budget and risking a calendar never being asked. freeBusy already takes N calendars in ONE request,
+// so aggregating costs the same round trip it always did.
+describe("google calendar toolpack — aggregated availability (issue #100)", () => {
+  const ANA = "ana@group.calendar.google.com";
+  const PAULO = "paulo@group.calendar.google.com";
+  const CLINIC = {
+    calendarIds: [ANA, PAULO],
+    calendarLabels: { [ANA]: "Dra. Ana", [PAULO]: "Dr. Paulo" },
+    slotDurationMinutes: 60,
+    slotGranularityMinutes: 60,
+  };
+  const RANGE = {
+    timeMin: "2099-06-22T09:00:00-03:00",
+    timeMax: "2099-06-22T12:00:00-03:00",
+  };
+  type AggSlot = {
+    start: string;
+    end: string;
+    label: string;
+    calendarId: string;
+    calendarLabel?: string;
+  };
+  const parse = (out: string) =>
+    JSON.parse(out) as {
+      slots: AggSlot[];
+      unavailableCalendars?: string[];
+      coveredUntil?: string;
+    };
+
+  test("no calendarId asks every allowed calendar in ONE freeBusy request", async () => {
+    const { impl, calls } = stubFetch(200, {
+      calendars: { [ANA]: { busy: [] }, [PAULO]: { busy: [] } },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    expect(calls).toHaveLength(1);
+    expect(bodyOf(calls[0] as { init: RequestInit })).toMatchObject({
+      items: [{ id: ANA }, { id: PAULO }],
+    });
+    expect(parse(out).slots.length).toBe(6);
+  });
+
+  test("every slot carries the calendar that can actually take it", async () => {
+    const { impl } = stubFetch(200, {
+      calendars: {
+        [ANA]: {
+          busy: [
+            {
+              start: "2099-06-22T09:00:00-03:00",
+              end: "2099-06-22T10:00:00-03:00",
+            },
+          ],
+        },
+        [PAULO]: { busy: [] },
+      },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const nine = parse(out).slots.filter((s) => localHM(s.start) === "09:00");
+    expect(nine).toHaveLength(1);
+    expect(nine[0]?.calendarId).toBe(PAULO);
+    expect(nine[0]?.calendarLabel).toBe("Dr. Paulo");
+  });
+
+  test("the merged list is chronological across calendars", async () => {
+    const { impl } = stubFetch(200, {
+      calendars: {
+        [ANA]: {
+          busy: [
+            {
+              start: "2099-06-22T09:00:00-03:00",
+              end: "2099-06-22T11:00:00-03:00",
+            },
+          ],
+        },
+        [PAULO]: {
+          busy: [
+            {
+              start: "2099-06-22T10:00:00-03:00",
+              end: "2099-06-22T12:00:00-03:00",
+            },
+          ],
+        },
+      },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const times = parse(out).slots.map((s) => Date.parse(s.start));
+    expect(times).toEqual([...times].sort((a, b) => a - b));
+  });
+
+  test("an explicit calendarId still asks that one calendar only", async () => {
+    const { impl, calls } = stubFetch(200, {
+      calendars: { [ANA]: { busy: [] } },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({ ...RANGE, calendarId: "Dra. Ana" })) as string;
+    expect(bodyOf(calls[0] as { init: RequestInit })).toMatchObject({
+      items: [{ id: ANA }],
+    });
+    expect(parse(out).slots.every((s) => s.calendarId === ANA)).toBe(true);
+  });
+
+  test("a calendar freeBusy could not read is EXCLUDED and named, never treated as free", async () => {
+    // Including it with an empty busy list would offer a professional whose bookings we cannot see,
+    // which is a double booking. Dropping it only under-offers.
+    const { impl } = stubFetch(200, {
+      calendars: {
+        [ANA]: { busy: [] },
+        [PAULO]: { errors: [{ domain: "global", reason: "notFound" }] },
+      },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const parsed = parse(out);
+    expect(parsed.slots.every((s) => s.calendarId === ANA)).toBe(true);
+    expect(parsed.unavailableCalendars).toEqual(["Dr. Paulo"]);
+  });
+
+  test("a single calendar is NOT capped, even past the aggregate ceiling", async () => {
+    // The earlier version of this test used a 12-hour hourly window, which is 12 slots: it asserted
+    // the guarantee without ever reaching the ceiling it claimed did not apply. At the 5-minute floor
+    // a near-24h range yields ~287 starts, which is past the 250 an aggregate query is bound to.
+    const { impl } = stubFetch(200, { calendars: { [ANA]: { busy: [] } } });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      {
+        ...CLINIC,
+        calendarIds: [ANA],
+        slotDurationMinutes: 5,
+        slotGranularityMinutes: 5,
+      },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({
+      timeMin: "2099-06-22T00:00:00-03:00",
+      timeMax: "2099-06-22T23:59:00-03:00",
+    })) as string;
+    const parsed = parse(out);
+    expect(parsed.slots.length).toBeGreaterThan(250);
+    expect(parsed.coveredUntil).toBeUndefined();
+  });
+
+  test("a batch that THROWS costs only its own calendars, like a batch that 500s", async () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `c${i}@x`);
+    let n = 0;
+    const impl = (async () => {
+      if (n++ > 0) throw new Error("socket hang up");
+      return new Response(
+        JSON.stringify({
+          calendars: Object.fromEntries(
+            ids.slice(0, 10).map((id) => [id, { busy: [] }]),
+          ),
+        }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: ids, calendarLabels: {} },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const parsed = parse(out);
+    expect(parsed.unavailableCalendars).toEqual(ids.slice(10));
+    expect(parsed.slots.length).toBeGreaterThan(0);
+  });
+
+  test("the calendarId ARG says omitting it searches everyone, not just the prose", async () => {
+    // Where the model actually decides. The tool description says to omit it, but an optional field
+    // is filled or skipped while reading the field, and the shared description ("Which calendar to
+    // act on") argues the other way with a list of valid values in sight.
+    const argDesc = (name: string) => {
+      const tool = toolFor(name, CLINIC, baseCtx());
+      if (!tool) throw new Error(`tool not built: ${name}`);
+      const shape = (
+        tool.schema as { shape: Record<string, { description?: string }> }
+      ).shape;
+      return shape.calendarId?.description ?? "";
+    };
+    const availability = argDesc("calendar_check_availability");
+    expect(availability).toMatch(/omit/i);
+    expect(availability).toMatch(/every calendar/i);
+    // The acting tools must NOT inherit it: there, leaving it out is refused.
+    expect(argDesc("calendar_create_event")).not.toMatch(/omit/i);
+  });
+
+  test("the tool description tells the model what coveredUntil means", async () => {
+    // A field the model is never told about cannot be acted on, and a truncated list read as complete
+    // is the model reporting later times unavailable.
+    const desc = toolFor("calendar_check_availability", CLINIC, baseCtx())
+      ?.description as string;
+    expect(desc).toContain("coveredUntil");
+    expect(desc).toContain("timeMin");
+  });
+
+  test("an afternoon is still offered: several calendars are not cut to their first few starts", async () => {
+    // The reviewer's scenario. At the default 15-minute grain an eight-slot-per-calendar bound
+    // exposes under two hours, so "do you have anything after lunch?" answers no while the afternoon
+    // is free. Nothing may truncate the range.
+    const { impl } = stubFetch(200, {
+      calendars: { [ANA]: { busy: [] }, [PAULO]: { busy: [] } },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, slotDurationMinutes: 30, slotGranularityMinutes: 15 },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({
+      timeMin: "2099-06-22T09:00:00-03:00",
+      timeMax: "2099-06-22T18:00:00-03:00",
+    })) as string;
+    const slots = parse(out).slots;
+    const afternoon = slots.filter(
+      (s) => Number(localHM(s.start).slice(0, 2)) >= 14,
+    );
+    expect(afternoon.length).toBeGreaterThan(0);
+    expect(new Set(afternoon.map((s) => s.calendarId))).toEqual(
+      new Set([ANA, PAULO]),
+    );
+  });
+
+  test("the query is BATCHED across every allowed calendar", async () => {
+    // Google's calendarExpansionMax of 50 is a PER-REQUEST ceiling, so batching satisfies it. An
+    // earlier revision trimmed the allowlist at 50 and reported the tail as unavailable, throwing
+    // away calendars that one more batch would have covered.
+    const many = Array.from({ length: 50 }, (_, i) => `c${i}@x`);
+    const { impl, calls } = stubFetch(200, {
+      calendars: Object.fromEntries(many.map((id) => [id, { busy: [] }])),
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: many, calendarLabels: {} },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const asked = calls.flatMap(
+      (c) => (bodyOf(c) as { items: { id: string }[] }).items,
+    );
+    expect(calls).toHaveLength(5);
+    for (const c of calls) {
+      expect(
+        (bodyOf(c) as { items: unknown[] }).items.length,
+      ).toBeLessThanOrEqual(10);
+    }
+    expect(asked.map((i) => i.id)).toEqual(many);
+    expect(parse(out).unavailableCalendars).toBeUndefined();
+  });
+
+  test("an allowlist too large to aggregate is refused, and one calendar still works", async () => {
+    // The bound sits on the calendar count rather than on each consequence (requests in flight, slot
+    // entries, the always-kept first start time) because they all come from the same arbitrary-length
+    // config array. Refusing names what the operator has to change; an explicit calendarId is
+    // unaffected at any allowlist size.
+    const ids = Array.from({ length: 51 }, (_, i) => `c${i}@x`);
+    const { impl, calls } = stubFetch(200, {
+      calendars: { "c0@x": { busy: [] } },
+    });
+    const refused = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: ids, calendarLabels: {} },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    expect(refused).toContain("the limit is 50");
+    expect(calls).toHaveLength(0);
+
+    const ok = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: ids, calendarLabels: {} },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({ ...RANGE, calendarId: "c0@x" })) as string;
+    expect(parse(ok).slots.length).toBeGreaterThan(0);
+  });
+
+  test('a 2xx whose body cannot be parsed is retriable, not "HTTP null"', async () => {
+    const impl = (async () =>
+      new Response("<html>proxy ate it</html>", {
+        status: 200,
+      })) as unknown as typeof fetch;
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    expect(out).toContain("could not be read");
+    expect(out).not.toContain("null");
+  });
+
+  test("one failed batch costs only its own calendars, not the whole answer", async () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `c${i}@x`);
+    let n = 0;
+    const impl = (async () => {
+      const first = n++ === 0;
+      return new Response(
+        JSON.stringify(
+          first
+            ? {
+                calendars: Object.fromEntries(
+                  ids.slice(0, 10).map((id) => [id, { busy: [] }]),
+                ),
+              }
+            : {},
+        ),
+        { status: first ? 200 : 500 },
+      );
+    }) as unknown as typeof fetch;
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: ids, calendarLabels: {} },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const parsed = parse(out);
+    expect(parsed.unavailableCalendars).toEqual(ids.slice(10));
+    expect(
+      parsed.slots.every((s) => ids.slice(0, 10).includes(s.calendarId)),
+    ).toBe(true);
+  });
+
+  test("a calendar listed as BOTH operable and blocking still blocks its siblings", async () => {
+    // freeBusy ignores transparent and all-day events, which is exactly the closure shape, so a
+    // doubly-listed calendar has to be READ as a blocker for the others. Excluding every queried
+    // calendar from the blocking read (an earlier revision) made that closure invisible to everyone.
+    const { impl } = routedFetch([
+      {
+        match: "/freeBusy",
+        json: { calendars: { [ANA]: { busy: [] }, [PAULO]: { busy: [] } } },
+      },
+      {
+        match: "ana%40group",
+        json: {
+          items: [
+            {
+              start: { dateTime: "2099-06-22T09:00:00-03:00" },
+              end: { dateTime: "2099-06-22T10:00:00-03:00" },
+            },
+          ],
+        },
+      },
+    ]);
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, blockingCalendarIds: [ANA] },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    const nine = parse(out).slots.filter((s) => localHM(s.start) === "09:00");
+    // Blocked for Paulo (the sibling), and NOT self-blocked for Ana: her own freeBusy says free.
+    expect(nine.map((s) => s.calendarId)).toEqual([ANA]);
+  });
+
+  test("a blocker whose only sibling went unreadable is not read at all", async () => {
+    // The blocking read is decided from the calendars that ANSWERED, not the ones asked for. A
+    // doubly-listed calendar applies to its siblings only, so with no readable sibling left the
+    // request is pure risk: an error or a truncated page on it would refuse availability that is fine.
+    const { impl, calls } = routedFetch([
+      {
+        match: "/freeBusy",
+        json: {
+          calendars: {
+            [ANA]: { busy: [] },
+            [PAULO]: { errors: [{ domain: "global", reason: "notFound" }] },
+          },
+        },
+      },
+    ]);
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, blockingCalendarIds: [ANA] },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    expect(calls).toHaveLength(1);
+    expect(parse(out).slots.length).toBeGreaterThan(0);
+  });
+
+  test("an oversized answer stops at a whole start time and says where to continue", async () => {
+    // 50 calendars over a working day is far past what one tool result can carry. The range must not
+    // be collapsed silently: the caller is told the time to resume from.
+    const ids = Array.from({ length: 50 }, (_, i) => `c${i}@x`);
+    const { impl } = stubFetch(200, {
+      calendars: Object.fromEntries(ids.map((id) => [id, { busy: [] }])),
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: ids, calendarLabels: {} },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({
+      timeMin: "2099-06-22T09:00:00-03:00",
+      timeMax: "2099-06-22T18:00:00-03:00",
+    })) as string;
+    const parsed = parse(out) as {
+      slots: AggSlot[];
+      coveredUntil?: string;
+    };
+    expect(parsed.slots.length).toBeLessThanOrEqual(250);
+    expect(parsed.coveredUntil).toBeTruthy();
+    // Whole start times only: every calendar that answered is present at each time returned.
+    const perTime = new Map<string, number>();
+    for (const s of parsed.slots)
+      perTime.set(s.start, (perTime.get(s.start) ?? 0) + 1);
+    expect([...new Set(perTime.values())]).toEqual([50]);
+  });
+
+  test("when NO calendar could be read it refuses instead of reporting nothing free", async () => {
+    // An empty slot list reads as "this day is fully booked". Saying that because every calendar
+    // failed would send the customer away from a clinic that is in fact open.
+    const { impl } = stubFetch(200, {
+      calendars: {
+        [ANA]: { errors: [{ domain: "global", reason: "notFound" }] },
+        [PAULO]: { errors: [{ domain: "global", reason: "notFound" }] },
+      },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      CLINIC,
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    expect(out).toContain("cannot be verified");
+    expect(out).not.toContain("slots");
+  });
+
+  test("a single allowed calendar keeps the pinned shape, still tagged", async () => {
+    const { impl, calls } = stubFetch(200, {
+      calendars: { [ANA]: { busy: [] } },
+    });
+    const out = (await toolFor(
+      "calendar_check_availability",
+      { ...CLINIC, calendarIds: [ANA] },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(RANGE)) as string;
+    expect(bodyOf(calls[0] as { init: RequestInit })).toMatchObject({
+      items: [{ id: ANA }],
+    });
+    expect(parse(out).slots.every((s) => s.calendarId === ANA)).toBe(true);
+  });
+});

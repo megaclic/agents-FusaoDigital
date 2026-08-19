@@ -6,6 +6,12 @@
 // No back-compat with the old single-shot flat shape: an agent without a `steps` array gets one
 // default step (its pre-multi-step config is not read).
 
+import {
+  clipText,
+  FOLLOW_UP_INSTRUCTIONS_MAX,
+  FOLLOW_UP_MAX_STEPS,
+} from "@/modules/agents/text-caps";
+
 export type FollowUpDelayUnit = "minutes" | "hours" | "days";
 
 export interface FollowUpStep {
@@ -26,7 +32,9 @@ export interface FollowUpConfig {
   pauseWhileAppointment: boolean;
 }
 
-export const FOLLOW_UP_MAX_STEPS = 10;
+// Re-exported: the number lives with the text caps because the walker that mirrors this reader has to
+// know where the reader stops looking, and importing it back from here would close a cycle.
+export { FOLLOW_UP_MAX_STEPS } from "@/modules/agents/text-caps";
 
 function cloneDefaults(): FollowUpConfig {
   return {
@@ -90,9 +98,10 @@ function readStep(raw: unknown): FollowUpStep | null {
   const delayUnit: FollowUpDelayUnit = VALID_UNITS.has(bag.delayUnit as string)
     ? (bag.delayUnit as FollowUpDelayUnit)
     : "minutes";
-  const instructions = (
-    typeof bag.instructions === "string" ? bag.instructions.trim() : ""
-  ).slice(0, 2000);
+  const instructions = clipText(
+    typeof bag.instructions === "string" ? bag.instructions.trim() : "",
+    FOLLOW_UP_INSTRUCTIONS_MAX,
+  );
   const step: FollowUpStep = { delayValue, delayUnit, instructions };
   // Accept the new `assignLabels` array; fall back to the legacy single `assignLabel` string so an
   // agent saved before multi-label keeps its label. De-duped, trimmed, bounded.

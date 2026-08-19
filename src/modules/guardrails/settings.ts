@@ -1,5 +1,11 @@
 import { MODEL_PROVIDERS, type ModelConfig } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
+import {
+  CUSTOM_POLICY_MAX,
+  clipText,
+  GENERATION_PROMPT_MAX,
+  TEMPLATE_MESSAGE_MAX,
+} from "@/modules/agents/text-caps";
 
 // Per-agent guardrails (input/output moderation) config, read from `agent.settings.guardrails`. A
 // dedicated LLM "guardrails agent" (its OWN selectable chat model, separate from the main agent's)
@@ -100,9 +106,6 @@ export const GUARDRAILS_DEFAULTS: GuardrailsConfig = {
   },
 };
 
-const MAX_TEMPLATE = 2000;
-const MAX_GENERATION_PROMPT = 2000;
-const MAX_POLICY = 2000;
 const MAX_COMPETITORS = 50;
 const MAX_COMPETITOR_LEN = 100;
 
@@ -141,13 +144,13 @@ function readDirection(
     enabled: bool(b.enabled, d.enabled),
     checks: readChecks(b.checks, d.checks),
     action: readAction(b.action),
-    templateMessage: (str(b.templateMessage) ?? d.templateMessage).slice(
-      0,
-      MAX_TEMPLATE,
+    templateMessage: clipText(
+      str(b.templateMessage) ?? d.templateMessage,
+      TEMPLATE_MESSAGE_MAX,
     ),
-    generationPrompt: (str(b.generationPrompt) ?? d.generationPrompt).slice(
-      0,
-      MAX_GENERATION_PROMPT,
+    generationPrompt: clipText(
+      str(b.generationPrompt) ?? d.generationPrompt,
+      GENERATION_PROMPT_MAX,
     ),
   };
 }
@@ -193,7 +196,7 @@ export function readGuardrailsConfig(settings: unknown): GuardrailsConfig {
     credentialRef: str(bag.credentialRef),
     baseURL: str(bag.baseURL),
     competitors: readCompetitors(bag.competitors),
-    customPolicy: (str(bag.customPolicy) ?? "").slice(0, MAX_POLICY),
+    customPolicy: clipText(str(bag.customPolicy) ?? "", CUSTOM_POLICY_MAX),
     input: readDirection(bag.input, GUARDRAILS_DEFAULTS.input),
     output: readDirection(bag.output, GUARDRAILS_DEFAULTS.output),
   };

@@ -38,6 +38,7 @@ import { cn } from "@/client/lib/utils";
 import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditModal";
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
+import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
 import type {
   ChannelBinding,
   GrantState,
@@ -1483,6 +1484,7 @@ export function ToolGrantsEditor({
                   setHandoff({ ...handoff, instructions: e.target.value })
                 }
                 rows={3}
+                maxLength={TOOL_INSTRUCTIONS_MAX}
                 placeholder={t(
                   "editor.handoffInstructionsPlaceholder",
                   "e.g. Only escalate after two failed attempts. Send billing issues to the Finance team.",
@@ -1527,6 +1529,7 @@ export function ToolGrantsEditor({
                   value={kanbanInstructions}
                   onChange={(e) => setKanbanInstructions(e.target.value)}
                   rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
                   placeholder={t(
                     "editor.kanbanInstructionsPlaceholder",
                     'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
@@ -1550,6 +1553,7 @@ export function ToolGrantsEditor({
                   value={zproCrmInstructions}
                   onChange={(e) => setZproCrmInstructions(e.target.value)}
                   rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
                   placeholder={t(
                     "editor.kanbanInstructionsPlaceholder",
                     'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
@@ -1603,6 +1607,7 @@ export function ToolGrantsEditor({
                   setUpdateKanbanTaskInstructions(e.target.value)
                 }
                 rows={3}
+                maxLength={TOOL_INSTRUCTIONS_MAX}
                 placeholder={t(
                   "editor.updateKanbanInstructionsPlaceholder",
                   "e.g. When the customer confirms a meeting, set the due date; keep the title as the customer's full name.",
@@ -1632,6 +1637,7 @@ export function ToolGrantsEditor({
                 value={customAttributeInstructions}
                 onChange={(e) => setCustomAttributeInstructions(e.target.value)}
                 rows={3}
+                maxLength={TOOL_INSTRUCTIONS_MAX}
                 placeholder={t(
                   "editor.attrInstructionsPlaceholder",
                   'e.g. Save the qualified budget on the contact as "orcamento"; set "lead_stage" on the card.',
@@ -1661,6 +1667,7 @@ export function ToolGrantsEditor({
                 value={labelInstructions}
                 onChange={(e) => setLabelInstructions(e.target.value)}
                 rows={3}
+                maxLength={TOOL_INSTRUCTIONS_MAX}
                 placeholder={t(
                   "editor.labelInstructionsPlaceholder",
                   'e.g. Add "vip" to the contact for premium customers; tag the conversation "urgent" when the customer is upset.',
