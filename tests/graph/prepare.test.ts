@@ -35,6 +35,7 @@ function makeConfig(
     contactDbId: null,
     contactInboxId: null,
     systemPrompt: "Você é um assistente.",
+    systemPromptAudit: "Você é um assistente.",
     mc: {
       provider: "openai",
       model: "gpt-4o-mini",
@@ -65,6 +66,8 @@ function makeConfig(
     contactName: null,
     timezone: "America/Sao_Paulo",
     maxToolCalls: 10,
+    maxHistoryTokens: null,
+    memoryCompaction: true,
     logToolValues: false,
     ...over,
   } as AgentConfig;

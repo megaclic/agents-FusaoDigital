@@ -33,6 +33,10 @@ import { clampOversizedTextInPlace } from "@/modules/agents/text-caps";
 import { normalizeSettingsForStorage } from "@/modules/images/settings";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import { assertNoSecrets } from "@/modules/n8n-export/n8n";
+import {
+  canonicalBodyShape,
+  unsupportedBodyShape,
+} from "@/modules/tool-definitions/body-shape";
 import { normalizeToolShapes } from "@/modules/tool-definitions/normalize";
 import {
   createPendingVaultEntry,
@@ -83,6 +87,12 @@ const exportedGrantSchema = z.discriminatedUnion("source", [
 // import). Knowledge bases carry metadata; their documents' SOURCE TEXT is bundled only with the
 // separate ?documents opt-in (re-chunked + re-embedded at the destination — embeddings/chunks, being
 // derived and model-specific, are never exported).
+// Wire-format constant, not data. `tool_definitions.risk_tier` is `@ignore`d in the schema (issue
+// #149), so the field is not on the row here and reading it would not compile: the export writes
+// this instead. The KEY stays on the wire for the reason spelled out on `riskTier` below, and the
+// value is arbitrary because no build in any supported version acts on it.
+const RETIRED_RISK_TIER = "medium";
+
 const exportedHttpToolSchema = z.object({
   name: z.string(),
   label: z.string().nullable().optional(),
@@ -96,7 +106,17 @@ const exportedHttpToolSchema = z.object({
   // Optional so exports produced before query existed still import (defaults to {}).
   query: z.record(z.string(), z.unknown()).optional(),
   body: z.record(z.string(), z.unknown()),
-  riskTier: z.string(),
+  // Retired (issue #137) and read by nothing. The KEY outlives the column, and outlives the schema
+  // ignoring it, because they are different compatibility surfaces. A rollback is one operator on one instance minutes apart,
+  // which is what #149's one-release wait bounds; a bundle is a file handed to ANOTHER instance at
+  // an arbitrary version, and the format is versioned as a whole (`version: z.literal(1)`), so an
+  // instance one release behind parses our bundle with a schema where this key is REQUIRED.
+  // Omitting it would make every bundle this build writes unimportable there, and bumping the
+  // version would only trade that for a cleaner refusal while also making THIS build reject every
+  // v1 bundle. So the export echoes RETIRED_RISK_TIER instead of the row, and this stays optional
+  // in both directions: a bundle written after the column is dropped still imports, and one written
+  // before it does too, with the value discarded on the way in.
+  riskTier: z.string().optional(),
   ackEnabled: z.boolean(),
   ackMessage: z.string().nullable().optional(),
   credentialRef: z.string().nullable().optional(),
@@ -144,6 +164,10 @@ const exportedBusinessHoursSchema = z.object({
   name: z.string(),
   timezone: z.string().optional(),
   windows: z.array(z.unknown()).optional(),
+  // Absent in exports written before date exceptions existed, which import as a schedule with none —
+  // the same schedule the source had. Omitting this field here would not fail any type check: the
+  // export would simply arrive at the destination with every holiday and shutdown silently gone.
+  exceptions: z.array(z.unknown()).optional(),
   source: z.string().optional(),
 });
 const exportedComponentsSchema = z.object({
@@ -566,6 +590,7 @@ export async function exportAgent(
               name: true,
               timezone: true,
               windows: true,
+              exceptions: true,
               source: true,
             },
           })
@@ -586,7 +611,7 @@ export async function exportAgent(
           outputSchema: (r.outputSchema ?? {}) as Record<string, unknown>,
           query: (r.query ?? {}) as Record<string, unknown>,
           body: (r.body ?? {}) as Record<string, unknown>,
-          riskTier: r.riskTier,
+          riskTier: RETIRED_RISK_TIER,
           ackEnabled: r.ackEnabled,
           ackMessage: r.ackMessage,
           credentialRef: r.credentialRef,
@@ -620,6 +645,7 @@ export async function exportAgent(
           name: r.name,
           timezone: r.timezone,
           windows: (r.windows ?? []) as unknown[],
+          exceptions: (r.exceptions ?? []) as unknown[],
           source: r.source,
         })),
       };
@@ -1046,6 +1072,9 @@ async function createMissingBusinessHours(
         ...(h.windows != null
           ? { windows: h.windows as Prisma.InputJsonValue }
           : {}),
+        ...(h.exceptions != null
+          ? { exceptions: h.exceptions as Prisma.InputJsonValue }
+          : {}),
         ...(h.source ? { source: h.source } : {}),
       },
     });
@@ -1083,11 +1112,26 @@ async function createMissingComponents(
     // NOTE: the import writes straight to the DB (not via the service), so canonicalize authoring
     // shapes here too; a bundle exported from a pre-normalization instance may carry JSON-Schema
     // inputSchema / single-brace placeholders.
+    // A body shape this version refuses is CANONICALIZED rather than refused, the same trade the
+    // expectedStatuses line below makes: failing a whole bundle over an untidily stored body would
+    // be worse than importing it. `canonicalBodyShape` returns what `parseBody` was already
+    // executing, so the outbound request is byte-identical and only the storage stops holding keys
+    // nothing reads. Blanking it to `{}` would NOT be equivalent: that is behaviour-preserving only
+    // for a body with no recognized mode, and would switch a `{mode:"raw", …, extra}` tool to the
+    // fields assembly — changing what it sends (issue #150).
+    const badBody = unsupportedBodyShape(tdef.body);
+    if (badBody) {
+      warnings.push({
+        code: "httpToolBodyIgnored",
+        params: { name: tdef.name },
+        target: { kind: "tool", name: tdef.name },
+      });
+    }
     const { shapes } = normalizeToolShapes({
       urlTemplate: tdef.urlTemplate,
       query: tdef.query ?? {},
       headers: tdef.headers,
-      body: tdef.body,
+      body: badBody ? canonicalBodyShape(tdef.body) : tdef.body,
       inputSchema: tdef.inputSchema,
     });
     await db.toolDefinition.create({
@@ -1105,7 +1149,6 @@ async function createMissingComponents(
         outputSchema: tdef.outputSchema as Prisma.InputJsonValue,
         query: shapes.query as Prisma.InputJsonValue,
         body: shapes.body as Prisma.InputJsonValue,
-        riskTier: tdef.riskTier,
         // Normalized like the shapes above, and for the same reason: the import writes straight to
         // the DB, so a hand-edited bundle would otherwise store a list the service would refuse.
         expectedStatuses: normalizeExpectedStatuses(tdef.expectedStatuses),

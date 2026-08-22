@@ -16,6 +16,7 @@ export const FLOW_STAGES = [
   "split", // humanized balloon delivery
   "handoff", // human takeover detected before posting
   "presence", // WhatsApp "digitando..." heartbeat signal (Z-PRO channel)
+  "memory", // a closed attendance folded into the contact's memory (compaction)
 ] as const;
 export type FlowStage = (typeof FLOW_STAGES)[number];
 

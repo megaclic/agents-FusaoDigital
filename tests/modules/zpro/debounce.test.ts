@@ -143,6 +143,7 @@ describe.skipIf(!dbUp)("zpro debounce (DB-backed)", () => {
       kind: "DEBOUNCE",
       payload: { threadId, ...payload },
       attempts: 0,
+      claimSeq: 1,
     };
   }
 

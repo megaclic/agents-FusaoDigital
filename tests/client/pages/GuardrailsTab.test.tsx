@@ -98,10 +98,24 @@ describe("GuardrailsTab template message", () => {
     expect(template.every((v) => v === String(TEMPLATE_MESSAGE_MAX))).toBe(
       true,
     );
+    // ONE, not two: the guidance steers a replacement reply, and the input direction never writes
+    // one (see src/modules/guardrails/analyze.ts), so offering the field there would be a control
+    // that visibly does nothing.
     const generation = caps(["Generation guidance", "Orientação de geração"]);
-    expect(generation.length).toBe(2);
+    expect(generation.length).toBe(1);
     expect(generation.every((v) => v === String(GENERATION_PROMPT_MAX))).toBe(
       true,
     );
+  });
+
+  // The field is not merely absent on the input direction: the operator has to learn WHERE it went,
+  // otherwise picking "generated" there looks like a feature that silently does nothing. The
+  // template hint is the place, because the template is what that direction actually sends.
+  test("the input direction says the template is always what gets sent", () => {
+    renderWith("generated");
+    const hints = screen.queryAllByText(
+      /SEMPRE isto que sai|ALWAYS what gets sent/,
+    );
+    expect(hints.length).toBe(1);
   });
 });

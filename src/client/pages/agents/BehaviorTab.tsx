@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowRightLeft,
+  Brain,
   CalendarClock,
   Gauge,
   Image,
@@ -42,14 +43,15 @@ import {
   VISION_DEFAULT_MODEL,
 } from "@/client/lib/providerDefaults";
 import { providerLabel } from "@/client/lib/providerLabels";
-import { formatWindowsSummary } from "@/client/lib/schedulePreview";
 import { isValidHttpUrl } from "@/client/lib/validation";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import {
   EXTRACTION_PROMPT_MAX,
   FOLLOW_UP_INSTRUCTIONS_MAX,
+  TEMPLATE_MESSAGE_MAX,
 } from "@/modules/agents/text-caps";
+import { formatWindowsSummary } from "@/modules/business-hours/announce";
 import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
@@ -139,6 +141,9 @@ interface VisionState {
 
 interface LimitsState {
   maxToolCalls: string;
+  // Empty string = no ceiling. Kept as text so an operator can clear the field to disable it; the
+  // reader turns anything non-positive into null.
+  maxHistoryTokens: string;
 }
 
 // NOTE: The allowed-host list is edited as raw textarea text (one per line) and only turns into an
@@ -188,6 +193,10 @@ interface BehaviorTabProps {
   hours: Hours[];
   businessHoursId: string;
   setBusinessHoursId: (v: string) => void;
+  awayEnabled: boolean;
+  setAwayEnabled: (v: boolean) => void;
+  awayMessage: string;
+  setAwayMessage: (v: string) => void;
   followUpHoursId: string;
   setFollowUpHoursId: (v: string) => void;
   debounce: DebounceState;
@@ -211,6 +220,10 @@ interface BehaviorTabProps {
   setVision: React.Dispatch<React.SetStateAction<VisionState>>;
   visionCredBaseUrl: string | null;
   limits: LimitsState;
+  memory: { compactionEnabled: boolean };
+  setMemory: React.Dispatch<
+    React.SetStateAction<{ compactionEnabled: boolean }>
+  >;
   observability: { logToolValues: boolean };
   setObservability: React.Dispatch<
     React.SetStateAction<{ logToolValues: boolean }>
@@ -242,6 +255,7 @@ function toScheduleOption(h: Hours): ScheduleOption {
     id: String(h.id),
     name: h.name,
     windows: (h.windows ?? []) as ScheduleOption["windows"],
+    exceptions: (h.exceptions ?? []) as ScheduleOption["exceptions"],
     timezone: h.timezone,
   };
 }
@@ -790,6 +804,10 @@ export function BehaviorTab({
   hours,
   businessHoursId,
   setBusinessHoursId,
+  awayEnabled,
+  setAwayEnabled,
+  awayMessage,
+  setAwayMessage,
   followUpHoursId,
   setFollowUpHoursId,
   debounce,
@@ -810,6 +828,8 @@ export function BehaviorTab({
   setVision,
   visionCredBaseUrl,
   limits,
+  memory,
+  setMemory,
   observability,
   setObservability,
   setLimits,
@@ -941,6 +961,11 @@ export function BehaviorTab({
       label: t("editor.limits", "Execution limits"),
     },
     {
+      id: "memory",
+      icon: Brain,
+      label: t("editor.memory", "Memory"),
+    },
+    {
       id: "observability",
       icon: ScrollText,
       label: t("editor.observability", "Logs"),
@@ -963,7 +988,7 @@ export function BehaviorTab({
             title={t("editor.availability", "Availability")}
             description={t(
               "editor.availabilityHint",
-              "When the agent is active and answering. Outside these hours it stays silent and notifies the operator with a private note.",
+              "When the agent is active and answering. Outside these hours it stays silent, notifies the operator with a private note, and, if you turn it on below, tells the customer too.",
             )}
           >
             <FormField
@@ -981,6 +1006,34 @@ export function BehaviorTab({
                 }}
               />
             </FormField>
+            <SwitchField
+              checked={awayEnabled}
+              onCheckedChange={setAwayEnabled}
+              label={t(
+                "editor.awayEnabled",
+                "Reply to the customer while closed",
+              )}
+            />
+            {awayEnabled && (
+              <FormField
+                label={t("editor.awayMessage", "Out-of-hours message")}
+                description={t(
+                  "editor.awayMessageHint",
+                  'Sent to the customer while the agent is outside these hours, at most once a day per conversation. Write {next_open} (or {proximo_atendimento} for a Portuguese message) where the next opening should appear: the customer reads something like "Monday, 08/25, 09:00".',
+                )}
+              >
+                <Textarea
+                  value={awayMessage}
+                  onChange={(e) => setAwayMessage(e.target.value)}
+                  rows={2}
+                  maxLength={TEMPLATE_MESSAGE_MAX}
+                  placeholder={t(
+                    "editor.awayMessagePlaceholder",
+                    "We are closed right now. We will be back {next_open}.",
+                  )}
+                />
+              </FormField>
+            )}
           </Section>
 
           <Section
@@ -1903,7 +1956,44 @@ export function BehaviorTab({
                   }
                 />
               </FormField>
+              <FormField
+                label={t("editor.limitsMaxHistoryTokens", "History ceiling")}
+                description={t(
+                  "editor.limitsMaxHistoryTokensHint",
+                  "The agent remembers every conversation it has had with this contact on this channel, and sends all of it on every turn, so a returning customer gets slower and more expensive the more they talk. This caps how much of that memory travels: older attendances stop being sent once the cap is reached, and the conversation being answered is never dropped. The count is an estimate and runs low on tool-heavy threads, and the instructions and tool definitions are not counted at all, so set it below the budget you actually have. Empty = no ceiling. 2,000-1,000,000.",
+                )}
+              >
+                <Input
+                  type="number"
+                  min={2000}
+                  max={1000000}
+                  placeholder={t("editor.limitsNoCeiling", "No ceiling")}
+                  value={limits.maxHistoryTokens}
+                  onChange={(e) =>
+                    setLimits({ ...limits, maxHistoryTokens: e.target.value })
+                  }
+                />
+              </FormField>
             </div>
+          </Section>
+
+          <Section
+            id="memory"
+            icon={Brain}
+            title={t("editor.memory", "Memory")}
+            description={t(
+              "editor.memoryHint",
+              'The agent remembers every conversation it has had with this contact on this channel. When an attendance ends, its messages are replaced by a summary of it, so the memory becomes "N summarized attendances + the current one". What survives a summary is the useful part: who the contact is, what was agreed, what was left open. Exact wording does not, so turn this off if the agent must be able to quote an old conversation word for word. The summary is written by the agent\'s own model, after the reply is sent, so no customer waits for it. It runs once for every attendance that ends, including the ones your team handled without the agent.',
+            )}
+          >
+            <SwitchField
+              checked={memory.compactionEnabled}
+              onCheckedChange={(v) => setMemory({ compactionEnabled: v })}
+              label={t(
+                "editor.memoryCompaction",
+                "Summarize attendances that have ended",
+              )}
+            />
           </Section>
 
           <Section

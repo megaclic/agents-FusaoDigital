@@ -66,6 +66,7 @@ enum SchedulerJobKind {
   REDIRECT_FOLLOWUP
   SCHEDULED_MESSAGE
   ZPRO_STATUS_CHECK
+  MEMORY_COMPACT
 }
 
 enum SchedulerJobStatus {
@@ -122,6 +123,7 @@ model Tenant {
   contacts                      Contact[]
   conversations                 Conversation[]
   agentThreads                  AgentThread[]
+  attendanceSummaries           AttendanceSummary[]
   agents                        Agent[]
   businessHours                 BusinessHours[]
   knowledgeBases                KnowledgeBase[]
@@ -286,6 +288,7 @@ model ChatwootInstance {
   webhookDeliveries ChatwootWebhookDelivery[]
   agentBots         ChatwootAgentBot[]
   agentThreads      AgentThread[]
+  attendanceSummaries AttendanceSummary[]
 
   @@unique([tenantId, accountId])
   // Global (no tenantId): one Chatwoot account belongs to a single tenant across the whole fleet.
@@ -490,6 +493,12 @@ model Conversation {
   // one-shot as testNoticeSentAt: the agent stays silent outside its configured business hours and the
   // operator is notified once per conversation (NULL = not yet). /reset clears it.
   outOfHoursNoticeSentAt DateTime? @map("out_of_hours_notice_sent_at")
+  // When the customer-facing out-of-hours message was last SENT (issue #153). Separate from the note
+  // above because the two answer different questions on different clocks: the note tells the operator
+  // why the bot is quiet, once per conversation; the message tells the CUSTOMER, once per local day,
+  // and a conversation that already carried a note today must still get the message the first time the
+  // operator writes one. NULL = never sent. /reset clears it.
+  awayMessageSentAt      DateTime? @map("away_message_sent_at")
   // WhatsApp→chat redirect gate watermarks (only on the entry WhatsApp conversation). redirectSentAt =
   // when the redirect link was last sent (one-shot + cooldown anchor); redirectCount = how many times it
   // has been sent (bounded by maxResends). NULL/0 = never redirected.
@@ -524,8 +533,13 @@ model Conversation {
 //     thread, so a NEW conversation reusing the thread gets the "fresh attendance" divider. Tracking
 //     this per-thread (not per-contact) is what stops a multi-channel contact from getting spurious
 //     dividers mid-conversation when they speak on another channel.
-//   - lastSyncedMessageId: (Fase 2) the ingestion watermark — highest message id already folded into
-//     the thread by the continuous-sync path, so turns and the sync never double-append a message.
+//   - lastSyncedMessageId / lastAgentMessageId: the ingestion watermarks — highest message id already
+//     folded into the thread by the continuous-sync path, so turns and the sync never double-append a
+//     message. ONE PER DIRECTION, and that is not redundancy: a monotonic watermark only holds while
+//     the ids reaching it arrive in order, and the two writers do not share a latency. A customer's
+//     message waits on the eager media pass (a provider round-trip for STT/vision); an agent's reply
+//     waits on nothing. An attendant answering a voice note therefore lands FIRST, and a single
+//     column would advance past the customer's id and drop their message from the memory for good.
 model AgentThread {
   id                  BigInt   @id @default(autoincrement())
   tenantId            BigInt   @map("tenant_id")
@@ -534,6 +548,7 @@ model AgentThread {
   threadId            String   @map("thread_id")
   lastConversationId  Int?     @map("last_conversation_id")
   lastSyncedMessageId Int?     @map("last_synced_message_id")
+  lastAgentMessageId  Int?     @map("last_agent_message_id")
   createdAt           DateTime @default(now()) @map("created_at")
   updatedAt           DateTime @updatedAt @map("updated_at")
 
@@ -767,6 +782,57 @@ enum ZproSenderType {
   HUMAN
 }
 
+// One row per attendance that has been folded into a contact's memory: the condensed form of the raw
+// turns that used to sit in the graph thread. Keyed on the SAME triple as AgentThread plus the
+// Chatwoot conversation display_id, so an attendance is summarized EXACTLY ONCE, ever — the unique
+// key is what makes a re-armed compaction job cost nothing instead of paying for a second generation
+// (and writing a second, differently-worded memory of the same attendance).
+//
+// The rows are the source of truth for the memory head prepended to the thread; the thread only
+// carries a rendered copy. Keeping them here rather than only inside the message means a summary is
+// never re-summarized (no compounding loss), survives a checkpointer reset, and is inspectable.
+model AttendanceSummary {
+  id                 BigInt   @id @default(autoincrement())
+  tenantId           BigInt   @map("tenant_id")
+  chatwootInstanceId BigInt   @map("chatwoot_instance_id")
+  contactInboxId     Int      @map("contact_inbox_id")
+  // Chatwoot display_id of the attendance this summarizes. On a thread that had several raw
+  // attendances waiting (compaction newly enabled, or a run that kept failing), one row covers the
+  // whole backlog and carries the display_id of the most recent closed one.
+  conversationId     Int      @map("conversation_id")
+  // The graph message id of the LAST turn this row summarized, and the reason a row is a SEGMENT of
+  // an attendance rather than the whole of it. A conversation can be resolved, compacted, reopened by
+  // the customer and resolved again: the second cut carries only the new turns, so keying on the
+  // conversation alone would either replace the first summary with a description of the tail or
+  // reuse the first for turns it never saw. Both lose half the attendance. Keyed on this, the second
+  // pass writes its own row and both segments survive; a RETRY of the same cut finds the same id and
+  // costs nothing.
+  lastMessageId      String   @map("last_message_id")
+  summary            String
+  // How many raw messages this row replaced, for the turn trail. Never any of their text.
+  messageCount       Int      @map("message_count")
+  // When the attendance itself happened (the mirrored conversation's last event), NOT when the job
+  // ran. Compaction can run months after the fact — the boundary trigger fires only when the contact
+  // comes back — and dating the memory by the job would tell the model a returning customer's
+  // history happened today.
+  //
+  // NULLABLE because that rule has to hold when the date cannot be read at all: with the mirrored
+  // conversation gone, `now()` is not a fallback, it is the exact lie the rule above forbids, and it
+  // would also sort the oldest attendance to the FRONT of the window the head renders. Unknown sorts
+  // last on the descending window (so it never displaces a genuinely newer entry) and renders with
+  // no date attribute.
+  attendanceAt       DateTime? @map("attendance_at")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, chatwootInstanceId, contactInboxId, conversationId, lastMessageId])
+  @@index([tenantId, chatwootInstanceId, contactInboxId])
+  @@map("attendance_summaries")
+}
+
 // ──────────────────────────────────────────────── agent config ──
 
 model Agent {
@@ -808,6 +874,9 @@ model BusinessHours {
   name      String
   timezone  String   @default("America/Sao_Paulo")
   windows   Json     @default("[]")
+  // Date exceptions that REPLACE the weekly grid on the dates they match (holidays, shutdowns,
+  // half-days). Empty array = the weekly grid alone, i.e. exactly the pre-#129 behavior.
+  exceptions Json    @default("[]")
   source    String   @default("LOCAL") // LOCAL|CHATWOOT_MIRROR
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -1009,9 +1078,23 @@ model ToolDefinition {
   body          Json     @default("{}")
   credentialRef String?  @map("credential_ref")
   enabled       Boolean  @default(true)
-  // NOTE: low|medium|high. Surfaced in the tool-selection UI so granting a write/financial tool
-  // is a deliberate, visible act; default medium for a custom HTTP tool of unknown impact.
-  riskTier      String   @default("medium") @map("risk_tier")
+  // NOTE: RETIRED (issue #137). `@ignore` is what retires it: the field leaves the generated client
+  // entirely, so no query this build sends NAMES the column and reading it is a compile error, while
+  // the column itself stays in the database and in the migration history (`migrate diff` across this
+  // attribute is an empty migration).
+  //
+  // Not naming it is the point, and it is a stronger condition than not reading it: a Prisma query
+  // without an explicit `select` asks for every scalar column of the model, and so does a relation
+  // pulled in as `toolDefinition: true`, so a call site that never touches the field still puts it
+  // in the SQL. An older image running such a query after the column is dropped answers
+  // `undefined_column`. Measured on v1.9.0 against a database with the column already gone: the
+  // agent export and saving a tool both failed, and only the one read with an explicit select kept
+  // working, which is the opposite of what auditing the SELECT lists suggests (issue #149).
+  //
+  // So the drop belongs one release after THIS attribute, not one release after #137: rolling back
+  // now lands on a build that still asks for the column. Dropping it is then this line's removal
+  // plus the migration `migrate diff` already writes.
+  riskTier      String   @default("medium") @map("risk_tier") @ignore
   // HTTP statuses this tool declares as RESULTS rather than integration failures. Empty (the
   // default) keeps issue #40's behavior, where every non-2xx is logged warn and reaches the alert
   // channels. A declarative lookup that answers 404 for "no record" lists it here so a healthy turn
@@ -1231,6 +1314,10 @@ model SchedulerJob {
   runAt     DateTime           @map("run_at")
   attempts  Int                @default(0)
   claimedAt DateTime?          @map("claimed_at")
+  // Which claim on this row is the current one. The claim BUMPS it and hands the value to the
+  // handler; the three writes that finish a job CAS on it, so a run whose claim was superseded
+  // writes nothing instead of landing on work it does not own (issue #164).
+  claimSeq  Int                @default(0) @map("claim_seq")
   lastError String?            @map("last_error")
   createdAt DateTime           @default(now()) @map("created_at")
   updatedAt DateTime           @updatedAt @map("updated_at")

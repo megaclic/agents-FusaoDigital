@@ -66,6 +66,7 @@ import { ToolFlowLogger } from "@/graph/tool-flowlog";
 import type { NativeToolName } from "@/graph/tools/catalog";
 import { UsageCapture } from "@/graph/usage";
 import { runScopedOn } from "@/lib/tenancy";
+import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
   emitFlowEvent,
@@ -200,6 +201,10 @@ export interface LoadedZproAgent {
   // observability.ts's resolveLangfuseConfig, fully channel-agnostic). null when tracing is off/
   // unconfigured for this tenant. See docs/zpro.md's "Langfuse tracing" section.
   langfuseCfg: LangfuseConfig | null;
+  // Per-turn tool-call cap + history-token ceiling (agent.settings.limits — same reader/shape
+  // src/graph/prepare.ts's Chatwoot path uses). Z-PRO calls buildAgentGraph directly rather than
+  // through buildModelAndGraph, so both have to be threaded through by hand below.
+  limits: ReturnType<typeof readLimitsConfig>;
 }
 
 // Scoped read (no network): resolve the binding's Agent + its model credential. Returns null when
@@ -313,6 +318,7 @@ export async function loadZproAgent(
       crmConfig: readZproCrmConfig(agent.settings),
       handoffConfig: readHandoffConfig(agent.settings),
       serviceWindowConfig: readServiceWindowConfig(agent.settings),
+      limits: readLimitsConfig(agent.settings),
     };
   });
 }
@@ -478,6 +484,7 @@ export async function runLoadedZproTurn(
       flow,
       client,
       ticketId,
+      customerText: text,
     });
 
     // INPUT guardrail: screen the customer message BEFORE the agent processes it. A violation
@@ -619,6 +626,29 @@ export async function runLoadedZproTurn(
           provider: loaded.mc.provider,
           model: loaded.mc.model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      // Same reason as onModelRetry above: buildAgentGraph is called directly here, so the per-turn
+      // tool-call cap and history-token ceiling (agent.settings.limits) need their own wiring rather
+      // than inheriting Chatwoot's buildModelAndGraph plumbing (src/graph/prepare.ts).
+      maxToolCalls: loaded.limits.maxToolCalls,
+      onToolLimit: ({ maxToolCalls, toolCalls }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          detail: { toolLimitHit: maxToolCalls, toolCalls },
+        }),
+      maxHistoryTokens: loaded.limits.maxHistoryTokens,
+      onHistoryTrim: ({ kept, dropped, tokens }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "ok",
+          detail: {
+            historyKept: kept,
+            historyDropped: dropped,
+            historyTokens: tokens,
+          },
         }),
     });
 

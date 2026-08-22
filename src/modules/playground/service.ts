@@ -25,11 +25,6 @@ import {
 import { ToolFlowLogger } from "@/graph/tool-flowlog";
 import {
   CONVERSATION_NATIVE_TOOL_NAMES,
-  NATIVE_TOOL_RISK,
-  type NativeToolName,
-  RAG_TOOL_RISK,
-  type RagToolName,
-  type RiskTier,
   UTILITY_NATIVE_TOOL_NAMES,
 } from "@/graph/tools/catalog";
 import type { McpLoadDeps } from "@/graph/tools/mcp";
@@ -306,6 +301,11 @@ async function buildPlaygroundGraph(params: {
   // Same warn line the reactive turn leaves when a model call had to be retried. The caller passes
   // it because the FlowContext is the caller's.
   onModelRetry?: (info: { attempt: number; error: unknown }) => void;
+  onHistoryTrim?: (info: {
+    kept: number;
+    dropped: number;
+    tokens: number;
+  }) => void;
 }) {
   const { tenantId, agentId, threadId, base } = params;
   const loaded = await loadPlaygroundConfig({
@@ -338,6 +338,7 @@ async function buildPlaygroundGraph(params: {
     makeModel: params.deps?.makeModel,
     checkpointer: params.deps?.checkpointer,
     onModelRetry: params.onModelRetry,
+    onHistoryTrim: params.onHistoryTrim,
   });
   // Tag usage as playground so it never pollutes the real dashboard figures (the dashboard
   // defaults to source="inbox"). inboxId is null here (no mirror conversation).
@@ -365,13 +366,12 @@ export interface PlaygroundToolInfo {
   name: string;
   description: string;
   category: PlaygroundToolCategory;
-  risk?: RiskTier;
   // True when auto-simulated in the playground (conversation natives have no real effect). Every
   // other category runs for real unless the operator supplies a mock (toolMocks) for it.
   simulated: boolean;
 }
 
-// Lists the tools the agent would have in a playground turn, with category/risk + whether each is
+// Lists the tools the agent would have in a playground turn, with category + whether each is
 // auto-simulated — so the console can render the simulate-a-return UI without the operator typing
 // tool names by hand. Loads the config + builds the SAME (simulated-native) toolset a turn builds,
 // then classifies each tool by the loaded grant name-sets. MCP is best-effort (same network a turn
@@ -411,29 +411,11 @@ export async function listPlaygroundTools(params: {
     const name = tl.name;
     const description = tl.description ?? "";
     if (conversation.has(name))
-      return {
-        name,
-        description,
-        category: "native",
-        risk: NATIVE_TOOL_RISK[name as NativeToolName],
-        simulated: true,
-      };
+      return { name, description, category: "native", simulated: true };
     if (utility.has(name))
-      return {
-        name,
-        description,
-        category: "utility",
-        risk: NATIVE_TOOL_RISK[name as NativeToolName],
-        simulated: false,
-      };
+      return { name, description, category: "utility", simulated: false };
     if (knowledge.has(name))
-      return {
-        name,
-        description,
-        category: "knowledge",
-        risk: RAG_TOOL_RISK[name as RagToolName],
-        simulated: false,
-      };
+      return { name, description, category: "knowledge", simulated: false };
     if (http.has(name))
       return { name, description, category: "http", simulated: false };
     if (mcp.has(name))
@@ -496,6 +478,17 @@ export async function runPlaygroundTurn(
           level: "warn",
           status: "ok",
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onHistoryTrim: ({ kept, dropped, tokens }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "ok",
+          detail: {
+            historyKept: kept,
+            historyDropped: dropped,
+            historyTokens: tokens,
+          },
         }),
     });
 
@@ -695,6 +688,17 @@ export async function runPlaygroundFollowup(
         level: "warn",
         status: "ok",
         detail: { retriedEmptyResponse: attempt },
+      }),
+    onHistoryTrim: ({ kept, dropped, tokens }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "info",
+        status: "ok",
+        detail: {
+          historyKept: kept,
+          historyDropped: dropped,
+          historyTokens: tokens,
+        },
       }),
   });
 

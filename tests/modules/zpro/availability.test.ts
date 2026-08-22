@@ -80,6 +80,7 @@ describe.skipIf(!dbUp)("resolveZproAvailability", () => {
     const hours = await resolveZproAvailability(tenantId, inst.id, appDb);
     expect(hours).toEqual({
       windows: [{ day: 1, start: "09:00", end: "18:00" }],
+      exceptions: [],
       timezone: "America/Sao_Paulo",
     });
 

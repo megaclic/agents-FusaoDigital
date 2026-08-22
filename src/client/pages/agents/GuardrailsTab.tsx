@@ -199,12 +199,17 @@ export function GuardrailsTab({
               <FormField
                 label={t("editor.guardrails.template", "Template message")}
                 description={
-                  d.action === "generated"
-                    ? t(
-                        "editor.guardrails.templateFallbackHint",
-                        "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
-                      )
-                    : undefined
+                  d.action !== "generated"
+                    ? undefined
+                    : dir === "input"
+                      ? t(
+                          "editor.guardrails.templateInboundHint",
+                          "On the customer's message this is ALWAYS what gets sent. There is nothing to rewrite here, because the text under review is the customer's own message, so the guardrails agent is never asked to compose a reply. When it was, the customer could dictate that reply: a message telling it to state a price and a partnership produced exactly that, word for word, in every one of 16 runs.",
+                        )
+                      : t(
+                          "editor.guardrails.templateFallbackHint",
+                          "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
+                        )
                 }
               >
                 <Textarea
@@ -217,7 +222,10 @@ export function GuardrailsTab({
                 />
               </FormField>
             )}
-            {d.action === "generated" && (
+            {/* NOTE: Output only. On the customer's message nothing is ever composed, so this field
+                would steer nothing — and a control that visibly does nothing is worse than one that
+                is not offered. The template hint above says why, where the operator is looking. */}
+            {d.action === "generated" && dir === "output" && (
               <FormField
                 label={t(
                   "editor.guardrails.generationPrompt",

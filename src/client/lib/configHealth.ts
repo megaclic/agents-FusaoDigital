@@ -4,6 +4,11 @@ import {
 } from "@/client/lib/credentialRef";
 import { isValidHttpUrl } from "@/client/lib/validation";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
+import { readAvailabilityConfig } from "@/modules/availability/away";
+import {
+  type Schedule,
+  scheduleCanClose,
+} from "@/modules/business-hours/hours";
 import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 
 // Live configuration-health checks for the agent editor (item 1): detect features that are turned on
@@ -18,9 +23,16 @@ export type ConfigIssueKey =
   | "ttsNormalize"
   | "vision"
   | "guardrails"
+  | "guardrailsFailing"
   | "knowledge"
   | "embedding"
   | "redirect"
+  // Two spellings of one collision, because the customer sees two different things and the operator
+  // has two different fixes. "Both" is the duplicate: Chatwoot's inbox reply and the agent's away
+  // message, back to back. "Chatwoot" is the contradiction: Chatwoot announces the closure and the
+  // agent, which reads a schedule Chatwoot cannot see, serves the customer through it.
+  | "outOfHoursBoth"
+  | "outOfHoursChatwoot"
   | "textCap";
 
 export interface ConfigIssue {
@@ -50,6 +62,15 @@ export interface ConfigIssue {
   field?: string;
   length?: number;
   max?: number;
+  // For "guardrailsFailing": how many analyses could not run in the window, and when the last one
+  // was. The count is what makes the warning actionable (one is a blip, forty is a dead screen) and
+  // the timestamp is what lets an operator who just fixed it see the count stop.
+  failures?: number;
+  lastFailureAt?: string;
+  // For the out-of-hours issues: the inboxes that answer out of hours from Chatwoot's side, by the
+  // name CHATWOOT gives them. Named rather than counted because the fix is on the other product's
+  // screen, and "two of your inboxes" does not tell anyone which two to open.
+  inboxNames?: string[];
 }
 
 // Where a capped field is edited, by the path the walker reports. A path with no entry has no control
@@ -121,6 +142,13 @@ export interface ConfigHealthInput {
   // which is a question about what the General tab is about to save.
   modelProvider: string;
   modelCredentialRef: string;
+  // The agent's own on/off, AS SAVED. Required rather than optional, and read by exactly one check:
+  // the out-of-hours collision is the only line in this panel that claims something about what the
+  // CUSTOMER receives. Every other line describes the configuration ("on, but no key"), which stays
+  // true of an agent nobody has switched on; a disabled agent, though, says nothing to anybody, so
+  // both spellings of that collision would be false. Required because the only thing that could
+  // catch a caller dropping it is the compiler — no test mounts the editor.
+  agentEnabled: boolean;
   // The agent's model as STORED, with its EFFECTIVE endpoint (a credential that carries one wins
   // over the typed field). Separate from the pair above on purpose: the speech rewrite inherits
   // from the SAVED model, because the editor's tabs save independently and a Behavior save carries
@@ -151,6 +179,14 @@ export interface ConfigHealthInput {
   // message is delivered as if it had been screened and approved.
   guardrailsEnabled?: boolean;
   guardrailsCredentialRef?: string;
+  // What the screen actually DID, read back from the execution log (modules/guardrails/health.ts):
+  // how many analyses could not run in the recent window, and when the last one was. Configuration
+  // alone cannot see this half. A model id the vendor retired, a parameter it rejects on every call
+  // and a chronic timeout are all valid configuration until the call is made, and the pass is
+  // fail-open, so each one delivers messages as if they had been reviewed. Absent or 0 raises
+  // nothing: the count has to have arrived from the server to mean anything.
+  guardrailsFailures?: number;
+  guardrailsLastFailureAt?: string | null;
   // Refs (`vault:<id>`) whose vault entry exists but is still pending (secret not filled in yet). A
   // feature wired to one of these is configured but cannot run until the operator fills it.
   pendingRefs?: Set<string>;
@@ -175,6 +211,15 @@ export interface ConfigHealthInput {
   redirectEntryInboxId?: string;
   redirectEntryZproInstanceId?: string;
   redirectWidgetInboxId?: number | null;
+  // The agent's bound inboxes on which Chatwoot sends an out-of-hours reply of its own, read live by
+  // the server (chatwoot/management.ts). Absent or empty raises nothing, and the two cases are
+  // deliberately the same value: a Chatwoot that could not be read reports no inboxes, and a warning
+  // invented by an outage is worse than one that arrives a page load late.
+  outOfOfficeInboxes?: { id: string; name: string }[];
+  // The schedule the agent is bound to AS SAVED, or null for "always on". Needed to answer which of
+  // the two collisions this is: the away message is gated by the same schedule that gates replies, so
+  // an agent that never closes never sends it however the block is configured.
+  savedSchedule?: Schedule | null;
 }
 
 // The three ways one credentialed feature can be unrunnable. Every credential ref on the agent goes
@@ -357,15 +402,36 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
     { key: "vision", tab: "behavior", sectionId: "vision" },
     credIssue(input.visionEnabled, input.visionCredentialRef, pending, known),
   );
+  const guardrailsCred = credIssue(
+    Boolean(input.guardrailsEnabled),
+    input.guardrailsCredentialRef ?? "",
+    pending,
+    known,
+  );
   push(
     { key: "guardrails", tab: "guardrails", sectionId: "gr-model" },
-    credIssue(
-      Boolean(input.guardrailsEnabled),
-      input.guardrailsCredentialRef ?? "",
-      pending,
-      known,
-    ),
+    guardrailsCred,
   );
+  // The credentialed guardrail that still could not run: same consequence (messages delivered
+  // unscreened), a cause no ref check can reach. Suppressed while the credential verdict above is
+  // live, and not for tidiness: with no credential the runtime never builds the model and writes no
+  // failure rows at all, so a count arriving next to a credential issue can only be a leftover from
+  // before that credential broke. Fixing the ref is the move either way.
+  if (
+    input.guardrailsEnabled &&
+    !guardrailsCred &&
+    (input.guardrailsFailures ?? 0) > 0
+  ) {
+    issues.push({
+      key: "guardrailsFailing",
+      tab: "guardrails",
+      sectionId: "gr-model",
+      failures: input.guardrailsFailures,
+      ...(input.guardrailsLastFailureAt
+        ? { lastFailureAt: input.guardrailsLastFailureAt }
+        : {}),
+    });
+  }
   // Knowledge bases with documents awaiting indexing. Indexing needs the tenant's embedding credential,
   // so if that prerequisite is missing we raise ONE "embedding" issue (the root cause) instead of N
   // per-base "index me" prompts that would just fail: no ref → point at embedding settings; a
@@ -406,6 +472,37 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       key: "redirect",
       tab: "channelRedirect",
       sectionId: "cr-entry",
+    });
+  }
+  // Chatwoot answers out of hours on an inbox this agent is bound to. Unlike every other check here
+  // this one is not about a feature that cannot run: both features run, and it is the customer who
+  // gets the wrong experience — two messages, or a closure notice followed by service.
+  //
+  // Which of the two is decided by the agent's SAVED availability block, never by what the operator
+  // is typing: a warning that changed while a message is half-written would be describing a
+  // configuration that does not exist yet. The same reading the runtime uses, because a second
+  // reading of the same bag is a second answer waiting to happen.
+  const outOfOffice = input.outOfOfficeInboxes ?? [];
+  if (input.agentEnabled && outOfOffice.length > 0) {
+    const away = readAvailabilityConfig(input.settings);
+    // The switch and the copy are only two thirds of it. The away message rides the SAME gate that
+    // silences replies, so an agent whose schedule never closes — none picked, or one with no windows
+    // — sends nothing out of hours no matter what the block says, and calling that the duplicate
+    // would describe two messages where the customer gets a closure notice and then normal service.
+    // The condition is asked of the schedule module rather than restated here, because a console that
+    // re-derives the gate's rule is a console that will disagree with it.
+    const agentAlsoReplies =
+      scheduleCanClose(input.savedSchedule) &&
+      away.enabled &&
+      away.awayMessage.trim() !== "";
+    issues.push({
+      key: agentAlsoReplies ? "outOfHoursBoth" : "outOfHoursChatwoot",
+      tab: "behavior",
+      // The section holds both halves of the answer: the schedule the agent follows and the switch
+      // for its own message. Neither is the whole fix — Chatwoot's side is the other product's
+      // screen — but every move the operator can make from this console starts there.
+      sectionId: "availability",
+      inboxNames: outOfOffice.map((i) => i.name),
     });
   }
   // Last: these are about text already in the row, not about a feature that cannot run, so they read

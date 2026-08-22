@@ -25,6 +25,12 @@ import {
   updateAgent,
 } from "@/modules/agents/service";
 import { exportAgent, importAgent } from "@/modules/agents/transfer";
+import { listOutOfOfficeInboxes } from "@/modules/chatwoot/management";
+import {
+  GUARDRAIL_HEALTH_WINDOW_HOURS,
+  guardrailHealthWindowStart,
+  readGuardrailHealth,
+} from "@/modules/guardrails/health";
 import { listProviderModels } from "@/modules/models/service";
 import { getPlaygroundMedia } from "@/modules/playground/media";
 import {
@@ -95,10 +101,17 @@ export function splitAgentUpdateBody(
 
 // Live, non-persisted playground override (the "edit live" popup): the unsaved prompt/model/settings
 // draft. The secret never travels — modelConfig carries only a credentialRef, resolved server-side.
-const playgroundDraftSchema = t.Object({
+// NOTE: Elysia normalizes `draft` against this schema, so a field that is missing HERE is stripped
+// from the request before the handler ever sees it — silently, with the turn then running against
+// the saved config. The type below is derived from this object precisely so the two cannot drift:
+// declaring a draft field in TypeScript alone does not carry it over the wire.
+export const playgroundDraftSchema = t.Object({
   systemPrompt: t.Optional(
     t.String({ maxLength: config.agent.promptMaxChars }),
   ),
+  // The Availability picker's current value ("" = none). Semantic validation lives at the one place
+  // that resolves it (prepare.ts: digits only, scoped read, anything else reads as no schedule).
+  businessHoursId: t.Optional(t.String({ maxLength: 20 })),
   modelConfig: t.Optional(t.Record(t.String(), t.Unknown())),
   settings: t.Optional(t.Record(t.String(), t.Unknown())),
   // Playground tool-simulation: tool name → canned result (overrides any real/simulated execution).
@@ -111,14 +124,7 @@ const playgroundDraftSchema = t.Object({
   promptNow: t.Optional(t.String({ maxLength: 40 })),
 });
 
-type PlaygroundDraft = {
-  systemPrompt?: string;
-  modelConfig?: Record<string, unknown>;
-  settings?: Record<string, unknown>;
-  toolMocks?: Record<string, string>;
-  promptVars?: Record<string, string>;
-  promptNow?: string;
-};
+type PlaygroundDraft = typeof playgroundDraftSchema.static;
 
 // `draft` rides the multipart request as a JSON string. Elysia's multipart parser auto-parses any
 // field whose value starts with `{`/`[` and is valid JSON (see adapter/web-standard formData), so a
@@ -256,6 +262,60 @@ export const agentsController = new Elysia({
       detail: doc(
         "Get agent channel binding",
         "Whether the agent is bound to a Chatwoot inbox, a Z-PRO instance, both, or neither — an agent has no channel discriminator of its own. Used by the editor to hide/disable controls with no effect on a Z-PRO-only agent (e.g. the WhatsApp 24h window, which has no Z-PRO backend yet). Does not validate that the agent id exists — an unknown id resolves to {chatwoot:false, zpro:false}, same as a real, unbound agent.",
+      ),
+      response: errors(400, 401, 403),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  // Whether this agent's guardrail screen is actually running, from what it recorded. The editor's
+  // configuration-warning panel needs it because configuration cannot answer the question: analysis
+  // is fail-open, so a screen that can never run reads as one that ran and approved everywhere else.
+  .get(
+    "/:id/guardrails/health",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      windowHours: GUARDRAIL_HEALTH_WINDOW_HOURS,
+      ...(await readGuardrailHealth(
+        ctxOrThrow(tenantContext),
+        BigInt(params.id),
+        guardrailHealthWindowStart(),
+      )),
+    }),
+    {
+      detail: doc(
+        "Get guardrail health",
+        "Counts the guardrail analyses that could not run for this agent in the recent window, with the most recent one and the error it carried. Analysis is fail-open, so a check counted here caught nothing and held nothing back. It does not follow that the turn went out unscreened: the other direction may still have screened it, and a split output analysis can carry an error from one half and a violation from the other.",
+      ),
+      response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  // Which of this agent's bound inboxes ALREADY answer out of hours from Chatwoot's side. The editor's
+  // warning panel needs it for the same reason it needs guardrail health: the answer is not in this
+  // product's configuration at all, and the collision it warns about is invisible from either console.
+  .get(
+    "/:id/inboxes/out-of-office",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      inboxes: await listOutOfOfficeInboxes(
+        ctxOrThrow(tenantContext),
+        BigInt(params.id),
+      ),
+    }),
+    {
+      detail: doc(
+        "List inboxes that answer out of hours",
+        'The agent\'s bound inboxes whose Chatwoot inbox-level out-of-office reply is configured (working hours enabled AND a message set), read live from Chatwoot. Chatwoot\'s schedule is keyed on the day of the week alone, so it cannot express the dated closures this product\'s business hours can: the two calendars disagree on holidays by construction. An inbox on an unreachable Chatwoot account is omitted rather than reported, so an empty list means "nothing found", not "nothing to find".',
       ),
       response: errors(400, 401, 403),
       requireRole: "TENANT_ADMIN",
@@ -662,7 +722,7 @@ export const agentsController = new Elysia({
       }),
     },
   )
-  // Lists the agent's tools (name/description/category/risk + which are auto-simulated) so the
+  // Lists the agent's tools (name/description/category + which are auto-simulated) so the
   // playground can render the simulate-a-return UI without the operator typing tool names by hand.
   .get(
     "/:id/playground/tools",
@@ -679,7 +739,7 @@ export const agentsController = new Elysia({
     {
       detail: doc(
         "List playground tools",
-        "Returns the agent's tools (name, description, category, risk, auto-simulated flag) for the simulate-a-return UI.",
+        "Returns the agent's tools (name, description, category, auto-simulated flag) for the simulate-a-return UI.",
       ),
       response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",

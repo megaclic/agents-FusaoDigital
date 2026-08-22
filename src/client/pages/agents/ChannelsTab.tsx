@@ -41,9 +41,15 @@ type ZproInstanceDto = NonNullable<ZproInstancesData>["instances"][number];
 export function ChannelsTab({
   agentId,
   agentName,
+  onBindingChanged,
 }: {
   agentId: string;
   agentName: string;
+  // Binding acts immediately, with no save to piggyback on, and the editor's warning panel asks a
+  // question whose answer is per-BOUND-inbox (whether Chatwoot already replies out of hours there).
+  // Without this the panel would only catch up on the next load, which is the one moment the
+  // operator has already stopped looking for it.
+  onBindingChanged?: () => void;
 }) {
   const { t } = useTranslation();
   const { showToast } = useToast();
@@ -121,6 +127,7 @@ export function ChannelsTab({
         return next;
       });
       showToast(t("channels.bound", "Inbox updated."), "success");
+      onBindingChanged?.();
     } catch {
       showToast(
         t("channels.bindError", "Could not update the inbox."),

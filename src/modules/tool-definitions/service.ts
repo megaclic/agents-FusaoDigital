@@ -5,6 +5,7 @@ import { normalizeExpectedStatuses } from "@/graph/tools/http-status";
 import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { requireVaultRef } from "@/modules/vault/service";
+import { unsupportedBodyShape } from "./body-shape";
 import { normalizeToolShapes } from "./normalize";
 
 // Custom HTTP tool definitions (per-tenant). A definition is the LLM-facing parameter schema +
@@ -30,7 +31,6 @@ export interface ToolDefinitionDto {
   body: Record<string, unknown>;
   credentialRef: string | null;
   enabled: boolean;
-  riskTier: string;
   expectedStatuses: number[];
   ackEnabled: boolean;
   ackMessage: string | null;
@@ -53,7 +53,6 @@ const SELECT = {
   body: true,
   credentialRef: true,
   enabled: true,
-  riskTier: true,
   expectedStatuses: true,
   ackEnabled: true,
   ackMessage: true,
@@ -76,7 +75,6 @@ function toDto(r: {
   body: unknown;
   credentialRef: string | null;
   enabled: boolean;
-  riskTier: string;
   expectedStatuses: number[];
   ackEnabled: boolean;
   ackMessage: string | null;
@@ -98,7 +96,6 @@ function toDto(r: {
     body: (r.body ?? {}) as Record<string, unknown>,
     credentialRef: r.credentialRef,
     enabled: r.enabled,
-    riskTier: r.riskTier,
     expectedStatuses: r.expectedStatuses,
     ackEnabled: r.ackEnabled,
     ackMessage: r.ackMessage,
@@ -122,12 +119,13 @@ export const toolDefinitionCreateSchema = z
     outputSchema: z.record(z.string(), z.unknown()).optional(),
     // Query-string params (Record<string,string> templates), applied for any method.
     query: z.record(z.string(), z.unknown()).optional(),
-    // Body shape: { mode: "kv", rows } | { mode: "raw", raw } | legacy { mode: "fields" }
-    // (validated/narrowed at runtime in http.ts).
+    // Body shape: { mode: "kv", rows } | { mode: "raw", raw } | legacy { mode: "fields" }, checked
+    // by assertSupportedBody below rather than narrowed at runtime (issue #150). The check is not a
+    // zod refinement because its whole job is to tell the author what to write instead, and only an
+    // AppError reaches them as a message — a zod issue lands in the generic branch.
     body: z.record(z.string(), z.unknown()).optional(),
     credentialRef: z.string().min(1).max(128).nullish(),
     enabled: z.boolean().optional(),
-    riskTier: z.enum(["low", "medium", "high"]).optional(),
     // Normalized (deduped/sorted, 2xx and out-of-range dropped) rather than rejected: see
     // graph/tools/http-status. Accepts numeric strings, which a JSON body from REST/MCP often carries.
     expectedStatuses: z.array(z.union([z.number(), z.string()])).optional(),
@@ -185,6 +183,11 @@ async function assertNameFree(
   }
 }
 
+function assertSupportedBody(body: unknown): void {
+  const reason = unsupportedBodyShape(body);
+  if (reason) throw new AppError(reason, 400);
+}
+
 export async function createToolDefinition(
   ctx: TenantContext,
   input: ToolDefinitionCreate,
@@ -195,6 +198,7 @@ export async function createToolDefinition(
   }
   const tenantId = ctx.tenantId;
   const data = toolDefinitionCreateSchema.parse(input);
+  assertSupportedBody(data.body);
   // NOTE: canonicalize programmatic authoring shapes (JSON-Schema inputSchema, single-brace
   // {var}) so storage always holds what the runtime executes.
   const { shapes } = normalizeToolShapes({
@@ -225,7 +229,6 @@ export async function createToolDefinition(
         body: (shapes.body ?? {}) as Prisma.InputJsonValue,
         credentialRef,
         enabled: data.enabled ?? true,
-        riskTier: data.riskTier ?? "medium",
         expectedStatuses: normalizeExpectedStatuses(data.expectedStatuses),
         ackEnabled: data.ackEnabled ?? false,
         ackMessage: data.ackMessage ?? null,
@@ -243,6 +246,9 @@ export async function updateToolDefinition(
   base: PrismaClient = basePrisma,
 ): Promise<ToolDefinitionDto> {
   const data = toolDefinitionUpdateSchema.parse(patch);
+  // NOTE: an absent body is not judged, so a row stored before this check stays editable — only a
+  // write that sets the body is refused.
+  assertSupportedBody(data.body);
   return runScopedOn(base, ctx, async (db) => {
     const current = await db.toolDefinition.findUnique({
       where: { id },
@@ -306,7 +312,6 @@ export async function updateToolDefinition(
         ? await requireVaultRef(db, data.credentialRef)
         : null;
     if (data.enabled !== undefined) patchData.enabled = data.enabled;
-    if (data.riskTier !== undefined) patchData.riskTier = data.riskTier;
     if (data.expectedStatuses !== undefined)
       patchData.expectedStatuses = normalizeExpectedStatuses(
         data.expectedStatuses,

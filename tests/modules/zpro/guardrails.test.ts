@@ -4,7 +4,11 @@
 // chat model and ZproClient are both duck-typed and cast, same pattern as tests/modules/zpro/tts.test.ts
 // and tests/modules/guardrails.test.ts's own fakeModel. This only tests the WIRING (trip note via
 // ZproClient.createNote, fail-open when disabled/unresolved, action → return shape), not the
-// analysis logic itself.
+// analysis logic itself. `provider: "openai-compatible"` on every gr fixture forces verdictAskMode's
+// "prose" mode (matching tests/modules/guardrails.test.ts's own hardcoded "prose"): the default
+// GUARDRAILS_DEFAULTS.provider ("openai") asks for a json-schema verdict, which the fakeModel below
+// cannot answer (no withStructuredOutput) — a silent fail-open that happened to converge on the same
+// expected `null` for a "no violation" case, but genuinely failed the "violated: true" ones.
 
 import { describe, expect, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
@@ -39,12 +43,17 @@ describe("makeZproGuardrailRunner", () => {
   test("fail-open: null model (disabled/unresolved credential) never trips", async () => {
     const { client } = fakeClient();
     const runGuardrail = makeZproGuardrailRunner({
-      gr: { ...GUARDRAILS_DEFAULTS, enabled: true },
+      gr: {
+        ...GUARDRAILS_DEFAULTS,
+        enabled: true,
+        provider: "openai-compatible",
+      },
       model: null,
       systemPrompt: "x",
       flow,
       client,
       ticketId: 1,
+      customerText: "cliente",
     });
     expect(await runGuardrail("input", "anything")).toBeNull();
   });
@@ -54,6 +63,7 @@ describe("makeZproGuardrailRunner", () => {
     const gr = {
       ...GUARDRAILS_DEFAULTS,
       enabled: true,
+      provider: "openai-compatible" as const,
       input: { ...GUARDRAILS_DEFAULTS.input, enabled: false },
     };
     const runGuardrail = makeZproGuardrailRunner({
@@ -65,6 +75,7 @@ describe("makeZproGuardrailRunner", () => {
       flow,
       client,
       ticketId: 1,
+      customerText: "cliente",
     });
     expect(await runGuardrail("input", "xingamento")).toBeNull();
   });
@@ -72,12 +83,17 @@ describe("makeZproGuardrailRunner", () => {
   test("a clean verdict (violated: false) returns null and leaves no note", async () => {
     const { client, notes } = fakeClient();
     const runGuardrail = makeZproGuardrailRunner({
-      gr: { ...GUARDRAILS_DEFAULTS, enabled: true },
+      gr: {
+        ...GUARDRAILS_DEFAULTS,
+        enabled: true,
+        provider: "openai-compatible",
+      },
       model: fakeModel(JSON.stringify({ violated: false })),
       systemPrompt: "x",
       flow,
       client,
       ticketId: 42,
+      customerText: "cliente",
     });
     expect(await runGuardrail("input", "oi, tudo bem?")).toBeNull();
     expect(notes).toHaveLength(0);
@@ -88,6 +104,7 @@ describe("makeZproGuardrailRunner", () => {
     const gr = {
       ...GUARDRAILS_DEFAULTS,
       enabled: true,
+      provider: "openai-compatible" as const,
       input: {
         ...GUARDRAILS_DEFAULTS.input,
         action: "template" as const,
@@ -107,6 +124,7 @@ describe("makeZproGuardrailRunner", () => {
       flow,
       client,
       ticketId: 42,
+      customerText: "cliente",
     });
     const outcome = await runGuardrail("input", "xingamento");
     expect(outcome).toEqual({ reply: "Não posso ajudar com isso." });
@@ -120,6 +138,7 @@ describe("makeZproGuardrailRunner", () => {
     const gr = {
       ...GUARDRAILS_DEFAULTS,
       enabled: true,
+      provider: "openai-compatible" as const,
       output: { ...GUARDRAILS_DEFAULTS.output, action: "silent" as const },
     };
     const runGuardrail = makeZproGuardrailRunner({
@@ -129,6 +148,7 @@ describe("makeZproGuardrailRunner", () => {
       flow,
       client,
       ticketId: 1,
+      customerText: "cliente",
     });
     expect(await runGuardrail("output", "reply text")).toEqual({
       reply: null,
@@ -140,6 +160,7 @@ describe("makeZproGuardrailRunner", () => {
     const gr = {
       ...GUARDRAILS_DEFAULTS,
       enabled: true,
+      provider: "openai-compatible" as const,
       output: {
         ...GUARDRAILS_DEFAULTS.output,
         action: "generated" as const,
@@ -159,6 +180,7 @@ describe("makeZproGuardrailRunner", () => {
       flow,
       client,
       ticketId: 1,
+      customerText: "cliente",
     });
     expect(await withSuggestion("output", "reply")).toEqual({
       reply: "resposta segura sugerida",
@@ -171,6 +193,7 @@ describe("makeZproGuardrailRunner", () => {
       flow,
       client,
       ticketId: 1,
+      customerText: "cliente",
     });
     expect(await withoutSuggestion("output", "reply")).toEqual({
       reply: "fallback",

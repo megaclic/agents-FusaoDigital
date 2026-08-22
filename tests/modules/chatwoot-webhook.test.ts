@@ -11,6 +11,7 @@ import {
   firstLocationAttachment,
   isHumanAgentMessage,
   isIncomingMessage,
+  isNewHumanAgentMessage,
   isNewIncomingMessage,
   normalizeChatwootEvent,
   shouldBotHandle,
@@ -179,7 +180,6 @@ describe("normalizeChatwootEvent", () => {
       id: 33,
       name: "João",
     });
-    expect(human && isHumanAgentMessage(human)).toBe(true);
   });
 
   test("returns null for a non-object or eventless payload", () => {
@@ -281,40 +281,6 @@ describe("firstLocationAttachment (issue #45)", () => {
         loc({ latitude: -91, longitude: 10, fallbackTitle: "Praça da Sé" }),
       ]),
     ).toEqual({ latitude: null, longitude: null, title: "Praça da Sé" });
-  });
-});
-
-describe("isHumanAgentMessage (continuous-ingestion role gate)", () => {
-  const msg = (over: Record<string, unknown>) =>
-    normalizeChatwootEvent({
-      event: "message_created",
-      id: 1,
-      content: "x",
-      message_type: "outgoing",
-      private: false,
-      sender: { id: 1, name: "A", type: "user" },
-      conversation: { id: 42, inbox_id: 7, status: "open" },
-      ...over,
-    });
-
-  test("true only for a brand-new outgoing message authored by a human (User) agent", () => {
-    expect(isHumanAgentMessage(msg({}) as never)).toBe(true);
-    // Our bot / another bot (agent_bot) → not human.
-    expect(
-      isHumanAgentMessage(
-        msg({ sender: { id: 9, name: "Bot", type: "agent_bot" } }) as never,
-      ),
-    ).toBe(false);
-    // Incoming (the customer) → not a human AGENT message.
-    expect(
-      isHumanAgentMessage(msg({ message_type: "incoming" }) as never),
-    ).toBe(false);
-    // A private note (operator-only) → never part of the customer dialogue.
-    expect(isHumanAgentMessage(msg({ private: true }) as never)).toBe(false);
-    // An edit (message_updated) → must not re-ingest.
-    expect(
-      isHumanAgentMessage(msg({ event: "message_updated" }) as never),
-    ).toBe(false);
   });
 });
 
@@ -428,6 +394,94 @@ describe("isNewIncomingMessage (voice-note infinite-loop guard)", () => {
       meta: {},
     });
     expect(conv && isNewIncomingMessage(conv)).toBe(false);
+  });
+});
+
+describe("isNewHumanAgentMessage (issue #187)", () => {
+  // `sender.type` values come from the fork's own webhook_data serializers: User → "user",
+  // AgentBot → "agent_bot", Contact → no `type` key at all.
+  const message = (over: Record<string, unknown>) =>
+    normalizeChatwootEvent({
+      event: "message_created",
+      id: 1001,
+      content: "Consigo fechar por R$ 1.200",
+      message_type: "outgoing",
+      private: false,
+      sender: { id: 5, name: "Ana", type: "user" },
+      conversation: {
+        id: 42,
+        inbox_id: 7,
+        status: "open",
+        meta: { assignee_type: "user", assignee: { id: 5 } },
+      },
+      ...over,
+    });
+
+  test("true for a human agent's outgoing message", () => {
+    const n = message({});
+    expect(n && isNewHumanAgentMessage(n)).toBe(true);
+  });
+
+  // Already in the thread, written by the turn that produced it. Ingesting it would duplicate every
+  // answer the agent ever gave.
+  test("false for our own bot's outgoing message", () => {
+    const n = message({
+      sender: { id: 9, name: "Atendente", type: "agent_bot" },
+    });
+    expect(n && isNewHumanAgentMessage(n)).toBe(false);
+  });
+
+  // The operator talking to their own team. It never reached the customer, and it must not enter the
+  // contact's permanent memory.
+  test("false for a private note", () => {
+    const n = message({ private: true });
+    expect(n && isNewHumanAgentMessage(n)).toBe(false);
+  });
+
+  test("false for an incoming message (that is the customer, and the other predicate's job)", () => {
+    const n = message({
+      message_type: "incoming",
+      sender: { id: 77, name: "Cliente" },
+    });
+    expect(n && isNewHumanAgentMessage(n)).toBe(false);
+    expect(n && isNewIncomingMessage(n)).toBe(true);
+  });
+
+  // Same rule as isNewIncomingMessage, same reason: an update is our own write-back coming back, and
+  // an edit to a reply is not a new thing said.
+  test("false for message_updated", () => {
+    const n = message({ event: "message_updated" });
+    expect(n && isHumanAgentMessage(n)).toBe(true);
+    expect(n && isNewHumanAgentMessage(n)).toBe(false);
+  });
+
+  // A template is an automated send (campaign, canned HSM), not a person typing; an activity is
+  // Chatwoot narrating itself. Neither is dialogue with the customer.
+  test("false for a template and for an activity message", () => {
+    for (const message_type of ["template", "activity"]) {
+      const n = message({ message_type });
+      expect(n && isNewHumanAgentMessage(n)).toBe(false);
+    }
+  });
+
+  // Round-1 review finding (P2), confirmed on live rows. The fork stores an emoji react as a real
+  // message: MessageBuilder with message_type "outgoing", content = the emoji, sender Current.user,
+  // and content_attributes.is_reaction. Every other clause here matches it, so without this the
+  // permanent memory of the attendance would carry a line reading `atendente: 👍`.
+  test("false for a reaction, which is an outgoing message from a real user", () => {
+    const n = message({
+      content: "👍",
+      content_attributes: { is_reaction: true },
+    });
+    expect(n?.message?.isReaction).toBe(true);
+    expect(n && isNewHumanAgentMessage(n)).toBe(false);
+  });
+
+  // A sender we cannot classify is not assumed to be a person. Attributing an unknown author to the
+  // team writes words into the memory that nobody on the team said.
+  test("false when the payload carries no sender", () => {
+    const n = message({ sender: null });
+    expect(n && isNewHumanAgentMessage(n)).toBe(false);
   });
 });
 
@@ -582,6 +636,10 @@ describe("parseInboxList", () => {
           name: "WhatsApp Vendas",
           channel_type: "Channel::Whatsapp",
           provider: "whatsapp_cloud",
+          // Chatwoot's own out-of-hours reply, both halves of it, on the same serializer
+          // (app/views/api/v1/models/_inbox.json.jbuilder in the fork).
+          working_hours_enabled: true,
+          out_of_office_message: "Estamos fechados.",
         },
         // baileys is a Channel::Whatsapp too, but an unofficial provider (no window).
         {
@@ -589,6 +647,8 @@ describe("parseInboxList", () => {
           name: "WhatsApp Bridge",
           channel_type: "Channel::Whatsapp",
           provider: "baileys",
+          working_hours_enabled: false,
+          out_of_office_message: "",
         },
         { id: 3, name: "Site", channel_type: "Channel::WebWidget" },
       ],
@@ -599,19 +659,50 @@ describe("parseInboxList", () => {
         name: "WhatsApp Vendas",
         channelType: "Channel::Whatsapp",
         provider: "whatsapp_cloud",
+        workingHoursEnabled: true,
+        outOfOfficeMessage: "Estamos fechados.",
       },
       {
         chatwootInboxId: 2,
         name: "WhatsApp Bridge",
         channelType: "Channel::Whatsapp",
         provider: "baileys",
+        workingHoursEnabled: false,
+        outOfOfficeMessage: "",
       },
       {
         chatwootInboxId: 3,
         name: "Site",
         channelType: "Channel::WebWidget",
         provider: null,
+        workingHoursEnabled: false,
+        outOfOfficeMessage: null,
       },
+    ]);
+  });
+
+  // The out-of-hours pair comes off a wire this product does not own, and the warning it feeds is
+  // about someone else's product. Anything but a real `true` reads as off, so a serializer that
+  // starts sending "true" can only make the warning disappear — never make one up about an inbox
+  // that answers nothing.
+  test("reads the out-of-hours switch strictly, and a non-string message as absent", () => {
+    const raw = [
+      { id: 1, working_hours_enabled: "true", out_of_office_message: "hi" },
+      { id: 2, working_hours_enabled: 1, out_of_office_message: "hi" },
+      { id: 3, working_hours_enabled: true, out_of_office_message: null },
+      { id: 4, working_hours_enabled: true, out_of_office_message: 42 },
+    ];
+    expect(
+      parseInboxList(raw).map((i) => [
+        i.chatwootInboxId,
+        i.workingHoursEnabled,
+        i.outOfOfficeMessage,
+      ]),
+    ).toEqual([
+      [1, false, "hi"],
+      [2, false, "hi"],
+      [3, true, null],
+      [4, true, null],
     ]);
   });
 
@@ -628,12 +719,16 @@ describe("parseInboxList", () => {
         name: "Stringy",
         channelType: null,
         provider: null,
+        workingHoursEnabled: false,
+        outOfOfficeMessage: null,
       },
       {
         chatwootInboxId: 9,
         name: "Inbox 9",
         channelType: null,
         provider: null,
+        workingHoursEnabled: false,
+        outOfOfficeMessage: null,
       },
     ]);
   });

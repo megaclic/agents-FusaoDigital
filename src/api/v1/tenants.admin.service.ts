@@ -4,10 +4,10 @@ import { ConflictError, ForbiddenError, NotFoundError } from "@/lib/errors";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
   TENANT_SELECT,
-  toDto,
   type TenantCreate,
   type TenantDto,
   type TenantUpdate,
+  toDto,
 } from "./tenants.service";
 
 // Tenant mutation service. Create and delete provision/deprovision a tenant in the fleet — there is
@@ -67,10 +67,18 @@ export async function updateTenant(
     const tenant =
       ctx.role === "SUPER_ADMIN"
         ? await asSuperAdminOn(base, (db) =>
-            db.tenant.update({ where: { id }, data: patch, select: TENANT_SELECT }),
+            db.tenant.update({
+              where: { id },
+              data: patch,
+              select: TENANT_SELECT,
+            }),
           )
         : await runScopedOn(base, ctx, (db) =>
-            db.tenant.update({ where: { id }, data: patch, select: TENANT_SELECT }),
+            db.tenant.update({
+              where: { id },
+              data: patch,
+              select: TENANT_SELECT,
+            }),
           );
     return toDto(tenant);
   } catch (err) {

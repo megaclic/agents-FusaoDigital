@@ -1,9 +1,11 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { HumanMessage } from "@langchain/core/messages";
+import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { verdictAskMode } from "@/graph/model-config";
+import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
@@ -28,14 +30,29 @@ import {
   withFlowStage,
 } from "@/modules/flowlog/service";
 import { analyzeGuardrail } from "@/modules/guardrails/analyze";
+import { loggableCategories } from "@/modules/guardrails/log-categories";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
+import { armCompaction } from "@/modules/memory/compact";
 import { deliverReply } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
-import { chatwootThreadId, resolveGraphThreadId } from "./checkpointer";
+import {
+  attendanceHasStarted,
+  claimAttendanceBoundary,
+  needsAttendanceStartProbe,
+} from "./attendance-boundary";
+import {
+  chatwootThreadId,
+  getCheckpointer,
+  resolveGraphThreadId,
+} from "./checkpointer";
 import { lastAssistantText } from "./graph";
-import { clearTurnInFlight, markTurnInFlight } from "./inflight";
-import { CONVERSATION_DIVIDER } from "./ingest";
+import {
+  clearTurnInFlight,
+  isTurnInFlight,
+  markTurnInFlight,
+} from "./inflight";
+import { conversationDividerMessage, conversationStamp } from "./markers";
 import { createChatModel, type ResolvedModelConfig } from "./models";
 import {
   type AgentConfig,
@@ -46,9 +63,14 @@ import {
   loadAgentConfig,
 } from "./prepare";
 import { AgentStatusReporter } from "./status";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 import { ToolFlowLogger } from "./tool-flowlog";
 import type { McpLoadDeps } from "./tools/mcp";
-import { buildNativeTools, type TurnState } from "./tools/native";
+import {
+  buildNativeTools,
+  handoffAnsweredTheTurn,
+  type TurnState,
+} from "./tools/native";
 import type { UsagePersist } from "./usage";
 
 // The agent runtime: an incoming Chatwoot message (gate=act) → resolve the inbox's Agent config
@@ -252,6 +274,7 @@ export async function runLoadedTurn(
     imagesInFlight: 0,
     imagesSeq: 0,
   };
+  const handoffState = { customerMessageSent: false, completed: false };
   const tools = await buildToolset(
     loaded,
     {
@@ -264,6 +287,7 @@ export async function runLoadedTurn(
       messageId: params.messageId,
       imageDeps: params.deps?.imageDeps,
       turnState,
+      handoffState,
     },
     { buildNativeTools, mcp: params.deps?.mcp, flow },
   );
@@ -293,6 +317,21 @@ export async function runLoadedTurn(
         model: loaded.mc.model,
         detail: { retriedEmptyResponse: attempt },
       }),
+    // The history ceiling dropped older attendances from this turn. INFO, not warn: emitFlowEvent
+    // fans warn/error out to the alert channels, and a correctly configured ceiling trims on nearly
+    // every turn of a long thread, so a warn here would page the operator forever for working.
+    // Counts only, never a fragment of what was dropped.
+    onHistoryTrim: ({ kept, dropped, tokens }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "info",
+        status: "ok",
+        detail: {
+          historyKept: kept,
+          historyDropped: dropped,
+          historyTokens: tokens,
+        },
+      }),
   });
   const callbacks = buildCallbacks(loaded, {
     tenantId,
@@ -314,48 +353,6 @@ export async function runLoadedTurn(
     conversationId,
     loaded.contactInboxId,
   );
-  let turnText = text;
-  if (loaded.contactInboxId != null) {
-    const contactInboxId = loaded.contactInboxId;
-    const isNewConversation = await runScopedOn(
-      base,
-      sysCtx(tenantId),
-      async (db) => {
-        // Per-THREAD divider marker (AgentThread keyed by contact-inbox): compare the last
-        // conversation that ran on THIS thread. A different display_id ⇒ a new conversation reusing
-        // the thread ⇒ inject the "fresh attendance" divider. Tracking it per-thread (not per-contact)
-        // means a multi-channel contact never gets a spurious divider from activity on another channel.
-        const key = {
-          tenantId_chatwootInstanceId_contactInboxId: {
-            tenantId,
-            chatwootInstanceId: instanceId,
-            contactInboxId,
-          },
-        };
-        const existing = await db.agentThread.findUnique({
-          where: key,
-          select: { lastConversationId: true },
-        });
-        const prev = existing?.lastConversationId ?? null;
-        // Advance the marker to the current conversation (idempotent within one conversation).
-        if (prev !== conversationId) {
-          await db.agentThread.upsert({
-            where: key,
-            create: {
-              tenantId,
-              chatwootInstanceId: instanceId,
-              contactInboxId,
-              threadId: graphThreadId,
-              lastConversationId: conversationId,
-            },
-            update: { lastConversationId: conversationId },
-          });
-        }
-        return prev != null && prev !== conversationId;
-      },
-    );
-    if (isNewConversation) turnText = `${CONVERSATION_DIVIDER}\n\n${text}`;
-  }
 
   // The live "agent is working" indicator on the per-tenant realtime channel:
   // `started` before the first token (instant feedback), `step` events from the
@@ -397,20 +394,27 @@ export async function runLoadedTurn(
   ): Promise<{ reply: string | null } | null> => {
     const dir = gr[direction];
     if (!guardrailModel || !dir.enabled) return null;
-    const verdict = await analyzeGuardrail(guardrailModel, {
-      direction,
-      text: subject,
-      checks: dir.checks,
-      competitors: gr.competitors,
-      customPolicy: gr.customPolicy,
-      systemPrompt: direction === "output" ? loaded.systemPrompt : undefined,
-      // The raw inbound text, not `turnText`: on the first turn of a new conversation the latter
-      // carries CONVERSATION_DIVIDER, and handing the guardrail a system marker as the customer's
-      // words would make it judge the reply against something nobody said.
-      customerMessage: direction === "output" ? text : undefined,
-      generationPrompt:
-        dir.action === "generated" ? dir.generationPrompt : undefined,
-    });
+    const verdict = await analyzeGuardrail(
+      guardrailModel,
+      {
+        direction,
+        text: subject,
+        checks: dir.checks,
+        competitors: gr.competitors,
+        customPolicy: gr.customPolicy,
+        systemPrompt: direction === "output" ? loaded.systemPrompt : undefined,
+        // The raw inbound text, not `turnText`: on the first turn of a new conversation the latter
+        // carries CONVERSATION_DIVIDER, and handing the guardrail a system marker as the customer's
+        // words would make it judge the reply against something nobody said.
+        customerMessage: direction === "output" ? text : undefined,
+        generationPrompt:
+          dir.action === "generated" ? dir.generationPrompt : undefined,
+      },
+      // Constrained where the endpoint implements it, in the dialect it speaks, and asked for in
+      // the prompt everywhere else. The provider decides, not the model id: the same adapter serves
+      // OpenAI itself and whatever an operator points `openai-compatible` at (issue #131).
+      verdictAskMode(gr.provider),
+    );
     // A guardrail that could not run reads exactly like one that ran and approved, so without this
     // line an expired credential is silent moderation for as long as nobody notices. The turn is
     // NOT blocked (fail-open stays), only recorded.
@@ -424,30 +428,41 @@ export async function runLoadedTurn(
       });
     }
     if (!verdict.violated) return null;
+    // NOTE: The turn trail and the operator note report what the guardrail DID, not what it was
+    // configured to do. `generated` with no replacement in hand sends the template — when the model
+    // returns none, and on the input direction every time (see modules/guardrails/analyze.ts) — and
+    // an operator reading "generated" on a line where the template went out is reading the config
+    // back, not the event.
+    const replacement =
+      dir.action === "generated" ? verdict.suggestedReply : null;
+    const effectiveAction =
+      dir.action === "generated" && replacement === null
+        ? "template"
+        : dir.action;
     emitFlowEvent(flow, {
       stage: "guardrail",
       status: "ok",
       level: "warn",
+      // NOTE: `categories` and `rationale` are both model-written, so neither can be copied into
+      // this row as it stands: `rationale` explains what in the message violated the policy, so it
+      // quotes the message, and `categories` is asked for as policy keys but arrives as whatever
+      // the model wrote. What goes in is the part with a known vocabulary, plus a COUNT of what did
+      // not match it, which is how "it violated something we cannot name here" stays visible. The
+      // private note two lines below carries both in full, on the conversation the text came from.
       detail: {
         direction,
-        action: dir.action,
-        categories: verdict.categories,
-        rationale: verdict.rationale,
+        action: effectiveAction,
+        ...loggableCategories(verdict.categories),
       },
     });
     await client
       .sendPrivateNote(
         conversationId,
-        `Guardrail (${direction}): ${verdict.categories.join(", ") || "policy"} — ${dir.action}. ${verdict.rationale}`,
+        `Guardrail (${direction}): ${verdict.categories.join(", ") || "policy"} — ${effectiveAction}. ${verdict.rationale}`,
       )
       .catch(() => {});
     if (dir.action === "silent") return { reply: null };
-    return {
-      reply:
-        dir.action === "generated"
-          ? (verdict.suggestedReply ?? dir.templateMessage)
-          : dir.templateMessage,
-    };
+    return { reply: replacement ?? dir.templateMessage };
   };
   // How many balloons the (text) reply was delivered as, surfaced on `finished` so the UI can hold a
   // "delivering" indicator until the paced balloons land. 1 for audio / single send; null on no post.
@@ -456,11 +471,134 @@ export async function runLoadedTurn(
   // Mark this conversation's turn as in-flight so a concurrently-fired follow-up backs off instead
   // of nudging mid-turn (cleared in the finally on every exit). See ./inflight.
   markTurnInFlight(threadId);
+  // Released in the `finally` below, which is why the claim below lives INSIDE this try and not
+  // above it: `getCheckpointer`, the divider write and the marker upsert can all throw, and a claim
+  // that outlives its turn keeps every follow-up and every compaction for this contact backing off
+  // until the process restarts.
+  let claimedGraphThread = false;
   try {
+    // ── Attendance boundary. A NEW conversation reusing this contact-inbox thread gets the
+    //    "fresh attendance" divider, and the attendance it replaced becomes compactable.
+    //
+    //    Claimed ATOMICALLY, and the divider written as its own message rather than smuggled into the
+    //    customer's turn text, because the three things have to be all-or-nothing:
+    //
+    //      - Two deliveries for the same new conversation can run at once (debounce off is the common
+    //        setup). Both would read the same marker and both would prepend a divider; compaction cuts
+    //        at the LAST one, so the first exchange of the OPEN attendance would be summarized away as
+    //        if it had ended. The lock — the same one ingestion takes on this thread — makes exactly
+    //        one turn the claimant.
+    //      - The marker must not advance without the divider landing. It used to advance here while
+    //        the divider only reached the checkpointer if the invoke ran, so an input guardrail that
+    //        answered before the model, or a throw, left a boundary nothing could ever find again.
+    //        Writing the divider inside the claim removes the dependency on the turn succeeding.
+    //      - And with the divider durable at claim time, compaction can be armed right here instead of
+    //        waiting for the invoke.
+    //
+    //    The divider being its own message (the ingestion mechanism, same graph) is also why the
+    //    guardrails now see the customer's raw words on BOTH directions: there is no longer a turn text
+    //    carrying a system marker the customer never wrote.
+    if (loaded.contactInboxId != null) {
+      const contactInboxId = loaded.contactInboxId;
+      const checkpointerForDivider =
+        params.deps?.checkpointer ?? (await getCheckpointer());
+      const dividerGraph = buildThreadStateGraph(checkpointerForDivider);
+      const closedConversationId = await runScopedOn(
+        base,
+        sysCtx(tenantId),
+        (db) =>
+          withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+            // Per-THREAD marker (AgentThread keyed by contact-inbox): a different display_id ⇒ a new
+            // conversation reusing the thread. Per-thread and not per-contact, so a multi-channel
+            // contact never gets a spurious divider from activity on another channel.
+            const key = {
+              tenantId_chatwootInstanceId_contactInboxId: {
+                tenantId,
+                chatwootInstanceId: instanceId,
+                contactInboxId,
+              },
+            };
+            const existing = await db.agentThread.findUnique({
+              where: key,
+              select: { lastConversationId: true },
+            });
+            // Read BEFORE this turn adds its own claim: what matters is whether some OTHER invoke
+            // is mid-flight on this thread (./attendance-boundary.ts, case 1).
+            const anotherInvokeIsReading = isTurnInFlight(graphThreadId);
+            // Claim the thread against a memory-compaction rewrite, under the lock the rewrite also
+            // holds while it checks. That makes the two exclusive rather than merely staggered: the
+            // rewrite either completes before this claim — and the invoke below then loads the
+            // rewritten channel — or it finds the thread claimed and stands down. Claimed for EVERY
+            // turn, not only the ones that cross a boundary, because what has to be excluded is the
+            // invoke, and every turn has one. Released in the `finally` below, on every exit.
+            markTurnInFlight(graphThreadId);
+            claimedGraphThread = true;
+            const prev = existing?.lastConversationId ?? null;
+            const alreadyStarted = needsAttendanceStartProbe(
+              prev,
+              conversationId,
+              anotherInvokeIsReading,
+            )
+              ? attendanceHasStarted(
+                  (
+                    (
+                      await dividerGraph.getState({
+                        configurable: { thread_id: graphThreadId },
+                      })
+                    ).values as { messages?: BaseMessage[] } | undefined
+                  )?.messages ?? [],
+                  conversationId,
+                )
+              : false;
+            const claim = claimAttendanceBoundary({
+              previousConversationId: prev,
+              conversationId,
+              anotherInvokeIsReading,
+              attendanceAlreadyStarted: alreadyStarted,
+            });
+            if (claim.writeDivider) {
+              await dividerGraph.updateState(
+                { configurable: { thread_id: graphThreadId } },
+                { messages: [conversationDividerMessage(conversationId)] },
+                THREAD_STATE_NODE,
+              );
+            }
+            if (claim.advanceMarker) {
+              await db.agentThread.upsert({
+                where: key,
+                create: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  contactInboxId,
+                  threadId: graphThreadId,
+                  lastConversationId: conversationId,
+                },
+                update: { lastConversationId: conversationId },
+              });
+            }
+            return claim.closedConversationId;
+          }),
+      );
+      if (closedConversationId !== null) {
+        // Outside the lock: this opens its own transaction, and nesting one inside an advisory-lock
+        // transaction would hold that lock across a second connection's work.
+        await armCompaction({
+          tenantId,
+          instanceId,
+          contactInboxId,
+          conversationId: closedConversationId,
+          agentId: loaded.agentId,
+          reason: "new_attendance",
+          enabled: loaded.memoryCompaction,
+          base,
+        });
+      }
+    }
+
     // INPUT guardrail: screen the customer message BEFORE the agent processes it. On a violation,
     // send the configured template / a guardrails-generated safe reply and skip the graph, or stay
     // silent (send nothing). null ⇒ nothing tripped, proceed as normal.
-    const inGuard = await runGuardrail("input", turnText);
+    const inGuard = await runGuardrail("input", text);
     if (inGuard) {
       if (inGuard.reply !== null) {
         // NOTE: The guardrail reply is a post like any other, so it claims the trigger through the
@@ -483,14 +621,23 @@ export async function runLoadedTurn(
       {
         provider: loaded.mc.provider,
         model: loaded.mc.model,
-        // The fully-resolved system prompt the agent received THIS turn (item 15), so the operator can
-        // inspect it in the Logs page. Passes through redactSecretsDeep on write (secret-scrubbed +
-        // length-bounded); it is the tenant's own config, never customer PII.
-        detail: { systemPrompt: loaded.systemPrompt },
+        // The prompt the agent was given THIS turn (item 15), audited: the RESOLVED one is not the
+        // tenant's own config, it is where the contact's name, phone and attributes entered. See
+        // prompt-audit.ts.
+        detail: { systemPrompt: loaded.systemPromptAudit },
       },
       () =>
         graph.invoke(
-          { messages: [new HumanMessage(turnText)] },
+          {
+            messages: [
+              // Stamped with the conversation it belongs to: that stamp, not the divider, is what the
+              // compaction cut reads to find where this attendance starts.
+              new HumanMessage({
+                content: text,
+                additional_kwargs: conversationStamp(conversationId),
+              }),
+            ],
+          },
           {
             configurable: { thread_id: graphThreadId },
             callbacks: [...callbacks, status, toolLogger],
@@ -498,6 +645,25 @@ export async function runLoadedTurn(
         ),
     );
     let reply = lastAssistantText(result.messages).trim();
+
+    // The handoff already answered, so this final text would be a second copy of a line the
+    // customer has read — and the mirror recheck below cannot catch it, because Chatwoot's
+    // open/assignee event may still be in flight and the row still reads bot-owned.
+    //
+    // Blanked rather than returned early, so every gate after this point still applies. An image
+    // queued earlier in the same turn is not a duplicate of anything and still belongs to the
+    // customer, and its caption is model-written customer-facing text the output guardrail screens.
+    // An early return would deliver that image unscreened, or not at all.
+    // Dropped on the TRANSFER, not on the suppression: a conversation the human queue now owns is
+    // not ours to close, and that holds even when the closing line failed to send. The two questions
+    // have different answers exactly there.
+    if (handoffState.completed) turnState.resolveRequested = false;
+    const handedOff = handoffAnsweredTheTurn(handoffState);
+    if (handedOff) {
+      reply = "";
+      // The tool posted exactly one balloon, on every exit reachable from here.
+      deliveredBalloons = 1;
+    }
 
     // Re-check the live assignee (mirror) before posting: a human may have taken over during
     // the LLM call. NOTE: small TOCTOU between this read and the POST (the post is network and
@@ -535,6 +701,12 @@ export async function runLoadedTurn(
       }
       return { ours, voiceReply };
     });
+    // NOTE: A handoff we completed this turn reads as "not ours" here too, and the mirror records
+    // no reason for a status change, so there is nothing to tell our own transition apart from a
+    // human who grabbed the conversation in the same window. This gate exists for the second one,
+    // so it keeps failing closed for both: past this point the bot posts nothing, and an image the
+    // model queued before handing off is delivered only while Chatwoot's event is still in flight.
+    // Widening it on `handoffState.completed` would hand a genuine takeover back to the bot.
     if (!recheck.ours) {
       emitFlowEvent(flow, {
         stage: "handoff",
@@ -588,13 +760,16 @@ export async function runLoadedTurn(
       // not a silent one: returning "empty" here would let the deferred resolve close a conversation
       // nobody answered, and the callers only record a turn error (private note, lastError, alert)
       // when the turn THROWS. Best-effort per image still holds where a reply carries the turn.
-      if (queued > 0 && !sent) {
+      // NOTE: ...unless a handoff already answered. Then the images were NOT the turn, and a throw
+      // would record a turn error (private note, lastError, alert) on a conversation that was both
+      // answered and correctly handed to a human.
+      if (queued > 0 && !sent && !handedOff) {
         throw new Error(
           "send_image: nenhuma imagem foi entregue e o turno não tinha resposta em texto",
         );
       }
       await applyDeferredResolve(client, conversationId, turnState, flow);
-      return sent ? "posted" : "empty";
+      return sent || handedOff ? "posted" : "empty";
     }
 
     // The image lands before the text that talks about it, and before the TTS branch: an audio
@@ -684,6 +859,9 @@ export async function runLoadedTurn(
     return "posted";
   } finally {
     clearTurnInFlight(threadId);
+    // Only what this turn actually took: releasing a claim we never made would release a CONCURRENT
+    // turn's, and hand the thread to a compaction while that turn is still reading it.
+    if (claimedGraphThread) clearTurnInFlight(graphThreadId);
     status.finished(deliveredBalloons);
   }
 }

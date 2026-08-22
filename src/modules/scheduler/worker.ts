@@ -2,6 +2,11 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
+import { Semaphore } from "@/lib/semaphore";
+import {
+  JOB_SPENDS_PROVIDER,
+  sharedProviderConcurrency,
+} from "@/modules/scheduler/lanes";
 import {
   type ClaimedJob,
   claimDueJobs,
@@ -91,13 +96,15 @@ async function fail(
   error: string,
   base: PrismaClient,
 ): Promise<void> {
-  const { deadLettered } = await failJob(
+  const { deadLettered, applied } = await failJob(
     job.tenantId,
     job.id,
+    job.claimSeq,
     job.attempts,
     error,
     base,
   );
+  if (!applied) supersededWarning(job, "fail");
   if (deadLettered) await dispatchDeadLetter(job, error, base);
 }
 
@@ -119,30 +126,67 @@ export async function runClaimed(
     return;
   }
   if (result.outcome === "done") {
-    await completeJob(job.tenantId, job.id, base);
-  } else if (result.outcome === "reschedule") {
-    await rescheduleJob(
+    const { applied } = await completeJob(
       job.tenantId,
       job.id,
+      job.claimSeq,
+      base,
+    );
+    if (!applied) supersededWarning(job, "done");
+  } else if (result.outcome === "reschedule") {
+    const { applied } = await rescheduleJob(
+      job.tenantId,
+      job.id,
+      job.claimSeq,
       result.runAt,
       result.payload,
       base,
     );
+    if (!applied) supersededWarning(job, "reschedule");
   } else {
     await fail(job, result.error ?? "failed", base);
   }
 }
 
+// The claim this run held was no longer the current one, so its outcome was DISCARDED: the row now
+// belongs to a later claim, or to none. The handler still ran to completion, side effects included,
+// which is why this is worth a line — the whole reason issue #164 was filed is that these orderings
+// are invisible until someone traces them by hand, and a CAS that refuses in silence keeps them that
+// way. Not an error: refusing is the guard working. A handler whose work must not be repeated needs
+// its own exclusion (see the inFlight set in src/modules/memory/worker.ts); the token only decides
+// which write lands.
+function supersededWarning(job: ClaimedJob, outcome: string): void {
+  logger.warn(
+    { kind: job.kind, jobId: String(job.id), claimSeq: job.claimSeq, outcome },
+    "scheduler: claim superseded, outcome discarded",
+  );
+}
+
 export interface TickOptions {
   staleMs: number;
   batchSize: number;
+  // NOTE: test-only isolation, the same fence claimDueJobs and reapStaleJobs already document. The
+  // tick is cross-tenant by design (single leader in production), so two DB-backed suites running at
+  // once claim each other's rows: the batch fills with the other run's jobs, or this process
+  // executes them. Leave it unset in production.
+  tenantId?: bigint;
+  // NOTE: test-only, like tenantId. Production sizes this from the model budget
+  // (sharedProviderConcurrency); a test that scaled its workload to that budget would be asserting
+  // whatever AGENT_MODEL_CONCURRENCY happens to be on the machine running it — at 400 the bound is
+  // 100 and the batch it would need exceeds the claim's own hard cap. Leave it unset in production.
+  providerConcurrency?: number;
 }
 
 export async function runSchedulerTick(
   base: PrismaClient,
   opts: TickOptions,
 ): Promise<{ claimed: number; reaped: number }> {
-  const reaped = await reapStaleJobs(opts.staleMs, base);
+  const reaped = await reapStaleJobs(
+    opts.staleMs,
+    base,
+    new Date(),
+    opts.tenantId,
+  );
   // NOTE: The reaper is the other road to DEAD — a claim that crashed or hung never reaches failJob,
   // so without this a job that exhausts its attempts by hanging dies unannounced.
   for (const job of reaped) {
@@ -150,9 +194,57 @@ export async function runSchedulerTick(
       await dispatchDeadLetter(job, "reaped: the claim never finished", base);
     }
   }
-  const jobs = await claimDueJobs(opts.batchSize, base);
-  for (const job of jobs) {
-    await runClaimed(job, base);
+  const jobs = await claimDueJobs(
+    opts.batchSize,
+    base,
+    new Date(),
+    opts.tenantId,
+  );
+  // NOTE: The batch drains CONCURRENTLY, which is what the debounce and compaction lanes always did
+  // and this one did not (issue #165). Serially, the lane advanced at the speed of whatever was
+  // running: one large document being indexed, or one follow-up whose model call is slow, delayed
+  // every other job claimed with it — and the one where lateness is customer-visible is the
+  // appointment reminder, which exists to arrive BEFORE something. The kinds that call a model are
+  // still throttled, by the process-wide model semaphore they already go through, so concurrency
+  // here does not widen that budget; it stops short jobs from queueing behind long ones.
+  //
+  // What this gives up is FIFO WITHIN a batch (the claim still orders by run_at; the drain no longer
+  // waits). It costs one thing, and only in a state that is already broken: two reminders for the
+  // same appointment can differ (`isLast` decides whether the last one asks for confirmation), so
+  // running them out of order reads oddly. Reaching that state needs both to be overdue at once,
+  // and enqueue skips offsets already past — so it takes the scheduler being hours behind, where the
+  // reminders are late no matter what order they land in.
+  //
+  // allSettled: runClaimed never re-throws (it fails the job internally), but a stray throw must not
+  // stall the tick.
+  // The kinds that spend provider capacity go through a bound; the rest do not. Bounding the whole
+  // drain would put a heartbeat back behind a nudge, which is the head-of-line blocking this change
+  // removed — and leaving the costly ones unbounded lets a batch of twenty hold every model permit
+  // while a customer's reply waits (see JOB_SPENDS_PROVIDER).
+  const gate = new Semaphore(
+    opts.providerConcurrency ??
+      sharedProviderConcurrency(config.agent.modelConcurrency),
+  );
+  const settled = await Promise.allSettled(
+    jobs.map((job) =>
+      JOB_SPENDS_PROVIDER[job.kind]
+        ? gate.run(() => runClaimed(job, base))
+        : runClaimed(job, base),
+    ),
+  );
+  // NOTE: allSettled DISCARDS rejections, and the serial loop this replaced did not: an `await` that
+  // threw propagated out of the tick and startScheduler logged it. runClaimed swallows a handler's
+  // own error (it fails the job instead), so a rejection here is the infrastructure underneath —
+  // completeJob/failJob unable to reach the database — and the row stays CLAIMED until the reaper
+  // takes it minutes later. Logged per job rather than re-thrown, because one unreachable row must
+  // not decide the outcome of the other nineteen.
+  for (const [i, r] of settled.entries()) {
+    if (r.status !== "rejected") continue;
+    const job = jobs[i];
+    logger.error(
+      { err: r.reason, kind: job?.kind, jobId: job ? String(job.id) : null },
+      "scheduler: job left unfinished by a failed write",
+    );
   }
   return { claimed: jobs.length, reaped: reaped.length };
 }

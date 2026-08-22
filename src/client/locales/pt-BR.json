@@ -393,8 +393,10 @@
       "badgeN": "Follow-up {{step}}/{{total}}",
       "cadenceFirst": "após {{delay}} de silêncio",
       "cadenceNext": "{{delay}} após a anterior",
+      "closedToday": "Fechado hoje ({{label}})",
       "deferredHint": "O intervalo da etapa caiu fora do horário de envio, então foi adiado para o próximo horário disponível.",
       "done": "Sequência de follow-up concluída",
+      "exceptionToday": "Só hoje: {{hours}} ({{label}})",
       "imminent": "a qualquer momento",
       "imminentHint": "O horário estimado já passou; o envio roda em segundo plano, então o follow-up será enviado a qualquer momento.",
       "pausedAppointment": "Follow-up pausado · compromisso agendado",
@@ -607,7 +609,11 @@
     "attrInstructionsHint": "Opcional. Explica qual atributo definir na conversa, no contato ou no card do kanban, e quando. A IA já vê os atributos definidos; isto acrescenta suas regras. Anexado à descrição da ferramenta.",
     "attrInstructionsPlaceholder": "ex.: salve o orçamento qualificado no contato como \"orcamento\"; defina \"lead_stage\" no card.",
     "availability": "Disponibilidade",
-    "availabilityHint": "Quando o agente está ativo e respondendo. Fora desse horário ele fica em silêncio e avisa o operador por nota privada.",
+    "availabilityHint": "Quando o agente está ativo e respondendo. Fora desse horário ele fica em silêncio, avisa o operador por nota privada e, se você ligar a opção abaixo, avisa o cliente também.",
+    "awayEnabled": "Responder ao cliente fora do horário",
+    "awayMessage": "Mensagem fora do horário",
+    "awayMessageHint": "Enviada ao cliente enquanto o agente está fora desse horário, no máximo uma vez por dia por conversa. Escreva {proximo_atendimento} onde o próximo atendimento deve aparecer: o cliente lê algo como \"segunda-feira, 25/08, 09:00\".",
+    "awayMessagePlaceholder": "Estamos fora do horário de atendimento. Voltamos {proximo_atendimento}.",
     "back": "Voltar para agentes",
     "backToConversation": "Voltar para a conversa",
     "baseURL": "Base URL",
@@ -728,7 +734,11 @@
       "ttsNormalize": "A reescrita para fala está ligada mas a configuração de modelo dela não pode rodar, então o áudio sai sem ela. Confira provedor, modelo, chave e endpoint.",
       "vision": "A leitura de imagens/documentos está ligada, mas sem chave de API definida."
     },
+    "configIssueGuardrailsFailing": "Os guardrails estão ligados, mas {{failures}} das verificações não conseguiram rodar nas últimas {{hours}} horas (a mais recente {{when}}). A análise é fail-open, então verificação que não rodou não pegou nada e não segurou nada. Confira o modelo, o endpoint e a chave.",
+    "configIssueGuardrailsFailingCause": "Os guardrails estão ligados, mas {{failures}} das verificações não conseguiram rodar nas últimas {{hours}} horas (a mais recente {{when}}). A análise é fail-open, então verificação que não rodou não pegou nada e não segurou nada. A última respondeu: {{error}}",
     "configIssueKnowledge": "A base de conhecimento \"{{name}}\" tem documentos que precisam ser indexados.",
+    "configIssueOutOfHoursBoth": "O Chatwoot já responde fora do horário em {{inboxes}}, e a mensagem de fora do horário deste agente também está ligada, então o cliente recebe as duas. Os dois horários são configurados em produtos diferentes e o do Chatwoot não tem datas, então em feriado eles também vão divergir.",
+    "configIssueOutOfHoursChatwoot": "O Chatwoot responde fora do horário em {{inboxes}}, e este agente não lê esse horário: ele responde sempre que o dele diz que está aberto. O cliente pode ouvir que está fechado e ser atendido logo em seguida.",
     "configIssuePending": {
       "embedding": "Uma base de conhecimento precisa ser indexada, mas a credencial de embedding ainda não foi preenchida.",
       "guardrails": "A credencial dos guardrails está referenciada, mas ainda não foi preenchida, então as mensagens saem sem triagem.",
@@ -860,7 +870,8 @@
       "policy": "Política",
       "policyDesc": "Lista de concorrentes e instruções extras usadas pelas checagens.",
       "template": "Mensagem template",
-      "templateFallbackHint": "Enviada sempre que nenhuma resposta substituta é escrita: quando o modelo não devolve nenhuma, e sempre que a checagem de relevância for a que disparou, porque aí não há resposta para reescrever."
+      "templateFallbackHint": "Enviada sempre que nenhuma resposta substituta é escrita: quando o modelo não devolve nenhuma, e sempre que a checagem de relevância for a que disparou, porque aí não há resposta para reescrever.",
+      "templateInboundHint": "Na mensagem do cliente é SEMPRE isto que sai. Aqui não existe resposta para reescrever, porque o texto sob revisão é a mensagem do próprio cliente, então o agente de guardrails não é chamado para compor uma. Quando era, o cliente conseguia ditar essa resposta: uma mensagem mandando ele informar um preço e uma parceria produziu exatamente isso, palavra por palavra, nas 16 execuções."
     },
     "handoffAgentChoice": "A IA escolhe",
     "handoffAgentChoiceHint": "A IA enxerga automaticamente seus agentes e times do Chatwoot e escolhe um ao transferir. Opcionalmente, oriente pela instrução (ex.: mande cobrança para o Financeiro).",
@@ -898,6 +909,7 @@
       "hoursNotFound": "O horário \"{{name}}\" não foi encontrado aqui, então ficou em branco.",
       "hoursReused": "O horário \"{{name}}\" já existia e foi reaproveitado; confira se a agenda está certa.",
       "httpGrantNotFound": "A ferramenta \"{{name}}\" não foi encontrada, então a concessão foi ignorada.",
+      "httpToolBodyIgnored": "A ferramenta \"{{name}}\" tinha um corpo de requisição num formato que esta versão não aceita, então ele foi reduzido à parte que de fato estava sendo enviada. A requisição não mudou; abra em Corpo da requisição para conferir.",
       "httpToolCredNotFound": "A credencial \"{{credential}}\" da ferramenta \"{{tool}}\" não foi encontrada aqui, então ficou em branco.",
       "httpToolReused": "A ferramenta \"{{name}}\" já existia e foi reaproveitada; confira se está certa.",
       "integrationGrantNotFound": "A integração \"{{name}}\" não foi encontrada, então a concessão foi ignorada.",
@@ -934,8 +946,14 @@
     "labelInstructionsPlaceholder": "ex.: adicione \"vip\" ao contato para clientes premium; marque a conversa como \"urgente\" quando o cliente estiver irritado.",
     "limits": "Limites de execução",
     "limitsHint": "Limite quanto trabalho o agente faz em um único turno antes de ter que responder.",
+    "limitsMaxHistoryTokens": "Teto de histórico",
+    "limitsMaxHistoryTokensHint": "O agente lembra de toda conversa que já teve com este contato neste canal, e manda tudo isso a cada turno, então um cliente que volta fica mais lento e mais caro quanto mais fala. Isto limita quanto dessa memória viaja: atendimentos antigos deixam de ser enviados ao atingir o limite, e a conversa que está sendo respondida nunca é descartada. A contagem é uma estimativa e fica baixa em thread com muita ferramenta, e as instruções e as definições de ferramentas não entram na conta, então configure abaixo do orçamento que você realmente tem. Vazio = sem teto. 2.000 a 1.000.000.",
     "limitsMaxToolCalls": "Máx. de ferramentas / turno",
     "limitsMaxToolCallsHint": "Depois desse número de usos de ferramenta o agente é obrigado a responder com o que já tem (sem erro). 1-50.",
+    "limitsNoCeiling": "Sem teto",
+    "memory": "Memória",
+    "memoryCompaction": "Resumir atendimentos encerrados",
+    "memoryHint": "O agente lembra de toda conversa que já teve com este contato neste canal. Quando um atendimento termina, as mensagens dele são substituídas por um resumo, e a memória vira \"N atendimentos resumidos + o atual\". O que sobrevive ao resumo é a parte útil: quem é o contato, o que ficou acordado, o que ficou em aberto. A redação exata não sobrevive, então desligue se o agente precisar citar uma conversa antiga palavra por palavra. O resumo é escrito pelo modelo do próprio agente, depois que a resposta já foi enviada, então nenhum cliente espera por ele. Ele roda uma vez para cada atendimento que termina, inclusive os que a sua equipe atendeu sem o agente.",
     "mode": "Modo",
     "modeHint": "Um agente em teste fica em silêncio na conversa até o cliente enviar /teste; em produção responde normalmente.",
     "model": "Modelo",
@@ -1127,6 +1145,8 @@
   },
   "hours": {
     "add": "Novo horário",
+    "addException": "Adicionar data",
+    "addExceptionRange": "Adicionar horário",
     "addTitle": "Novo horário",
     "addWindow": "Adicionar janela",
     "alwaysOpen": "Sem janelas = sempre aberto.",
@@ -1140,12 +1160,23 @@
     "emptyDesc": "Defina quando seus agentes estão disponíveis para responder.",
     "emptyTitle": "Nenhum horário ainda",
     "end": "Fim",
+    "exceptionClosed": "Fechado o dia todo",
+    "exceptionDate": "Data",
+    "exceptionDateEnd": "Última data",
+    "exceptionLabel": "Nome",
+    "exceptionRecurring": "Todo ano",
+    "exceptions": "Feriados e fechamentos",
+    "exceptionsHint": "Uma data listada aqui substitui as janelas semanais acima. Sem horário, fica fechado o dia todo.",
+    "exceptionUntil": "até",
+    "invalidException": "Confira a data e se todo fim é depois do seu início.",
+    "invalidExceptionsSave": "Ajuste as exceções destacadas antes de salvar.",
     "invalidWindow": "O fim deve ser depois do início.",
     "invalidWindowsSave": "Ajuste as janelas destacadas antes de salvar.",
     "mirror": "Espelhado",
     "name": "Nome",
     "noTimezoneResults": "Nenhum fuso horário corresponde à busca.",
     "noWindows": "Sem janelas",
+    "removeException": "Remover data",
     "removeWindow": "Remover janela",
     "saved": "Horário de atendimento salvo.",
     "saveError": "Não foi possível salvar (verifique o fuso horário).",
@@ -1825,6 +1856,9 @@
     "tenantAdmin": "Admin do tenant"
   },
   "schedule": {
+    "exceptionCount_one": "{{count}} exceção",
+    "exceptionCount_many": "{{count}} exceções",
+    "exceptionCount_other": "{{count}} exceções",
     "noWindows": "Sem janelas"
   },
   "schedulePicker": {
@@ -1878,6 +1912,9 @@
     "createError": "Erro ao criar tenant",
     "createSuccess": "Tenant criado com sucesso",
     "createTitle": "Criar novo tenant",
+    "deepLinkUnavailable": "Este link aponta para um tenant que você não pode abrir. Nada foi trocado.",
+    "deepLinkUnverified": "Não foi possível conferir este link",
+    "deepLinkUnverifiedHelp": "Este link abre outro tenant, e não foi possível ler a lista de tenants que você pode abrir. Nada foi trocado.",
     "demo": "Demo",
     "label": "Tenant",
     "name": "Nome",
@@ -1903,6 +1940,9 @@
     "light": "Claro"
   },
   "toolpackTools": {
+    "argNote": {
+      "calendarId": "O agente só recebe este argumento quando a integração permite vários calendários; com um só, ele é usado automaticamente."
+    },
     "asaas_create_pix_charge": {
       "desc": "Abre uma cobrança PIX e retorna o código copia-e-cola e a página de pagamento.",
       "label": "Gerar cobrança PIX"
@@ -2084,6 +2124,7 @@
       "secretKey": "Secret key"
     },
     "fill": "Preencher",
+    "fillLinkNotHere": "Essa credencial não está no tenant que você tem aberto. Troque de tenant e siga o link de novo.",
     "fillTitle": "Preencher credencial pendente",
     "getKeyLink": "Pegue a sua em {{service}}",
     "getKeyPrompt": "Precisa de uma chave de API?",

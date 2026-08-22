@@ -59,6 +59,7 @@ function jobFor(ticketId: number, stepIndex?: number): ClaimedJob {
         ? { threadId: threadOf(ticketId) }
         : { threadId: threadOf(ticketId), stepIndex },
     attempts: 0,
+    claimSeq: 1,
   };
 }
 
@@ -430,7 +431,14 @@ describe.skipIf(!dbUp)("FOLLOWUP_SWEEP — Z-PRO eligibility", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     expect(sweep).toBeDefined();
     await sweep?.(
-      { id: 1n, tenantId, kind: "FOLLOWUP_SWEEP", payload: {}, attempts: 0 },
+      {
+        id: 1n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 1,
+      },
       appDb,
     );
   }

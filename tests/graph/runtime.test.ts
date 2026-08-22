@@ -1,24 +1,37 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
 import { encryptJson } from "@/api/lib/crypto";
+import { computeConfigIssues } from "@/client/lib/configHealth";
 import { contactInboxThreadId } from "@/graph/checkpointer";
+import {
+  clearTurnInFlight,
+  isTurnInFlight,
+  markTurnInFlight,
+} from "@/graph/inflight";
+import { isConversationDivider } from "@/graph/markers";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { runAgentTurn } from "@/graph/runtime";
+import type { TenantContext } from "@/lib/tenancy";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import { readGuardrailHealth } from "@/modules/guardrails/health";
+import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
+  guardrailModel,
+  HandoffThenReplyModel,
   ResolveThenReplyModel,
   SendImageAndResolveModel,
   SendImageBatchModel,
   SendImageOnlyModel,
+  SendImageThenHandoffModel,
   SendImageThenReplyModel,
 } from "../utils/scripted-models";
 
@@ -453,8 +466,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(after.lastConversationId).toBe(921);
 
-    // Both turns share ONE per-contact-inbox thread (continuity); only conv 921's human turn carries
-    // the divider so the model treats it as a fresh attendance.
+    // Both turns share ONE per-contact-inbox thread (continuity), and the boundary between them is
+    // its OWN message rather than a prefix on the customer's words: the divider is written when the
+    // boundary is claimed, so it survives a turn that never reaches the model, and the customer's
+    // message reaches the guardrails as the customer actually wrote it.
     const cp = await saver.get({
       configurable: {
         thread_id: contactInboxThreadId(tenantId, instanceId, contactInboxId),
@@ -463,9 +478,217 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const messages = ((
       cp?.channel_values as { messages?: Array<{ content: unknown }> }
     )?.messages ?? []) as Array<{ content: unknown }>;
-    expect(messages.length).toBe(4); // HumanA, AIReplyA, HumanB(+divider), AIReplyB
+    // HumanA, AIReplyA, DIVIDER, HumanB, AIReplyB
+    expect(messages.length).toBe(5);
     expect(String(messages[0]?.content)).not.toContain("nova conversa");
     expect(String(messages[2]?.content)).toContain("nova conversa");
+    // The customer's own message is untouched by the marker.
+    expect(String(messages[3]?.content)).not.toContain("nova conversa");
+    expect(String(messages[3]?.content)).toBe(String(messages[0]?.content));
+    // And the boundary is one the CUT can find. Recognition is by metadata, not by the text above,
+    // so a divider written without it would read as an ordinary turn here and the first attendance
+    // would never be compactable — the producer and the consumer only meet if this passes.
+    const cut = selectClosedPrefix(messages as unknown as BaseMessage[], {
+      currentAttendanceClosed: false,
+    });
+    expect(cut.closed).toHaveLength(2);
+    expect(cut.open).toHaveLength(3);
+  });
+
+  // The producer half of the memory-compaction guard. The consumer half (a compaction that finds the
+  // thread claimed stands down) is pinned in tests/modules/memory-compaction.test.ts; nothing there
+  // proves a turn ever CLAIMS it, and the two only meet if both name the same key — so this computes
+  // the key the same way compaction does, from contactInboxThreadId.
+  //
+  // Why it matters that the claim covers the invoke specifically: a LangGraph invoke saves the state
+  // it loaded when it started, so a compaction rewriting the channel in the middle of one is undone
+  // the moment the turn finishes, and the raw history it had replaced comes back.
+  test("a turn claims the memory thread for as long as its invoke holds it", async () => {
+    const contact = await suDb.contact.create({
+      data: { tenantId, chatwootContactId: 557, name: "Cliente" },
+      select: { id: true },
+    });
+    const contactInboxId = 7003;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 975,
+        contactInboxId,
+        status: "pending",
+        contactId: contact.id,
+        threadId: `${tenantId}:${instanceId}:975`,
+        lastEventAt: new Date(),
+      },
+    });
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const claimedDuringInvoke: boolean[] = [];
+    class ObservingModel {
+      async invoke(_messages: unknown[]) {
+        claimedDuringInvoke.push(isTurnInFlight(graphThreadId));
+        return new AIMessage(REPLY);
+      }
+      bindTools(_tools: unknown) {
+        return { invoke: (m: unknown[]) => this.invoke(m) };
+      }
+    }
+
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 975 }),
+      base: appDb,
+      deps: {
+        makeModel: () => new ObservingModel() as never,
+        makeClient: makeStubClient([]),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(claimedDuringInvoke).toEqual([true]);
+    // And released on the way out, or compaction for this contact would defer itself forever.
+    expect(isTurnInFlight(graphThreadId)).toBe(false);
+  });
+
+  // Without a contact-inbox there is no per-contact memory thread, and resolveGraphThreadId falls
+  // back to the per-CONVERSATION id — the very key the follow-up guard uses. A turn that releases a
+  // claim it never took would then release a concurrent turn's, and a nudge would fire into the
+  // middle of that turn: the bug the follow-up guard exists to prevent, reintroduced from the side.
+  test("a turn without a contact-inbox releases nothing it did not claim", async () => {
+    await seedConversation(976, null);
+    const threadId = `${tenantId}:${instanceId}:976`;
+    // Stands in for a concurrent turn on the same conversation, still running.
+    markTurnInFlight(threadId);
+    try {
+      await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 976 }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStubClient([]),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(isTurnInFlight(threadId)).toBe(true);
+    } finally {
+      clearTurnInFlight(threadId);
+    }
+    expect(isTurnInFlight(threadId)).toBe(false);
+  });
+
+  // The divider is written by something that is NOT an invoke, so an invoke that started earlier — a
+  // turn of the conversation that just ended, still generating — saves the channel it loaded and
+  // erases it. Deferring the claim keeps the divider (prompt content) worth writing later, and the
+  // messages keep their own conversation stamps meanwhile, so the CUT lands in the right place either
+  // way: the deferred turn belongs to the new attendance, not to the one that closed.
+  test("a boundary is not claimed while another invoke is reading the thread", async () => {
+    const contact = await suDb.contact.create({
+      data: { tenantId, chatwootContactId: 558, name: "Cliente" },
+      select: { id: true },
+    });
+    const contactInboxId = 7004;
+    for (const convId of [980, 981]) {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: convId,
+          contactInboxId,
+          status: "pending",
+          contactId: contact.id,
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(),
+        },
+      });
+    }
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const saver = new MemorySaver();
+    const turn = (conversationId: number) =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStubClient([]),
+          checkpointer: saver,
+        },
+      });
+
+    await turn(980);
+    // A turn of the OLD conversation, still invoking when the new one arrives.
+    markTurnInFlight(graphThreadId);
+    try {
+      await turn(981);
+    } finally {
+      clearTurnInFlight(graphThreadId);
+    }
+
+    // Compaction is armed regardless: the attendance that ended is compactable now, and making it
+    // wait for a next turn that may never come is how a boundary quietly goes uncompacted.
+    expect(
+      await suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "MEMORY_COMPACT",
+          dedupeKey: graphThreadId,
+          status: "PENDING",
+        },
+      }),
+    ).toBe(1);
+
+    // The marker stayed put, so the boundary is still there to be claimed.
+    const marker = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(marker.lastConversationId).toBe(980);
+
+    // And the NEXT turn, with nothing in flight, claims it: divider written, marker advanced.
+    await turn(981);
+    const after = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(after.lastConversationId).toBe(981);
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const messages = ((
+      cp?.channel_values as { messages?: BaseMessage[] } | undefined
+    )?.messages ?? []) as BaseMessage[];
+    // Two: the first conversation's turn and its reply. The turn that ran while the boundary was
+    // deferred carries conversation 981 on its own message, so it stays in the OPEN attendance — the
+    // cut reads the stamp, not the divider.
+    expect(
+      selectClosedPrefix(messages, { currentAttendanceClosed: false }).closed,
+    ).toHaveLength(2);
+    // And no divider was appended: it could only land AFTER the exchange that already happened on
+    // this conversation, telling the model that part of the conversation it is in the middle of is a
+    // past attendance. A hint in the wrong place is worse than no hint.
+    expect(messages.some(isConversationDivider)).toBe(false);
   });
 
   test("inbox without an Agent → no-agent (silent)", async () => {
@@ -544,6 +767,278 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       if (!resolvedLogged) await new Promise((r) => setTimeout(r, 100));
     }
     expect(resolvedLogged).toBe(true);
+  });
+
+  test("handoff customerMessage is terminal when the mirror status event lags", async () => {
+    await seedConversation(996, null);
+    const CLOSING = "Vou te encaminhar para o time.";
+    const FINAL = "Vou te encaminhar para o time!";
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 996 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(FINAL, CLOSING) as unknown as BaseChatModel,
+        // Deliberately do NOT mirror toggleStatus: this is the production lag that allowed the final
+        // reply through after the tool had already sent customerMessage.
+        makeClient: makeResolveClient(calls),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 996, CLOSING],
+      ["toggleStatus", 996, "open"],
+    ]);
+  });
+
+  // The closing line going out is not the same event as the transfer happening. sendPrivateNote and
+  // toggleStatus are NOT best-effort inside the tool, so either can throw after the customer has
+  // already been told a human is coming. The conversation then stays `pending` — still the bot's,
+  // never queued to anyone — and the model gets the tool error plus one more step. That recovery
+  // reply is the only thing between the customer and a promise nobody is going to keep.
+  test("a handoff whose transfer throws still delivers the model's recovery reply", async () => {
+    await seedConversation(997, null);
+    const CLOSING = "Um humano já te atende.";
+    const RECOVERY =
+      "Desculpe, não consegui transferir. Vou seguir te ajudando.";
+    const calls: Array<[string, number, string]> = [];
+    const client = {
+      sendMessage: async (c: number, t: string) => {
+        calls.push(["sendMessage", c, t]);
+        return {};
+      },
+      toggleStatus: async (c: number, s: string) => {
+        calls.push(["toggleStatus", c, s]);
+        throw new Error("chatwoot 502");
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 997 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            RECOVERY,
+            CLOSING,
+          ) as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 997, CLOSING],
+      ["toggleStatus", 997, "open"],
+      ["sendMessage", 997, RECOVERY],
+    ]);
+    // Still the bot's: nothing was handed anywhere, which is why the reply above had to go out.
+    const row = await suDb.conversation.findFirst({
+      where: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 997,
+      },
+      select: { status: true },
+    });
+    expect(row?.status).toBe("pending");
+  });
+
+  // A photo the model queued earlier in the same turn is not a second copy of the closing line, and
+  // the tool already told the model it was on its way.
+  test("a handoff still delivers an image queued earlier in the same turn", async () => {
+    await allowImageHost();
+    await seedConversation(998, null);
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 998 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: makeImageClient(calls),
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 998, "Segue a foto. Vou te passar para um humano."],
+      ["toggleStatus", 998, "open"],
+      ["sendFileAttachment", 998, "imagem.png"],
+    ]);
+  });
+
+  // The deferred resolve falls with the TRANSFER, not with the suppression of the final text. The
+  // two come apart exactly when the closing line fails to send: the customer never heard it, so the
+  // model's reply still has to go out, but the conversation is already a human's and resolving it
+  // would close an open request out from under them.
+  test("a handoff never lets the deferred resolve close the conversation", async () => {
+    await seedConversation(9977, null);
+    const calls: Array<[string, number, string]> = [];
+    let sends = 0;
+    const client = {
+      sendMessage: async (c: number, t: string) => {
+        // Only the tool's closing line fails; the fallback reply below must still be deliverable.
+        if (sends++ === 0) {
+          calls.push(["sendMessage-THREW", c, t]);
+          throw new Error("chatwoot 500");
+        }
+        calls.push(["sendMessage", c, t]);
+        return {};
+      },
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    class ResolveThenHandoffModel {
+      async invoke() {
+        return new AIMessage("Já resolvo para você.");
+      }
+      bindTools(_t: unknown) {
+        let n = 0;
+        return {
+          async invoke() {
+            n++;
+            if (n === 1)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  { name: "resolve_conversation", args: {}, id: "c1" },
+                ],
+              });
+            if (n === 2)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "handoff_to_human",
+                    args: { customerMessage: "Um humano já te atende." },
+                    id: "c2",
+                  },
+                ],
+              });
+            return new AIMessage("Já resolvo para você.");
+          },
+        };
+      }
+    }
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9977 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new ResolveThenHandoffModel() as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    // The only toggleStatus is the handoff's `open`. A "resolved" here would be the deferred intent
+    // closing a conversation the human queue had just been handed.
+    expect(calls).toEqual([
+      ["sendMessage-THREW", 9977, "Um humano já te atende."],
+      ["toggleStatus", 9977, "open"],
+      ["sendMessage", 9977, "Já resolvo para você."],
+    ]);
+  });
+
+  // The bound on the case above, pinned so it is a decision and not a surprise: once the mirror
+  // reflects the status the tool set, the takeover gate ends the turn and the queued image does not
+  // go out. The gate cannot tell our own transition from a human grabbing the conversation in the
+  // same window, and it fails closed for the one that matters.
+  test("a handoff stops at the takeover gate once the mirror reflects it", async () => {
+    await allowImageHost();
+    await seedConversation(9988, null);
+    const calls: Array<[string, number, string]> = [];
+    const base = makeImageClient(calls);
+    const client = await base();
+    const mirrored = {
+      ...client,
+      // The webhook lands DURING generation: by the recheck the row is no longer bot-owned.
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        await suDb.conversation.updateMany({
+          where: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: c,
+          },
+          data: { status },
+        });
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9988 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: async () => mirrored,
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("taken-over");
+    expect(calls).toEqual([
+      ["sendMessage", 9988, "Segue a foto. Vou te passar para um humano."],
+      ["toggleStatus", 9988, "open"],
+    ]);
+  });
+
+  // An image-only turn that delivers nothing throws, because the images WERE the turn and a silent
+  // failure would let the deferred resolve close a conversation nobody answered. After a handoff
+  // that rule does not hold: the closing line answered the customer and a human owns the thread, so
+  // a failed attachment must not also brand the turn as errored (private note, lastError, alert).
+  test("a failed image does not error the turn when a handoff already answered", async () => {
+    await allowImageHost();
+    await seedConversation(9989, null);
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9989 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: makeImageClient(calls, { attachmentFails: true }),
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("posted");
   });
 
   test("taken over mid-turn discards the resolve intent", async () => {
@@ -1114,6 +1609,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   // real-model steering of `generationPrompt` is a separate live check.
   describe("guardrails 'generated' action", () => {
     const GUARD_MODEL = "guard-sentinel";
+
     const G_BOT = 91;
     const G_INBOX = 71;
     let gTenantId = 0n;
@@ -1209,9 +1705,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       (verdictJson: string) =>
       (cfg: ResolvedModelConfig): BaseChatModel =>
         cfg.model === GUARD_MODEL
-          ? ({
-              invoke: async () => ({ content: verdictJson }),
-            } as unknown as BaseChatModel)
+          ? guardrailModel(async () => ({ content: verdictJson }))
           : new FakeListChatModel({ responses: [REPLY] });
 
     const guardStub =
@@ -1312,9 +1806,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         deps: {
           makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
             cfg.model === GUARD_MODEL
-              ? ({
-                  invoke: async () => ({ content: verdict }),
-                } as unknown as BaseChatModel)
+              ? guardrailModel(async () => ({ content: verdict }))
               : (new SendImageThenReplyModel(
                   REPLY,
                   IMG_URL,
@@ -1370,9 +1862,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         deps: {
           makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
             cfg.model === GUARD_MODEL
-              ? ({
-                  invoke: async () => ({ content: verdict }),
-                } as unknown as BaseChatModel)
+              ? guardrailModel(async () => ({ content: verdict }))
               : (new SendImageOnlyModel(
                   IMG_URL,
                   "legenda proibida",
@@ -1387,7 +1877,17 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(sent).toEqual([]);
     });
 
-    test("input 'generated' → delivers the suggestedReply and skips the agent graph", async () => {
+    // On the INPUT direction there is no assistant reply to rewrite — the analyzed text is the
+    // CUSTOMER's own message — so `generated` has nothing to repair and the model composes from an
+    // empty desk: no agent prompt, no knowledge base, no account data (`runGuardrail` passes
+    // systemPrompt and customerMessage as undefined for input). Measured live, 32 runs per case:
+    // against gpt-5.4-mini it wrote in the CUSTOMER's voice 18/32 (the bot posting the customer's
+    // own complaint back at them) and named an operator-banned competitor 14/32. Worse on
+    // gpt-4o-mini, where the customer's message could DICTATE the reply: one instructing the
+    // reviewer to state a price and a partnership produced exactly that, verbatim, 16/16.
+    // So the replacement is dropped and the configured template goes out, exactly as
+    // answer_relevance already does for the same reason (issues #95, #99).
+    test("input 'generated' → sends the template, never a composed reply", async () => {
       await setGuardrails({
         enabled: true,
         provider: "openai",
@@ -1428,10 +1928,19 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
       });
       expect(outcome).toBe("posted");
-      // The generated suggestedReply is delivered — NOT the template, NOT the agent's own REPLY.
-      expect(sent).toEqual([[940, "GEN-IN-REPLY"]]);
-      // The operator is notified via a private note so a replaced reply is never invisible.
+      // The template goes out. The model DID write a replacement (the fake verdict carries one) and
+      // it is discarded — that is the whole rule, and asserting only "not GEN-IN-REPLY" would pass
+      // for a turn that posted nothing at all.
+      expect(sent).toEqual([[940, "TEMPLATE-IN"]]);
+      // Still skips the agent graph: the customer never gets the agent's own REPLY either.
+      expect(sent.some(([, text]) => text === REPLY)).toBe(false);
+      // The operator is notified via a private note so a replaced reply is never invisible, and the
+      // note names what the guardrail DID. Reporting the configured "generated" on a line where the
+      // template went out is the config read back, not the event, and it is what an operator
+      // debugging "why did my customer get this text" reads first.
       expect(notes.length).toBe(1);
+      expect(notes[0]?.[1]).toContain("— template.");
+      expect(notes[0]?.[1]).not.toContain("generated");
     });
 
     test("issue #49: an input-guardrail reply claims the trigger too (superseded → nothing posted)", async () => {
@@ -1595,6 +2104,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // suggestedReply was null → the runtime falls back to the configured templateMessage.
       expect(sent).toEqual([[942, "TEMPLATE-OUT"]]);
       expect(notes.length).toBe(1);
+      // Same rule on this direction, and this case is older than the input one: a `generated` action
+      // that produced nothing sent the template while the note claimed "generated".
+      expect(notes[0]?.[1]).toContain("— template.");
     });
 
     test("output 'silent' discards the resolve intent (no toggle, no reply)", async () => {
@@ -1632,9 +2144,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         cfg: ResolvedModelConfig,
       ): BaseChatModel =>
         cfg.model === GUARD_MODEL
-          ? ({
-              invoke: async () => ({ content: verdict }),
-            } as unknown as BaseChatModel)
+          ? guardrailModel(async () => ({ content: verdict }))
           : (new ResolveThenReplyModel(
               "Fechado, obrigado!",
             ) as unknown as BaseChatModel);
@@ -1695,14 +2205,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       const providerLike = (cfg: ResolvedModelConfig): BaseChatModel =>
         cfg.model === "gpt-4o-mini"
           ? new FakeListChatModel({ responses: [REPLY] })
-          : ({
-              invoke: async () => {
-                if (!cfg.model.trim()) {
-                  throw new Error("400 invalid value for 'model': ''");
-                }
-                return { content: verdict };
-              },
-            } as unknown as BaseChatModel);
+          : guardrailModel(async () => {
+              if (!cfg.model.trim()) {
+                throw new Error("400 invalid value for 'model': ''");
+              }
+              return { content: verdict };
+            });
       const outcome = await runAgentTurn({
         tenantId: gTenantId,
         instanceId: gInstanceId,
@@ -1721,9 +2229,99 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
 
     // Fail-open stays fail-open: a guardrail that cannot run must never cost the customer the reply.
     // But it also must not be indistinguishable from a guardrail that ran and approved, or an
+    // Which shape the call takes is decided from the guardrail's PROVIDER, and this is the only
+    // place that decision becomes an actual request. Asserting it on the table alone would leave
+    // the wiring untested, which is how a provider ends up correctly classified and still asked the
+    // wrong way — the classification is one call away from the runtime, and nothing else reads it.
+    describe("the provider decides how the verdict is asked for", () => {
+      const shapes = [
+        // Constrained, in the dialect this endpoint speaks.
+        { provider: "openai", conversationId: 953, expected: "json-schema" },
+        { provider: "google", conversationId: 955, expected: "openapi" },
+        // Off it: json_schema is refused by this API, so the call has to stay the one that works.
+        { provider: "deepseek", conversationId: 954, expected: "prose" },
+      ] as const;
+
+      for (const { provider, conversationId, expected } of shapes) {
+        test(`${provider} is asked in the ${expected} shape`, async () => {
+          await setGuardrails({
+            enabled: true,
+            provider,
+            model: GUARD_MODEL,
+            credentialRef: gVaultRef,
+            input: { enabled: false },
+            output: {
+              enabled: true,
+              action: "template",
+              checks: {
+                toxicity: true,
+                unsafeContent: false,
+                competitorMentions: false,
+                promptAdherence: false,
+              },
+              templateMessage: "TEMPLATE-SHAPE",
+            },
+          });
+          await seedConv(conversationId);
+          const sent: Array<[number, string]> = [];
+          const notes: Array<[number, string]> = [];
+          const shapesSeen: string[] = [];
+          const clean = JSON.stringify({
+            violated: false,
+            categories: [],
+            rationale: "",
+            suggestedReply: null,
+          });
+          const recordingGuard = (cfg: ResolvedModelConfig): BaseChatModel =>
+            cfg.model === GUARD_MODEL
+              ? ({
+                  invoke: async () => {
+                    shapesSeen.push("prose");
+                    return { content: clean };
+                  },
+                  // The dialect is visible in the schema it is handed, which is the whole point:
+                  // asking Gemini in OpenAI's dialect is refused on every screen.
+                  withStructuredOutput: (schema: {
+                    properties: Record<string, { nullable?: unknown }>;
+                  }) => ({
+                    invoke: async () => {
+                      shapesSeen.push(
+                        schema.properties.suggestedReply?.nullable === true
+                          ? "openapi"
+                          : "json-schema",
+                      );
+                      return {
+                        raw: { content: clean },
+                        parsed: JSON.parse(clean),
+                      };
+                    },
+                  }),
+                } as unknown as BaseChatModel)
+              : new FakeListChatModel({ responses: [REPLY] });
+          const outcome = await runAgentTurn({
+            tenantId: gTenantId,
+            instanceId: gInstanceId,
+            agentBotId: G_BOT,
+            event: incoming({ conversationId, inboxId: G_INBOX }),
+            base: appDb,
+            deps: {
+              makeModel: recordingGuard,
+              makeClient: guardStub(sent, notes),
+              checkpointer: new MemorySaver(),
+            },
+          });
+          expect(outcome).toBe("posted");
+          // The verdict was clean either way, so the customer reads the agent, not the template.
+          // Without this the assertion above would also pass on a guardrail that never ran.
+          expect(sent).toEqual([[conversationId, REPLY]]);
+          expect(shapesSeen).toEqual([expected]);
+        });
+      }
+    });
+
     // operator whose credential expired reads "no violations" forever. Same argument that put
     // `retriedEmptyResponse` in the trail on #63.
-    test("a guardrail that cannot run leaves a line in the turn trail", async () => {
+    test("a guardrail that cannot run is reported on the screen that enabled it", async () => {
       await setGuardrails({
         enabled: true,
         provider: "openai",
@@ -1747,11 +2345,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       const notes: Array<[number, string]> = [];
       const unreachable = (cfg: ResolvedModelConfig): BaseChatModel =>
         cfg.model === GUARD_MODEL
-          ? ({
-              invoke: async () => {
-                throw new Error("401 incorrect api key provided");
-              },
-            } as unknown as BaseChatModel)
+          ? guardrailModel(async () => {
+              throw new Error("401 incorrect api key provided");
+            })
           : new FakeListChatModel({ responses: [REPLY] });
       const outcome = await runAgentTurn({
         tenantId: gTenantId,
@@ -1769,21 +2365,50 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // The customer still gets answered: moderation failing is not the customer's problem.
       expect(sent).toEqual([[952, REPLY]]);
 
+      // ...and the console says so where the feature was turned on. The chain under test is the
+      // whole one: the vendor refuses the call, the turn records a guardrail failure, the health
+      // read counts it, and the editor's configuration-warning panel raises a line for it. Ending
+      // at the log row instead would assert a proxy: that row already existed and the operator
+      // still had no way to learn the screen was dead from the screen that switched it on.
       // emitFlowEvent is fire-and-forget, so poll briefly.
-      let failureLogged = false;
-      for (let i = 0; i < 30 && !failureLogged; i++) {
-        const rows = await suDb.executionLog.findMany({
-          where: { tenantId: gTenantId, stage: "guardrail", level: "warn" },
-          select: { detail: true },
-        });
-        failureLogged = rows.some(
-          (r) =>
-            (r.detail as Record<string, unknown> | null)?.outcome ===
-            "analysis_failed",
-        );
-        if (!failureLogged) await new Promise((r) => setTimeout(r, 100));
+      const ctx: TenantContext = {
+        tenantId: gTenantId,
+        userId: null,
+        role: "TENANT_ADMIN",
+      };
+      const since = new Date(Date.now() - 3_600_000);
+      let health = { failures: 0, lastAt: null as string | null };
+      for (let i = 0; i < 30 && health.failures === 0; i++) {
+        health = await readGuardrailHealth(ctx, gAgentId, since, appDb);
+        if (health.failures === 0) await new Promise((r) => setTimeout(r, 100));
       }
-      expect(failureLogged).toBe(true);
+      expect(health.failures).toBeGreaterThan(0);
+      expect(
+        computeConfigIssues({
+          agentEnabled: true,
+          modelProvider: "openai",
+          modelCredentialRef: "vault:1",
+          savedModelProvider: "openai",
+          sttEnabled: false,
+          sttCredentialRef: "",
+          ttsMode: "never",
+          ttsCredentialRef: "",
+          visionEnabled: false,
+          visionCredentialRef: "",
+          guardrailsEnabled: true,
+          guardrailsCredentialRef: "vault:1",
+          guardrailsFailures: health.failures,
+          guardrailsLastFailureAt: health.lastAt,
+        }),
+      ).toEqual([
+        {
+          key: "guardrailsFailing",
+          tab: "guardrails",
+          sectionId: "gr-model",
+          failures: health.failures,
+          lastFailureAt: health.lastAt as string,
+        },
+      ]);
     });
     // answer_relevance is the only check that needs the customer's own message: without it the
     // reviewer can judge tone, scope and persona, but not whether the reply answered the question.
@@ -1797,16 +2422,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ): ((cfg: ResolvedModelConfig) => BaseChatModel) =>
       (cfg: ResolvedModelConfig): BaseChatModel =>
         cfg.model === GUARD_MODEL
-          ? ({
-              invoke: async (msgs: { content: unknown }[]) => {
-                // Every message, not just the system prompt: the customer's words ride at user
-                // level now, and the point of these tests is WHAT the reviewer received.
-                captured.push(
-                  msgs.map((m) => String(m.content)).join("\n---\n"),
-                );
-                return { content: verdictJson };
-              },
-            } as unknown as BaseChatModel)
+          ? guardrailModel(async (msgs) => {
+              // Every message, not just the system prompt: the customer's words ride at user
+              // level now, and the point of these tests is WHAT the reviewer received.
+              captured.push(msgs.map((m) => String(m.content)).join("\n---\n"));
+              return { content: verdictJson };
+            })
           : new FakeListChatModel({ responses: [REPLY] });
 
     const RELEVANCE_CHECKS = {
@@ -2101,30 +2722,28 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       const captured: string[] = [];
       const nameSpotter = (cfg: ResolvedModelConfig): BaseChatModel =>
         cfg.model === GUARD_MODEL
-          ? ({
-              invoke: async (msgs: { content: unknown }[]) => {
-                const system = String(msgs[0]?.content ?? "");
-                // Everything under review, without the policy text that names the list itself.
-                const material = msgs
-                  .slice(1)
-                  .map((m) => String(m.content))
-                  .join("\n");
-                captured.push(
-                  `${system.includes("competitor_mention") ? "POLICY" : "no-policy"}::${material}`,
-                );
-                const flags =
-                  system.includes("competitor_mention") &&
-                  material.includes("Zenvia");
-                return {
-                  content: JSON.stringify({
-                    violated: flags,
-                    categories: flags ? ["competitor_mention"] : [],
-                    rationale: flags ? "named a competitor" : "",
-                    suggestedReply: null,
-                  }),
-                };
-              },
-            } as unknown as BaseChatModel)
+          ? guardrailModel(async (msgs) => {
+              const system = String(msgs[0]?.content ?? "");
+              // Everything under review, without the policy text that names the list itself.
+              const material = msgs
+                .slice(1)
+                .map((m) => String(m.content))
+                .join("\n");
+              captured.push(
+                `${system.includes("competitor_mention") ? "POLICY" : "no-policy"}::${material}`,
+              );
+              const flags =
+                system.includes("competitor_mention") &&
+                material.includes("Zenvia");
+              return {
+                content: JSON.stringify({
+                  violated: flags,
+                  categories: flags ? ["competitor_mention"] : [],
+                  rationale: flags ? "named a competitor" : "",
+                  suggestedReply: null,
+                }),
+              };
+            })
           : new FakeListChatModel({ responses: [REPLY] });
       const outcome = await runAgentTurn({
         tenantId: gTenantId,
@@ -2187,23 +2806,21 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // that also names the banned competitor.
       const fabricator = (cfg: ResolvedModelConfig): BaseChatModel =>
         cfg.model === GUARD_MODEL
-          ? ({
-              invoke: async (msgs: { content: unknown }[]) => {
-                const relevance = String(msgs[0]?.content ?? "").includes(
-                  "<customer_message>",
-                );
-                return {
-                  content: JSON.stringify({
-                    violated: relevance,
-                    categories: relevance ? ["answer_relevance"] : [],
-                    rationale: relevance ? "does not answer" : "",
-                    suggestedReply: relevance
-                      ? "Sim, trabalhamos com a Zenvia."
-                      : null,
-                  }),
-                };
-              },
-            } as unknown as BaseChatModel)
+          ? guardrailModel(async (msgs) => {
+              const relevance = String(msgs[0]?.content ?? "").includes(
+                "<customer_message>",
+              );
+              return {
+                content: JSON.stringify({
+                  violated: relevance,
+                  categories: relevance ? ["answer_relevance"] : [],
+                  rationale: relevance ? "does not answer" : "",
+                  suggestedReply: relevance
+                    ? "Sim, trabalhamos com a Zenvia."
+                    : null,
+                }),
+              };
+            })
           : new FakeListChatModel({ responses: [REPLY] });
       const outcome = await runAgentTurn({
         tenantId: gTenantId,

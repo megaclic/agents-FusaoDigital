@@ -1,0 +1,20 @@
+# Normalize line endings to LF for all text files, regardless of the checkout platform's
+# core.autocrlf. Without this, a Windows checkout (core.autocrlf=true, the Git-for-Windows
+# default) converts every file to CRLF on disk while biome.jsonc's formatter.lineEnding is "lf",
+# so a repo-wide `bun run lint` (the pre-commit hook's first step) fails on every file the
+# working tree hasn't been through `biome format` on since the last checkout — hundreds of files
+# with no content change of their own. This declares the repository's own norm (LF), independent
+# of any one clone's local git config, which this project never modifies programmatically.
+* text=auto eol=lf
+
+# Genuinely binary — never touched by line-ending normalization.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary

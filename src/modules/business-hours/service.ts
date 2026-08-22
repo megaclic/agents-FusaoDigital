@@ -1,12 +1,20 @@
 import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
+import { parseDbId } from "@/lib/db-id";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
   isOpenAt,
-  isWindowOrdered,
+  isRangeOrdered,
+  isRealDate,
+  parseExceptions,
+  parseSchedule,
   parseWindows,
+  type Schedule,
+  type ScheduleException,
+  scheduleCanClose,
+  scheduleExceptionSchema,
   type WindowSpec,
   windowSpecSchema,
 } from "./hours";
@@ -20,6 +28,7 @@ export interface BusinessHoursDto {
   name: string;
   timezone: string;
   windows: WindowSpec[];
+  exceptions: ScheduleException[];
   source: string;
   createdAt: Date;
   updatedAt: Date;
@@ -30,6 +39,7 @@ const SELECT = {
   name: true,
   timezone: true,
   windows: true,
+  exceptions: true,
   source: true,
   createdAt: true,
   updatedAt: true,
@@ -40,6 +50,7 @@ function toDto(r: {
   name: string;
   timezone: string;
   windows: unknown;
+  exceptions: unknown;
   source: string;
   createdAt: Date;
   updatedAt: Date;
@@ -49,6 +60,7 @@ function toDto(r: {
     name: r.name,
     timezone: r.timezone,
     windows: parseWindows(r.windows),
+    exceptions: parseExceptions(r.exceptions),
     source: r.source,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
@@ -73,7 +85,7 @@ function assertValidTimezone(tz: string): void {
 // as a no-op. The editor prevents this client-side; this guards the REST/MCP paths.
 function assertValidWindows(windows: WindowSpec[]): void {
   for (const w of windows) {
-    if (!isWindowOrdered(w)) {
+    if (!isRangeOrdered(w)) {
       throw new AppError(
         `invalid window for day ${w.day}: end (${w.end}) must be after start (${w.start})`,
         400,
@@ -83,11 +95,44 @@ function assertValidWindows(windows: WindowSpec[]): void {
   }
 }
 
+// Same contract for the exception ranges, plus the two things a regex cannot decide: that the date is
+// a day that exists (2026-02-30 parses and would roll over into March), and that a dated span does
+// not run backwards. A RECURRING span may: its end month-day precedes its start when it wraps the
+// year end, which is how a Dec 23 → Jan 2 shutdown is written.
+function assertValidExceptions(exceptions: ScheduleException[]): void {
+  for (const e of exceptions) {
+    if (!isRealDate(e.date) || (e.dateEnd && !isRealDate(e.dateEnd))) {
+      throw new AppError(
+        `invalid exception date: ${e.dateEnd ? `${e.date}..${e.dateEnd}` : e.date} is not a calendar date`,
+        400,
+        "errors.invalidBusinessHoursException",
+      );
+    }
+    if (e.dateEnd && !e.recurring && e.dateEnd < e.date) {
+      throw new AppError(
+        `invalid exception span: end (${e.dateEnd}) is before start (${e.date})`,
+        400,
+        "errors.invalidBusinessHoursException",
+      );
+    }
+    for (const r of e.ranges) {
+      if (!isRangeOrdered(r)) {
+        throw new AppError(
+          `invalid range on ${e.date}: end (${r.end}) must be after start (${r.start})`,
+          400,
+          "errors.invalidBusinessHoursException",
+        );
+      }
+    }
+  }
+}
+
 export const businessHoursCreateSchema = z
   .object({
     name: z.string().min(1).max(200),
     timezone: z.string().min(1).max(64).optional(),
     windows: z.array(windowSpecSchema).max(200).optional(),
+    exceptions: z.array(scheduleExceptionSchema).max(400).optional(),
   })
   .strict();
 export type BusinessHoursCreate = z.infer<typeof businessHoursCreateSchema>;
@@ -124,6 +169,26 @@ export async function getBusinessHours(
   return toDto(row);
 }
 
+// The whole schedule behind an id that arrives as a STRING from an integration config, for the
+// availability paths. Null (⇒ "always on" at the caller) for a non-numeric, deleted, or other-tenant
+// id: the read is scoped, so RLS is what fences the last case. Separate from getBusinessHours, which
+// is the API projection and throws for a missing row.
+export async function readSchedule(
+  ctx: TenantContext,
+  id: string,
+  base: PrismaClient = basePrisma,
+): Promise<Schedule | null> {
+  const parsed = parseDbId(id);
+  if (parsed === null) return null;
+  const row = await runScopedOn(base, ctx, (db) =>
+    db.businessHours.findUnique({
+      where: { id: parsed },
+      select: { windows: true, exceptions: true, timezone: true },
+    }),
+  );
+  return row ? parseSchedule(row) : null;
+}
+
 export async function createBusinessHours(
   ctx: TenantContext,
   input: BusinessHoursCreate,
@@ -134,6 +199,7 @@ export async function createBusinessHours(
   const data = businessHoursCreateSchema.parse(input);
   if (data.timezone) assertValidTimezone(data.timezone);
   if (data.windows) assertValidWindows(data.windows);
+  if (data.exceptions) assertValidExceptions(data.exceptions);
   return runScopedOn(base, ctx, async (db) => {
     const row = await db.businessHours.create({
       data: {
@@ -141,6 +207,7 @@ export async function createBusinessHours(
         name: data.name,
         ...(data.timezone ? { timezone: data.timezone } : {}),
         windows: (data.windows ?? []) as Prisma.InputJsonValue,
+        exceptions: (data.exceptions ?? []) as Prisma.InputJsonValue,
         source: "LOCAL",
       },
       select: SELECT,
@@ -158,6 +225,7 @@ export async function updateBusinessHours(
   const data = businessHoursUpdateSchema.parse(patch);
   if (data.timezone) assertValidTimezone(data.timezone);
   if (data.windows) assertValidWindows(data.windows);
+  if (data.exceptions) assertValidExceptions(data.exceptions);
   return runScopedOn(base, ctx, async (db) => {
     const current = await db.businessHours.findUnique({
       where: { id },
@@ -176,6 +244,9 @@ export async function updateBusinessHours(
         ...(data.timezone !== undefined ? { timezone: data.timezone } : {}),
         ...(data.windows !== undefined
           ? { windows: data.windows as Prisma.InputJsonValue }
+          : {}),
+        ...(data.exceptions !== undefined
+          ? { exceptions: data.exceptions as Prisma.InputJsonValue }
           : {}),
       },
     });
@@ -214,16 +285,19 @@ export async function deleteBusinessHours(
 // schedule / empty windows → always on (never silenced). Pure so it is unit-testable. Channel-
 // agnostic by design — shared verbatim by both src/modules/chatwoot/webhook.ts and
 // src/modules/zpro/* rather than duplicated, since the two channel integrations never import from
-// each other directly (see docs/zpro.md's module map).
+// each other directly (see docs/zpro.md's module map). The CUSTOMER-facing away message (#153,
+// src/modules/availability/away.ts's awayMessageDue/renderAwayMessage) is a separate decision on its
+// own watermark, wired only on the Chatwoot side today — this gate's "silence" is the only half Z-PRO
+// currently has.
 export function outOfHoursGate(
-  hours: { windows: WindowSpec[]; timezone: string } | null,
+  hours: Schedule | null,
   now: Date,
   noticeAlreadySent: boolean,
 ): { silence: boolean; postNote: boolean } {
-  if (!hours || hours.windows.length === 0) {
+  if (!scheduleCanClose(hours)) {
     return { silence: false, postNote: false };
   }
-  if (isOpenAt(hours.windows, hours.timezone, now)) {
+  if (isOpenAt(hours, now)) {
     return { silence: false, postNote: false };
   }
   return { silence: true, postNote: !noticeAlreadySent };

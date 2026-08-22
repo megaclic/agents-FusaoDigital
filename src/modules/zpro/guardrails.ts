@@ -5,6 +5,7 @@
 // place of Chatwoot's client.sendPrivateNote.
 
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { verdictAskMode } from "@/graph/model-config";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import { analyzeGuardrail } from "@/modules/guardrails/analyze";
 import type { GuardrailsConfig } from "@/modules/guardrails/settings";
@@ -25,21 +26,33 @@ export function makeZproGuardrailRunner(params: {
   flow: FlowContext;
   client: ZproClient;
   ticketId: number;
+  // The customer's own raw inbound text for THIS turn — passed through as `customerMessage` on the
+  // output-direction call so a "generate a safe replacement" verdict rewrites the ASSISTANT's reply,
+  // never the customer's own message (mirrors src/graph/runtime.ts's own call).
+  customerText: string;
 }): RunGuardrail {
-  const { gr, model, systemPrompt, flow, client, ticketId } = params;
+  const { gr, model, systemPrompt, flow, client, ticketId, customerText } =
+    params;
   return async (direction, text) => {
     const dir = gr[direction];
     if (!model || !dir.enabled) return null;
-    const verdict = await analyzeGuardrail(model, {
-      direction,
-      text,
-      checks: dir.checks,
-      competitors: gr.competitors,
-      customPolicy: gr.customPolicy,
-      systemPrompt: direction === "output" ? systemPrompt : undefined,
-      generationPrompt:
-        dir.action === "generated" ? dir.generationPrompt : undefined,
-    });
+    const verdict = await analyzeGuardrail(
+      model,
+      {
+        direction,
+        text,
+        checks: dir.checks,
+        competitors: gr.competitors,
+        customPolicy: gr.customPolicy,
+        systemPrompt: direction === "output" ? systemPrompt : undefined,
+        customerMessage: direction === "output" ? customerText : undefined,
+        generationPrompt:
+          dir.action === "generated" ? dir.generationPrompt : undefined,
+      },
+      // Constrained where the endpoint implements it, in the dialect it speaks — same rule as
+      // src/graph/runtime.ts's own call (issue #131).
+      verdictAskMode(gr.provider),
+    );
     if (!verdict.violated) return null;
     emitFlowEvent(flow, {
       stage: "guardrail",

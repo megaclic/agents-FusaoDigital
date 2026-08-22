@@ -58,91 +58,91 @@ export function TenantSwitcher() {
 
   return (
     <DropdownMenuPrimitive.Root>
-        <DropdownMenuPrimitive.Trigger asChild>
-          <button
-            type="button"
-            aria-label={t("tenant.switcher", "Switch tenant")}
-            className="group inline-flex max-w-50 items-center gap-2 rounded-lg border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary"
-          >
-            <Building2 className="h-4 w-4 shrink-0" aria-hidden="true" />
-            <span className="hidden truncate sm:inline">{activeName}</span>
-            <ChevronDown
-              aria-hidden="true"
-              className="h-4 w-4 shrink-0 transition-transform group-data-[state=open]:rotate-180"
-            />
-          </button>
-        </DropdownMenuPrimitive.Trigger>
+      <DropdownMenuPrimitive.Trigger asChild>
+        <button
+          type="button"
+          aria-label={t("tenant.switcher", "Switch tenant")}
+          className="group inline-flex max-w-50 items-center gap-2 rounded-lg border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary"
+        >
+          <Building2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+          <span className="hidden truncate sm:inline">{activeName}</span>
+          <ChevronDown
+            aria-hidden="true"
+            className="h-4 w-4 shrink-0 transition-transform group-data-[state=open]:rotate-180"
+          />
+        </button>
+      </DropdownMenuPrimitive.Trigger>
 
-        <DropdownMenuPrimitive.Portal>
-          <DropdownMenuPrimitive.Content
-            align="start"
-            sideOffset={6}
-            className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 z-(--z-dropdown) max-h-80 min-w-56 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in"
-          >
-            <DropdownMenuPrimitive.Label className="px-2 py-1 font-medium text-text-muted text-xs uppercase">
-              {t("tenant.label", "Tenant")}
-            </DropdownMenuPrimitive.Label>
-            {tenants.length === 0 ? (
-              <p className="px-2 py-1.5 text-sm text-text-muted">
-                {t("tenant.none", "No tenants yet.")}
-              </p>
-            ) : (
-              <DropdownMenuPrimitive.RadioGroup
-                value={active}
-                onValueChange={(value) => {
-                  // Re-selecting the active tenant is a no-op (avoid a needless full reload).
-                  if (value === active) return;
-                  // Switching reloads the whole app, so any unsaved page edits are
-                  // lost — gate it behind the discard confirm and only persist +
-                  // reload once approved. Persisting before the (cancelable) native
-                  // prompt would otherwise leave the new tenant set while the UI
-                  // stays put, surfacing the switch only on the next refresh.
-                  confirmLeave(() => {
-                    suppressUnloadPrompt();
-                    setActiveTenantId(value);
-                    // On a detail route the id belongs to the old tenant and won't exist in the new one,
-                    // so reloading in place would 404. Land on the list root instead. assign() is still
-                    // a full reload, so the TOCTOU-safe single-source-of-truth invariant holds.
-                    const target = tenantSwitchTarget(window.location.pathname);
-                    if (target) window.location.assign(target);
-                    else window.location.reload();
-                  });
-                }}
-              >
-                {tenants.map((tn) => {
-                  const selected = tn.id === active;
-                  return (
-                    <DropdownMenuPrimitive.RadioItem
-                      key={tn.id}
-                      value={tn.id}
-                      className={cn(itemCls, { "bg-bg-tertiary": selected })}
-                    >
-                      <span className="flex-1 truncate">{tn.name}</span>
-                      {selected && (
-                        <Check
-                          className="ml-auto h-3.5 w-3.5 shrink-0"
-                          aria-hidden="true"
-                        />
-                      )}
-                    </DropdownMenuPrimitive.RadioItem>
-                  );
-                })}
-              </DropdownMenuPrimitive.RadioGroup>
-            )}
-            <DropdownMenuPrimitive.Separator className="my-1 h-px bg-border" />
-            <DropdownMenuPrimitive.Item
-              className={cn(itemCls, "text-text-secondary")}
-              onSelect={() =>
-                confirmLeave(() => navigate("/admin/tenants?create=1"))
-              }
+      <DropdownMenuPrimitive.Portal>
+        <DropdownMenuPrimitive.Content
+          align="start"
+          sideOffset={6}
+          className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 z-(--z-dropdown) max-h-80 min-w-56 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in"
+        >
+          <DropdownMenuPrimitive.Label className="px-2 py-1 font-medium text-text-muted text-xs uppercase">
+            {t("tenant.label", "Tenant")}
+          </DropdownMenuPrimitive.Label>
+          {tenants.length === 0 ? (
+            <p className="px-2 py-1.5 text-sm text-text-muted">
+              {t("tenant.none", "No tenants yet.")}
+            </p>
+          ) : (
+            <DropdownMenuPrimitive.RadioGroup
+              value={active}
+              onValueChange={(value) => {
+                // Re-selecting the active tenant is a no-op (avoid a needless full reload).
+                if (value === active) return;
+                // Switching reloads the whole app, so any unsaved page edits are
+                // lost — gate it behind the discard confirm and only persist +
+                // reload once approved. Persisting before the (cancelable) native
+                // prompt would otherwise leave the new tenant set while the UI
+                // stays put, surfacing the switch only on the next refresh.
+                confirmLeave(() => {
+                  suppressUnloadPrompt();
+                  setActiveTenantId(value);
+                  // On a detail route the id belongs to the old tenant and won't exist in the new one,
+                  // so reloading in place would 404. Land on the list root instead. assign() is still
+                  // a full reload, so the TOCTOU-safe single-source-of-truth invariant holds.
+                  const target = tenantSwitchTarget(window.location.pathname);
+                  if (target) window.location.assign(target);
+                  else window.location.reload();
+                });
+              }}
             >
-              <Plus className="h-4 w-4 shrink-0" aria-hidden="true" />
-              <span className="flex-1 truncate">
-                {t("tenant.create", "Create tenant")}
-              </span>
-            </DropdownMenuPrimitive.Item>
-          </DropdownMenuPrimitive.Content>
-        </DropdownMenuPrimitive.Portal>
+              {tenants.map((tn) => {
+                const selected = tn.id === active;
+                return (
+                  <DropdownMenuPrimitive.RadioItem
+                    key={tn.id}
+                    value={tn.id}
+                    className={cn(itemCls, { "bg-bg-tertiary": selected })}
+                  >
+                    <span className="flex-1 truncate">{tn.name}</span>
+                    {selected && (
+                      <Check
+                        className="ml-auto h-3.5 w-3.5 shrink-0"
+                        aria-hidden="true"
+                      />
+                    )}
+                  </DropdownMenuPrimitive.RadioItem>
+                );
+              })}
+            </DropdownMenuPrimitive.RadioGroup>
+          )}
+          <DropdownMenuPrimitive.Separator className="my-1 h-px bg-border" />
+          <DropdownMenuPrimitive.Item
+            className={cn(itemCls, "text-text-secondary")}
+            onSelect={() =>
+              confirmLeave(() => navigate("/admin/tenants?create=1"))
+            }
+          >
+            <Plus className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="flex-1 truncate">
+              {t("tenant.create", "Create tenant")}
+            </span>
+          </DropdownMenuPrimitive.Item>
+        </DropdownMenuPrimitive.Content>
+      </DropdownMenuPrimitive.Portal>
     </DropdownMenuPrimitive.Root>
   );
 }

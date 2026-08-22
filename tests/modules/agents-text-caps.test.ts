@@ -69,6 +69,22 @@ describe("the settings text walker", () => {
     );
   });
 
+  // The input direction never writes a replacement, so its generation guidance reaches no prompt and
+  // the editor no longer offers the field. Capping it anyway would refuse a write over text nothing
+  // reads AND raise a console warning routed to `gr-input`, a section with no field to fix it in —
+  // an unclearable warning whose "Go to" lands nowhere. Same rule the walker already applies to tool
+  // names it does not recognize.
+  test("the input direction's generation guidance is not capped, because nothing reads it", () => {
+    expect(
+      paths({
+        guardrails: {
+          input: { generationPrompt: over(GENERATION_PROMPT_MAX) },
+          output: { generationPrompt: over(GENERATION_PROMPT_MAX) },
+        },
+      }),
+    ).toEqual(["guardrails.output.generationPrompt"]);
+  });
+
   test("a value exactly at the cap is not oversized", () => {
     expect(
       paths({

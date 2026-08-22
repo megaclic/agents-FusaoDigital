@@ -35,7 +35,10 @@ import {
 import { ServiceLogo } from "@/client/components/icons/ServiceLogo";
 import { api } from "@/client/lib/api";
 import { credentialCompat } from "@/client/lib/credentialCompat";
-import { toolpackToolMeta } from "@/client/lib/toolpackTools";
+import {
+  toolpackToolMeta,
+  withToolpackArgNotes,
+} from "@/client/lib/toolpackTools";
 
 type CatalogData = Awaited<
   ReturnType<typeof api.api.v1.integrations.catalog.get>
@@ -74,12 +77,14 @@ function toScheduleOption(h: {
   id: string;
   name: string;
   windows?: unknown;
+  exceptions?: unknown;
   timezone: string;
 }): ScheduleOption {
   return {
     id: String(h.id),
     name: h.name,
     windows: (h.windows ?? []) as ScheduleOption["windows"],
+    exceptions: (h.exceptions ?? []) as ScheduleOption["exceptions"],
     timezone: h.timezone,
   };
 }
@@ -1703,7 +1708,9 @@ export function IntegrationEditModal({
                           {meta.description}
                         </p>
                         {tool.args.length > 0 && (
-                          <ToolArgPills args={tool.args} />
+                          <ToolArgPills
+                            args={withToolpackArgNotes(tool.name, tool.args, t)}
+                          />
                         )}
                       </div>
                     );

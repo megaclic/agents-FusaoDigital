@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import {
+  claimDueCompactionJobs,
   claimDueJobs,
   completeJob,
   enqueueJob,
@@ -43,6 +44,17 @@ async function statusOf(id: bigint) {
     select: { status: true, attempts: true },
   });
   return row;
+}
+
+// The claim token the row currently carries. The tests in this file assert STATUS transitions, so
+// they want whatever token is live at that moment; the token's own semantics — what a STALE one must
+// refuse — are asserted in tests/modules/scheduler-claim-token.test.ts.
+async function seqOf(id: bigint): Promise<number> {
+  const row = await suDb.schedulerJob.findUniqueOrThrow({
+    where: { id },
+    select: { claimSeq: true },
+  });
+  return row.claimSeq;
 }
 
 describe.skipIf(!dbUp)("scheduler", () => {
@@ -132,6 +144,80 @@ describe.skipIf(!dbUp)("scheduler", () => {
     expect(b.payload).toEqual({ threadId: "1:2:3" });
   });
 
+  // THE LANE SPLIT. The scheduler tick awaits its claimed jobs one at a time, so a kind that takes
+  // seconds per job holds up everything behind it. Two kinds are drained by their own workers for
+  // opposite reasons — DEBOUNCE because it must be fast, MEMORY_COMPACT because it is slow and fires
+  // for every agent on every closed attendance — and neither may be picked up here, or the split
+  // buys nothing.
+  test("the shared lane claims neither debounce nor compaction jobs", async () => {
+    const shared = await enqueueJob({
+      tenantId,
+      kind: "WEBHOOK_RETRY",
+      dedupeKey: "dk-lane-shared",
+      runAt: past(),
+      base: appDb,
+    });
+    const debounce = await enqueueJob({
+      tenantId,
+      kind: "DEBOUNCE",
+      dedupeKey: "dk-lane-debounce",
+      runAt: past(),
+      base: appDb,
+    });
+    const compaction = await enqueueJob({
+      tenantId,
+      kind: "MEMORY_COMPACT",
+      dedupeKey: "dk-lane-compaction",
+      runAt: past(),
+      base: appDb,
+    });
+
+    const claimed = await claimDueJobs(50, appDb, new Date(), tenantId);
+    const ids = claimed.map((j) => j.id);
+    expect(ids).toContain(shared);
+    expect(ids).not.toContain(debounce);
+    expect(ids).not.toContain(compaction);
+    // Still PENDING, waiting for their own lane — not skipped, not lost.
+    expect((await statusOf(compaction)).status).toBe("PENDING");
+
+    // And the compaction lane claims that one, and only that one.
+    const mine = await claimDueCompactionJobs(50, appDb, new Date(), tenantId);
+    const mineIds = mine.map((j) => j.id);
+    expect(mineIds).toEqual([compaction]);
+  });
+
+  // The exclusion has to happen in the CLAIM, not after it: a row left PENDING is protected by the
+  // very CAS that would otherwise let a handler still running complete a newer arm (both are guarded
+  // on id + CLAIMED).
+  test("an excluded id is left PENDING, not claimed", async () => {
+    const busy = await enqueueJob({
+      tenantId,
+      kind: "MEMORY_COMPACT",
+      dedupeKey: "dk-lane-busy",
+      runAt: past(),
+      base: appDb,
+    });
+    const free = await enqueueJob({
+      tenantId,
+      kind: "MEMORY_COMPACT",
+      dedupeKey: "dk-lane-free",
+      runAt: past(),
+      base: appDb,
+    });
+
+    const claimed = await claimDueCompactionJobs(
+      50,
+      appDb,
+      new Date(),
+      tenantId,
+      [busy],
+    );
+    const ids = claimed.map((j) => j.id);
+    expect(ids).toContain(free);
+    expect(ids).not.toContain(busy);
+    expect((await statusOf(busy)).status).toBe("PENDING");
+  });
+
   test("claim → complete", async () => {
     const id = await enqueueJob({
       tenantId,
@@ -144,7 +230,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
     const mine = claimed.find((j) => j.id === id);
     expect(mine).toBeDefined();
     expect((await statusOf(id)).status).toBe("CLAIMED");
-    await completeJob(tenantId, id, appDb);
+    await completeJob(tenantId, id, await seqOf(id), appDb);
     expect((await statusOf(id)).status).toBe("DONE");
   });
 
@@ -160,6 +246,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
     await rescheduleJob(
       tenantId,
       id,
+      await seqOf(id),
       new Date(Date.now() + 3_600_000),
       undefined,
       appDb,
@@ -183,6 +270,7 @@ describe.skipIf(!dbUp)("scheduler", () => {
     await rescheduleJob(
       tenantId,
       id,
+      await seqOf(id),
       past(),
       { threadId: "1:2:3", stepIndex: 1 },
       appDb,
@@ -196,7 +284,14 @@ describe.skipIf(!dbUp)("scheduler", () => {
 
     // Omitting the payload on a later reschedule keeps the current one.
     await claimDueJobs(10, appDb, new Date(), tenantId);
-    await rescheduleJob(tenantId, id, past(), undefined, appDb);
+    await rescheduleJob(
+      tenantId,
+      id,
+      await seqOf(id),
+      past(),
+      undefined,
+      appDb,
+    );
     const row2 = await suDb.schedulerJob.findUniqueOrThrow({
       where: { id },
       select: { payload: true },
@@ -213,14 +308,14 @@ describe.skipIf(!dbUp)("scheduler", () => {
       base: appDb,
     });
     await claimDueJobs(10, appDb, new Date(), tenantId);
-    await failJob(tenantId, id, 0, "boom", appDb);
+    await failJob(tenantId, id, await seqOf(id), 0, "boom", appDb);
     expect((await statusOf(id)).status).toBe("PENDING"); // retry
     // simulate near the cap
     await suDb.schedulerJob.update({
       where: { id },
       data: { attempts: 4, status: "CLAIMED" },
     });
-    await failJob(tenantId, id, 4, "boom again", appDb);
+    await failJob(tenantId, id, await seqOf(id), 4, "boom again", appDb);
     expect((await statusOf(id)).status).toBe("DEAD");
   });
 

@@ -24,6 +24,7 @@ import {
   type McpConnectionUpdate,
   updateMcpConnection,
 } from "@/modules/mcp-connections/service";
+import { unsupportedBodyShape } from "@/modules/tool-definitions/body-shape";
 import { normalizeToolShapes } from "@/modules/tool-definitions/normalize";
 import {
   createToolDefinition,
@@ -451,7 +452,6 @@ export interface ToolWriteArgs {
   body?: Record<string, unknown>;
   credential_ref?: string | null;
   enabled?: boolean;
-  risk_tier?: "low" | "medium" | "high";
   expected_statuses?: number[];
   ack_enabled?: boolean;
   ack_message?: string | null;
@@ -474,9 +474,16 @@ async function buildToolPatch(
   if (args.input_schema !== undefined) patch.inputSchema = args.input_schema;
   if (args.output_schema !== undefined) patch.outputSchema = args.output_schema;
   if (args.query !== undefined) patch.query = args.query;
-  if (args.body !== undefined) patch.body = args.body;
+  if (args.body !== undefined) {
+    // NOTE: refused here and not only in the service, for the same reason the expected_statuses
+    // line below gives: a dry run never calls the service, so a body the apply would reject was
+    // previewed back intact and with no warning — which is how the shape reached production in the
+    // first place (issue #150).
+    const badBody = unsupportedBodyShape(args.body);
+    if (badBody) return { fail: err(badBody) };
+    patch.body = args.body;
+  }
   if (args.enabled !== undefined) patch.enabled = args.enabled;
-  if (args.risk_tier !== undefined) patch.riskTier = args.risk_tier;
   // Normalized HERE and not only in the service: this patch is also what a dry run shows as the
   // preview, and a preview that echoes the raw argument promises a shape the apply would not write.
   if (args.expected_statuses !== undefined)

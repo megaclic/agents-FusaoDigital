@@ -517,10 +517,11 @@ const FOREIGN_EVENT =
 
 // NOTE: zod-optional but never optional in practice, for the tools that ACT on one calendar: the arg
 // is only ever EXPOSED when the integration allows several (calendarArgSchema), and then one of them
-// must be named or pickCalendarId refuses. The trailing sentence is for the operator reading the arg
-// list in the console, which is per-catalog and therefore always shows this field.
+// must be named or pickCalendarId refuses. What the model reads here is only what it needs to fill
+// the argument; the console's own explanation of WHY the arg can be absent is operator text and
+// lives in the frontend, translated, at `toolpackArgNote` (issue #118).
 const CALENDAR_ID_DESC =
-  "Which calendar to act on: name or id of one of the calendars in `<allowed_calendars>`. This arg only appears when the integration allows several calendars; with a single one it is used automatically.";
+  "Which calendar to act on: name or id of one of the calendars in `<allowed_calendars>`.";
 
 // NOTE: Availability is the ONE tool where omitting this is not a mistake but the default, and the
 // arg description is where that has to be said. The tool description already says so, but the model
@@ -632,30 +633,13 @@ const CONFIRM_APPOINTMENT_SCHEMA = z.object({
 });
 
 const GCAL_TOOL_SPECS: ToolSpec[] = [
-  { name: "calendar_list_events", risk: "low", schema: LIST_EVENTS_SCHEMA },
-  {
-    name: "calendar_check_availability",
-    risk: "low",
-    schema: CHECK_AVAILABILITY_SCHEMA,
-  },
-  {
-    name: "calendar_create_event",
-    risk: "medium",
-    schema: CREATE_EVENT_SCHEMA,
-  },
-  {
-    name: "calendar_update_event",
-    risk: "medium",
-    schema: UPDATE_EVENT_SCHEMA,
-  },
-  {
-    name: "calendar_cancel_event",
-    risk: "medium",
-    schema: CANCEL_EVENT_SCHEMA,
-  },
+  { name: "calendar_list_events", schema: LIST_EVENTS_SCHEMA },
+  { name: "calendar_check_availability", schema: CHECK_AVAILABILITY_SCHEMA },
+  { name: "calendar_create_event", schema: CREATE_EVENT_SCHEMA },
+  { name: "calendar_update_event", schema: UPDATE_EVENT_SCHEMA },
+  { name: "calendar_cancel_event", schema: CANCEL_EVENT_SCHEMA },
   {
     name: "calendar_confirm_appointment",
-    risk: "medium",
     schema: CONFIRM_APPOINTMENT_SCHEMA,
   },
 ];
@@ -951,8 +935,12 @@ function buildCheckAvailabilityTool(
         timeMin: input.timeMin,
         timeMax: input.timeMax,
         now: new Date(),
-        scheduleWindows: schedule?.windows ?? [],
-        scheduleTz: schedule?.timezone ?? timeZone,
+        // No schedule ⇒ always on, and the integration's display timezone renders the labels.
+        schedule: schedule ?? {
+          windows: [],
+          exceptions: [],
+          timezone: timeZone,
+        },
         // NOTE: Each source's busy list is assembled HERE: its own bookings plus every blocking calendar
         // except itself.
         sources: sources.map((src) => ({

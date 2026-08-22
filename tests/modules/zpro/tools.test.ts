@@ -13,7 +13,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
-import { resolveBusinessHoursById } from "@/graph/prepare";
+import { readSchedule } from "@/modules/business-hours/service";
 import type { ZproClient } from "@/modules/zpro/client";
 import { __resetZproCrmCaches } from "@/modules/zpro/crm";
 import { loadZproAgentTools } from "@/modules/zpro/tools";
@@ -176,13 +176,17 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
       },
     });
 
-    const resolved = await resolveBusinessHoursById(
-      appDb,
-      tenantId,
+    // readSchedule (not the narrower resolveBusinessHoursById) is what Z-PRO's tools.ts wires now,
+    // matching Chatwoot's own resolveBusinessHours closure — the whole schedule, including date
+    // exceptions, not just the weekly grid.
+    const resolved = await readSchedule(
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
       String(bh.id),
+      appDb,
     );
     expect(resolved).toEqual({
       windows: [{ day: 1, start: "09:00", end: "18:00" }],
+      exceptions: [],
       timezone: "America/Sao_Paulo",
     });
 
@@ -200,7 +204,11 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
       },
     });
     expect(
-      await resolveBusinessHoursById(appDb, tenantId, String(otherBh.id)),
+      await readSchedule(
+        { tenantId, userId: null, role: "TENANT_ADMIN" },
+        String(otherBh.id),
+        appDb,
+      ),
     ).toBeNull();
 
     await suDb.$executeRawUnsafe(

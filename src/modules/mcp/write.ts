@@ -13,7 +13,6 @@ import {
 import basePrisma from "@/api/lib/prisma";
 import { updateTenant } from "@/api/v1/tenants.admin.service";
 import { getTenant } from "@/api/v1/tenants.service";
-import config from "@/config";
 import { AppError } from "@/lib/errors";
 import {
   asSuperAdminOn,
@@ -42,6 +41,7 @@ import {
   tryResolveVaultSecret,
   vaultNameByRef,
 } from "@/modules/vault/service";
+import { vaultCreateUrl, vaultFillUrl } from "./console-links";
 import { hasScope, type VerifiedToken } from "./oauth/tokens";
 
 // MCP write tools — the privileged half of the MCP surface, gated by the hardened-spec guardrails:
@@ -179,13 +179,8 @@ export async function recordMcpAudit(
 // ── secret-by-reference helpers (the binding rule: no raw secret ever crosses the model) ──
 //
 // MCP tools speak vault entry NAMES; nothing accepts a raw secret value as an argument nor returns
-// one. consoleUrl builds an out-of-band link the operator follows in the browser when a credential
-// must be created or a generated secret revealed.
-
-export function consoleUrl(path: string): string {
-  const baseUrl = config.publicUrl.replace(/\/+$/, "");
-  return `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
-}
+// one. `console-links.ts` builds the out-of-band link the operator follows in the browser when a
+// credential must be created or a generated secret revealed.
 
 // Resolution outcome for a credential argument: either a stable `vault:<id>` ref to store, or a
 // WriteResult to short-circuit the tool with (an explicit error, or a graceful "create it first"
@@ -217,7 +212,7 @@ export async function resolveSecretRef(
       fail: ok({
         needsCredential: true,
         message: `No vault entry named "${nameOrRef}". Create it in the console (the secret value is never passed through this tool), then retry.`,
-        createAt: consoleUrl("/vault"),
+        createAt: vaultCreateUrl(ctx.tenantId),
       }),
     };
   }
@@ -322,7 +317,7 @@ export async function credentialCreate(
       name: args.name,
       kind,
       status: "pending",
-      fillAt: consoleUrl(`/resources/vault?fill=${id}`),
+      fillAt: vaultFillUrl(ctx.tenantId, id),
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
@@ -502,6 +497,8 @@ export async function agentSettingsSet(
   if (args.limits !== undefined) patch.limits = args.limits;
   if (args.observability !== undefined)
     patch.observability = args.observability;
+  if (args.availability !== undefined) patch.availability = args.availability;
+  if (args.memory !== undefined) patch.memory = args.memory;
   if (args.channelRedirect !== undefined)
     patch.channelRedirect = args.channelRedirect;
   if (args.attributeContext !== undefined)
@@ -510,7 +507,7 @@ export async function agentSettingsSet(
   if (args.zproCrm !== undefined) patch.zproCrm = args.zproCrm;
   if (Object.keys(patch).length === 0) {
     return err(
-      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, channelRedirect, attributeContext, sendImage, zproCrm, observability and/or grounding)",
+      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, availability, channelRedirect, attributeContext, sendImage, zproCrm, observability, memory and/or grounding)",
     );
   }
 

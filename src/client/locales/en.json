@@ -392,8 +392,10 @@
       "badgeN": "Follow-up {{step}}/{{total}}",
       "cadenceFirst": "after {{delay}} of silence",
       "cadenceNext": "{{delay}} after the previous",
+      "closedToday": "Closed today ({{label}})",
       "deferredHint": "The step's delay landed outside the send schedule, so it was pushed to the next available time.",
       "done": "Follow-up sequence complete",
+      "exceptionToday": "Today only: {{hours}} ({{label}})",
       "imminent": "any moment now",
       "imminentHint": "The estimated time has passed; it runs on a background worker, so the follow-up will be sent at any moment.",
       "pausedAppointment": "Follow-up paused · appointment booked",
@@ -605,7 +607,11 @@
     "attrInstructionsHint": "Optional. Explains which attribute to set on the conversation, the contact, or the kanban card, and when. The AI already sees the defined attributes; this adds your rules. Appended to the tool description.",
     "attrInstructionsPlaceholder": "e.g. Save the qualified budget on the contact as \"orcamento\"; set \"lead_stage\" on the card.",
     "availability": "Availability",
-    "availabilityHint": "When the agent is active and answering. Outside these hours it stays silent and notifies the operator with a private note.",
+    "availabilityHint": "When the agent is active and answering. Outside these hours it stays silent, notifies the operator with a private note, and, if you turn it on below, tells the customer too.",
+    "awayEnabled": "Reply to the customer while closed",
+    "awayMessage": "Out-of-hours message",
+    "awayMessageHint": "Sent to the customer while the agent is outside these hours, at most once a day per conversation. Write {next_open} (or {proximo_atendimento} for a Portuguese message) where the next opening should appear: the customer reads something like \"Monday, 08/25, 09:00\".",
+    "awayMessagePlaceholder": "We are closed right now. We will be back {next_open}.",
     "back": "Back to agents",
     "backToConversation": "Back to the conversation",
     "baseURL": "Base URL",
@@ -726,7 +732,11 @@
       "ttsNormalize": "The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.",
       "vision": "Image/document reading is on but has no API key set."
     },
+    "configIssueGuardrailsFailing": "Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. Check the model, the endpoint and the key.",
+    "configIssueGuardrailsFailingCause": "Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. The last one said: {{error}}",
     "configIssueKnowledge": "Knowledge base \"{{name}}\" has documents that need indexing.",
+    "configIssueOutOfHoursBoth": "Chatwoot already replies out of hours on {{inboxes}}, and this agent's out-of-hours message is on as well, so the customer gets both. The two schedules are set in different products and Chatwoot's has no dates in it, so on a holiday they will disagree too.",
+    "configIssueOutOfHoursChatwoot": "Chatwoot replies out of hours on {{inboxes}}, and this agent does not read that schedule: it answers whenever its own says it is open. The customer can be told the business is closed and served in the same breath.",
     "configIssuePending": {
       "embedding": "A knowledge base needs indexing, but the embedding credential is not filled in yet.",
       "guardrails": "The guardrails credential is referenced but not filled in yet, so messages go out unscreened.",
@@ -858,7 +868,8 @@
       "policy": "Policy",
       "policyDesc": "Competitor list and extra instructions used by the checks.",
       "template": "Template message",
-      "templateFallbackHint": "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite."
+      "templateFallbackHint": "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
+      "templateInboundHint": "On the customer's message this is ALWAYS what gets sent. There is nothing to rewrite here, because the text under review is the customer's own message, so the guardrails agent is never asked to compose a reply. When it was, the customer could dictate that reply: a message telling it to state a price and a partnership produced exactly that, word for word, in every one of 16 runs."
     },
     "handoffAgentChoice": "Let the AI choose",
     "handoffAgentChoiceHint": "The AI automatically sees your Chatwoot agents and teams and picks one when handing off. Optionally steer it from the instructions (e.g. send billing questions to Finance).",
@@ -896,6 +907,7 @@
       "hoursNotFound": "Business hours \"{{name}}\" were not found here, so they were left unset.",
       "hoursReused": "Business hours \"{{name}}\" already existed and were reused; check the schedule is right.",
       "httpGrantNotFound": "Tool \"{{name}}\" was not found, so its grant was skipped.",
+      "httpToolBodyIgnored": "Tool \"{{name}}\" had a request body in a shape this version does not accept, so it was reduced to the part that was actually being sent. The request is unchanged; open it under Body to check it.",
       "httpToolCredNotFound": "Tool \"{{tool}}\" credential \"{{credential}}\" was not found here, so it was left unset.",
       "httpToolReused": "Tool \"{{name}}\" already existed and was reused; check it is right.",
       "integrationGrantNotFound": "Integration \"{{name}}\" was not found, so its grant was skipped.",
@@ -932,8 +944,14 @@
     "labelInstructionsPlaceholder": "e.g. Add \"vip\" to the contact for premium customers; tag the conversation \"urgent\" when the customer is upset.",
     "limits": "Execution limits",
     "limitsHint": "Cap how much work the agent does in a single turn before it must answer.",
+    "limitsMaxHistoryTokens": "History ceiling",
+    "limitsMaxHistoryTokensHint": "The agent remembers every conversation it has had with this contact on this channel, and sends all of it on every turn, so a returning customer gets slower and more expensive the more they talk. This caps how much of that memory travels: older attendances stop being sent once the cap is reached, and the conversation being answered is never dropped. The count is an estimate and runs low on tool-heavy threads, and the instructions and tool definitions are not counted at all, so set it below the budget you actually have. Empty = no ceiling. 2,000-1,000,000.",
     "limitsMaxToolCalls": "Max tool calls / turn",
     "limitsMaxToolCallsHint": "After this many tool uses the agent is forced to reply with what it has (no error). 1-50.",
+    "limitsNoCeiling": "No ceiling",
+    "memory": "Memory",
+    "memoryCompaction": "Summarize attendances that have ended",
+    "memoryHint": "The agent remembers every conversation it has had with this contact on this channel. When an attendance ends, its messages are replaced by a summary of it, so the memory becomes \"N summarized attendances + the current one\". What survives a summary is the useful part: who the contact is, what was agreed, what was left open. Exact wording does not, so turn this off if the agent must be able to quote an old conversation word for word. The summary is written by the agent's own model, after the reply is sent, so no customer waits for it. It runs once for every attendance that ends, including the ones your team handled without the agent.",
     "mode": "Mode",
     "modeHint": "A test agent stays silent in a conversation until the customer sends /teste; production answers normally.",
     "model": "Model",
@@ -1124,6 +1142,8 @@
   },
   "hours": {
     "add": "New schedule",
+    "addException": "Add date",
+    "addExceptionRange": "Add hours",
     "addTitle": "New schedule",
     "addWindow": "Add window",
     "alwaysOpen": "No windows = always open.",
@@ -1137,12 +1157,23 @@
     "emptyDesc": "Define when your agents are available to respond.",
     "emptyTitle": "No schedules yet",
     "end": "End",
+    "exceptionClosed": "Closed all day",
+    "exceptionDate": "Date",
+    "exceptionDateEnd": "Last date",
+    "exceptionLabel": "Name",
+    "exceptionRecurring": "Every year",
+    "exceptions": "Holidays and closures",
+    "exceptionsHint": "A date listed here replaces the weekly windows above. With no hours it is closed all day.",
+    "exceptionUntil": "through",
+    "invalidException": "Check the date and that every end is after its start.",
+    "invalidExceptionsSave": "Fix the highlighted exceptions before saving.",
     "invalidWindow": "End must be after start.",
     "invalidWindowsSave": "Fix the highlighted windows before saving.",
     "mirror": "Mirrored",
     "name": "Name",
     "noTimezoneResults": "No timezones match your search.",
     "noWindows": "No windows",
+    "removeException": "Remove date",
     "removeWindow": "Remove window",
     "saved": "Business hours saved.",
     "saveError": "Could not save (check the timezone).",
@@ -1819,6 +1850,8 @@
     "tenantAdmin": "Tenant admin"
   },
   "schedule": {
+    "exceptionCount_one": "{{count}} exception",
+    "exceptionCount_other": "{{count}} exceptions",
     "noWindows": "No windows"
   },
   "schedulePicker": {
@@ -1872,6 +1905,9 @@
     "createError": "Could not create the tenant",
     "createSuccess": "Tenant created successfully",
     "createTitle": "Create new tenant",
+    "deepLinkUnavailable": "This link points at a tenant you cannot open. Nothing was switched.",
+    "deepLinkUnverified": "Could not check this link",
+    "deepLinkUnverifiedHelp": "This link opens a different tenant, and the list of tenants you can open could not be read. Nothing was switched.",
     "demo": "Demo",
     "label": "Tenant",
     "name": "Name",
@@ -1897,6 +1933,9 @@
     "light": "Light"
   },
   "toolpackTools": {
+    "argNote": {
+      "calendarId": "The agent only receives this argument when the integration allows several calendars; with a single one it is used automatically."
+    },
     "asaas_create_pix_charge": {
       "desc": "Open a PIX charge and return the copy-and-paste code plus the payment page.",
       "label": "PIX charge"
@@ -2078,6 +2117,7 @@
       "secretKey": "Secret key"
     },
     "fill": "Fill",
+    "fillLinkNotHere": "That credential is not in the tenant you have open. Switch tenant and follow the link again.",
     "fillTitle": "Fill pending credential",
     "getKeyLink": "Get yours at {{service}}",
     "getKeyPrompt": "Need an API key?",

@@ -100,6 +100,39 @@ export class ResolveThenReplyModel {
   }
 }
 
+// Calls handoff_to_human with a customer-facing closing line, then also returns a final reply.
+// Reproduces the double-send when the handoff's mirror event lands after generation.
+export class HandoffThenReplyModel {
+  constructor(
+    private reply: string,
+    private customerMessage: string,
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage(this.reply);
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        return n === 1
+          ? new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: "handoff_to_human",
+                  args: { customerMessage: self.customerMessage },
+                  id: "call_handoff",
+                },
+              ],
+            })
+          : new AIMessage(self.reply);
+      },
+    };
+  }
+}
+
 // Calls send_image once (a product photo the agent already has the URL for), then answers with text.
 // Mirrors ResolveThenReplyModel: the point is the ORDER of what reaches Chatwoot, not the content.
 export class SendImageThenReplyModel {
@@ -129,6 +162,52 @@ export class SendImageThenReplyModel {
               ],
             })
           : new AIMessage(self.reply);
+      },
+    };
+  }
+}
+
+// Queues an image and only then hands off. The image is not a duplicate of the handoff's closing
+// line, so it still belongs to the customer: this is the shape that tells a suppressed duplicate
+// apart from a dropped attachment.
+export class SendImageThenHandoffModel {
+  constructor(
+    private url: string,
+    private customerMessage: string,
+    private caption?: string,
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage("");
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 1)
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "send_image",
+                args: { url: self.url, caption: self.caption },
+                id: "call_send_image",
+              },
+            ],
+          });
+        if (n === 2)
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "handoff_to_human",
+                args: { customerMessage: self.customerMessage },
+                id: "call_handoff",
+              },
+            ],
+          });
+        return new AIMessage("");
       },
     };
   }
@@ -205,3 +284,27 @@ export class SendImageAndResolveModel {
     };
   }
 }
+
+// A guardrail model double that answers BOTH call shapes, because which one goes out is decided by
+// the PROVIDER and not by the test (`acceptsConstrainedOutput`, issue #131). `withStructuredOutput`
+// reuses the same `invoke`, so a double that throws keeps throwing and one that records keeps
+// recording, and a reply that is not json arrives with no parsed answer — the same thing the
+// Anthropic adapter does with a model that answers in text instead of calling the forced tool.
+export const guardrailModel = (
+  invoke: (msgs: { content: unknown }[]) => Promise<{ content: string }>,
+): BaseChatModel =>
+  ({
+    invoke,
+    withStructuredOutput: () => ({
+      invoke: async (msgs: { content: unknown }[]) => {
+        const raw = await invoke(msgs);
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(raw.content);
+        } catch {
+          parsed = null;
+        }
+        return { raw, parsed };
+      },
+    }),
+  }) as unknown as BaseChatModel;

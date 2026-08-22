@@ -20,10 +20,7 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import config from "@/config";
-import {
-  resolveBusinessHoursById,
-  resolveInjectableCredential,
-} from "@/graph/prepare";
+import { resolveInjectableCredential } from "@/graph/prepare";
 import { buildHttpTools, loadToolSelections } from "@/graph/tools/assemble";
 import type { NativeToolName } from "@/graph/tools/catalog";
 import { loadMcpToolsForAgent } from "@/graph/tools/mcp";
@@ -34,6 +31,7 @@ import {
   cancelAppointmentReminders,
   enqueueAppointmentReminders,
 } from "@/modules/appointments/reminders";
+import { readSchedule } from "@/modules/business-hours/service";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { HandoffConfig } from "@/modules/handoff/settings";
@@ -141,8 +139,11 @@ export async function loadZproAgentTools(
 
   const resolveCredential = (ref: string) =>
     resolveInjectableCredential(base, tenantId, ref);
+  // Whole schedule (windows + date exceptions), matching Chatwoot's own resolveBusinessHours closure
+  // in graph/prepare.ts's buildToolset — readSchedule (not the narrower resolveBusinessHoursById) is
+  // what keeps a holiday/shutdown exception honored by the Calendar toolpack on the Z-PRO side too.
   const resolveBusinessHours = (id: string) =>
-    resolveBusinessHoursById(base, tenantId, id);
+    readSchedule(sysCtx(tenantId), id, base);
 
   // Hoisted above toolpackTools (native-tools-only in the original port) so the Calendar toolpack's
   // reminder-enqueue failures can also surface here — see scheduleAppointmentReminders below.
