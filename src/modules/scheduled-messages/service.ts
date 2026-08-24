@@ -14,6 +14,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { type AgentNudge, parseThreadId, runAgentNudge } from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
+import { clipText } from "@/lib/text";
 import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { runZproAgentNudge } from "@/modules/zpro/nudge";
@@ -61,7 +62,7 @@ export async function scheduleMessage(
     runAt,
     payload: {
       threadId: args.threadId,
-      instructions: args.instructions.trim().slice(0, MAX_INSTRUCTIONS_LEN),
+      instructions: clipText(args.instructions.trim(), MAX_INSTRUCTIONS_LEN),
     },
     base: args.base,
   });

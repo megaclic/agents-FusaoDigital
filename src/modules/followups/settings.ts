@@ -1,3 +1,4 @@
+import { clipText } from "@/lib/text";
 // Per-agent follow-up configuration from agent.settings.followUp.
 // Same reader/default/clamp pattern as debounce/stt/tts/split/serviceWindow.
 //
@@ -7,7 +8,6 @@
 // default step (its pre-multi-step config is not read).
 
 import {
-  clipText,
   FOLLOW_UP_INSTRUCTIONS_MAX,
   FOLLOW_UP_MAX_STEPS,
 } from "@/modules/agents/text-caps";
@@ -87,7 +87,15 @@ function clampInt(
   return Math.min(Math.max(Math.round(v), min), max);
 }
 
-const VALID_UNITS = new Set<string>(["minutes", "hours", "days"]);
+// Exported for the MCP argument schema (see modules/agents/settings-schema); the Set below is
+// derived from it so the two can never disagree.
+export const FOLLOW_UP_DELAY_UNITS = [
+  "minutes",
+  "hours",
+  "days",
+] as const satisfies readonly FollowUpDelayUnit[];
+
+const VALID_UNITS = new Set<string>(FOLLOW_UP_DELAY_UNITS);
 
 // Normalize one raw step (clamp delay, trim/bound instructions + label). Returns null only for a
 // non-object input; missing numeric/string fields collapse to defaults.
@@ -113,7 +121,7 @@ function readStep(raw: unknown): FollowUpStep | null {
   const labels: string[] = [];
   for (const l of rawLabels) {
     if (typeof l !== "string") continue;
-    const trimmed = l.trim().slice(0, 100);
+    const trimmed = clipText(l.trim(), 100);
     if (trimmed && !labels.includes(trimmed)) labels.push(trimmed);
   }
   if (labels.length > 0) step.assignLabels = labels;

@@ -1,6 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { isCredentialRequest } from "@/api/middlewares/rateLimit";
-import app from "@/app";
 import {
   assertCredentialBudgetIsTighter,
   assertLimiterBudgetsAreDistinct,
@@ -27,9 +26,16 @@ interface ListeningApp {
 let base = "";
 let server: ListeningApp["server"] | undefined;
 
-beforeAll(() => {
+beforeAll(async () => {
   (globalThis as { Response: typeof Response }).Response = BunResponse;
-  const listening = app.listen(0) as unknown as ListeningApp;
+  // Cache-busted import, not the plain `@/app` singleton: `.listen()` mutates whatever instance it
+  // is called on, and several other test files (tests/api/v1/*) import the plain specifier and call
+  // `.handle()` on it expecting a never-listened app — Bun's `Server.requestIP()` rejects a manually
+  // constructed Request once a real listener has touched the shared instance. A fresh module
+  // evaluation is a fresh, independent Elysia instance to listen on, same real wiring, own copy.
+  const cacheBust: string = "credential-rate-limit-test";
+  const freshApp = (await import(`@/app?${cacheBust}`)).default;
+  const listening = freshApp.listen(0) as unknown as ListeningApp;
   if (!listening.server?.port) throw new Error("Failed to start the app");
   server = listening.server;
   base = `http://localhost:${listening.server.port}`;

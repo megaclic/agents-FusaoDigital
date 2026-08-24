@@ -1,3 +1,4 @@
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { type BaseMessage, RemoveMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
@@ -8,16 +9,23 @@ import {
   getCheckpointer,
 } from "@/graph/checkpointer";
 import { isTurnInFlight } from "@/graph/inflight";
+import { drainPendingIngest } from "@/graph/ingest-drain";
 import { memoryHeadMessage, stampedConversationId } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
-import { createChatModel } from "@/graph/models";
+import type { ModelConfig } from "@/graph/model-config";
+import { resolveModelOverride } from "@/graph/model-override";
+import { createChatModel, type ResolvedModelConfig } from "@/graph/models";
 import { buildCallbacks, loadAgentConfig } from "@/graph/prepare";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { emitFlowEvent } from "@/modules/flowlog/service";
-import { enqueueJob } from "@/modules/scheduler/service";
-import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
+import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  type JobResult,
+  registerDeadLetterHandler,
+  registerJobHandler,
+} from "@/modules/scheduler/worker";
 import {
   MEMORY_HEAD_MAX_ATTENDANCES,
   renderMemoryHead,
@@ -250,6 +258,32 @@ export async function runCompaction(
   }
   const cfg = loaded.cfg;
 
+  // BARRIER (issue #194), and it runs BEFORE the generation fence below for a reason spelled out
+  // there. Compaction is the other reader of this thread, and it is the one that cannot be corrected
+  // afterwards: it replaces the raw turns of a closed attendance with a summary of them, so a message
+  // still sitting in the ingestion queue is a message summarised out of existence — the later turn's
+  // own barrier then appends it AFTER a summary written without it.
+  //
+  // This is also what makes the whole design independent of which workers a deployment runs. The
+  // shared tick and the compaction tick are separately switchable, and a queue whose only drain is a
+  // worker that may be off is a queue that silently stops.
+  //
+  // AND THE ANSWER IS CONSULTED, unlike at the two readers that cannot wait. A drain that ends with
+  // the thread still owing something — a job that deferred for a turn, one that failed, one another
+  // process has claimed — leaves this compaction about to read an incomplete attendance, and the
+  // turn's release would clear the in-flight check below without putting the message back. Nothing
+  // is paid for and nothing is written: the compaction job comes back, exactly as it does for a turn.
+  if ((await drainPendingIngest(tenantId, graphThreadId, base)) !== "drained") {
+    logger.info(
+      "memory: ingestion still owed on thread=%s, deferring compaction",
+      graphThreadId,
+    );
+    return {
+      outcome: "reschedule",
+      runAt: new Date(Date.now() + DEFER_ON_TURN_MS),
+    };
+  }
+
   // GENERATION FENCE, first half. The AgentThread row id is the token that says which generation of
   // this thread the job belongs to (see the second half, at the write below), so a job that starts
   // without one has no token and every later check would wave it through.
@@ -258,10 +292,33 @@ export async function runCompaction(
   // under this same lock. The channel can still come back populated afterwards — an invoke that
   // started earlier saves the state it had loaded, stamps included, and a nudge can write a
   // checkpoint without ever creating a row — and that residue is exactly what would be summarized
-  // here and rendered back into the memory the operator explicitly cleared. Every path that stamps a
-  // message upserts the row, so a thread with something to compact and no row is that residue and
-  // nothing else. Refused before the state read, so it costs neither a generation nor a query.
-  const threadRowId = loaded.threadRowId;
+  // here and rendered back into the memory the operator explicitly cleared.
+  //
+  // THE PREMISE OF THAT MOVED WITH #194, which is why the drain above is not below this. The fence
+  // rests on "every path that stamps a message upserts the row", so a thread with something to
+  // compact and no row is residue and nothing else. Ingestion now stamps from a QUEUED row, so a
+  // brand-new contact inbox whose first attendance was handled entirely by a person can reach a
+  // resolve with messages owed and no thread row yet — read as residue, that attendance is retired
+  // without ever being summarised, and no later event re-arms it. The drain is what tells the two
+  // apart: it creates the row for a thread that has real messages owed, and what is STILL null after
+  // it is residue. Re-read only on that path, so the ordinary compaction pays nothing for it.
+  const threadRowId =
+    loaded.threadRowId ??
+    (
+      await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.agentThread.findUnique({
+          where: {
+            tenantId_chatwootInstanceId_contactInboxId: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              contactInboxId,
+            },
+          },
+          select: { id: true },
+        }),
+      )
+    )?.id ??
+    null;
   if (threadRowId === null) return { outcome: "done" };
 
   // A turn holding this thread will undo the rewrite below, so there is nothing to gain by reading
@@ -408,12 +465,89 @@ export async function runCompaction(
   if (existing) {
     summary = existing.summary;
   } else {
+    // WHICH model writes the memory. Everything the summariser may inherit from the agent comes back
+    // through the resolver BY NAME, and the config below is built from that alone rather than spread
+    // from `cfg.mc`: a spread carries whatever else the agent's config holds — today its
+    // credentialRef, tomorrow any field the schema grows — across a provider switch, which is the
+    // one thing the resolution exists to refuse. The speech rewrite is built the same way.
+    const resolved = resolveModelOverride(
+      cfg.memoryCompactionOverride,
+      {
+        provider: cfg.mc.provider,
+        model: cfg.mc.model,
+        baseURL: cfg.credentialBaseUrl ?? cfg.mc.baseURL,
+      },
+      { ownCredentialBaseURL: cfg.memoryCompactionCredentialBaseUrl },
+    );
+    // FAIL, where the speech rewrite SKIPS. Skipping the rewrite costs one reply its delivery in
+    // speech; skipping the summary would leave the thread raw while reporting success, and the next
+    // run would find the same turns and pay for them again. Failing keeps the thread intact, retries
+    // with backoff, and — because a configuration this refuses will not become runnable by retrying —
+    // reaches DEAD after five attempts with the reason on the line. The next attendance re-arms with
+    // a fresh budget, so a corrected configuration recovers on its own.
+    if (!resolved.runnable) {
+      return {
+        outcome: "fail",
+        error: `memory compaction model not runnable: ${resolved.reason ?? "unknown"}`,
+      };
+    }
+    // Its own credential was configured and did not resolve. Falling back to the AGENT's key would be
+    // a silent substitution on a provider that may not even accept it.
+    if (resolved.credential === "own" && !cfg.memoryCompactionApiKey) {
+      return {
+        outcome: "fail",
+        error: "memory compaction model: credential_not_found",
+      };
+    }
+    // Same VENDOR is not enough to carry the agent's sampling: `reasoningEffort` is an OpenAI-only
+    // setting picked for one model id, and `planOpenAITransport` turns any explicit value into a
+    // /v1/responses call carrying that effort. Handed to a different model on the same account —
+    // the cheap-swap this knob exists for — that is a request the endpoint can refuse, and the
+    // refusal costs every compaction on the agent, not one call.
+    const sameModel =
+      resolved.provider === cfg.mc.provider && resolved.model === cfg.mc.model;
+    const mc: ResolvedModelConfig = {
+      provider: resolved.provider as ModelConfig["provider"],
+      model: resolved.model,
+      apiKey:
+        resolved.credential === "own"
+          ? cfg.memoryCompactionApiKey
+          : resolved.credential === "agent"
+            ? cfg.apiKey
+            : "",
+      baseURL: resolved.baseURL ?? undefined,
+      // Carried from the agent only while the call lands on the SAME model. Not a style choice: with
+      // nothing configured this is the whole of what keeps the summaries identical to the ones this
+      // install was already producing, and the prompt behind them was chosen by an A/B battery (see
+      // ./summarize.ts) measured at whatever the agent was set to. Silently moving the temperature
+      // would invalidate that measurement for every existing install.
+      //
+      // And that reason stops applying the instant the operator names a different model, which is
+      // what makes "same vendor" the wrong test: the measurement being preserved was taken on the
+      // agent's model, and a knob chosen for it is not a setting the new one has to accept.
+      ...(sameModel
+        ? {
+            temperature: cfg.mc.temperature,
+            reasoningEffort: cfg.mc.reasoningEffort,
+          }
+        : {}),
+    };
     const makeModel = deps.makeModel ?? createChatModel;
-    const model = makeModel({
-      ...cfg.mc,
-      apiKey: cfg.apiKey,
-      baseURL: cfg.credentialBaseUrl ?? cfg.mc.baseURL,
-    });
+    // createChatModel REJECTS some configurations synchronously (openai-compatible with no effective
+    // base URL throws), and this config is separately editable, so that throw is reachable without
+    // the agent's own model being broken. Uncaught it would escape as an unhandled job error rather
+    // than a named one.
+    let model: BaseChatModel;
+    try {
+      model = makeModel(mc);
+    } catch (err) {
+      return {
+        outcome: "fail",
+        error: `memory compaction model could not be built: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      };
+    }
     // Outside every lock: this is a provider round-trip, and holding a Postgres advisory lock across
     // the wire would block ingestion on this thread for as long as the model takes.
     // The same usage/trace handlers a turn's generation carries, with its own node label: this call
@@ -431,7 +565,10 @@ export async function runCompaction(
         // usage row and a trace that said something else would put this spend on an attendance that
         // was never summarized here.
         conversationId: segment?.id ?? null,
-        model: cfg.mc.model,
+        // The model that ACTUALLY ran, not the agent's: this row is what the cost break-down reads,
+        // and naming the agent's model here would file the summariser's spend under a model that
+        // never saw the transcript.
+        model: mc.model,
         source: "inbox",
         base,
       }),
@@ -637,9 +774,128 @@ const compactHandler = async (
   return runCompaction(job.tenantId, payload, base);
 };
 
+// THE STATEMENT: this attendance will never be summarised.
+//
+// Every failure inside runCompaction returns before the success line, so until this existed the
+// operator's trail showed every other stage of the turn and no memory line at all — for a model that
+// does not exist on the account, a key not entitled to it, an endpoint that is down, a rate limit.
+// The gap predates the summariser's own model override and the override is what makes it cost: a
+// configuration can now fail ONLY compaction, so replies keep going out normally and the thing that
+// silently stops is what the agent remembers (issue #196).
+//
+// ONLY AT THE DEAD-LETTER, not on the failures before it. A failure is not a statement that the work
+// is lost — the next attempt may succeed, and the four before the cap are usually the same sentence
+// four times inside half a minute (the whole budget burns in ~30s of jittered backoff). DEAD is the
+// one moment the scheduler can say nobody is coming back for it, which is also the moment worth an
+// alert channel's attention. What this trades away is a failure whose CAUSE changed between attempts:
+// the line carries the last error, so four refusals from the provider followed by a lost race at the
+// rewrite report the race.
+//
+// The attempt count is deliberately NOT on the line. It looked like it would say which road ended the
+// job and it does not: both roads end at the cap, and the two disagree about the number while meaning
+// the same thing — `failJob` increments the row and hands the hook the claim it was given, so the
+// fifth failure reports four, while the reaper increments in SQL and returns five. What actually
+// tells the roads apart is the error itself, which the reaper writes as "reaped: the claim never
+// finished" and nothing else does.
+//
+// `error`, not `warn`: the convention elsewhere is that a stage whose failure the caller RECOVERS
+// from is an advisory. Nothing recovers this one. The next attendance re-arms with a fresh budget, so
+// a corrected configuration heals on its own — but the attendance this job was carrying is gone.
+//
+// The trail alone, and no private note in Chatwoot the way a dead debounce flush posts one (issue
+// #71). A turn that never happened is visible to the customer, who is waiting; a memory that was
+// never written is not, and a note about it would land in the conversation of a human agent who can
+// do nothing with it.
+export async function announceDeadCompaction(
+  job: ClaimedJob,
+  error: string,
+  base: PrismaClient,
+): Promise<void> {
+  const payload = parsePayload(job.payload);
+  if (!payload) return;
+  const { instanceId, contactInboxId, conversationId, agentId, reason } =
+    payload;
+  const read = await runScopedOn(base, sysCtx(job.tenantId), async (db) => {
+    // RE-READ rather than trust the dead-letter that got us here. `armCompaction` upserts this very
+    // row — the dedupeKey is the THREAD, reused by every attendance this contact ever has — back to
+    // PENDING with a fresh retry budget, and the raw turns this job failed to cut are still on the
+    // thread, so a re-armed row is an attendance that may yet be summarised. Suppressing loses
+    // nothing: a configuration still broken fails the new arm too, and announces then.
+    //
+    // It NARROWS the window and cannot close it, which is worth stating rather than leaving for
+    // someone to discover. The trail write is fire-and-forget by design (../flowlog/service.ts), so
+    // no job ever waits on it, and a re-arm landing between this read and that insert still gets
+    // announced over. Closing it would mean writing the row inside this transaction — giving up the
+    // redaction and alert dispatch that live in the emit, to defend against an attendance boundary
+    // arriving inside one scheduled callback. The residue is a line the next attendance's success
+    // line follows, which is legible; the alternative was announcing over EVERY re-arm.
+    const row = await db.schedulerJob.findUnique({
+      where: { id: job.id },
+      select: { status: true },
+    });
+    // Any status but DEAD suppresses, and the two that get here are not the same statement. PENDING
+    // is the re-arm above. DONE is what /reset writes (`cancelPendingJob` updates rather than
+    // deletes), so an operator who just cleared this thread is not told its memory went unwritten —
+    // though only if the reset lands inside this hook's own execution, since a DEAD row is not
+    // PENDING and reset leaves it alone. A missing row cannot be reached by this kind at all
+    // (JOB_DELETE_ON_DONE is false for MEMORY_COMPACT, so nothing ever deletes it) and is treated as
+    // live for the same reason the others are: no row is not evidence that work was lost.
+    if (row?.status !== "DEAD") return "live" as const;
+    // Without these the line exists and cannot be FOUND: the Logs page filters by conversation and
+    // inbox database ids, and the operator opening the trail from a conversation is exactly who this
+    // line is for. One indexed read on the mirror row, on a path that runs once per lost attendance.
+    return db.conversation.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_chatwootConversationId: {
+          tenantId: job.tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: conversationId,
+        },
+      },
+      select: { id: true, inboxId: true },
+    });
+  });
+  // Kept apart from "the mirror row is gone", which is a different answer with the same shape: that
+  // one still announces, with null ids, because the attendance really was lost.
+  if (read === "live") return;
+  const conv = read;
+  emitFlowEvent(
+    {
+      tenantId: job.tenantId,
+      turnId: crypto.randomUUID(),
+      source: "inbox",
+      agentId,
+      threadId: contactInboxThreadId(job.tenantId, instanceId, contactInboxId),
+      conversationId: conv?.id ?? null,
+      inboxId: conv?.inboxId ?? null,
+      base,
+    },
+    {
+      stage: "memory",
+      level: "error",
+      status: "error",
+      detail: {
+        // The attendance the job was ARMED for. The success line names the segment it actually cut,
+        // which on an owed rewrite is an older one — but nothing was cut here, so there is no segment
+        // to name and the arming is the only true anchor.
+        attendanceConversationId: conversationId,
+        reason,
+      },
+      // The half an operator acts on: `credential_not_found` and `HTTP 401` are different problems
+      // with different fixes. Everything that reaches here is already a closed vocabulary — the
+      // resolver's own reasons, the scheduler's "reaped: the claim never finished", and what
+      // ./summarize.ts allows a provider failure to say — so this is not where a provider's words
+      // would be filtered out, it is where they must never arrive. emitFlowEvent sanitizes and
+      // bounds it regardless, as defence in depth.
+      errorMessage: error,
+    },
+  );
+}
+
 let registered = false;
 export function registerMemoryHandlers(): void {
   if (registered) return;
   registerJobHandler("MEMORY_COMPACT", compactHandler);
+  registerDeadLetterHandler("MEMORY_COMPACT", announceDeadCompaction);
   registered = true;
 }

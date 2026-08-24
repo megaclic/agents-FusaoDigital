@@ -7395,6 +7395,10 @@
                   "forceAudio": {
                     "description": "Force an audio (TTS) reply for this turn regardless of the saved mode.",
                     "type": "boolean"
+                  },
+                  "guardrails": {
+                    "description": "Run the agent's guardrails over this turn (default true). Off skips the screening model call entirely.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -7466,6 +7470,10 @@
                   "forceAudio": {
                     "description": "Force an audio (TTS) reply for this turn regardless of the saved mode.",
                     "type": "boolean"
+                  },
+                  "guardrails": {
+                    "description": "Run the agent's guardrails over this turn (default true). Off skips the screening model call entirely.",
+                    "type": "boolean"
                   }
                 },
                 "required": [
@@ -7536,6 +7544,10 @@
                   },
                   "forceAudio": {
                     "description": "Force an audio (TTS) reply for this turn regardless of the saved mode.",
+                    "type": "boolean"
+                  },
+                  "guardrails": {
+                    "description": "Run the agent's guardrails over this turn (default true). Off skips the screening model call entirely.",
                     "type": "boolean"
                   }
                 },
@@ -7828,6 +7840,10 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "guardrails": {
+                    "description": "Run the agent's guardrails over the simulated follow-up (default true).",
+                    "type": "boolean"
                   }
                 }
               }
@@ -7891,6 +7907,10 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "guardrails": {
+                    "description": "Run the agent's guardrails over the simulated follow-up (default true).",
+                    "type": "boolean"
                   }
                 }
               }
@@ -7954,6 +7974,10 @@
                         "type": "string"
                       }
                     }
+                  },
+                  "guardrails": {
+                    "description": "Run the agent's guardrails over the simulated follow-up (default true).",
+                    "type": "boolean"
                   }
                 }
               }
@@ -8474,6 +8498,10 @@
                     "description": "Force an audio reply when the string equals \"true\".",
                     "type": "string"
                   },
+                  "guardrails": {
+                    "description": "Skip the guardrail screening when the string equals \"false\" (default: screened).",
+                    "type": "string"
+                  },
                   "transcription": {
                     "description": "JSON-encoded precomputed transcription from step 1; when present, STT is skipped here.",
                     "type": "string"
@@ -8557,6 +8585,10 @@
                     "description": "Force an audio reply when the string equals \"true\".",
                     "type": "string"
                   },
+                  "guardrails": {
+                    "description": "Skip the guardrail screening when the string equals \"false\" (default: screened).",
+                    "type": "string"
+                  },
                   "transcription": {
                     "description": "JSON-encoded precomputed transcription from step 1; when present, STT is skipped here.",
                     "type": "string"
@@ -8638,6 +8670,10 @@
                   },
                   "forceAudio": {
                     "description": "Force an audio reply when the string equals \"true\".",
+                    "type": "string"
+                  },
+                  "guardrails": {
+                    "description": "Skip the guardrail screening when the string equals \"false\" (default: screened).",
                     "type": "string"
                   },
                   "transcription": {
@@ -9166,6 +9202,10 @@
                     "description": "Force an audio reply when the string equals \"true\".",
                     "type": "string"
                   },
+                  "guardrails": {
+                    "description": "Skip the guardrail screening when the string equals \"false\" (default: screened).",
+                    "type": "string"
+                  },
                   "kind": {
                     "description": "Precomputed extraction kind from step 1: \"image\", \"document\", or \"unsupported\". When present with extracted, the vision call is skipped.",
                     "type": "string"
@@ -9253,6 +9293,10 @@
                     "description": "Force an audio reply when the string equals \"true\".",
                     "type": "string"
                   },
+                  "guardrails": {
+                    "description": "Skip the guardrail screening when the string equals \"false\" (default: screened).",
+                    "type": "string"
+                  },
                   "kind": {
                     "description": "Precomputed extraction kind from step 1: \"image\", \"document\", or \"unsupported\". When present with extracted, the vision call is skipped.",
                     "type": "string"
@@ -9338,6 +9382,10 @@
                   },
                   "forceAudio": {
                     "description": "Force an audio reply when the string equals \"true\".",
+                    "type": "string"
+                  },
+                  "guardrails": {
+                    "description": "Skip the guardrail screening when the string equals \"false\" (default: screened).",
                     "type": "string"
                   },
                   "kind": {

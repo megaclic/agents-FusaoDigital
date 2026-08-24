@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Elysia } from "elysia";
 import { clientKeyFor, rateLimitMiddleware } from "@/api/middlewares/rateLimit";
-import app from "@/app";
 import { AppError, ForbiddenError, NotFoundError } from "@/lib/errors";
 
 // What a REJECTED request costs. Separate from rateLimit.test.ts, which is about who a bucket
@@ -24,13 +23,16 @@ interface ListeningApp {
 let base = "";
 let server: ListeningApp["server"] | undefined;
 
-beforeAll(() => {
+beforeAll(async () => {
   (globalThis as { Response: typeof Response }).Response = BunResponse;
   // NOTE: registered on the REAL app, so the hooks it exercises are the ones src/app.ts installed,
   // in the order it installed them. There is no unauthenticated route in the app that throws a
   // 404 to borrow for this, and rebuilding an equivalent app would pin the test's own ordering
-  // instead of the app's. It mutates the exported singleton, which is safe only because this is the
-  // one test file that imports it.
+  // instead of the app's. Cache-busted import (not the plain `@/app` singleton), so the route this
+  // adds and the `.listen()` below land on a private copy: other test files (tests/api/v1/*) import
+  // the plain specifier and call `.handle()` on it expecting a never-listened, never-extended app.
+  const cacheBust: string = "rate-limit-metering-test";
+  const app = (await import(`@/app?${cacheBust}`)).default;
   app.get("/__metering/thrown-404", () => {
     throw new NotFoundError("gone");
   });

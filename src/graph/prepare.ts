@@ -6,8 +6,9 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import config from "@/config";
+import type { ModelOverride } from "@/graph/model-override";
 import { parseDbId } from "@/lib/db-id";
-import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import type { ScopedDb, TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
@@ -36,6 +37,11 @@ import {
   type ChatwootVocab,
   loadChatwootVocab,
 } from "@/modules/chatwoot/vocab";
+import {
+  type ContactAuthConfig,
+  readContactAuthConfig,
+} from "@/modules/contact-auth/settings";
+import type { ObservedConversation } from "@/modules/conversations/record-resolution";
 import { resolveVariantOverride } from "@/modules/experiments/service";
 import {
   emitFlowEvent,
@@ -75,8 +81,7 @@ import { readSplitConfig, type SplitConfig } from "@/modules/split/service";
 import { llmNormalizeForSpeech } from "@/modules/tts/normalize";
 import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 import { readTtsConfig, type TtsConfig } from "@/modules/tts/settings";
-import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
-import { ensureFreshMcpAccessToken } from "@/modules/vault/mcp-oauth";
+import { resolveInjectableCredential } from "@/modules/vault/injectable";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
 import { chatwootThreadId, getCheckpointer } from "./checkpointer";
 import { buildAgentGraph } from "./graph";
@@ -124,47 +129,6 @@ function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-// Resolves a credential ref into the string that gets injected (bearer/header/etc). For most kinds
-// this is the stored string secret. For the managed-OAuth kinds (`google_oauth`, `mcp_oauth`) the
-// stored value is a JSON object, so we auto-refresh and return the fresh access token (the bearer
-// value). Returns null when the entry is missing. The refresh paths do their own scoped reads/writes
-// + a refresh network call OUTSIDE any caller tx, so this must not be invoked inside one.
-// Exported so src/modules/zpro/tools.ts can build the same ToolpackCtx.resolveCredential the
-// Chatwoot path uses — the body is channel-agnostic (vault + OAuth refresh, no Chatwoot object).
-export async function resolveInjectableCredential(
-  base: PrismaClient,
-  tenantId: bigint,
-  ref: string,
-): Promise<string | null> {
-  const entry = await runScopedOn(base, sysCtx(tenantId), (db) =>
-    tryResolveVaultEntry<unknown>(db, ref),
-  );
-  if (!entry) return null;
-  if (entry.kind === "google_oauth" || entry.kind === "mcp_oauth") {
-    const id = ref.startsWith("vault:")
-      ? BigInt(ref.slice("vault:".length))
-      : null;
-    if (id === null) return null;
-    // A refresh failure (revoked/expired grant, network hiccup) used to throw here and propagate as
-    // an unhandled exception inside the tool call — unlike the "entry missing" case above, which
-    // already degrades gracefully to null (the tool then reports NOT_CONNECTED to the model instead
-    // of crashing the turn).
-    try {
-      return await (entry.kind === "mcp_oauth"
-        ? ensureFreshMcpAccessToken(sysCtx(tenantId), id, base)
-        : ensureFreshGoogleAccessToken(sysCtx(tenantId), id, base));
-    } catch (err) {
-      logger.warn(
-        "resolveInjectableCredential: OAuth refresh failed for %s: %s",
-        ref,
-        err instanceof Error ? err.message : String(err),
-      );
-      return null;
-    }
-  }
-  return typeof entry.secret === "string" ? entry.secret : null;
-}
-
 // Optional grounding threshold from agent.settings.grounding.maxDistance (a positive cosine
 // distance). Anything malformed → null (no filtering), so a bad setting never silently blinds RAG.
 // Exported for src/modules/zpro/tools.ts, which reads the same agent.settings bag.
@@ -204,7 +168,9 @@ export interface AgentConfig {
   credentialBaseUrl: string | null;
   // Guardrails (input/output moderation): config + the guardrails agent's OWN resolved API key /
   // baseURL (its chat model is separate from the main agent's). apiKey "" ⇒ disabled or the
-  // credential did not resolve ⇒ the runtime skips analysis (fail-open).
+  // credential did not resolve ⇒ the runtime skips the analysis (fail-open). The gate tells those
+  // two apart: switched off reads as `not-run`, an empty key on an ENABLED direction as
+  // `unavailable`, which is what puts an unresolvable ref in front of the operator.
   guardrails: GuardrailsConfig;
   guardrailsApiKey: string;
   guardrailsCredentialBaseUrl: string | null;
@@ -228,6 +194,10 @@ export interface AgentConfig {
   // WhatsApp 24h service-window gate for proactive sends + the contact name for template params.
   serviceWindowConfig: ServiceWindowConfig;
   handoffConfig: HandoffConfig;
+  // Contact authorization gate (docs/contact-auth.md). Enforced by the webhook gate, the debounce
+  // flush, the proactive nudge and the manual re-engage, NOT here; carried on the config so they
+  // need no second settings read.
+  contactAuthConfig: ContactAuthConfig;
   // Hosts the send_image tool may fetch an image from (operator-set; empty = the tool refuses).
   sendImageConfig: SendImageConfig;
   // Per-agent kanban guidance (operator funnel note), surfaced in the kanban_move_card description.
@@ -252,6 +222,11 @@ export interface AgentConfig {
   // the thread (agent.settings.memory.compaction). Read here so the turn that CROSSES an
   // attendance boundary can arm the compaction job without a second query.
   memoryCompaction: boolean;
+  // The summariser's own model, as an override of the agent's, plus the credential it names. Same
+  // three-field shape as the speech rewrite above; resolved through graph/model-override.ts.
+  memoryCompactionOverride: ModelOverride;
+  memoryCompactionApiKey: string;
+  memoryCompactionCredentialBaseUrl: string | null;
   // Whether this agent's tool lines log the VALUES the model sent instead of their shape
   // (agent.settings.observability.logToolValues; off by default — see src/modules/flowlog/shape.ts).
   logToolValues: boolean;
@@ -369,7 +344,8 @@ export async function loadAgentConfig(
     credentialBaseUrl = entry.baseUrl;
   }
   // Guardrails agent's own credential (separate model). Resolved only when enabled; a missing/
-  // unresolvable credential leaves the key empty and the runtime skips analysis (fail-open, logged).
+  // unresolvable credential leaves the key empty and the runtime skips the analysis (fail-open,
+  // logged), reporting `unavailable` rather than `not-run` so the operator can see it happened.
   const guardrails = readGuardrailsConfig(effSettings);
   let guardrailsApiKey = "";
   let guardrailsCredentialBaseUrl: string | null = null;
@@ -409,6 +385,30 @@ export async function loadAgentConfig(
         "agent %s: tts normalize credentialRef %s did not resolve, so the speech rewrite is skipped",
         String(args.agentId),
         ttsCfg.normalizeCredentialRef,
+      );
+    }
+  }
+  // The summariser's own credential, when it runs on a separate model. Same fail-open shape as the
+  // two above: an unresolvable ref leaves the key empty, and runCompaction then FAILS the job rather
+  // than quietly falling back to the agent's key on a provider that may not accept it. Failing is
+  // right here where skipping is right for the rewrite: a skipped rewrite costs one sentence's
+  // delivery, a summary written by the wrong model is memory this contact carries forever.
+  const memoryCfg = readMemoryConfig(effSettings).compaction;
+  let memoryCompactionApiKey = "";
+  let memoryCompactionCredentialBaseUrl: string | null = null;
+  if (memoryCfg.enabled && memoryCfg.credentialRef) {
+    const mEntry = await tryResolveVaultEntry<string>(
+      db,
+      memoryCfg.credentialRef,
+    );
+    if (mEntry) {
+      memoryCompactionApiKey = mEntry.secret;
+      memoryCompactionCredentialBaseUrl = mEntry.baseUrl;
+    } else {
+      logger.warn(
+        "agent %s: memory compaction credentialRef %s did not resolve, so the attendance summary is not written",
+        String(args.agentId),
+        memoryCfg.credentialRef,
       );
     }
   }
@@ -689,6 +689,7 @@ export async function loadAgentConfig(
     splitConfig: readSplitConfig(effSettings),
     serviceWindowConfig: readServiceWindowConfig(effSettings),
     handoffConfig: readHandoffConfig(effSettings),
+    contactAuthConfig: readContactAuthConfig(effSettings),
     sendImageConfig: readSendImageConfig(effSettings),
     kanbanConfig: readKanbanConfig(effSettings),
     toolGuidance: readToolGuidance(effSettings),
@@ -710,7 +711,15 @@ export async function loadAgentConfig(
     timezone,
     maxToolCalls: limits.maxToolCalls,
     maxHistoryTokens: limits.maxHistoryTokens,
-    memoryCompaction: readMemoryConfig(effSettings).compaction.enabled,
+    memoryCompaction: memoryCfg.enabled,
+    memoryCompactionOverride: {
+      provider: memoryCfg.provider,
+      model: memoryCfg.model,
+      credentialRef: memoryCfg.credentialRef,
+      baseURL: memoryCfg.baseURL,
+    },
+    memoryCompactionApiKey,
+    memoryCompactionCredentialBaseUrl,
     logToolValues: readObservabilityConfig(effSettings).logToolValues,
   };
 }
@@ -722,6 +731,10 @@ export interface ToolsetCtx {
   client: ChatwootClient;
   conversationId: number;
   threadId: string;
+  // The conversation's status as this turn observed it, before any close of ours. Feeds the
+  // IMMEDIATE resolve_conversation path (nudge turns, which carry no turnState): a close that had
+  // already happened when the turn started is not the agent's. See record-resolution.ts rule 2.
+  observed?: ObservedConversation;
   // Chatwoot id of the message that triggered this turn, exposed to HTTP tools as {{message_id}}.
   // Direct path: the incoming message's id. Debounce flush: the burst's last incoming message id
   // (the watermark), since the coalesced turn answers up to that message. 0/absent ⇒ not exposed.
@@ -748,8 +761,8 @@ export interface ToolsetCtx {
     imagesSeq: number;
   };
   // Structural mirror of HandoffTurnState in tools/native.ts, for the same reason as turnState.
-  // Two bits, not one: the closing line reached the customer, and the transfer itself completed.
-  handoffState?: { customerMessageSent: boolean; completed: boolean };
+  // Two fields, not one: the line the model wants delivered, and whether the transfer completed.
+  handoffState?: { customerMessage: string | null; completed: boolean };
 }
 
 export interface ToolBuildDeps {
@@ -771,7 +784,7 @@ export interface ToolBuildDeps {
         imagesInFlight: number;
         imagesSeq: number;
       };
-      handoffState?: { customerMessageSent: boolean; completed: boolean };
+      handoffState?: { customerMessage: string | null; completed: boolean };
       transferWithSummary?: boolean;
       handoff?: HandoffConfig;
       handoffTargets?: HandoffTargets;
@@ -779,6 +792,9 @@ export interface ToolBuildDeps {
       base?: PrismaClient;
       contactDbId?: bigint | null;
       conversationDbId?: bigint | null;
+      // Mirrors ToolCtx.observed (this whole ctx is a structural copy of it, so a field added
+      // there has to be added here too or the call below stops type-checking).
+      observed?: ObservedConversation;
       contactVoiceReply?: boolean | null;
       timezone?: string;
       vocab?: ChatwootVocab;
@@ -1073,6 +1089,7 @@ export async function buildToolset(
         base: ctx.base,
         contactDbId: cfg.contactDbId,
         conversationDbId: cfg.conversationDbId,
+        observed: ctx.observed,
         contactVoiceReply: cfg.contactVoiceReply,
         timezone: cfg.timezone,
         vocab,

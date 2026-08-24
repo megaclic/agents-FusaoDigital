@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { buildMcpServer } from "@/modules/mcp/server";
 
@@ -15,7 +16,9 @@ import { buildMcpServer } from "@/modules/mcp/server";
 // is not legitimate is not noticing. The second asserts what must SURVIVE a trim, because a ceiling
 // on its own invites cutting whatever is easiest rather than whatever is cheapest.
 
-async function descriptions(): Promise<Map<string, string>> {
+async function listed(): Promise<
+  Map<string, { description: string; schema: string }>
+> {
   const principal: VerifiedToken = {
     userId: 1n,
     tenantId: 1n,
@@ -31,12 +34,66 @@ async function descriptions(): Promise<Map<string, string>> {
   await client.connect(clientT);
   const { tools } = await client.listTools();
   await client.close();
-  return new Map(tools.map((t) => [t.name, t.description ?? ""]));
+  return new Map(
+    tools.map((t) => [
+      t.name,
+      {
+        description: t.description ?? "",
+        schema: JSON.stringify(t.inputSchema),
+      },
+    ]),
+  );
 }
 
-// NOTE: headroom over the current 3,534 for an ordinary edit, well under the 6,107 this replaced.
-// Round 1's correction spent 118 of that headroom, which is the kind of edit it is there for.
-const SETTINGS_DESC_CEILING = 3800;
+async function descriptions(): Promise<Map<string, string>> {
+  return new Map([...(await listed())].map(([n, t]) => [n, t.description]));
+}
+
+// NOTE: headroom over the current 1,931 for an ordinary edit, the same slack the 3,800 carried over
+// 3,534. Issue #142 spent 166 of that slack and the ceiling is deliberately NOT moving for it: what
+// went into the prose is only the half a caller cannot read off the schema (a summariser override
+// that is stored without complaint and then never runs), and 69 characters of remaining headroom is
+// the ratchet doing its job, not a number to relieve. The next append here is a decision. What was 6,107 before #161 and 3,534 after it came down again when #174 moved every field
+// name, choice and range into the schema; what is left is the rules a caller cannot read off either
+// the schema or docs/ — the ones that REFUSE a call, and the ones the write accepts and the runtime
+// then never acts on.
+// RAISED from 2,000 for the Z-PRO fork's own settings-schema sync: `zproCrm` (a Z-PRO-only block,
+// no Chatwoot equivalent) needed one sentence saying so, and the docs/ pointer list gained
+// `contact-auth, zpro`. 98 characters, all pointing a caller at where the fact actually lives
+// rather than restating it here.
+const SETTINGS_DESC_CEILING = 2_110;
+
+// NOTE: the ratchet has to follow the content. A ceiling on the description alone would have watched
+// the half that shrank while the shape it moved into grew unwatched — `tools/list` ships both, and a
+// client pays for both before it knows whether the tool will be used. Headroom over the current
+// 9,711 is deliberately tighter than a whole block (~600 characters), so the next block declaring
+// its fields here is a decision rather than a reflex.
+//
+// RAISED from 10,200 for issue #142, and the raise is the decision the ceiling exists to force. The
+// `memory.compaction` block gained the summariser's own model override — the same quartet tts
+// carries for its rewrite — and it costs 524 characters, near enough a whole block. Most of that is
+// the provider ENUM, which is the one part worth publishing: it is the list a client renders. The
+// only discretionary 72 in it is the `null inherits the agent's` note on that enum, and trimming it
+// to fit under 10,200 was the available move and the wrong one — null is the whole semantics of the
+// override, and cutting the sentence that explains it is cutting what is easiest rather than what is
+// cheapest. Headroom over 10,235 stays tighter than a block, as before.
+//
+// RAISED from 10,600 for issue #182, and again the raise is the decision the ceiling forces. The
+// `contactAuth` block declares nine fields and costs 1,068 characters, above a whole block, and
+// trimming it to fit was tried first: it bought 92. What is left is not padding. Three of the nine
+// carry a note a caller cannot get by trying, and each names a way the block fails SILENTLY.
+// `noticeCooldownSeconds` reads as a verdict cache to anyone who has met one, and a caller who
+// believes it is caching sets it high and thinks revocation is instant when it is not.
+// `includeMessageText` is read as false under GET, so the unlock flow is configured, stored,
+// and never runs. `denyMessage: null` means say nothing, which is a refusal the customer sees no
+// sign of. The rest is the shape: nine fields, an enum and the nullable wrappers, and that part
+// does not compress. Headroom over 11,303 stays tighter than a block, as before.
+// RAISED from 11,650 for the Z-PRO fork's own settings-schema sync (upstream's #174 typed-schema
+// refactor did not know about the fork's Z-PRO-only fields): `handoff.targetQueueId` (the pinned
+// Z-PRO queue target) and `channelRedirect.entryZproInstanceId` (the Z-PRO entry channel) each
+// needed one field on an existing block, and `zproCrm` needed a whole new one (`pipelineId` +
+// `instructions`). None of the three has a Chatwoot equivalent to fold into, so none compresses.
+const SETTINGS_SCHEMA_CEILING = 12_350;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -64,6 +121,50 @@ describe("MCP tool descriptions", () => {
     expect(d).toContain("refused, not trimmed");
     // NOTE: a credential travels as a name or a stable ref, never as a secret.
     expect(d).toContain("NAME or a stable vault:<id>");
+    // NOTE: the same read-time outcome on the summariser, and the one place it differs: an
+    // attendance ends and nothing is written, so the thread stays raw and the memory the whole
+    // feature exists to keep is the thing that goes missing. Asserted separately from the tts
+    // clause it shares a sentence with, because a trim that keeps one and drops the other reads
+    // as a smaller edit than it is.
+    expect(d).toContain(
+      "stops the SUMMARISER instead and the thread stays raw",
+    );
+  });
+
+  test("agent_settings_set stays under its schema ceiling", async () => {
+    const t = (await listed()).get("agent_settings_set");
+    expect(t).toBeDefined();
+    expect((t as { schema: string }).schema.length).toBeLessThanOrEqual(
+      SETTINGS_SCHEMA_CEILING,
+    );
+  });
+
+  // NOTE: the two move together, or the maintenance doubles instead of halving. A field the schema
+  // declares and the paragraph repeats is a second copy that drifts silently — which is exactly how
+  // `vision.provider` came to be published as three providers while the registry had five. Only
+  // camelCase names are checked: they cannot appear in prose by accident, unlike "mode" or "model".
+  test("the description does not restate what the schema declares", async () => {
+    const declared = new Set<string>();
+    for (const key of Object.keys(BEHAVIOR_PATCH_SHAPE)) {
+      const block =
+        BEHAVIOR_PATCH_SHAPE[key as keyof typeof BEHAVIOR_PATCH_SHAPE].unwrap();
+      for (const field of Object.keys(block.shape)) declared.add(field);
+    }
+    // NOTE: the names a REFUSAL rule has to spell out. They are in the description because of what
+    // happens to the call, not because of what shape the field has.
+    const namedByARule = new Set([
+      "credentialRef",
+      "normalizeProvider",
+      "normalizeModel",
+      "normalizeCredentialRef",
+      "awayMessage",
+      "extractionPrompt",
+    ]);
+    const d = (await descriptions()).get("agent_settings_set") as string;
+    const restated = [...declared]
+      .filter((f) => /[a-z][A-Z]/.test(f) && !namedByARule.has(f))
+      .filter((f) => d.includes(f));
+    expect(restated).toEqual([]);
   });
 
   // NOTE: the norm is about WHERE content lives, not about length, so the check that matters for the

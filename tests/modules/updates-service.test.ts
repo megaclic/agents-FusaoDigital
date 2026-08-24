@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import config from "@/config";
 import {
   fetchAnnouncements,
   fetchLatestVersion,
@@ -6,6 +7,10 @@ import {
 import { getUpdates, resetUpdatesCache } from "@/modules/updates/service";
 
 const realFetch = globalThis.fetch;
+// This fork disables hub communication by default (config.hub.url = "", see config.ts) — getUpdates
+// short-circuits to an empty payload with no fetch at all before that is set. Every test here
+// exercises the fetch path, so the suite opts back in for its own duration.
+const realHubUrl = config.hub.url;
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -27,10 +32,12 @@ function stubFetch(route: (url: string) => Response | Promise<Response>): {
 }
 
 beforeEach(() => {
+  config.hub.url = "https://hub.example.test";
   resetUpdatesCache();
 });
 
 afterEach(() => {
+  config.hub.url = realHubUrl;
   globalThis.fetch = realFetch;
   resetUpdatesCache();
 });

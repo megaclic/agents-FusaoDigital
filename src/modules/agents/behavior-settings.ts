@@ -2,6 +2,7 @@ import { readLimitsConfig } from "@/modules/agents/limits";
 import { readAvailabilityConfig } from "@/modules/availability/away";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
+import { readContactAuthConfig } from "@/modules/contact-auth/settings";
 import { readDebounceConfig } from "@/modules/debounce/settings";
 import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import { readFollowUpConfig } from "@/modules/followups/settings";
@@ -49,6 +50,7 @@ export interface BehaviorSettings {
   sendImage: ReturnType<typeof readSendImageConfig>;
   limits: ReturnType<typeof readLimitsConfig>;
   availability: ReturnType<typeof readAvailabilityConfig>;
+  contactAuth: ReturnType<typeof readContactAuthConfig>;
   channelRedirect: ReturnType<typeof readChannelRedirectConfig>;
   guardrails: ReturnType<typeof readGuardrailsConfig>;
   // NOTE: Which Chatwoot custom attributes (per scope) are injected into the system prompt.
@@ -78,6 +80,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "sendImage",
   "limits",
   "availability",
+  "contactAuth",
   "channelRedirect",
   "guardrails",
   "attributeContext",
@@ -102,6 +105,7 @@ export function readBehaviorSettings(settings: unknown): BehaviorSettings {
     sendImage: readSendImageConfig(settings),
     limits: readLimitsConfig(settings),
     availability: readAvailabilityConfig(settings),
+    contactAuth: readContactAuthConfig(settings),
     channelRedirect: readChannelRedirectConfig(settings),
     guardrails: readGuardrailsConfig(settings),
     attributeContext: readAttributeContextConfig(settings),
@@ -126,6 +130,7 @@ export interface BehaviorSettingsPatch {
   sendImage?: Record<string, unknown>;
   limits?: Record<string, unknown>;
   availability?: Record<string, unknown>;
+  contactAuth?: Record<string, unknown>;
   channelRedirect?: Record<string, unknown>;
   guardrails?: Record<string, unknown>;
   attributeContext?: Record<string, unknown>;
@@ -240,6 +245,7 @@ export function mergeBehaviorSettings(
   next.sendImage = normalized.sendImage;
   next.limits = normalized.limits;
   next.availability = normalized.availability;
+  next.contactAuth = normalized.contactAuth;
   next.channelRedirect = normalized.channelRedirect;
   next.guardrails = normalized.guardrails;
   next.attributeContext = normalized.attributeContext;

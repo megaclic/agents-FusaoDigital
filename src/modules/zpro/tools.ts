@@ -20,7 +20,6 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import config from "@/config";
-import { resolveInjectableCredential } from "@/graph/prepare";
 import { buildHttpTools, loadToolSelections } from "@/graph/tools/assemble";
 import type { NativeToolName } from "@/graph/tools/catalog";
 import { loadMcpToolsForAgent } from "@/graph/tools/mcp";
@@ -37,6 +36,7 @@ import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { HandoffConfig } from "@/modules/handoff/settings";
 import type { SendImageConfig } from "@/modules/images/settings";
 import { buildToolpackTools } from "@/modules/integrations/toolpacks";
+import { resolveInjectableCredential } from "@/modules/vault/injectable";
 import type { ZproClient } from "./client";
 import {
   loadZproQueues,

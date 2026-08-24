@@ -126,6 +126,58 @@ export const playgroundDraftSchema = t.Object({
 
 type PlaygroundDraft = typeof playgroundDraftSchema.static;
 
+// The playground turn/follow-up request bodies, exported so the wire contract is TESTED rather than
+// mirrored: a field that exists in TypeScript but not here is stripped by Elysia's normalize before
+// the handler runs, and a test that copies the schema validates its own copy (issue #170).
+export const playgroundTurnBodySchema = t.Object({
+  message: t.String({
+    minLength: 1,
+    maxLength: 10_000,
+    description: "The user message to send to the agent.",
+  }),
+  threadId: t.Optional(
+    t.String({
+      description:
+        "Playground thread id, shaped tenantId:playground:agentId:uuid. Honored only when it matches this tenant and agent; otherwise a fresh thread is started.",
+    }),
+  ),
+  draft: t.Optional(playgroundDraftSchema),
+  forceAudio: t.Optional(
+    t.Boolean({
+      description:
+        "Force an audio (TTS) reply for this turn regardless of the saved mode.",
+    }),
+  ),
+  guardrails: t.Optional(
+    t.Boolean({
+      description:
+        "Run the agent's guardrails over this turn (default true). Off skips the screening model call entirely.",
+    }),
+  ),
+});
+
+export const playgroundFollowupBodySchema = t.Object({
+  threadId: t.Optional(
+    t.String({
+      description:
+        "Playground thread id, shaped tenantId:playground:agentId:uuid, on which to simulate the follow-up.",
+    }),
+  ),
+  context: t.Optional(
+    t.String({
+      maxLength: 1000,
+      description: "Optional extra context to pass to the follow-up turn.",
+    }),
+  ),
+  draft: t.Optional(playgroundDraftSchema),
+  guardrails: t.Optional(
+    t.Boolean({
+      description:
+        "Run the agent's guardrails over the simulated follow-up (default true).",
+    }),
+  ),
+});
+
 // `draft` rides the multipart request as a JSON string. Elysia's multipart parser auto-parses any
 // field whose value starts with `{`/`[` and is valid JSON (see adapter/web-standard formData), so a
 // well-formed draft arrives already as an object; a malformed one stays a string. Accept both and
@@ -154,6 +206,14 @@ function decodeMultipartText(raw: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+// A boolean that rides multipart as a string. ABSENT stays absent: the default for this flag lives
+// in the service (`screensThisTurn`), and coercing an omitted field to `true` here would put a
+// second copy of it on the two endpoints that happen to use multipart, where a change to the real
+// one would never reach. Only an explicit "false" is a decision.
+export function decodeMultipartFlag(raw: unknown): boolean | undefined {
+  return raw === undefined ? undefined : raw !== "false";
 }
 
 // The extract-only step reports one of three kinds; only these are honored as a precomputed value.
@@ -675,6 +735,7 @@ export const agentsController = new Elysia({
         threadId?: string;
         draft?: PlaygroundDraft;
         forceAudio?: boolean;
+        guardrails?: boolean;
       };
       return {
         instance: instanceIdentity,
@@ -685,6 +746,7 @@ export const agentsController = new Elysia({
           threadId: b.threadId,
           overrides: b.draft,
           forceAudio: b.forceAudio,
+          guardrails: b.guardrails,
         })),
       };
     },
@@ -700,26 +762,7 @@ export const agentsController = new Elysia({
           description: "Agent id, a BigInt encoded as a decimal string.",
         }),
       }),
-      body: t.Object({
-        message: t.String({
-          minLength: 1,
-          maxLength: 10_000,
-          description: "The user message to send to the agent.",
-        }),
-        threadId: t.Optional(
-          t.String({
-            description:
-              "Playground thread id, shaped tenantId:playground:agentId:uuid. Honored only when it matches this tenant and agent; otherwise a fresh thread is started.",
-          }),
-        ),
-        draft: t.Optional(playgroundDraftSchema),
-        forceAudio: t.Optional(
-          t.Boolean({
-            description:
-              "Force an audio (TTS) reply for this turn regardless of the saved mode.",
-          }),
-        ),
-      }),
+      body: playgroundTurnBodySchema,
     },
   )
   // Lists the agent's tools (name/description/category + which are auto-simulated) so the
@@ -760,6 +803,7 @@ export const agentsController = new Elysia({
         threadId?: string;
         context?: string;
         draft?: PlaygroundDraft;
+        guardrails?: boolean;
       };
       return {
         instance: instanceIdentity,
@@ -769,6 +813,7 @@ export const agentsController = new Elysia({
           threadId: b.threadId,
           context: b.context,
           overrides: b.draft,
+          guardrails: b.guardrails,
         })),
       };
     },
@@ -784,22 +829,7 @@ export const agentsController = new Elysia({
           description: "Agent id, a BigInt encoded as a decimal string.",
         }),
       }),
-      body: t.Object({
-        threadId: t.Optional(
-          t.String({
-            description:
-              "Playground thread id, shaped tenantId:playground:agentId:uuid, on which to simulate the follow-up.",
-          }),
-        ),
-        context: t.Optional(
-          t.String({
-            maxLength: 1000,
-            description:
-              "Optional extra context to pass to the follow-up turn.",
-          }),
-        ),
-        draft: t.Optional(playgroundDraftSchema),
-      }),
+      body: playgroundFollowupBodySchema,
     },
   )
   // Playground voice note, step 1/2: transcribe ONLY, so the console can show the transcription
@@ -857,6 +887,7 @@ export const agentsController = new Elysia({
         threadId?: string;
         draft?: string | PlaygroundDraft;
         forceAudio?: string;
+        guardrails?: string;
         transcription?: string;
       };
       const overrides = parseDraft(b.draft);
@@ -869,6 +900,7 @@ export const agentsController = new Elysia({
           threadId: b.threadId,
           overrides,
           forceAudio: b.forceAudio === "true",
+          guardrails: decodeMultipartFlag(b.guardrails),
           transcription: decodeMultipartText(b.transcription),
         })),
       };
@@ -904,6 +936,12 @@ export const agentsController = new Elysia({
         forceAudio: t.Optional(
           t.String({
             description: 'Force an audio reply when the string equals "true".',
+          }),
+        ),
+        guardrails: t.Optional(
+          t.String({
+            description:
+              'Skip the guardrail screening when the string equals "false" (default: screened).',
           }),
         ),
         transcription: t.Optional(
@@ -970,6 +1008,7 @@ export const agentsController = new Elysia({
         threadId?: string;
         draft?: string | PlaygroundDraft;
         forceAudio?: string;
+        guardrails?: string;
         kind?: string;
         extracted?: string;
       };
@@ -983,6 +1022,7 @@ export const agentsController = new Elysia({
           threadId: b.threadId,
           overrides,
           forceAudio: b.forceAudio === "true",
+          guardrails: decodeMultipartFlag(b.guardrails),
           kind: decodeExtractKind(b.kind),
           extracted: decodeMultipartText(b.extracted),
         })),
@@ -1017,6 +1057,12 @@ export const agentsController = new Elysia({
         forceAudio: t.Optional(
           t.String({
             description: 'Force an audio reply when the string equals "true".',
+          }),
+        ),
+        guardrails: t.Optional(
+          t.String({
+            description:
+              'Skip the guardrail screening when the string equals "false" (default: screened).',
           }),
         ),
         kind: t.Optional(

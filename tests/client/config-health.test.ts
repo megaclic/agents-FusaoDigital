@@ -191,6 +191,135 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
     ]);
   });
 
+  // The attendance summariser's own model. Its failure is louder than the rewrite's (the job fails
+  // and retries to DEAD) and more expensive: what is lost is not one reply's delivery but the
+  // contact's memory of an attendance that already ended, and nothing ever goes back for it. The
+  // console is still the only place an operator would see it before it happens.
+  describe("attendance summary model", () => {
+    const mem = (compaction: Record<string, unknown>) => ({
+      ...base,
+      settings: { memory: { compaction: { enabled: true, ...compaction } } },
+    });
+
+    // Nothing configured IS the agent's model, and an agent model that cannot run is the "model"
+    // issue. A second line for it would send the operator to fix the summariser when what is broken
+    // is the agent.
+    test("no override configured raises nothing", () => {
+      expect(computeConfigIssues(mem({}))).toEqual([]);
+      expect(computeConfigIssues({ ...base, settings: {} })).toEqual([]);
+    });
+
+    test("the agent's own provider, picked explicitly, needs no credential of its own", () => {
+      expect(computeConfigIssues(mem({ provider: "openai" }))).toEqual([]);
+    });
+
+    test("a different provider with no key of its own is flagged", () => {
+      expect(computeConfigIssues(mem({ provider: "anthropic" }))).toEqual([
+        { key: "memoryModel", tab: "behavior", sectionId: "memory" },
+      ]);
+    });
+
+    test("a different provider WITH its own key is fine", () => {
+      expect(
+        computeConfigIssues(
+          mem({ provider: "anthropic", credentialRef: "vault:3" }),
+        ),
+      ).toEqual([]);
+    });
+
+    // The reason this check exists at all: REST and MCP write the bag directly, so a model id or a
+    // key with no provider arrives here from paths the editor never validated, and the runtime
+    // stores it without complaint and then never summarises.
+    test("a model with no provider is flagged, not silently inherited", () => {
+      expect(computeConfigIssues(mem({ model: "gpt-5.4-nano" }))).toEqual([
+        { key: "memoryModel", tab: "behavior", sectionId: "memory" },
+      ]);
+    });
+
+    // The editor's strictness, not the runtime's: `llama:8080` is a non-empty string, so the runtime
+    // says "there is something there" and the summariser dies at the first closed attendance.
+    test("an openai-compatible endpoint that is not a URL is flagged", () => {
+      expect(
+        computeConfigIssues(
+          mem({ provider: "openai-compatible", baseURL: "llama:8080" }),
+        ),
+      ).toEqual([{ key: "memoryModel", tab: "behavior", sectionId: "memory" }]);
+    });
+
+    test("an openai-compatible endpoint with no address at all is flagged", () => {
+      expect(
+        computeConfigIssues(mem({ provider: "openai-compatible" })),
+      ).toEqual([{ key: "memoryModel", tab: "behavior", sectionId: "memory" }]);
+    });
+
+    // Compaction off means there is no call to configure, so a leftover override is not a problem
+    // the operator has to act on now.
+    test("compaction turned off raises nothing, whatever the override holds", () => {
+      expect(
+        computeConfigIssues({
+          ...base,
+          settings: {
+            memory: { compaction: { enabled: false, provider: "anthropic" } },
+          },
+        }),
+      ).toEqual([]);
+    });
+
+    // The endpoint the runtime will actually use comes off the CREDENTIAL when it carries one
+    // (`loadAgentConfig` reads it from the vault), and it outranks whatever the bag holds. A check
+    // that resolves without it calls a summariser that runs perfectly well broken, the moment the
+    // vault answers. Found by review, on the fix for the previous round.
+    test("an endpoint carried by the credential is not reported as missing", () => {
+      expect(
+        computeConfigIssues({
+          ...mem({ provider: "openai-compatible", credentialRef: "vault:3" }),
+          savedMemoryCredentialBaseURL: "https://llm.internal.example/v1",
+          knownRefs: new Set(["vault:1", "vault:3"]),
+        }),
+      ).toEqual([]);
+    });
+
+    // And the inverse the same omission hid: a credential that carries an endpoint on a vendor that
+    // never sends one. The request would go to that vendor's own host, not the operator's.
+    test("a credential endpoint on a keyed vendor is flagged as unsupported", () => {
+      expect(
+        computeConfigIssues({
+          ...mem({ provider: "anthropic", credentialRef: "vault:3" }),
+          savedMemoryCredentialBaseURL: "https://proxy.example/v1",
+          knownRefs: new Set(["vault:1", "vault:3"]),
+        }),
+      ).toEqual([{ key: "memoryModel", tab: "behavior", sectionId: "memory" }]);
+    });
+
+    // Before the vault answers, an endpoint that is merely unread looks absent. Announcing a
+    // runnable summariser as broken is the false alarm the deferral exists to prevent.
+    test("no verdict while the vault has not answered about its credential", () => {
+      expect(
+        computeConfigIssues({
+          ...mem({ provider: "openai-compatible", credentialRef: "vault:3" }),
+          knownRefs: null,
+        }),
+      ).toEqual([]);
+    });
+
+    test("its credential being a pending vault entry is flagged as pending", () => {
+      expect(
+        computeConfigIssues({
+          ...mem({ provider: "openai", credentialRef: "vault:3" }),
+          pendingRefs: new Set(["vault:3"]),
+        }),
+      ).toEqual([
+        {
+          key: "memoryModel",
+          tab: "behavior",
+          sectionId: "memory",
+          pending: true,
+          vaultId: "3",
+        },
+      ]);
+    });
+  });
+
   // The speech rewrite fails SILENTLY when it cannot run (best-effort: the audio still goes out,
   // just unrewritten), so the editor is the only place this can be caught.
   describe("speech rewrite model", () => {
@@ -1188,6 +1317,129 @@ describe("computeConfigIssues — text stored over its cap", () => {
 // for a field the console has no control for: an embedding issue also carries no tab, and its fix
 // (fill the vault entry, or set the tenant embedding) is exactly what the button is for.
 describe("issueHasAction", () => {
+  // The unlock flow needs the conversation to still be the bot's when the code arrives, and the
+  // handoff gives it away on the first refusal. Neither switch is wrong alone, so the pair is
+  // reported rather than resolved.
+  describe("the unlock flow against the handoff", () => {
+    const unlocking = {
+      ...base,
+      contactAuthEnabled: true,
+      contactAuthUrl: "https://ops.example.com/authorize",
+      contactAuthIncludeMessageText: true,
+      contactAuthHandoffEnabled: true,
+    };
+
+    test("flags the pair, deep-linking to behavior/contactAuth", () => {
+      expect(computeConfigIssues(unlocking)).toEqual([
+        {
+          key: "contactAuthUnlockHandoff",
+          tab: "behavior",
+          sectionId: "contactAuth",
+        },
+      ]);
+    });
+
+    test("no flag with the handoff off — that is the working unlock setup", () => {
+      expect(
+        computeConfigIssues({
+          ...unlocking,
+          contactAuthHandoffEnabled: false,
+          // A deny message, so the silent-refusal check below does not fire instead.
+          contactAuthDenyMessage: "Envie seu código de acesso.",
+        }),
+      ).toEqual([]);
+    });
+
+    test("no flag when the gate itself is off", () => {
+      expect(
+        computeConfigIssues({ ...unlocking, contactAuthEnabled: false }),
+      ).toEqual([]);
+    });
+  });
+
+  // The other end: refuse, say nothing, hand nobody the conversation. The customer's message goes
+  // unanswered with no sign anything happened, and only a private note records it.
+  describe("a refusal that reaches nobody", () => {
+    const gated = {
+      ...base,
+      contactAuthEnabled: true,
+      contactAuthUrl: "https://ops.example.com/authorize",
+    };
+
+    test("flags a gate with no deny message and no handoff", () => {
+      expect(
+        computeConfigIssues({ ...gated, contactAuthHandoffEnabled: false }),
+      ).toEqual([
+        {
+          key: "contactAuthSilentRefusal",
+          tab: "behavior",
+          sectionId: "contactAuth",
+        },
+      ]);
+    });
+
+    test("a deny message alone clears it — silence towards a stranger is a choice", () => {
+      expect(
+        computeConfigIssues({
+          ...gated,
+          contactAuthHandoffEnabled: false,
+          contactAuthDenyMessage: "Atendemos apenas clientes cadastrados.",
+        }),
+      ).toEqual([]);
+    });
+
+    test("the handoff alone clears it — a human takes it from there", () => {
+      expect(
+        computeConfigIssues({ ...gated, contactAuthHandoffEnabled: true }),
+      ).toEqual([]);
+    });
+
+    test("whitespace is not a deny message", () => {
+      expect(
+        computeConfigIssues({
+          ...gated,
+          contactAuthHandoffEnabled: false,
+          contactAuthDenyMessage: "   ",
+        }).map((i) => i.key),
+      ).toEqual(["contactAuthSilentRefusal"]);
+    });
+  });
+
+  // An enabled gate with no usable endpoint. `readContactAuthConfig` normalizes a missing or
+  // malformed URL to null and keeps `enabled` as it found it, so REST and MCP can store the pair —
+  // and the runtime then fails closed on EVERY message with `not_configured`. Silent by
+  // construction: the agent stops answering and nothing on the page says why.
+  describe("an enabled gate with no endpoint", () => {
+    test("flags a gate with no URL, deep-linking to behavior/contactAuth", () => {
+      expect(
+        computeConfigIssues({
+          ...base,
+          contactAuthEnabled: true,
+          contactAuthDenyMessage: "Atendemos apenas clientes cadastrados.",
+        }),
+      ).toEqual([
+        { key: "contactAuthNoUrl", tab: "behavior", sectionId: "contactAuth" },
+      ]);
+    });
+
+    test("whitespace is not a URL", () => {
+      expect(
+        computeConfigIssues({
+          ...base,
+          contactAuthEnabled: true,
+          contactAuthUrl: "   ",
+          contactAuthDenyMessage: "Atendemos apenas clientes cadastrados.",
+        }).map((i) => i.key),
+      ).toEqual(["contactAuthNoUrl"]);
+    });
+
+    test("no flag when the gate is off — an unused URL field is not a problem", () => {
+      expect(
+        computeConfigIssues({ ...base, contactAuthEnabled: false }),
+      ).toEqual([]);
+    });
+  });
+
   test("a targetless textCap issue has no action, and everything else does", () => {
     expect(
       issueHasAction({ key: "textCap", field: "toolGuidance.private_note" }),

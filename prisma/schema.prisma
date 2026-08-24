@@ -67,6 +67,7 @@ enum SchedulerJobKind {
   SCHEDULED_MESSAGE
   ZPRO_STATUS_CHECK
   MEMORY_COMPACT
+  INGEST_MESSAGE
 }
 
 enum SchedulerJobStatus {
@@ -131,6 +132,7 @@ model Tenant {
   knowledgeDocuments            KnowledgeDocument[]
   playgroundSessions            PlaygroundSession[]
   playgroundMedia               PlaygroundMedia[]
+  playgroundTurnNotes           PlaygroundTurnNote[]
   approvalQueueItems            ApprovalQueueItem[]
   vaultEntries                  VaultEntry[]
   toolDefinitions               ToolDefinition[]
@@ -281,13 +283,14 @@ model ChatwootInstance {
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime  @updatedAt @map("updated_at")
 
-  tenant            Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  deployment        ChatwootDeployment        @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
-  inboxes           Inbox[]
-  conversations     Conversation[]
-  webhookDeliveries ChatwootWebhookDelivery[]
-  agentBots         ChatwootAgentBot[]
-  agentThreads      AgentThread[]
+  tenant              Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deployment          ChatwootDeployment        @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  inboxes             Inbox[]
+  contacts            Contact[]
+  conversations       Conversation[]
+  webhookDeliveries   ChatwootWebhookDelivery[]
+  agentBots           ChatwootAgentBot[]
+  agentThreads        AgentThread[]
   attendanceSummaries AttendanceSummary[]
 
   @@unique([tenantId, accountId])
@@ -381,13 +384,19 @@ model Inbox {
 }
 
 model Contact {
-  id                BigInt   @id @default(autoincrement())
-  tenantId          BigInt   @map("tenant_id")
-  chatwootContactId Int?     @map("chatwoot_contact_id")
-  name              String?
-  email             String?
-  phone             String?
-  attributes        Json     @default("{}")
+  id                 BigInt    @id @default(autoincrement())
+  tenantId           BigInt    @map("tenant_id")
+  // A Chatwoot contact id is unique inside ONE account, not across the tenant. Without this column
+  // two accounts under the same tenant collapsed contact 42 into one row, and the mirror's
+  // last-writer-wins left one person's name over another's phone. Inbox and Conversation were
+  // already scoped this way; the contact was the odd one out, and the contact-authorization gate
+  // treats these fields as the identity it sends to the operator's endpoint.
+  chatwootInstanceId BigInt    @map("chatwoot_instance_id")
+  chatwootContactId  Int?      @map("chatwoot_contact_id")
+  name               String?
+  email              String?
+  phone              String?
+  attributes         Json      @default("{}")
   // Mirror of the contact's Chatwoot custom attributes (meta.sender.custom_attributes, refreshed on
   // every webhook event). Read-only projection: the agent WRITES through the Chatwoot API and this
   // column follows. Feeds the per-agent attribute context injected into the system prompt, so a turn
@@ -399,17 +408,30 @@ model Contact {
   customAttributesAt DateTime? @map("custom_attributes_at")
   // Chatwoot's meta.sender.thumbnail, refreshed on every webhook event that carries it.
   avatarUrl          String?   @map("avatar_url")
+  // Source watermark of each identity field above, for the same reason customAttributesAt exists one
+  // field up: the write is unconditional otherwise, and deliveries do arrive out of order, so an
+  // older event could restore what a newer one cleared. These are load-bearing beyond the prompt —
+  // the authorization gate asks the endpoint about whoever these values name.
+  //
+  // One per FIELD, because a Chatwoot payload states a subset of them and absent is not cleared: a
+  // row-wide position would let an event that says nothing about the phone advance the phone's own
+  // position, and a clear arriving late behind it would then be rejected as stale.
+  nameAt             DateTime? @map("name_at")
+  emailAt            DateTime? @map("email_at")
+  phoneAt            DateTime? @map("phone_at")
+  attributesAt       DateTime? @map("attributes_at")
   // Per-contact audio-reply preference (TTS mode "preference"): true = wants audio, false = wants
   // text, null = unknown (falls back to mirroring what the customer sent). Set by the agent's
   // set_voice_preference native tool. RLS-scoped column — NOT a Chatwoot custom attribute.
-  voiceReply        Boolean? @map("voice_reply")
-  createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  voiceReply         Boolean?  @map("voice_reply")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
 
-  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant        Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance      ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
   conversations Conversation[]
 
-  @@unique([tenantId, chatwootContactId])
+  @@unique([tenantId, chatwootInstanceId, chatwootContactId])
   @@index([tenantId])
   @@map("contacts")
 }
@@ -432,6 +454,24 @@ model Conversation {
   // Display name of the current human assignee (meta.assignee.name), mirrored so the console shows a
   // real name instead of "Human #id". NULL when unassigned or assigned to a bot.
   assigneeName           String?   @map("assignee_name")
+  // Who closed this conversation, recorded at the moment WE close it: "agent" (the
+  // resolve_conversation tool), "followup_abandonment", "redirect_closing", "console", or
+  // "legacy_unknown" for a row the migration found already resolved. NULL = not resolved, or
+  // resolved by something outside our code (an operator in the Chatwoot UI, an automation rule,
+  // `auto_resolve_after`) — none of which reach us, which is why the dashboard reads a recorded
+  // origin instead of inferring one from status + assignee. Cleared whenever the mirror applies a
+  // status that is not "resolved". See src/modules/conversations/resolution-origin.ts.
+  resolvedBy             String?   @map("resolved_by")
+  // The conversation's status version as the CLOSING CALLER observed it — the floor that says which
+  // close the stamp is about. The caller's reading and not the row's at write time: a reopen
+  // mirrored between the toggle returning and the write would otherwise date the stamp to the wrong
+  // episode. Our toggle is stamped before its own webhook arrives, so a
+  // `resolved` event that LOSES the ordering is normally that close failing to land and the stamp
+  // must go; but a delayed `resolved` from an EARLIER episode loses in exactly the same way while
+  // saying nothing about the current one. A claim at or below this floor predates the stamp and is
+  // therefore a different close. NULL on a Chatwoot that sends no versions, where there is nothing
+  // to compare and the rule falls back to its unprotected form.
+  resolvedByAt           Float?    @map("resolved_by_at")
   threadId               String    @map("thread_id") // tenantId:instanceId:convId
   // Mirror of the conversation's Chatwoot custom attributes and of the LINKED KANBAN CARD's ones
   // (conversation.custom_attributes / conversation.kanban_task.custom_attributes on the webhook
@@ -533,13 +573,18 @@ model Conversation {
 //     thread, so a NEW conversation reusing the thread gets the "fresh attendance" divider. Tracking
 //     this per-thread (not per-contact) is what stops a multi-channel contact from getting spurious
 //     dividers mid-conversation when they speak on another channel.
-//   - lastSyncedMessageId / lastAgentMessageId: the ingestion watermarks — highest message id already
-//     folded into the thread by the continuous-sync path, so turns and the sync never double-append a
-//     message. ONE PER DIRECTION, and that is not redundancy: a monotonic watermark only holds while
-//     the ids reaching it arrive in order, and the two writers do not share a latency. A customer's
-//     message waits on the eager media pass (a provider round-trip for STT/vision); an agent's reply
-//     waits on nothing. An attendant answering a voice note therefore lands FIRST, and a single
-//     column would advance past the customer's id and drop their message from the memory for good.
+//   - lastSyncedMessageId / lastAgentMessageId: the HIGHEST message id folded into the thread by the
+//     continuous-sync path, per direction. One per direction is not redundancy: the two writers do
+//     not share a latency, so an attendant answering a voice note lands before the note itself and a
+//     single column would advance past the customer's id.
+//   - recentSyncedMessageIds / recentAgentMessageIds: the ids actually folded in, most recent last,
+//     capped. These are what DECIDE a re-delivery; the scalars above only say how far we got.
+//     A high-water mark cannot do both jobs, and issue #194 is the bill for asking it to: within one
+//     direction the ids also arrive out of order (media waits on the eager pass, text does not), and
+//     a mark that had advanced past a lower id read that message as already handled. It was not
+//     late, it was ABSENT — nothing re-delivers it and nothing restores it. Membership answers
+//     exactly for what it holds; below the OLDEST id it holds, the answer is "older than anything we
+//     remember", which is the ancient re-delivery the mark was guarding against in the first place.
 model AgentThread {
   id                  BigInt   @id @default(autoincrement())
   tenantId            BigInt   @map("tenant_id")
@@ -549,6 +594,8 @@ model AgentThread {
   lastConversationId  Int?     @map("last_conversation_id")
   lastSyncedMessageId Int?     @map("last_synced_message_id")
   lastAgentMessageId  Int?     @map("last_agent_message_id")
+  recentSyncedMessageIds Int[] @default([]) @map("recent_synced_message_ids")
+  recentAgentMessageIds  Int[] @default([]) @map("recent_agent_message_ids")
   createdAt           DateTime @default(now()) @map("created_at")
   updatedAt           DateTime @updatedAt @map("updated_at")
 
@@ -792,14 +839,14 @@ enum ZproSenderType {
 // carries a rendered copy. Keeping them here rather than only inside the message means a summary is
 // never re-summarized (no compounding loss), survives a checkpointer reset, and is inspectable.
 model AttendanceSummary {
-  id                 BigInt   @id @default(autoincrement())
-  tenantId           BigInt   @map("tenant_id")
-  chatwootInstanceId BigInt   @map("chatwoot_instance_id")
-  contactInboxId     Int      @map("contact_inbox_id")
+  id                 BigInt    @id @default(autoincrement())
+  tenantId           BigInt    @map("tenant_id")
+  chatwootInstanceId BigInt    @map("chatwoot_instance_id")
+  contactInboxId     Int       @map("contact_inbox_id")
   // Chatwoot display_id of the attendance this summarizes. On a thread that had several raw
   // attendances waiting (compaction newly enabled, or a run that kept failing), one row covers the
   // whole backlog and carries the display_id of the most recent closed one.
-  conversationId     Int      @map("conversation_id")
+  conversationId     Int       @map("conversation_id")
   // The graph message id of the LAST turn this row summarized, and the reason a row is a SEGMENT of
   // an attendance rather than the whole of it. A conversation can be resolved, compacted, reopened by
   // the customer and resolved again: the second cut carries only the new turns, so keying on the
@@ -807,10 +854,10 @@ model AttendanceSummary {
   // reuse the first for turns it never saw. Both lose half the attendance. Keyed on this, the second
   // pass writes its own row and both segments survive; a RETRY of the same cut finds the same id and
   // costs nothing.
-  lastMessageId      String   @map("last_message_id")
+  lastMessageId      String    @map("last_message_id")
   summary            String
   // How many raw messages this row replaced, for the turn trail. Never any of their text.
-  messageCount       Int      @map("message_count")
+  messageCount       Int       @map("message_count")
   // When the attendance itself happened (the mirrored conversation's last event), NOT when the job
   // ran. Compaction can run months after the fact — the boundary trigger fires only when the contact
   // comes back — and dating the memory by the job would tell the model a returning customer's
@@ -822,8 +869,8 @@ model AttendanceSummary {
   // last on the descending window (so it never displaces a genuinely newer entry) and renders with
   // no date attribute.
   attendanceAt       DateTime? @map("attendance_at")
-  createdAt          DateTime @default(now()) @map("created_at")
-  updatedAt          DateTime @updatedAt @map("updated_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
 
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
@@ -836,28 +883,28 @@ model AttendanceSummary {
 // ──────────────────────────────────────────────── agent config ──
 
 model Agent {
-  id                  BigInt   @id @default(autoincrement())
-  tenantId            BigInt   @map("tenant_id")
+  id                  BigInt    @id @default(autoincrement())
+  tenantId            BigInt    @map("tenant_id")
   name                String
-  systemPrompt        String   @map("system_prompt")
-  modelConfig         Json     @default("{}") @map("model_config")
-  businessHoursId     BigInt?  @map("business_hours_id")
-  followUpHoursId     BigInt?  @map("follow_up_hours_id")
-  transferWithSummary Boolean  @default(true) @map("transfer_with_summary")
-  enabled             Boolean  @default(true)
+  systemPrompt        String    @map("system_prompt")
+  modelConfig         Json      @default("{}") @map("model_config")
+  businessHoursId     BigInt?   @map("business_hours_id")
+  followUpHoursId     BigInt?   @map("follow_up_hours_id")
+  transferWithSummary Boolean   @default(true) @map("transfer_with_summary")
+  enabled             Boolean   @default(true)
   // Test vs production mode (item 1). A "test" agent stays silent in a conversation until the
   // customer sends /teste (which sets Conversation.testActivatedAt); "production" answers normally.
   // New agents are created in "test"; existing rows default to "production" so live agents keep
   // answering after the migration.
-  mode                String   @default("production")
-  settings            Json     @default("{}")
+  mode                String    @default("production")
+  settings            Json      @default("{}")
   // NOTE: Watermark stamped when the EFFECTIVE follow-up state (enabled && production && followUp.enabled)
   // transitions OFF→ON. The sweep only STARTS a sequence for conversations whose lastInboundAt is at
   // or after this instant, so arming follow-up never blasts the historical backlog. NULL = never
   // armed (fail-safe: the sweep skips this agent's conversations entirely).
   followUpArmedAt     DateTime? @map("follow_up_armed_at")
-  createdAt           DateTime @default(now()) @map("created_at")
-  updatedAt           DateTime @updatedAt @map("updated_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
 
   tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   toolSelections AgentToolSelection[]
@@ -869,17 +916,17 @@ model Agent {
 }
 
 model BusinessHours {
-  id        BigInt   @id @default(autoincrement())
-  tenantId  BigInt   @map("tenant_id")
-  name      String
-  timezone  String   @default("America/Sao_Paulo")
-  windows   Json     @default("[]")
+  id         BigInt   @id @default(autoincrement())
+  tenantId   BigInt   @map("tenant_id")
+  name       String
+  timezone   String   @default("America/Sao_Paulo")
+  windows    Json     @default("[]")
   // Date exceptions that REPLACE the weekly grid on the dates they match (holidays, shutdowns,
   // half-days). Empty array = the weekly grid alone, i.e. exactly the pre-#129 behavior.
-  exceptions Json    @default("[]")
-  source    String   @default("LOCAL") // LOCAL|CHATWOOT_MIRROR
-  createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  exceptions Json     @default("[]")
+  source     String   @default("LOCAL") // LOCAL|CHATWOOT_MIRROR
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
@@ -973,6 +1020,53 @@ model PlaygroundSession {
   @@map("playground_sessions")
 }
 
+// What the OPERATOR saw for one playground turn, when that differs from what the agent remembers.
+// The transcript and the agent's memory are two different things, and moderation is the first
+// feature where they legitimately diverge: production keeps the raw reply in the graph thread and
+// posts the screened one to Chatwoot, and a turn the input guardrail blocked never enters the
+// thread at all (issue #136). The playground rebuilds its transcript from the checkpointer, so
+// without this row a reload shows the reply the guardrail took away, with no sign it ever acted.
+//
+// Registered in TENANT_SCOPED_MODELS (src/lib/tenancy/multi-tenant.ts), like every table with a
+// tenant_id that is not global/identity: the extension supplies the tenant on insert and overrides
+// a caller-supplied one. A guard in tests/lib/tenancy.test.ts reads both sides, because that list
+// is kept by hand and this row joined it one review round late.
+//
+// Every turn the guardrail RAN on gets a row, the clean verdicts included: the playground's toggle
+// is per turn, so a reload with no clean mark cannot tell an approved reply from one nothing ever
+// screened. A turn it never ran on has no row and still comes from the checkpointer alone.
+model PlaygroundTurnNote {
+  id       BigInt @id @default(autoincrement())
+  tenantId BigInt @map("tenant_id")
+  agentId  BigInt @map("agent_id")
+  threadId String @map("thread_id")
+  // The AIMessage this OVERRIDES, when the rebuilt transcript still shows it. Null for a turn the
+  // thread has no record of (the input block); set but no longer shown when the agent's reply was
+  // empty, since the rebuild drops an AI message with no text. Both of those are placed instead,
+  // by the two ids below.
+  messageId String? @map("message_id")
+  // Where a blocked turn goes: the last message the rebuilt transcript SHOWED when it happened, so
+  // it lands after that turn. Deliberately not the raw tail of the thread, which can be a message
+  // the rebuild drops. Null means the thread was empty, i.e. it goes first.
+  anchorMessageId String? @map("anchor_message_id")
+  // The human message of this turn, minted by the service for EVERY turn. Two readers: the media
+  // saved for a blocked turn joins back on it, and an annotation whose own reply was dropped is
+  // placed after it.
+  userMessageId String? @map("user_message_id")
+  // The customer's own text, carried only for a blocked turn (the thread never received it).
+  userText String? @map("user_text")
+  // What the operator saw in place of the model's reply. Empty for a suppressed one.
+  reply String
+  // The TraceGuardrail entries for this turn, as the live turn returned them.
+  guardrails Json
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, threadId])
+  @@map("playground_turn_notes")
+}
+
 // Binary media (recorded voice notes, generated TTS replies, uploaded files) for playground replay.
 // Linked to a turn by the LangChain message id (messageId) it belongs to, with a creation-order
 // fallback. The conversation transcript lives in the checkpointer; only the bytes live here.
@@ -1050,64 +1144,47 @@ model VaultEntry {
 }
 
 model ToolDefinition {
-  id            BigInt   @id @default(autoincrement())
-  tenantId      BigInt   @map("tenant_id")
-  name          String
+  id               BigInt   @id @default(autoincrement())
+  tenantId         BigInt   @map("tenant_id")
+  name             String
   // Human-friendly display name as the operator typed it (accents/spaces preserved); `name` is the
   // normalized identifier the model calls, derived from `label`. Required: the editor only exposes the
   // display name and derives `name` from it (legacy null rows were backfilled with `name`).
-  label         String
-  description   String?
-  method        String   @default("POST")
-  urlTemplate   String   @map("url_template")
-  allowedHosts  String[] @map("allowed_hosts")
-  headers       Json     @default("{}")
+  label            String
+  description      String?
+  method           String   @default("POST")
+  urlTemplate      String   @map("url_template")
+  allowedHosts     String[] @map("allowed_hosts")
+  headers          Json     @default("{}")
   // AI-filled contract ONLY (the z.object the model receives): { [name]: { type, description?,
   // required?, enumValues?, itemType? } }. type ∈ string|integer|number|boolean|enum|array|object.
   // Fixed values live in body/query/headers as literal templates, NOT here. Legacy rows may still
   // carry source:"fixed"+value (the runtime honors both until the tool is re-saved).
-  inputSchema   Json     @default("{}") @map("input_schema")
-  outputSchema  Json     @default("{}") @map("output_schema")
+  inputSchema      Json     @default("{}") @map("input_schema")
+  outputSchema     Json     @default("{}") @map("output_schema")
   // Query-string params, applied for ANY method: Record<string,string> of templates
   // (fixed/context/{{secret}}/{{aiField}}), interpolated and added to searchParams.
-  query         Json     @default("{}")
+  query            Json     @default("{}")
   // Request body shape: { mode: "kv", rows: [{key,value}] } | { mode: "raw", raw }. "kv" assembles
   // JSON from explicit key/value rows (a row whose value is a lone {{aiField}} keeps the AI's type);
   // "raw" sends the interpolated template. Legacy: { mode: "fields" } assembles from the non-path
   // input fields (still honored by the runtime; converted to "kv" when the tool is re-saved).
-  body          Json     @default("{}")
-  credentialRef String?  @map("credential_ref")
-  enabled       Boolean  @default(true)
-  // NOTE: RETIRED (issue #137). `@ignore` is what retires it: the field leaves the generated client
-  // entirely, so no query this build sends NAMES the column and reading it is a compile error, while
-  // the column itself stays in the database and in the migration history (`migrate diff` across this
-  // attribute is an empty migration).
-  //
-  // Not naming it is the point, and it is a stronger condition than not reading it: a Prisma query
-  // without an explicit `select` asks for every scalar column of the model, and so does a relation
-  // pulled in as `toolDefinition: true`, so a call site that never touches the field still puts it
-  // in the SQL. An older image running such a query after the column is dropped answers
-  // `undefined_column`. Measured on v1.9.0 against a database with the column already gone: the
-  // agent export and saving a tool both failed, and only the one read with an explicit select kept
-  // working, which is the opposite of what auditing the SELECT lists suggests (issue #149).
-  //
-  // So the drop belongs one release after THIS attribute, not one release after #137: rolling back
-  // now lands on a build that still asks for the column. Dropping it is then this line's removal
-  // plus the migration `migrate diff` already writes.
-  riskTier      String   @default("medium") @map("risk_tier") @ignore
+  body             Json     @default("{}")
+  credentialRef    String?  @map("credential_ref")
+  enabled          Boolean  @default(true)
   // HTTP statuses this tool declares as RESULTS rather than integration failures. Empty (the
   // default) keeps issue #40's behavior, where every non-2xx is logged warn and reaches the alert
   // channels. A declarative lookup that answers 404 for "no record" lists it here so a healthy turn
   // stops emitting an alert; the model-facing text is unchanged either way. See
   // src/graph/tools/http-status.ts for why this is a list and not a range.
-  expectedStatuses Int[] @default([]) @map("expected_statuses")
+  expectedStatuses Int[]    @default([]) @map("expected_statuses")
   // Optional "I'll look into that for you…" acknowledgement: when ackEnabled is true, the agent
   // posts ackMessage to the customer (with a typing indicator) BEFORE invoking this — typically
   // slow — tool. Per-tool, opt-in; only fires on a real conversation, never in the playground.
-  ackEnabled    Boolean  @default(false) @map("ack_enabled")
-  ackMessage    String?  @map("ack_message")
-  createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  ackEnabled       Boolean  @default(false) @map("ack_enabled")
+  ackMessage       String?  @map("ack_message")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
 
   tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   toolSelections AgentToolSelection[]
@@ -1310,6 +1387,12 @@ model SchedulerJob {
   kind      SchedulerJobKind
   dedupeKey String             @map("dedupe_key")
   payload   Json               @default("{}")
+  /// The encrypted half of a payload, for the kinds that carry one (today: INGEST_MESSAGE, whose
+  /// rendered message body is a contact's own words). A plain String because `encryptJson` returns a
+  /// base64 blob and secrets do not go in a `Json` column, where accidental logging or serialization
+  /// of the whole payload would carry them along — the same rule VaultEntry.secret and
+  /// ChatwootInstance.adminToken follow. Null for every kind that carries nothing sensitive.
+  payloadSecret String?        @map("payload_secret")
   status    SchedulerJobStatus @default(PENDING)
   runAt     DateTime           @map("run_at")
   attempts  Int                @default(0)

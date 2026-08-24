@@ -4,6 +4,7 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { clipText } from "@/lib/text";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
@@ -11,7 +12,21 @@ import {
   shouldBotHandle,
 } from "@/modules/chatwoot/normalize";
 import { reconcileMirrorFromLive } from "@/modules/chatwoot/reconcile";
+import { withAuthContextSection } from "@/modules/contact-auth/context";
+import {
+  authorizeContact,
+  contactAuthFlowEvent,
+} from "@/modules/contact-auth/service";
+import { recordResolutionOrigin } from "@/modules/conversations/record-resolution";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import {
+  buildGuardrailGate,
+  chatwootNoteSink,
+  type GuardrailDecision,
+  guardrailLeftAMark,
+  guardrailRan,
+  screenedText,
+} from "@/modules/guardrails/gate";
 import { armCompaction } from "@/modules/memory/compact";
 import {
   buildTemplatePayload,
@@ -34,6 +49,7 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "./inflight";
+import { drainPendingIngest } from "./ingest-drain";
 import { conversationDividerMessage, nudgeMessage } from "./markers";
 import {
   type AgentConfig,
@@ -176,16 +192,14 @@ export function isNudgeSilent(reply: string): boolean {
 // newlines to a single line (so it cannot forge multi-line "system" framing), drop the data fence
 // token, and bound the length. Never let this text read as instructions.
 function sanitizeFreeText(s: string, max: number): string {
-  return (
-    s
-      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control chars is the point.
-      .replace(/[\u0000-\u001F\u007F]+/g, " ")
-      .split(DATA_FENCE)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, max)
-  );
+  const collapsed = s
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control chars is the point.
+    .replace(/[\u0000-\u001F\u007F]+/g, " ")
+    .split(DATA_FENCE)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clipText(collapsed, max);
 }
 
 // The system turn the agent sees: the AUTHORITATIVE directive first, then the untrusted event
@@ -259,6 +273,7 @@ export async function runAgentNudge(
       select: {
         inboxId: true,
         status: true,
+        chatwootStatusAt: true,
         assigneeType: true,
         assigneeId: true,
         assigneeName: true,
@@ -269,7 +284,12 @@ export async function runAgentNudge(
     if (!conv?.inboxId) return null;
     const inbox = await db.inbox.findUnique({
       where: { id: conv.inboxId },
-      select: { agentId: true, channelType: true, provider: true },
+      select: {
+        agentId: true,
+        channelType: true,
+        provider: true,
+        chatwootInboxId: true,
+      },
     });
     if (!inbox?.agentId) return null;
     // Test-mode gate: a "test" agent must not send proactive messages in a conversation that
@@ -292,12 +312,16 @@ export async function runAgentNudge(
     return {
       cfg,
       status: conv.status,
+      // NOTE: Kept beside `status` and moved with it: the pair is one observation, and the resolution
+      // recorder needs the version as much as the value (see ObservedConversation).
+      statusAt: conv.chatwootStatusAt,
       assigneeType: conv.assigneeType,
       assigneeId: conv.assigneeId,
       assigneeName: conv.assigneeName,
       lastInboundAt: conv.lastInboundAt,
       channelType: inbox.channelType,
       provider: inbox.provider,
+      chatwootInboxId: inbox.chatwootInboxId,
     };
   });
   if (loaded === "silenced") {
@@ -308,7 +332,10 @@ export async function runAgentNudge(
     return "silent";
   }
   if (!loaded) return "no-agent";
-  const cfg: AgentConfig = loaded.cfg;
+  // `let` for one reason: an authorized contact's facts are appended to the prompt below, after the
+  // gate that produced them. Everything downstream (toolset, graph, guardrail) reads this binding,
+  // so the block reaches all three without a second name to keep in sync.
+  let cfg: AgentConfig = loaded.cfg;
   const contactInboxId = cfg.contactInboxId;
 
   // Invoke on the SAME per-contact-inbox memory thread the reactive turn uses (resolveGraphThreadId),
@@ -391,6 +418,7 @@ export async function runAgentNudge(
       });
       // NOTE: Keep the in-memory snapshot in step so a second probe only re-writes on a NEW divergence.
       loaded.status = live.status;
+      loaded.statusAt = live.updatedAt;
       loaded.assigneeType = live.assigneeType;
       loaded.assigneeId = live.assigneeId;
       loaded.assigneeName = live.assigneeName;
@@ -443,7 +471,180 @@ export async function runAgentNudge(
         { ourAgentBotId: cfg.agentBotId },
       );
 
-  const handoffState = { customerMessageSent: false, completed: false };
+  const handoffState = {
+    customerMessage: null as string | null,
+    completed: false,
+  };
+
+  // Asked once before the send and once after moderation, which is why it is a closure and not two
+  // reads: the answer has to be produced the same way both times, or the second one would be a
+  // different question wearing the first one's name. Each mode keeps its own semantics — the
+  // live-gated path re-probes Chatwoot itself (the pre-invoke GET only covers the window BEFORE the
+  // model ran), the event-nudge path reads the mirror.
+  const botStillOwnsIt = async (): Promise<
+    "ours" | "not-ours" | "unavailable"
+  > => {
+    if (params.requireLiveBotOwnership) {
+      const post = await probeLiveOwnership();
+      if (post === "unavailable") return "unavailable";
+      return post === "not-owned" ? "not-ours" : "ours";
+    }
+    const ours = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+      const conv = await db.conversation.findUnique({
+        where: {
+          tenantId_chatwootInstanceId_chatwootConversationId: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: conversationId,
+          },
+        },
+        select: { assigneeType: true, status: true, assigneeId: true },
+      });
+      return shouldBotHandle(
+        {
+          assigneeType: conv?.assigneeType ?? null,
+          assigneeId: conv?.assigneeId ?? null,
+          status: conv?.status ?? null,
+        },
+        { ourAgentBotId: cfg.agentBotId },
+      );
+    });
+    return ours ? "ours" : "not-ours";
+  };
+
+  // `canMessage` is the caller's own proof of ownership, not a shared variable: the branches below
+  // run AFTER the model and pass the ownership re-probed then, while the contact-auth refusal runs
+  // BEFORE any model work and passes the one just probed. Reading a single later variable is what
+  // made the refusal path skip this function altogether.
+  const applyPostActions = async ({
+    canMessage,
+    // The resolve falls with the TRANSFER, on every branch: a conversation the human queue now owns
+    // is not ours to close, and that holds whether the closing line reached the customer, was
+    // suppressed by the guardrail or was left as a note outside the 24h window. Callers override
+    // only to take it away for a reason of their own, never to give it back.
+    allowResolve = !handoffState.completed,
+  }: {
+    canMessage: boolean;
+    allowResolve?: boolean;
+  }): Promise<void> => {
+    const actions = params.postActions;
+    if (!actions || !canMessage) return;
+    const labels = actions.assignLabels?.filter((l) => l.trim());
+    if (labels && labels.length > 0) {
+      try {
+        const current = await client.getConversationLabels(conversationId);
+        const merged = [...new Set([...current, ...labels])];
+        await client.setConversationLabels(conversationId, merged);
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "agentNudge: assignLabels failed",
+        );
+      }
+    }
+    if (allowResolve && actions.resolve) {
+      try {
+        await client.toggleStatus(conversationId, "resolved");
+        // NOTE: A follow-up ladder only advances while the customer stays silent (an inbound ends the
+        // episode), so the last step firing means nobody ever answered. Recording that keeps the
+        // Resolution funnel from reading an abandoned lead as a conversation the agent resolved.
+        await recordResolutionOrigin({
+          tenantId,
+          conversation: {
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: conversationId,
+          },
+          origin: "followup_abandonment",
+          // NOTE: `loaded` carries the probe's LIVE answer on the path that reaches this: every
+          // caller with allowResolve on runs after probeLiveOwnership, which writes both halves of
+          // what it saw back onto `loaded`. The contact-auth refusal, which is the one caller that
+          // runs before the model, passes allowResolve: false and never gets here.
+          observed: { status: loaded.status, statusAt: loaded.statusAt },
+          base,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "agentNudge: resolve failed",
+        );
+      }
+    }
+  };
+  // The contact authorization gate applies to proactive sends too (docs/contact-auth.md): a
+  // follow-up is a turn the agent starts, and a contact the reactive gate would refuse must not be
+  // reached out to either. Denied and cannot-tell alike end in silence: fail-closed has no
+  // "note instead" downgrade here, because the nudge's own text was written FOR the customer.
+  // Asked after the live-ownership probe (a conversation that is no longer the bot's costs no
+  // call) and before any tool/model work, so a refused nudge spends nothing.
+  // Asked only when this nudge could actually REACH the contact. A nudge on a conversation a human
+  // already owns cannot: `canMessagePre` is false and the whole thing ends as a private note to the
+  // operator (docs/integrations.md — "human handling ⇒ private note, not a customer message"), which
+  // is signal FOR the human, not an approach to the customer. Asking there would spend a call on
+  // somebody else's endpoint to decide about a message that never goes out, and — since the answer
+  // is acted on — would turn that documented note into silence.
+  if (cfg.contactAuthConfig.enabled && canMessagePre) {
+    const auth = await authorizeContact({
+      tenantId,
+      agentId: cfg.agentId,
+      contactDbId: cfg.contactDbId,
+      conversationId,
+      inboxId: loaded.chatwootInboxId,
+      channelType: loaded.channelType,
+      // A nudge is a turn the agent starts: there is no customer message to forward.
+      messageText: null,
+      // A nudge is its own asking: it carries no message text, so it must never join (or be
+      // joined by) the flight of an incoming message that does.
+      requestKey: "nudge",
+      cfg: cfg.contactAuthConfig,
+      base,
+      fetchImpl: params.deps?.contactAuthFetch,
+    });
+    emitFlowEvent(flow, contactAuthFlowEvent(auth));
+    if (auth.outcome !== "allowed") {
+      logger.info(
+        "agentNudge: contact not authorized (conv=%s outcome=%s), skipping",
+        String(conversationId),
+        auth.outcome,
+      );
+      // The step FIRED, and the deterministic post-actions are the system's, not the agent's: the
+      // follow-up handler stamps and advances the sequence either way, so skipping them here loses
+      // the operator's labels for good. No resolve, though: the same rule as the noted-window
+      // branch, where nothing reached the customer either.
+      //
+      // Ownership is asked AGAIN, not carried from before the gate: the authorization request is a
+      // round-trip to somebody else's endpoint with up to a ten-second ceiling, which is exactly the
+      // kind of slow work the normal path re-probes after. Stamping labels on a conversation a
+      // human took during those seconds is writing on their conversation. A probe that cannot
+      // answer means we do not know, and we do not touch it.
+      const stillOurs = await botStillOwnsIt().catch(() => "unavailable");
+      await applyPostActions({
+        canMessage: stillOurs === "ours",
+        allowResolve: false,
+      });
+      return "silent";
+    }
+    // Allowed, and the ownership probe above happened BEFORE a round-trip that may have taken ten
+    // seconds. The same reason the refusal re-asks: a human who took the conversation during the
+    // wait would otherwise have the follow-up's tools run on it, and the post-model re-probe only
+    // decides whether the TEXT goes out. A probe that cannot answer means we do not know, and a
+    // follow-up we are unsure about is one we do not send.
+    //
+    // A TAKEOVER is what this is looking for, which is why it sits under `canMessagePre`: a
+    // conversation that was already the human's before the call has not changed hands, and its
+    // private-note path is not something to fence.
+    if ((await botStillOwnsIt().catch(() => "unavailable")) !== "ours") {
+      logger.info(
+        "agentNudge: a human took the conversation during the authorization call (conv=%s)",
+        String(conversationId),
+      );
+      return "silent";
+    }
+    // The facts the endpoint volunteered about this contact, for this turn's prompt. A proactive
+    // turn benefits from them the same way a reactive one does, and the check that produced them is
+    // the one that just allowed this send.
+    cfg = withAuthContextSection(cfg, auth.context ?? null);
+  }
+
   const tools = await buildToolset(
     cfg,
     {
@@ -453,6 +654,12 @@ export async function runAgentNudge(
       client,
       conversationId,
       threadId: params.threadId,
+      // NOTE: The live probe's answer where this path has one, the mirror's otherwise. resolve_conversation
+      // runs immediately on a nudge turn (no turnState), so this is what tells its close apart from
+      // one that had already happened — but only as a FALLBACK: this snapshot is taken before
+      // `graph.invoke`, and the tool fires during a model call that can run for a minute, so the
+      // tool re-reads the live state itself and falls back here only when that read fails.
+      observed: { status: loaded.status, statusAt: loaded.statusAt },
       handoffState,
     },
     { buildNativeTools, mcp: params.deps?.mcp, flow },
@@ -525,9 +732,134 @@ export async function runAgentNudge(
     // No prior checkpoint / state unavailable → proceed.
   }
 
+  // What this channel allows RIGHT NOW, asked as a function instead of held as a value. The 24h
+  // service window is measured from the customer's last message, so it is the only input on this
+  // path that expires on its own while the turn is still running — and the guardrail below is a
+  // model round-trip with a 15s ceiling sitting between the question and the send.
+  //
+  // A closure rather than a `let` because asking costs nothing (a subtraction, no I/O) while
+  // forgetting to ask again costs the whole message: outside the window the provider rejects the
+  // free-form send, and on the handoff path that rejection lands in a catch with no second attempt
+  // behind it, so the sentence the transfer promised is lost instead of becoming a note.
+  const sendModeNow = () =>
+    proactiveSendMode(
+      cfg.serviceWindowConfig,
+      loaded.lastInboundAt,
+      params.deps?.now?.() ?? new Date(),
+      channelHasServiceWindow({
+        channelType: loaded.channelType,
+        provider: loaded.provider,
+      }),
+    );
+
+  // OUTPUT guardrail for proactive text (#160). A follow-up is a message the customer never asked
+  // for, which makes it the last one that should go out unmoderated — and until this unit existed
+  // the proactive path never called the guardrails module at all. Same gate the reactive turn uses,
+  // minus the customer's message, because there is none: gate.ts explains why that absence has to
+  // drop the relevance check rather than merely skip its call.
+  //
+  // Called ONLY where the text is about to reach the CUSTOMER: the branches that fall back to a
+  // private note are writing to the operator, and screening those would let a customer-facing
+  // template replace an internal notice, or a `silent` verdict delete the alert that explains the
+  // bot's silence.
+  //
+  // Returns the whole decision, not just the text. What follows a screening on this path depends on
+  // whether a judge ran at all and on whether it wrote anything down, and those are questions only
+  // the decision answers.
+  const screenOutput = (text: string): Promise<GuardrailDecision> =>
+    buildGuardrailGate({
+      cfg: cfg.guardrails,
+      apiKey: cfg.guardrailsApiKey,
+      credentialBaseUrl: cfg.guardrailsCredentialBaseUrl,
+      announce: chatwootNoteSink(client, conversationId),
+      flow,
+      systemPrompt: cfg.systemPrompt,
+      makeModel: params.deps?.makeModel,
+    })("output", text);
+
+  // What the transfer promised the customer, delivered on the way OUT of the turn — whatever the way
+  // out is. Called once on the normal path and once from the failure path, because the tool can
+  // complete the transfer and the model's next step can then throw, leaving the line in local state
+  // with nobody to deliver it and no later attempt able to: the conversation reads `open` from the
+  // moment the tool set it, so every retry stops at its own ownership gate.
+  //
+  // Returns what happened, for the caller to stamp and label, or null when there was no promise.
+  //
+  // Two call sites, and they are exclusive: the failure path always rethrows, so the normal one is
+  // unreachable after it. Anything that adds a third owns the at-most-once question, because a
+  // promise delivered twice is the duplicate #158 was about.
+  const deliverPromisedLine = async (): Promise<
+    "messaged" | "noted-window" | "silent" | null
+  > => {
+    if (!handoffAnsweredTheTurn(handoffState)) return null;
+    const line = handoffState.customerMessage;
+    // Outside the window a free-form send is the one the provider refuses, and an approved template
+    // says nothing about a transfer, so neither reaches the customer. The operator gets the sentence
+    // instead, explained, like any other proactive text that could not be sent.
+    //
+    // What it carries is the line the MODEL wrote, on both paths that reach here and not only the
+    // one that never screened it: a private note is written to the operator, and what the operator
+    // needs to read is what the transfer promised. A judge that objected to it has already said so,
+    // in its own note on this same conversation.
+    const noteOutsideWindow = async () => {
+      await client.sendPrivateNote(
+        conversationId,
+        `${OUTSIDE_WINDOW_NOTE_PREFIX}${line}`,
+      );
+      return "noted-window" as const;
+    };
+    try {
+      // The same question at two instants, and only the second one governs the send. Asked before
+      // the screening so a line that cannot go out anyway costs no model call, and asked again
+      // after it because that call is precisely where the window closes: 15 seconds is nothing
+      // against 24 hours except at the boundary, and the boundary is exactly where a follow-up
+      // chasing a customer who has gone quiet tends to land.
+      if (sendModeNow() !== "freeform") return await noteOutsideWindow();
+      const line2 = screenedText(await screenOutput(line), line);
+      if (line2 === null) return "silent";
+      if (sendModeNow() !== "freeform") return await noteOutsideWindow();
+      await client.sendMessage(conversationId, line2);
+      logger.info(
+        "agentNudge handed off: conv=%s source=%s",
+        String(conversationId),
+        params.nudge.source,
+      );
+      return "messaged";
+    } catch (e) {
+      // Best-effort, the semantics the line had while the tool sent it. No later attempt can deliver
+      // it, and throwing would only cost the operator an alert on a thread that was correctly handed
+      // to a human — and on the failure path it must never mask the error that ended the turn.
+      logger.warn(
+        "agentNudge handoff closing line failed to deliver (conv=%s): %s",
+        String(conversationId),
+        e instanceof Error ? e.message : String(e),
+      );
+      emitFlowEvent(flow, {
+        stage: "split",
+        status: "error",
+        level: "warn",
+        detail: { outcome: "handoff_closing_line_undelivered" },
+        errorMessage: e instanceof Error ? e.message : String(e),
+      });
+      // "silent" and not "messaged", because the caller stamps this on the turn trail as an `ok`
+      // row: "messaged" here would tell the operator a sentence reached the customer on the one
+      // path where it demonstrably did not. The union has no member for "tried and failed", and
+      // it does not need one — the error row emitted just above is that record, and "silent" is
+      // already this function's answer for "the customer received nothing from the promise".
+      return "silent";
+    }
+  };
+
   let claimedGraphThread = false;
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
+    // BARRIER (issue #194), for the same reason the reactive turn has one: a proactive turn reads
+    // this thread too, and a message still queued is a nudge written without it. Before the lock,
+    // which the drain also takes. A conversation-keyed thread simply matches no queued ingestion.
+    // Outcome discarded, as at the reactive turn and for the same reason: a nudge that finds
+    // ingestion still owed writes one message without one line of context, and the next reader gets
+    // it. See ./ingest-drain.ts for the reader that cannot make that trade.
+    await drainPendingIngest(tenantId, graphThreadId, base);
     // Taken INSIDE the try, and released only if it was actually taken: the transaction can reject
     // after its callback ran (a failed commit, a lost connection), and a claim made on the way to a
     // rejection that skips the `finally` never comes back — every later compaction on this thread
@@ -640,17 +972,26 @@ export async function runAgentNudge(
     // node already prepends the one-and-only system prompt, and a second system message in the thread
     // makes strict providers (Google) reject the call ("System messages are only permitted as the
     // first passed message"). The renderNudge directive + data fence read fine as a human trigger.
-    result = await graph.invoke(
-      {
-        messages: [
-          nudgeMessage(
-            renderNudge(params.nudge, canMessagePre),
-            conversationId,
-          ),
-        ],
-      },
-      invokeConfig,
-    );
+    // The catch is what keeps a handoff's promise from dying with a throw from INSIDE the graph:
+    // the tool can complete the transfer and the model's next step can then fail. The label and the
+    // follow-up stamp are deliberately NOT applied there — the turn failed, and the only thing that
+    // cannot wait for a retry is the sentence the customer was promised.
+    result = await graph
+      .invoke(
+        {
+          messages: [
+            nudgeMessage(
+              renderNudge(params.nudge, canMessagePre),
+              conversationId,
+            ),
+          ],
+        },
+        invokeConfig,
+      )
+      .catch(async (e) => {
+        await deliverPromisedLine();
+        throw e;
+      });
   } finally {
     if (claimedGraphThread) clearTurnInFlight(graphThreadId);
   }
@@ -668,33 +1009,27 @@ export async function runAgentNudge(
   // during execution with a delayed/lost webhook would leave the mirror bot-owned; nothing has been
   // posted yet, so failing closed here is free. Event nudges keep the mirror read (for them a
   // human-owned conversation downgrades to a private note rather than aborting).
+  //
+  // A completed transfer makes its closing line deliverable whatever these checks say, and whether
+  // or not they can run at all: the transfer already happened, that sentence is the last thing the
+  // bot owes the customer, and no later attempt can deliver it — the conversation reads `open` now,
+  // so every retry path stops at its own ownership gate. "Never message over a human" is the rule
+  // these checks exist for, and it does not reach the one conversation we just handed to one. Every
+  // OTHER kind of proactive text is still decided by them.
+  const handedOff = handoffAnsweredTheTurn(handoffState);
+
   let canMessagePost: boolean;
-  if (params.requireLiveBotOwnership) {
-    const post = await probeLiveOwnership();
-    if (post === "unavailable") return "live-unavailable";
-    if (post === "not-owned") return "stale";
+  if (handedOff) {
     canMessagePost = true;
   } else {
-    canMessagePost = await runScopedOn(base, sysCtx(tenantId), async (db) => {
-      const conv = await db.conversation.findUnique({
-        where: {
-          tenantId_chatwootInstanceId_chatwootConversationId: {
-            tenantId,
-            chatwootInstanceId: instanceId,
-            chatwootConversationId: conversationId,
-          },
-        },
-        select: { assigneeType: true, status: true, assigneeId: true },
-      });
-      return shouldBotHandle(
-        {
-          assigneeType: conv?.assigneeType ?? null,
-          assigneeId: conv?.assigneeId ?? null,
-          status: conv?.status ?? null,
-        },
-        { ourAgentBotId: cfg.agentBotId },
-      );
-    });
+    const owned = await botStillOwnsIt();
+    // Fail closed: nothing has been posted yet, so a probe that could not run costs a retry and
+    // nothing else.
+    if (owned === "unavailable") return "live-unavailable";
+    // The live-gated caller asked for certainty and gets an abort; an event nudge downgrades to a
+    // private note instead, which is the shape it has always had.
+    if (owned === "not-ours" && params.requireLiveBotOwnership) return "stale";
+    canMessagePost = owned === "ours";
   }
 
   // Deterministic post-actions applied by the SYSTEM whenever the step fires and the bot still owns
@@ -704,89 +1039,143 @@ export async function runAgentNudge(
   // allowResolve=false skips ONLY the resolve action (labels still apply): the noted-window branch
   // never reached the customer AND ends the sequence, so auto-resolving there would close the
   // conversation on the back of a message nobody received.
-  const applyPostActions = async ({
-    allowResolve = true,
-  }: {
-    allowResolve?: boolean;
-  } = {}): Promise<void> => {
-    const actions = params.postActions;
-    if (!actions || !canMessagePost) return;
-    const labels = actions.assignLabels?.filter((l) => l.trim());
-    if (labels && labels.length > 0) {
-      try {
-        const current = await client.getConversationLabels(conversationId);
-        const merged = [...new Set([...current, ...labels])];
-        await client.setConversationLabels(conversationId, merged);
-      } catch (err) {
-        logger.warn(
-          { err, conversationId: String(conversationId) },
-          "agentNudge: assignLabels failed",
-        );
-      }
-    }
-    if (allowResolve && actions.resolve) {
-      try {
-        await client.toggleStatus(conversationId, "resolved");
-      } catch (err) {
-        logger.warn(
-          { err, conversationId: String(conversationId) },
-          "agentNudge: resolve failed",
-        );
-      }
-    }
-  };
+
+  // The transfer is done and this is the sentence it promised the customer. Its own path, because
+  // every question the branches below answer is about the MODEL's proactive text and none of them
+  // applies here: there is no silence to respect (the transfer spoke for this turn), and no
+  // ownership left to protect (we are the ones who just handed the conversation over). It does
+  // respect the 24h service window, which the tool's own send used to walk straight past.
+  const promised = await deliverPromisedLine();
+  if (promised) {
+    if (promised !== "silent") markFollowUp(promised);
+    await applyPostActions({ canMessage: canMessagePost });
+    return promised;
+  }
 
   // Agent stayed silent: no message, but the deterministic actions still fire (covers "no reply on
   // the final follow-up: label + resolve").
-  const handedOff = handoffAnsweredTheTurn(handoffState);
   if (silent || !reply) {
     // Keyed on the TRANSFER, not on the suppression: a conversation the human queue now owns is not
     // ours to close, even when the closing line never made it out.
-    await applyPostActions({ allowResolve: !handoffState.completed });
+    await applyPostActions({ canMessage: canMessagePost });
     return "silent";
   }
 
   // Message the customer ONLY when the bot still owns the conversation AND we were in message mode;
   // otherwise it becomes a private note (never message over a human).
-  if (canMessagePre && canMessagePost) {
-    // WhatsApp 24h service window: free-form only within it. Outside → an approved template (HSM) if
-    // configured, else fall through to a private note (never a free-form message WhatsApp rejects).
-    const mode = proactiveSendMode(
-      cfg.serviceWindowConfig,
-      loaded.lastInboundAt,
-      new Date(),
-      channelHasServiceWindow({
-        channelType: loaded.channelType,
-        provider: loaded.provider,
-      }),
-    );
-    if (mode === "freeform") {
-      // The handoff already answered, so this text is the second copy. Deliberately INSIDE the
-      // freeform branch: outside the 24h window the tool's own send is the one the provider
-      // refuses, so the operator still needs the note and the label the branches below leave, and
-      // a turn that returned earlier would leave a fenced handoff with no trace anywhere.
-      if (handedOff) {
-        logger.info(
-          "agentNudge handed off: conv=%s source=%s",
-          String(conversationId),
-          params.nudge.source,
+  // WhatsApp 24h service window: free-form only within it. Outside → an approved template (HSM) if
+  // configured, else fall through to a private note (never a free-form message WhatsApp rejects).
+  //
+  // Screened BEFORE the last word on either of those, so both answers are newer than the screening.
+  // Moderation is a model round-trip with a 15s ceiling, and it was added to this path by the same
+  // change that reads this comment: the ownership taken before generation used to be consumed
+  // immediately, and now it would be consumed seconds later — by the send AND by the post-actions,
+  // which resolve the conversation. Closing a thread a human took over during those seconds is not
+  // a message landing late, it is the human's conversation being shut, and a window that shut in
+  // the same seconds turns the send into one the provider refuses.
+  //
+  // A completed transfer is exempt, as it is everywhere else here: its closing line left through
+  // `deliverPromisedLine` above and never reaches this branch.
+  if (canMessagePre && canMessagePost && sendModeNow() === "freeform") {
+    // The handoff already answered, so this text is the second copy. Deliberately INSIDE the
+    // freeform branch: outside the 24h window the tool's own send is the one the provider
+    // refuses, so the operator still needs the note and the label the branches below leave, and
+    // a turn that returned earlier would leave a fenced handoff with no trace anywhere. Checked
+    // before screening, so a suppressed copy never pays for a moderation round-trip either.
+    if (handedOff) {
+      logger.info(
+        "agentNudge handed off: conv=%s source=%s",
+        String(conversationId),
+        params.nudge.source,
+      );
+      markFollowUp("messaged");
+      // The label is how the operator triages what the bot left behind; the resolve is not ours.
+      await applyPostActions({
+        canMessage: canMessagePost,
+        allowResolve: false,
+      });
+      return "messaged";
+    }
+
+    // The one branch whose text the CUSTOMER reads, so the one branch that is screened. A failed
+    // send still throws here: nothing has been done to the conversation that a retry cannot repeat,
+    // so the job should run again rather than swallow the miss.
+    const decision = await screenOutput(reply);
+    const screened = screenedText(decision, reply);
+
+    // The recheck exists for ONE window: the judge's own model call, between the ownership answered
+    // before generation and everything below that consumes it — the send, and the post-actions that
+    // resolve the conversation. So it is asked exactly when that window exists, and skipped when no
+    // judge ran, which is the default configuration and would otherwise pay a live Chatwoot GET per
+    // follow-up for a window of zero length.
+    //
+    // Asked BEFORE the verdict is acted on, not inside the branch that sends: a suppressed reply
+    // runs the post-actions too, so it closes a human-owned thread exactly as hard as a delivered
+    // one would.
+    if (guardrailRan(decision)) {
+      const owned = await botStillOwnsIt().catch((err) => {
+        // Swallowed on purpose (a throw here re-runs the turn and rewrites whatever the judge just
+        // wrote), but never silently: this is the mirror's own database read failing.
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "agentNudge: ownership recheck after moderation could not read",
         );
-        markFollowUp("messaged");
-        // The label is how the operator triages what the bot left behind; the resolve is not ours.
-        await applyPostActions({ allowResolve: false });
-        return "messaged";
+        return "unavailable" as const;
+      });
+      // Whether abandoning the turn is still free is whatever the judge just did, so the judge is
+      // asked rather than assumed: a clean verdict leaves no trace and the step is worth running
+      // again, while a trip or a failed screening has already written the operator note or a warn
+      // that pages, and every retry repeats it while spending two model calls to reach the same
+      // verdict. Degrading costs the customer a follow-up nobody asked for; retrying costs the
+      // operator up to NUDGE_RETRY_LIMIT copies of one alert. Neither is free, so neither is the
+      // default. (The read itself failing is answered the same way, for the same reason.)
+      //
+      // Only the caller that opted into live gating is told, because it is the only one that can
+      // act: `live-unavailable` is documented as an outcome OF that gate, and the other three
+      // callers discard the return value entirely, so telling them loses the follow-up with no
+      // retry and no record. For them the recheck simply cannot say "still ours", and the note
+      // branch below is already the answer to that.
+      if (
+        owned === "unavailable" &&
+        !guardrailLeftAMark(decision) &&
+        params.requireLiveBotOwnership
+      ) {
+        return "live-unavailable";
       }
-      await client.sendMessage(conversationId, reply);
+      // A KNOWN takeover ends the episode either way: that outcome does not retry, so it costs no
+      // repetition — and "the human owns it" is a different fact from "we could not ask".
+      if (owned === "not-ours" && params.requireLiveBotOwnership)
+        return "stale";
+      canMessagePost = owned === "ours";
+    }
+
+    if (screened === null) {
+      await applyPostActions({ canMessage: canMessagePost });
+      return "silent";
+    }
+    // The window is asked again for the same reason the ownership is, and about the same stretch of
+    // time: the judge's model call. Both were read before it and are spent here. A mode that has
+    // gone stale sends a free-form message the provider now refuses, and this is the last point
+    // where the reply can still fall through to the template/note branch below instead of being
+    // lost to that rejection — on the handoff path, permanently.
+    if (canMessagePost && sendModeNow() === "freeform") {
+      await client.sendMessage(conversationId, screened);
       logger.info(
         "agentNudge messaged: conv=%s source=%s",
         String(conversationId),
         params.nudge.source,
       );
       markFollowUp("messaged");
-      await applyPostActions();
+      await applyPostActions({ canMessage: canMessagePost });
       return "messaged";
     }
-    if (mode === "template") {
+    // A human arrived while the judge was reading, or the window closed while it did. Everything
+    // below already knows what to do with either: `canMessagePost` carries the first, and the
+    // second is answered by asking again.
+  }
+
+  if (canMessagePre && canMessagePost) {
+    if (sendModeNow() === "template") {
       const payload = buildTemplatePayload(
         cfg.serviceWindowConfig,
         cfg.contactName,
@@ -800,7 +1189,7 @@ export async function runAgentNudge(
           payload.name,
         );
         markFollowUp("templated");
-        await applyPostActions();
+        await applyPostActions({ canMessage: canMessagePost });
         return "templated";
       }
     }
@@ -817,7 +1206,7 @@ export async function runAgentNudge(
       params.nudge.source,
     );
     markFollowUp("noted-window");
-    await applyPostActions({ allowResolve: false });
+    await applyPostActions({ canMessage: canMessagePost, allowResolve: false });
     return "noted-window";
   }
   await client.sendPrivateNote(conversationId, reply);
@@ -827,6 +1216,6 @@ export async function runAgentNudge(
     params.nudge.source,
   );
   markFollowUp("noted");
-  await applyPostActions();
+  await applyPostActions({ canMessage: canMessagePost });
   return "noted";
 }

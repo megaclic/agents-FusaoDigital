@@ -17,6 +17,8 @@ import {
 import { contentToText } from "@/graph/message-text";
 import { runModelCall } from "@/graph/model-limit";
 import { DATA_FENCE } from "@/graph/nudge";
+import { providerFailure } from "@/lib/provider-failure";
+import { clipText, clipTextEnd } from "@/lib/text";
 
 // Condenses the raw turns of a closed attendance into the memory the agent keeps of it.
 //
@@ -57,17 +59,14 @@ function clipTranscript(
   joined: string,
   maxHistoryTokens: number | null,
 ): string {
-  let text =
-    joined.length > TRANSCRIPT_MAX_CHARS
-      ? joined.slice(joined.length - TRANSCRIPT_MAX_CHARS)
-      : joined;
+  let text = clipTextEnd(joined, TRANSCRIPT_MAX_CHARS);
   if (!maxHistoryTokens || maxHistoryTokens <= 0) return text;
   for (let pass = 0; pass < CLIP_PASSES; pass++) {
     const estimate = estimateTokenCount(text);
     if (estimate <= maxHistoryTokens) break;
     const keep = Math.floor((text.length * maxHistoryTokens) / estimate);
     if (keep <= 0) return "";
-    text = text.slice(text.length - keep);
+    text = clipTextEnd(text, keep);
   }
   return text;
 }
@@ -218,6 +217,12 @@ export function renderTranscript(
   return clipTranscript(joined, maxHistoryTokens);
 }
 
+// The rule this file used to own now lives in `@/lib/provider-failure`, because five other provider
+// boundaries needed the same one and a rule written once per call site is a rule the next call site
+// is born without. What stays here is the reading only this caller has: `runModelCall` has already
+// reduced whatever the provider wrote, but it cannot know that OUR signal is what stopped the wait,
+// so the abort is asserted from the signal rather than inferred from the error.
+
 export async function summarizeAttendance(
   model: BaseChatModel,
   messages: BaseMessage[],
@@ -233,9 +238,22 @@ export async function summarizeAttendance(
   // remember. That is a legitimate empty summary, not a failure, so it must not carry `error`.
   if (!transcript.trim()) return { summary: "" };
 
+  // Ours, and held so that `signal.aborted` can be read afterwards: it is the only reading of "it
+  // timed out" that does not come from the response. Every other tell — the error's name, its
+  // message — is written by someone else.
+  //
+  // Made INSIDE the callback, which is not a detail. `runModelCall` waits on the process-wide model
+  // semaphore BEFORE it calls this, and calls it a SECOND time when the provider returns an empty
+  // completion. A signal created outside would spend its budget queueing behind other turns and hand
+  // the retry whatever was left — so on a fleet busy enough for the wait to approach the ceiling,
+  // every compaction would abort before its call began and dead-letter for a reason that has nothing
+  // to do with the provider. The variable therefore holds the LAST attempt's signal, which is the
+  // one the error came from.
+  let attemptSignal: AbortSignal | undefined;
   try {
-    const res = await runModelCall(() =>
-      model.invoke(
+    const res = await runModelCall(() => {
+      attemptSignal = AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS);
+      return model.invoke(
         [
           new SystemMessage(SYSTEM_PROMPT),
           // NOTE: The transcript is never interpolated into the system prompt. Everything in a
@@ -246,19 +264,19 @@ export async function summarizeAttendance(
           ),
         ],
         {
-          signal: AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS),
+          signal: attemptSignal,
           ...(callbacks ? { callbacks } : {}),
         },
-      ),
-    );
+      );
+    });
     const text = contentToText(res.content).trim();
     if (!text) return { summary: "", error: "empty completion" };
-    return { summary: text.slice(0, ATTENDANCE_SUMMARY_MAX) };
+    return { summary: clipText(text, ATTENDANCE_SUMMARY_MAX) };
   } catch (err) {
     logger.warn({ err }, "memory: attendance summary failed, thread untouched");
     return {
       summary: "",
-      error: err instanceof Error ? err.message : String(err),
+      error: providerFailure(err, attemptSignal?.aborted === true),
     };
   }
 }

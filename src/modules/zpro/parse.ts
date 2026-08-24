@@ -3,6 +3,7 @@
 // do agente, só roda para eventos que passam no gate) e mirror.ts (espelho de TODAS as mensagens,
 // inclusive as que o gate descarta), para não duplicar a mesma lógica de parsing duas vezes.
 
+import { clipText } from "@/lib/text";
 import type { WhatsappMediaType } from "./media-crypto";
 import type {
   ZproContactTagRef,
@@ -193,7 +194,7 @@ export function extractQuotedText(msg: ZproMsgTop): string | undefined {
   if (!quotedMessage || typeof quotedMessage !== "object") return undefined;
   const text = describeQuotedContent(quotedMessage as ZproMsgContent);
   if (!text) return undefined;
-  return text.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX);
+  return clipText(text.replace(/\s+/g, " ").trim(), QUOTE_MAX);
 }
 
 // Prefixes a message's text with a "replying to: ..." marker when it's a WhatsApp reply — same

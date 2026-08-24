@@ -349,7 +349,11 @@ describe.skipIf(!dbUp)("resolveZproSibling", () => {
     const contact =
       opts.chatwootContactId !== null
         ? await suDb.contact.create({
-            data: { tenantId, chatwootContactId: opts.chatwootContactId },
+            data: {
+              tenantId,
+              chatwootInstanceId: instance.id,
+              chatwootContactId: opts.chatwootContactId,
+            },
           })
         : null;
     const widgetConv = await suDb.conversation.create({

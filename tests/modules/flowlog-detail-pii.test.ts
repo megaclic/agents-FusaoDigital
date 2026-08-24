@@ -7,7 +7,10 @@ import { encryptJson } from "@/api/lib/crypto";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { runAgentTurn } from "@/graph/runtime";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import { clearContactAuthState } from "@/modules/contact-auth/state";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { guardrailModel, UsageReportingModel } from "../utils/scripted-models";
 
@@ -58,7 +61,11 @@ const ASKED = "meu processo e o xilofonte-7788"; // → the customer's own messa
 
 const BOT = 31;
 const INBOX = 17;
+// A second inbox whose agent runs the contact-authorization gate (its flow line is written by the
+// webhook, not by runAgentTurn, so its check has to travel that path).
+const INBOX_CA = 18;
 const GUARD_MODEL = "guard-model";
+let caInboxDbId = 0n;
 
 const incoming = (
   convId: number,
@@ -121,6 +128,20 @@ async function turnRows(convId: number, stages: readonly string[]) {
   throw new Error(
     `turn ${convId} never produced all of [${stages.join(", ")}]`,
   );
+}
+
+// The alert fan-out is dispatched from the same fire-and-forget emit as the row, and lands after it,
+// so it is polled for the same reason `turnRows` is.
+async function alertsFor(channelId: bigint) {
+  for (let i = 0; i < 200; i++) {
+    const rows = await suDb.alertDelivery.findMany({
+      where: { tenantId, channelId },
+      select: { summary: true },
+    });
+    if (rows.length > 0) return rows;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error("the failing turn never produced an alert delivery");
 }
 
 // The assertion itself: every marker, against every row of the turn, naming the stage that carries
@@ -228,8 +249,58 @@ describe.skipIf(!dbUp)(
           agentId: agent.id,
         },
       });
+      const caAgent = await suDb.agent.create({
+        data: {
+          tenantId,
+          name: "Portaria",
+          systemPrompt: "Você atende clientes.",
+          modelConfig: {
+            provider: "openai",
+            model: "gpt-4o-mini",
+            credentialRef: `vault:${llmKey.id}`,
+          },
+          settings: {
+            split: { enabled: false },
+            contactAuth: {
+              enabled: true,
+              url: "https://203.0.113.9:9443/check",
+              // POST + includeMessageText: the harshest shape, because the request now CARRIES the
+              // message the customer typed, and none of it may come back out through the log.
+              method: "POST",
+              includeMessageText: true,
+              denyMessage: "Atendemos apenas clientes cadastrados.",
+              handoffEnabled: false,
+            },
+          },
+        },
+        select: { id: true },
+      });
+      await suDb.chatwootAgentBot.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          agentId: caAgent.id,
+          chatwootAgentBotId: 32,
+          accessToken: encryptJson("BOT2"),
+          webhookSecret: encryptJson("S"),
+          webhookRouteTokenHash: `logpii-ca-route-${process.pid}`,
+          name: "Portaria",
+        },
+      });
+      const caInbox = await suDb.inbox.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootInboxId: INBOX_CA,
+          name: "Portaria",
+          agentId: caAgent.id,
+        },
+        select: { id: true },
+      });
+      caInboxDbId = caInbox.id;
       const contact = await suDb.contact.create({
         data: {
+          chatwootInstanceId: instanceId,
           tenantId,
           name: NAME,
           phone: PHONE,
@@ -398,6 +469,165 @@ describe.skipIf(!dbUp)(
       const detail = guard?.detail as Record<string, unknown> | null;
       expect(detail?.categories).toEqual(["toxicity"]);
       expect(detail?.categoriesUnnamed).toBe(1);
+    });
+
+    // The contact-authorization gate asks an OPERATOR-configured endpoint about the contact, and
+    // that endpoint's `reason` is free text that can (and here does) quote the phone it was asked
+    // about, the contact's name and the customer's own words. The slug guard is what keeps all of
+    // it out of the row; this is the check that it held on the write path.
+    test("a contact_auth line carries no phone even when the endpoint's reason quotes it", async () => {
+      clearContactAuthState();
+      const convId = 9604;
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          inboxId: caInboxDbId,
+          chatwootConversationId: convId,
+          status: "pending",
+          contactId,
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(Date.now() - 60_000),
+        },
+      });
+      const n = normalizeChatwootEvent({
+        event: "message_created",
+        id: 9901,
+        content: ASKED,
+        message_type: "incoming",
+        private: false,
+        conversation: {
+          id: convId,
+          inbox_id: INBOX_CA,
+          status: "pending",
+          contact_inbox: { id: 95_000 + convId },
+          meta: {
+            assignee_type: null,
+            assignee: null,
+            sender: { id: 31, name: NAME, phone_number: PHONE },
+          },
+          channel: "Channel::Api",
+          last_activity_at: Math.floor(Date.now() / 1000),
+        },
+      });
+      if (!n) throw new Error("unreachable: the fixture is a valid event");
+      const delivery = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `logpii-ca-${process.pid}`,
+          event: "message_created",
+          status: "PENDING",
+        },
+        select: { id: true },
+      });
+      const sent: Array<[number, string]> = [];
+      const contactAuthFetch = (async (_input: RequestInfo | URL) =>
+        new Response(
+          JSON.stringify({
+            authorized: false,
+            reason: `cliente ${NAME} (${PHONE}) não consta; disse "${ASKED}" sobre ${ATTR}`,
+          }),
+          { status: 200 },
+        )) as unknown as typeof fetch;
+      await processChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryRowId: delivery.id,
+        agentBotId: 32,
+        normalized: n,
+        base: appDb,
+        deps: {
+          makeClient: stub(sent) as never,
+          makeModel: () => {
+            throw new Error("the model must not run for a denied contact");
+          },
+          checkpointer: new MemorySaver(),
+          contactAuthFetch,
+        },
+      });
+      const rows = await turnRows(convId, ["contact_auth"]);
+      expectNoMarkers(rows, [NAME, PHONE, ATTR, ASKED]);
+      // The line still answers what happened: denied, fresh, HTTP 200, and no reason (it was prose).
+      const line = rows.find((r) => r.stage === "contact_auth");
+      expect(line?.detail).toMatchObject({
+        outcome: "denied",
+        shared: false,
+        status: 200,
+      });
+      expect(
+        (line?.detail as Record<string, unknown> | null)?.reason,
+      ).toBeUndefined();
+    });
+
+    // The invariant's blind spot until now: every scenario above is a turn that SUCCEEDS, so
+    // `errorMessage` is null in each row they read, and the half of the promise that column carries
+    // was asserted against nothing. It is the half with the wider door, too. `detail` is assembled
+    // by us key by key, while an error message is written by whoever threw — and the request the
+    // model call answers carries the entire conversation, so a refusal that quotes its input is the
+    // customer's own words arriving in a column `docs/logs.md` says never holds them.
+    //
+    // Both surfaces are asserted because the row is not the worst of the two: `emitFlowEvent` hands
+    // the same event to the alert fan-out, whose ledger is documented "no PII" and whose body is
+    // POSTed to a URL the operator configured, so this is the one that LEAVES the installation.
+    test("a provider refusal that quotes the request reaches neither the row nor the alert", async () => {
+      await seedConv(9605);
+      const channel = await suDb.alertChannel.create({
+        data: {
+          tenantId,
+          name: "pii-probe",
+          type: "webhook",
+          url: encryptJson({ url: "https://example.invalid/hook" }),
+          enabled: true,
+          minLevel: "error",
+          stages: [],
+        },
+      });
+      // Shaped on a real refusal: OpenAI names the offending field and quotes its content, and the
+      // content here is the resolved prompt plus the customer's message.
+      const refusing = {
+        _llmType: () => "refusing",
+        _modelType: () => "refusing",
+        lc_serializable: false,
+        bindTools() {
+          return this;
+        },
+        invoke: async () => {
+          throw Object.assign(
+            new Error(
+              `400 Invalid prompt: messages[1].content: "${ASKED}" (contact ${NAME}, ${PHONE}, ${ATTR})`,
+            ),
+            { status: 400 },
+          );
+        },
+      };
+      await expect(
+        runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: BOT,
+          event: incoming(9605),
+          base: appDb,
+          deps: {
+            makeModel: (): BaseChatModel =>
+              refusing as unknown as BaseChatModel,
+            makeClient: stub(),
+            checkpointer: new MemorySaver(),
+          },
+        }),
+      ).rejects.toThrow();
+      const rows = await turnRows(9605, ["generate"]);
+      expectNoMarkers(rows, [NAME, PHONE, ATTR, ASKED]);
+      // The line still has to be worth reading: a status is what an operator acts on.
+      const generate = rows.find((r) => r.stage === "generate");
+      expect(generate?.errorMessage).toContain("400");
+
+      const deliveries = await alertsFor(channel.id);
+      expect(deliveries.length).toBeGreaterThan(0);
+      const leaked = deliveries.filter((d) =>
+        [NAME, PHONE, ATTR, ASKED].some((m) => d.summary.includes(m)),
+      );
+      expect(leaked).toEqual([]);
     });
   },
 );

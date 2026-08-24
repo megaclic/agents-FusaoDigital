@@ -1,3 +1,4 @@
+import { clipText } from "@/lib/text";
 // Per-agent handoff targeting, read from `agent.settings.handoff`. Controls WHO receives the
 // conversation when the `handoff_to_human` native tool fires (the summary-note behavior stays on the
 // `Agent.transferWithSummary` column):
@@ -6,7 +7,7 @@
 //   * "pinned"       → assign to a fixed agent OR team the operator picked (targetAgentId/targetTeamId).
 //   * "agent_choice" → the model may pass a target NAME (agent or team), resolved against the live
 //                      Chatwoot list at call time; the operator lists the options in the prompt.
-import { clipText, TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
+import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
 
 export type HandoffMode = "route" | "pinned" | "agent_choice";
 
@@ -56,7 +57,13 @@ export function readToolInstructions(v: unknown): string | null {
   return t ? clipText(t, TOOL_INSTRUCTIONS_MAX) : null;
 }
 
-const MODES: HandoffMode[] = ["route", "pinned", "agent_choice"];
+// Exported so the MCP argument schema can declare the choices without re-typing them: a mode
+// added here reaches that schema by import rather than by somebody remembering.
+export const HANDOFF_MODES = [
+  "route",
+  "pinned",
+  "agent_choice",
+] as const satisfies readonly HandoffMode[];
 
 function posInt(v: unknown): number | null {
   return typeof v === "number" && Number.isInteger(v) && v > 0 ? v : null;
@@ -71,7 +78,9 @@ export function readHandoffConfig(settings: unknown): HandoffConfig {
   const bag = s as Record<string, unknown>;
   const mode = typeof bag.mode === "string" ? bag.mode : "";
   return {
-    mode: MODES.includes(mode as HandoffMode) ? (mode as HandoffMode) : "route",
+    mode: (HANDOFF_MODES as readonly string[]).includes(mode)
+      ? (mode as HandoffMode)
+      : "route",
     targetAgentId: posInt(bag.targetAgentId),
     targetTeamId: posInt(bag.targetTeamId),
     targetInstanceId: posInt(bag.targetInstanceId),

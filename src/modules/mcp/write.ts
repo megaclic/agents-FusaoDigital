@@ -20,12 +20,16 @@ import {
   type ScopedDb,
   type TenantContext,
 } from "@/lib/tenancy";
+import { clipText, replaceLoneSurrogates } from "@/lib/text";
 import {
   type BehaviorSettingsPatch,
   mergeBehaviorSettings,
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
-import { SETTINGS_CREDENTIAL_PATHS } from "@/modules/agents/credential-paths";
+import {
+  credRefSlot,
+  SETTINGS_CREDENTIAL_PATHS,
+} from "@/modules/agents/credential-paths";
 import {
   assertPromptSize,
   assertSettingsTextSizes,
@@ -85,11 +89,28 @@ export function diffFields(
 const AUDIT_STR_MAX = 4000;
 
 // Bound string sizes in the audit projection (a system prompt can be tens of KB).
+//
+// The same walker `redactSecretsDeep` is, aimed at the same kind of destination: `audit_logs.before`
+// and `.after` are `jsonb`, so an unpaired surrogate anywhere in the projection makes Postgres refuse
+// the whole write. Here the cost is worse than a lost log line — the change has already committed by
+// the time this row is written, so it lands, the tool reports a failure, and the record of who made
+// it is the only thing missing. Hence both repairs: `clipText` so the cut cannot manufacture an
+// orphan, and `replaceLoneSurrogates` for one that arrived with the value — a projection carries some
+// arguments as the MCP client sent them (`args.name`, `args.title`, `args.content`), and that JSON
+// can spell one out.
+//
+// NOTE: KEYS are not repaired here, and that asymmetry with redactSecretsDeep is deliberate rather
+// than an omission. Every key in a projection is a field name we wrote or an argument name taken
+// from the tool's own schema; the one bag whose keys are open-ended (`agent.settings`) is read back
+// out of a jsonb column, which is the very thing that cannot hold an orphan. The keys the other
+// walker repairs come from a model's tool-call arguments and from third parties' response bodies.
 export function truncForAudit(v: unknown): unknown {
   if (typeof v === "string") {
-    return v.length > AUDIT_STR_MAX
-      ? `${v.slice(0, AUDIT_STR_MAX)}…[truncated]`
-      : v;
+    return replaceLoneSurrogates(
+      v.length > AUDIT_STR_MAX
+        ? `${clipText(v, AUDIT_STR_MAX)}…[truncated]`
+        : v,
+    );
   }
   if (Array.isArray(v)) return v.map(truncForAudit);
   if (v && typeof v === "object") {
@@ -440,13 +461,14 @@ export async function agentSettingsGet(
     const settings = readBehaviorSettings(agent.settings);
     // The MCP contract speaks NAMES: project the stored `vault:<id>` refs back to entry names, over
     // the same (block, field) list the write path resolves them from.
-    for (const { block: key, field } of SETTINGS_CREDENTIAL_PATHS) {
-      const block = settings[key] as unknown as
-        | Record<string, unknown>
-        | undefined;
-      const ref = block?.[field];
-      if (block && typeof ref === "string" && ref) {
-        block[field] = await vaultNameByRef(ctx, ref, base);
+    for (const { path } of SETTINGS_CREDENTIAL_PATHS) {
+      const slot = credRefSlot(
+        settings as unknown as Record<string, unknown>,
+        path,
+      );
+      const ref = slot?.holder[slot.key];
+      if (slot && typeof ref === "string" && ref) {
+        slot.holder[slot.key] = await vaultNameByRef(ctx, ref, base);
       }
     }
     return ok({ agentId: agent.id, settings });
@@ -498,6 +520,7 @@ export async function agentSettingsSet(
   if (args.observability !== undefined)
     patch.observability = args.observability;
   if (args.availability !== undefined) patch.availability = args.availability;
+  if (args.contactAuth !== undefined) patch.contactAuth = args.contactAuth;
   if (args.memory !== undefined) patch.memory = args.memory;
   if (args.channelRedirect !== undefined)
     patch.channelRedirect = args.channelRedirect;
@@ -507,7 +530,7 @@ export async function agentSettingsSet(
   if (args.zproCrm !== undefined) patch.zproCrm = args.zproCrm;
   if (Object.keys(patch).length === 0) {
     return err(
-      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, availability, channelRedirect, attributeContext, sendImage, zproCrm, observability, memory and/or grounding)",
+      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, availability, contactAuth, channelRedirect, attributeContext, sendImage, zproCrm, observability, memory and/or grounding)",
     );
   }
 
@@ -516,14 +539,15 @@ export async function agentSettingsSet(
     // A `vault:<id>` ref is validated directly; a plain name goes through resolveVaultRefByName
     // so ambiguity (multiple kinds sharing the same name) surfaces as an explicit error rather
     // than a silent wrong-entry selection.
-    // NOTE: (block, field) pairs, not one field per block: `tts` carries a second credential for
-    // the speech normalizer's own model, and a loop that only knows `credentialRef` would let that
-    // one through as a raw name, which then fails to resolve at turn time instead of here.
-    for (const { block: key, field } of SETTINGS_CREDENTIAL_PATHS) {
+    // NOTE: PATHS, not one field per block: `tts` carries a second credential for the speech
+    // normalizer's own model, and `memory` carries one two levels down, on `compaction`. A loop that
+    // only knows `credentialRef`, or that only looks one level deep, lets those through as raw names
+    // — which then fail to resolve at turn time instead of here.
+    for (const { path } of SETTINGS_CREDENTIAL_PATHS) {
       // Re-read inside the loop: two fields of the same block are rewritten in sequence.
-      const block = patch[key];
-      const value = block?.[field];
-      if (block && typeof value === "string" && value) {
+      const slot = credRefSlot(patch as Record<string, unknown>, path);
+      const value = slot?.holder[slot.key];
+      if (slot && typeof value === "string" && value) {
         if (isVaultIdRef(value)) {
           // Caller passed a stable ref directly — just validate it resolves in this tenant.
           const name = await vaultNameByRef(ctx, value, base);
@@ -545,7 +569,7 @@ export async function agentSettingsSet(
               `credential "${value}" is ambiguous (types: ${typeList}); pass the vault:<id> ref or rename one of the entries`,
             );
           }
-          patch[key] = { ...block, [field]: resolution.ref };
+          slot.holder[slot.key] = resolution.ref;
         }
       }
     }

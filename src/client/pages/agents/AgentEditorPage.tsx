@@ -76,7 +76,12 @@ import {
 } from "@/modules/guardrails/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
-import { BehaviorTab, type SendImageState } from "./BehaviorTab";
+import {
+  BehaviorTab,
+  type ContactAuthState,
+  type MemoryState,
+  type SendImageState,
+} from "./BehaviorTab";
 import {
   type ChannelRedirectFormState,
   ChannelRedirectTab,
@@ -87,6 +92,7 @@ import { GeneralTab } from "./GeneralTab";
 import { GuardrailsTab } from "./GuardrailsTab";
 import { readGuardrailsFormState } from "./guardrailsFormState";
 import { KnowledgeTab } from "./KnowledgeTab";
+import { memoryToForm, memoryToStored } from "./memoryFormState";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
 import { ToolsTab } from "./ToolsTab";
@@ -312,6 +318,7 @@ function readBehaviorState(a: Agent) {
   const ac = (s.attributeContext ?? {}) as Record<string, unknown>;
   const si = (s.sendImage ?? {}) as Record<string, unknown>;
   const av = (s.availability ?? {}) as Record<string, unknown>;
+  const ca = (s.contactAuth ?? {}) as Record<string, unknown>;
 
   // NOTE: Attribute keys per scope: plain string lists (the runtime reader trims/dedups/caps them).
   const attrKeys = (v: unknown): string[] =>
@@ -342,6 +349,21 @@ function readBehaviorState(a: Agent) {
       language: str(st.language) || "pt",
       credentialRef: str(st.credentialRef),
       baseURL: str(st.baseURL),
+    },
+    contactAuth: {
+      enabled: ca.enabled === true,
+      url: str(ca.url),
+      credentialRef: str(ca.credentialRef),
+      timeoutMs: num(ca.timeoutMs) || "5000",
+      // NOTE: "0" is meaningful (notify on every refused message), and num(0) is the truthy
+      // string "0", so the fallback only fills a genuinely absent value.
+      noticeCooldownSeconds: num(ca.noticeCooldownSeconds) || "60",
+      includeMessageText: ca.includeMessageText === true,
+      denyMessage: str(ca.denyMessage),
+      handoffEnabled:
+        typeof ca.handoffEnabled === "boolean" ? ca.handoffEnabled : true,
+      handoffTeamId: num(ca.handoffTeamId),
+      handoffTeamInstanceId: num(ca.handoffTeamInstanceId),
     },
     tts: readTtsFormState(tt),
     split: {
@@ -410,7 +432,7 @@ function readBehaviorState(a: Agent) {
     // NOTE: Same reason as observability above — through the runtime's own reader, because this one
     // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
     // predates the feature, then persist that lie on the next save.
-    memory: { compactionEnabled: readMemoryConfig(s).compaction.enabled },
+    memory: memoryToForm(s),
   };
 }
 
@@ -626,6 +648,19 @@ function AgentEditor() {
     credentialRef: "",
     baseURL: "",
   });
+  // Contact authorization gate. Mirrors agent.settings.contactAuth (modules/contact-auth).
+  const [contactAuth, setContactAuth] = useState<ContactAuthState>({
+    enabled: false,
+    url: "",
+    credentialRef: "",
+    timeoutMs: "5000",
+    noticeCooldownSeconds: "60",
+    includeMessageText: false,
+    denyMessage: "",
+    handoffEnabled: true,
+    handoffTeamId: "",
+    handoffTeamInstanceId: "",
+  });
   // Text-to-speech (audio replies). Mode + provider mirror modules/tts.
   // Same reader the saved agent goes through, so a new field can never exist in one and not the
   // other: the Behavior save REPLACES this block wholesale.
@@ -670,9 +705,11 @@ function AgentEditor() {
   // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
   // agent.settings.observability (modules/flowlog/settings).
   const [observability, setObservability] = useState({ logToolValues: false });
-  // Whether an attendance that ended is folded into a summary. Mirrors agent.settings.memory
-  // (modules/memory/settings), which defaults to ON.
-  const [memory, setMemory] = useState({ compactionEnabled: true });
+  // Whether an attendance that ended is folded into a summary, and which model writes it. Seeded
+  // from the reader over an empty bag rather than a literal: the pre-load state is the same shape
+  // the round-trip pair produces, so a field added to `compaction` cannot default differently here
+  // than it does everywhere else.
+  const [memory, setMemory] = useState<MemoryState>(() => memoryToForm({}));
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -752,6 +789,7 @@ function AgentEditor() {
   const modelCredBaseUrl = vaultBaseUrl(model.credentialRef);
   const sttCredBaseUrl = vaultBaseUrl(stt.credentialRef);
   const visionCredBaseUrl = vaultBaseUrl(vision.credentialRef);
+  const memoryCredBaseUrl = vaultBaseUrl(memory.credentialRef);
   const ttsNormalizeCredBaseUrl = vaultBaseUrl(tts.normalizeCredentialRef);
 
   // Tool selection
@@ -882,6 +920,7 @@ function AgentEditor() {
     setSettings(b.settings);
     setDebounce(b.debounce);
     setStt(b.stt);
+    setContactAuth(b.contactAuth);
     setTts(b.tts);
     setSplit(b.split);
     setServiceWindow(b.serviceWindow);
@@ -918,6 +957,7 @@ function AgentEditor() {
     setSettings(b.settings);
     setDebounce(b.debounce);
     setStt(b.stt);
+    setContactAuth(b.contactAuth);
     setTts(b.tts);
     setSplit(b.split);
     setServiceWindow(b.serviceWindow);
@@ -1127,6 +1167,29 @@ function AgentEditor() {
         // displayed (credential's) value — keep the user's own config or null.
         baseURL: stt.baseURL.trim() || null,
       },
+      contactAuth: {
+        enabled: contactAuth.enabled,
+        url: contactAuth.url.trim() || null,
+        credentialRef: contactAuth.credentialRef || null,
+        timeoutMs: Number(contactAuth.timeoutMs) || 5000,
+        // NOTE: 0 is meaningful (notify on every refused message), so `|| 60` would erase it;
+        // only an emptied field falls back to the default.
+        noticeCooldownSeconds:
+          contactAuth.noticeCooldownSeconds.trim() === ""
+            ? 60
+            : Math.max(0, Number(contactAuth.noticeCooldownSeconds) || 0),
+        // NOTE: Stored even under GET (the runtime reader ignores it there), so flipping the
+        // method back and forth does not lose the choice.
+        includeMessageText: contactAuth.includeMessageText,
+        denyMessage: contactAuth.denyMessage.trim() || null,
+        handoffEnabled: contactAuth.handoffEnabled,
+        handoffTeamId: Number(contactAuth.handoffTeamId) || null,
+        // The account the team was picked from, saved with it. Never on its own: without a team it
+        // pins nothing, and a leftover from a cleared choice would outlive what it described.
+        handoffTeamInstanceId: contactAuth.handoffTeamId
+          ? Number(contactAuth.handoffTeamInstanceId) || null
+          : null,
+      },
       tts: ttsSettingsFrom(tts),
       split: {
         enabled: split.enabled,
@@ -1190,7 +1253,10 @@ function AgentEditor() {
         maxHistoryTokens: Number(limits.maxHistoryTokens) || null,
       },
       observability: { logToolValues: observability.logToolValues },
-      memory: { compaction: { enabled: memory.compactionEnabled } },
+      // NOTE: through the pair, not spelled out here. The Behavior save REPLACES the block, so a
+      // field the form dropped would be deleted on the next save — which is exactly how
+      // `tts.baseURL` was lost once, and the round-trip test over ./memoryFormState is the guard.
+      memory: memoryToStored(memory),
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1227,6 +1293,7 @@ function AgentEditor() {
       followUpHoursId,
       debounce,
       stt,
+      contactAuth,
       tts,
       split,
       serviceWindow,
@@ -1408,6 +1475,8 @@ function AgentEditor() {
   // t('editor.configIssue.tts', 'Audio replies are on but have no API key set.')
   // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.ttsNormalize', 'The speech-rewrite credential is referenced but not filled in yet.')
+  // t('editor.configIssue.memoryModel', 'A separate model is set for attendance summaries but its configuration cannot run, so attendances that end will not be summarized and the contact keeps no memory of them. Check its provider, model, key and endpoint.')
+  // t('editor.configIssuePending.memoryModel', 'The summary-model credential is referenced but not filled in yet, so attendances that end are not summarized.')
   // t('editor.configIssue.vision', 'Image/document reading is on but has no API key set.')
   // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
   // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
@@ -1418,6 +1487,11 @@ function AgentEditor() {
   // t('editor.configIssuePending.stt', 'The transcription credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.tts', 'The audio-reply credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.vision', 'The image-reading credential is referenced but not filled in yet.')
+  // t('editor.configIssuePending.contactAuth', 'The contact-authorization credential is referenced but not filled in yet, so the check fails and the agent stays silent.')
+  // t('editor.configIssueUnresolved.contactAuth', 'The contact-authorization credential no longer exists, so the check fails and the agent stays silent.')
+  // t('editor.configIssue.contactAuthUnlockHandoff', 'The access-code unlock and the handoff cancel each other out: the first refusal opens the conversation and assigns it, and a conversation that is open is no longer the AI\'s, so the code the customer sends next never reaches the check. Turn the handoff off to let contacts unlock themselves, or stop sending the message text if a human should take every refused conversation.')
+  // t('editor.configIssue.contactAuthSilentRefusal', 'A refused contact is left with nothing: no message is sent and the conversation is not opened for anyone, so their message goes unanswered and only a private note records it. Write the refusal message, or turn on the handoff to humans.')
+  // t('editor.configIssue.contactAuthNoUrl', 'The authorization check is on but has no endpoint to ask. Without one it fails on every message and the agent stops answering anyone. Fill in the endpoint URL, or turn the check off.')
   // t('editor.configIssue.embedding', 'A knowledge base needs indexing, but the tenant embedding is not configured.')
   // t('editor.configIssuePending.embedding', 'A knowledge base needs indexing, but the embedding credential is not filled in yet.')
   // t('editor.configIssue.redirect', 'Redirect is on but a WhatsApp or website-chat inbox is not set, so it will not run.')
@@ -1425,6 +1499,7 @@ function AgentEditor() {
   // t('editor.configIssueUnresolved.stt', 'The transcription credential no longer exists, so voice messages are not transcribed.')
   // t('editor.configIssueUnresolved.tts', 'The audio-reply credential no longer exists, so replies are sent as text.')
   // t('editor.configIssueUnresolved.ttsNormalize', 'The speech-rewrite credential no longer exists, so replies are spoken without the rewrite.')
+  // t('editor.configIssueUnresolved.memoryModel', 'The summary-model credential no longer exists, so attendances that end are not summarized.')
   // t('editor.configIssueUnresolved.vision', 'The image-reading credential no longer exists, so images and documents are not read.')
   // t('editor.configIssueUnresolved.embedding', 'A knowledge base needs indexing, but the embedding credential no longer exists.')
   // Knowledge bases this agent uses (its RAG grant) that still have documents awaiting indexing —
@@ -1446,6 +1521,13 @@ function AgentEditor() {
     : model;
   const savedModelBaseUrl =
     vaultBaseUrl(savedModel.credentialRef) ?? savedModel.baseURL;
+  // The summariser override is judged on the STORED bag (see `settings` on the input), so the
+  // credential whose endpoint outranks it has to be the stored one too. Reading the form's instead
+  // would judge a saved configuration against a credential the row does not name.
+  const savedMemoryCredBaseUrl = vaultBaseUrl(
+    readMemoryConfig(syncedAgentRef.current?.settings).compaction
+      .credentialRef ?? "",
+  );
   const configIssues = computeConfigIssues({
     settings: syncedAgentRef.current?.settings,
     // Saved, like the settings above. Absent only before the first load lands, and nothing that
@@ -1460,6 +1542,7 @@ function AgentEditor() {
     savedModelProvider: savedModel.provider,
     savedModelBaseURL: savedModelBaseUrl,
     savedModelCredentialRef: savedModel.credentialRef,
+    savedMemoryCredentialBaseURL: savedMemoryCredBaseUrl,
     ttsNormalize: tts.normalize,
     ttsNormalizeProvider: tts.normalizeProvider,
     ttsNormalizeModel: tts.normalizeModel,
@@ -1467,6 +1550,12 @@ function AgentEditor() {
     ttsNormalizeBaseURL: ttsNormalizeCredBaseUrl ?? tts.normalizeBaseURL,
     visionEnabled: vision.enabled,
     visionCredentialRef: vision.credentialRef,
+    contactAuthEnabled: contactAuth.enabled,
+    contactAuthUrl: contactAuth.url,
+    contactAuthCredentialRef: contactAuth.credentialRef,
+    contactAuthIncludeMessageText: contactAuth.includeMessageText,
+    contactAuthHandoffEnabled: contactAuth.handoffEnabled,
+    contactAuthDenyMessage: contactAuth.denyMessage,
     guardrailsEnabled: guardrails.enabled,
     guardrailsCredentialRef: guardrails.credentialRef ?? "",
     guardrailsFailures: guardrailHealth?.failures,
@@ -1902,6 +1991,10 @@ function AgentEditor() {
       !!tts.credentialRef &&
       (tts.provider !== "elevenlabs" || !!tts.voice.trim()),
     fileInput: vision.enabled && !!vision.credentialRef,
+    // Same two hard requirements the runtime has (modules/guardrails/gate): the feature switched on
+    // and its OWN credential resolved. A direction being off is not checked here — that is a per-
+    // direction answer, and the gate already returns "not-run" for it without costing anything.
+    guardrails: guardrails.enabled && !!guardrails.credentialRef,
   };
 
   // Live draft sent with each playground turn: the unsaved prompt/model/settings (never grants —
@@ -1947,6 +2040,7 @@ function AgentEditor() {
     setSettings(b.settings);
     setDebounce(b.debounce);
     setStt(b.stt);
+    setContactAuth(b.contactAuth);
     setTts(b.tts);
     setSplit(b.split);
     setServiceWindow(b.serviceWindow);
@@ -2870,6 +2964,8 @@ function AgentEditor() {
                 stt={stt}
                 setStt={setStt}
                 sttCredBaseUrl={sttCredBaseUrl}
+                contactAuth={contactAuth}
+                setContactAuth={setContactAuth}
                 tts={tts}
                 setTts={setTts}
                 // The SAVED model, not the one being edited on General (see savedModel above), and
@@ -2894,6 +2990,7 @@ function AgentEditor() {
                 vision={vision}
                 setVision={setVision}
                 visionCredBaseUrl={visionCredBaseUrl}
+                memoryCredBaseUrl={memoryCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
                 memory={memory}

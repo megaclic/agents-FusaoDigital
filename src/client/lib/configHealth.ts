@@ -3,12 +3,14 @@ import {
   VAULT_REF_PREFIX,
 } from "@/client/lib/credentialRef";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { resolveModelOverride } from "@/graph/model-override";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import { readAvailabilityConfig } from "@/modules/availability/away";
 import {
   type Schedule,
   scheduleCanClose,
 } from "@/modules/business-hours/hours";
+import { readMemoryConfig } from "@/modules/memory/settings";
 import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 
 // Live configuration-health checks for the agent editor (item 1): detect features that are turned on
@@ -21,9 +23,19 @@ export type ConfigIssueKey =
   | "stt"
   | "tts"
   | "ttsNormalize"
+  | "memoryModel"
   | "vision"
   | "guardrails"
   | "guardrailsFailing"
+  | "contactAuth"
+  // Not a missing credential: two switches that cancel each other out. The unlock flow needs the
+  // conversation to still be the bot's when the code arrives, and the handoff gives it away on the
+  // first refusal.
+  | "contactAuthUnlockHandoff"
+  // Nor a missing credential: an enabled gate that neither answers the customer nor opens the
+  // conversation, so a refusal reaches nobody.
+  | "contactAuthSilentRefusal"
+  | "contactAuthNoUrl"
   | "knowledge"
   | "embedding"
   | "redirect"
@@ -158,6 +170,12 @@ export interface ConfigHealthInput {
   // The saved model's credential, needed for one question only: whether an endpoint the rewrite
   // INHERITS could still arrive from that credential once the vault answers.
   savedModelCredentialRef?: string;
+  // The base URL carried by the SAVED summariser credential, which outranks the endpoint typed into
+  // the bag exactly as it does at runtime (`loadAgentConfig` reads it from the vault). Without it
+  // this check calls a summariser that runs perfectly well `endpoint_unusable` the moment the vault
+  // answers, and misses the opposite case — a credential endpoint on a vendor that never sends one.
+  // Null until the vault list lands, which is what the deferral below is for.
+  savedMemoryCredentialBaseURL?: string | null;
   sttEnabled: boolean;
   sttCredentialRef: string;
   // TTS has no boolean toggle — any mode other than "never" means audio replies are on.
@@ -174,6 +192,19 @@ export interface ConfigHealthInput {
   ttsNormalizeBaseURL?: string;
   visionEnabled: boolean;
   visionCredentialRef: string;
+  // The contact authorization gate. Its credential is OPTIONAL (a public or IP-fenced endpoint
+  // needs none), so an absent ref raises nothing; a ref that is pending or gone does, because the
+  // gate fails closed and the agent goes silent for every contact.
+  contactAuthEnabled?: boolean;
+  contactAuthCredentialRef?: string;
+  // The endpoint itself. `readContactAuthConfig` normalizes a missing or malformed URL to null and
+  // leaves `enabled` alone, so the pair is storable — and the gate then refuses every message.
+  contactAuthUrl?: string;
+  // The two sides of the unlock-vs-handoff contradiction, plus the copy: an enabled gate that
+  // neither speaks nor hands over leaves a refused customer with nothing at all.
+  contactAuthIncludeMessageText?: boolean;
+  contactAuthHandoffEnabled?: boolean;
+  contactAuthDenyMessage?: string;
   // Guardrails run on a model of their own, and theirs is the one credential whose failure is not
   // just a feature going quiet: `loadAgentConfig` fails open, so the analysis is skipped and every
   // message is delivered as if it had been screened and approved.
@@ -398,10 +429,136 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       ),
     );
   }
+  // The attendance summariser's own model, when one is configured. Same resolver, same reasons, one
+  // difference worth stating: this failure is not silent the way the rewrite's is — the job fails and
+  // retries to DEAD with the reason on its line — but nothing in the console says so, and what is
+  // lost is the contact's memory rather than one reply's delivery. An attendance that ends while this
+  // is broken stays raw forever; nothing goes back for it.
+  //
+  // Read from the SAVED bag for the same reason the rewrite reads the saved model: the Behavior tab
+  // carries none of General's pending edits, so a verdict against an unsaved provider is a verdict
+  // against a configuration that will not exist when this block lands.
+  const compaction = readMemoryConfig(input.settings).compaction;
+  const compactionOverridden =
+    compaction.provider !== null ||
+    compaction.model !== null ||
+    compaction.credentialRef !== null ||
+    compaction.baseURL !== null;
+  // Nothing configured is not a configuration that can fail: it IS the agent's model, and an agent
+  // model that cannot run is the "model" issue above. Raising a second line for it would tell the
+  // operator to fix the summariser when the thing to fix is the agent.
+  const compactionResolution =
+    compaction.enabled && compactionOverridden
+      ? resolveModelOverride(
+          {
+            provider: compaction.provider,
+            model: compaction.model,
+            credentialRef: compaction.credentialRef,
+            baseURL: compaction.baseURL,
+          },
+          {
+            provider: input.savedModelProvider,
+            model: "",
+            baseURL: input.savedModelBaseURL ?? null,
+          },
+          {
+            ownCredentialBaseURL: input.savedMemoryCredentialBaseURL ?? null,
+            isUsableBaseURL: isValidHttpUrl,
+          },
+        )
+      : null;
+  const compactionIssue: ConfigIssue = {
+    key: "memoryModel",
+    tab: "behavior",
+    sectionId: "memory",
+  };
+  // The same wait as the rewrite's, for the same reason: an endpoint can still arrive on a
+  // credential the vault has not answered for yet, and announcing a runnable summariser as broken is
+  // the false alarm the null-until-loaded rule exists to prevent.
+  const compactionEndpointOwed =
+    !endpointsKnown &&
+    Boolean(compaction.credentialRef || input.savedModelCredentialRef);
+  const compactionRefusalHolds =
+    compactionResolution !== null &&
+    !compactionResolution.runnable &&
+    !(
+      compactionEndpointOwed &&
+      compactionResolution.reason === "endpoint_unusable"
+    );
+  if (compactionRefusalHolds) {
+    issues.push(compactionIssue);
+  } else {
+    push(
+      compactionIssue,
+      credIssue(
+        compactionResolution !== null && Boolean(compaction.credentialRef),
+        compaction.credentialRef ?? "",
+        pending,
+        known,
+      ),
+    );
+  }
   push(
     { key: "vision", tab: "behavior", sectionId: "vision" },
     credIssue(input.visionEnabled, input.visionCredentialRef, pending, known),
   );
+  // NOTE: gated on the ref being present, so "missing" can never fire for this feature: enabled
+  // without a credential is a legitimate configuration here, unlike the blocks above.
+  push(
+    { key: "contactAuth", tab: "behavior", sectionId: "contactAuth" },
+    credIssue(
+      Boolean(input.contactAuthEnabled) &&
+        Boolean(input.contactAuthCredentialRef),
+      input.contactAuthCredentialRef ?? "",
+      pending,
+      known,
+    ),
+  );
+  // The unlock flow and the handoff want opposite things from the same refusal. Forwarding the
+  // message text exists so the customer can send an access code and be let in on their NEXT message;
+  // the handoff opens the conversation and assigns it, and an open conversation is no longer the
+  // bot's, so that next message never reaches the gate. The first refusal is then the last one, and
+  // the copy asking for a code is asking for something that can no longer be read. Neither switch is
+  // wrong on its own, so this is said rather than silently resolved.
+  if (
+    input.contactAuthEnabled &&
+    input.contactAuthIncludeMessageText &&
+    input.contactAuthHandoffEnabled
+  ) {
+    issues.push({
+      key: "contactAuthUnlockHandoff",
+      tab: "behavior",
+      sectionId: "contactAuth",
+    });
+  }
+  // An enabled gate with no endpoint to ask. The URL reader normalizes anything it cannot parse to
+  // null and keeps `enabled` as it found it, so REST, MCP and an import can store the pair; the
+  // runtime then fails closed on EVERY message with `not_configured`. That is the loudest failure
+  // this feature has (the agent answers nobody) and the quietest to diagnose, because nothing about
+  // a blank field says the gate in front of it is armed.
+  if (input.contactAuthEnabled && !(input.contactAuthUrl ?? "").trim()) {
+    issues.push({
+      key: "contactAuthNoUrl",
+      tab: "behavior",
+      sectionId: "contactAuth",
+    });
+  }
+  // The other end of the same switchboard: a gate that refuses, says nothing and hands nobody the
+  // conversation. The customer's message goes unanswered with no sign that anything happened, and
+  // the only record is a private note somebody has to go and read. Both switches are legitimate on
+  // their own — silence suits an unknown number, and no-handoff suits the unlock flow — so this is
+  // said rather than forced: the fix is a deny message, or the handoff, and the operator picks.
+  if (
+    input.contactAuthEnabled &&
+    !(input.contactAuthDenyMessage ?? "").trim() &&
+    !input.contactAuthHandoffEnabled
+  ) {
+    issues.push({
+      key: "contactAuthSilentRefusal",
+      tab: "behavior",
+      sectionId: "contactAuth",
+    });
+  }
   const guardrailsCred = credIssue(
     Boolean(input.guardrailsEnabled),
     input.guardrailsCredentialRef ?? "",
