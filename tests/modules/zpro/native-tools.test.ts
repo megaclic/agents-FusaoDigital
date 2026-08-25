@@ -308,7 +308,13 @@ describe("buildZproNativeTools (no client/DB access)", () => {
         return {};
       },
     } as unknown as ZproClient;
-    const turnState = { resolveRequested: false };
+    const turnState = {
+      resolveRequested: false,
+      pendingAttachments: [],
+      documentsInFlight: 0,
+      imagesInFlight: 0,
+      attachmentsSeq: 0,
+    };
     const tools = buildZproNativeTools(baseCtx({ client, turnState }), [
       "resolve_conversation",
     ]);

@@ -4,14 +4,14 @@ import { setupPrismaMock } from "@/tests/utils/prisma-mock";
 // The knowledge controller builds its whole Elysia route graph at import time, which reaches the
 // prisma singleton. Mock it so importing the module is side-effect-free.
 setupPrismaMock();
-const { readerSafeBlock, toSearchHitDto } = await import(
+const { readerSafeBlock, searchHitDto } = await import(
   "@/api/v1/knowledge.controller"
 );
 
 // The regression itself: ChunkHit carries id, knowledgeBaseId AND documentId as bigint, and a fix
 // that stringifies only the first two still 500s on the third the moment a real hit comes back —
 // `JSON.stringify` throws on ANY bigint anywhere in the tree, not just the ones a caller forgot.
-describe("toSearchHitDto", () => {
+describe("searchHitDto", () => {
   test("every bigint field is a string, and the rest of the hit survives untouched", () => {
     const hit = {
       id: 1n,
@@ -23,7 +23,7 @@ describe("toSearchHitDto", () => {
       metadata: { title: "x" },
       distance: 0.12,
     };
-    const dto = toSearchHitDto(hit);
+    const dto = searchHitDto(hit);
     expect(dto).toEqual({
       id: "1",
       knowledgeBaseId: "2",

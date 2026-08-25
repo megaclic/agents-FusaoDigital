@@ -6,6 +6,7 @@ import {
   resolveRequestTenantContext,
   roleAtLeast,
 } from "@/lib/tenancy";
+import { expectWaiverLedger } from "@/tests/utils/ledger";
 
 const superAdmin = { id: 1n, tenantId: null, role: "SUPER_ADMIN" as const };
 const tenantAdmin = { id: 2n, tenantId: 3n, role: "TENANT_ADMIN" as const };
@@ -159,5 +160,16 @@ describe("every model with a tenant_id is accounted for", () => {
         (m) => registered.has(m) || !withTenantId.includes(m),
       ),
     ).toEqual([]);
+  });
+
+  // Both assertions above read `registered` out of the tree, so the ledger is the one input neither
+  // of them can contradict: a model added to it is excused AND is not stale. Pinned at the thirteen
+  // upstream argued into it (six documented global/identity tables + seven "pre-existing gap, not
+  // audited"), plus five more of the same "pre-existing gap" shape this fork's own Z-PRO integration
+  // added on top (ZproInstance/ZproWebhookDelivery/ZproAgentBinding/ZproConversation/ZproMessage,
+  // above) — twelve "pre-existing gap" entries total, which is exactly why this list must not be
+  // where the thirteenth goes. tests/utils/ledger.ts, issue #293.
+  test("the unregistered-model ledger may only shrink", () => {
+    expectWaiverLedger("KNOWN_UNREGISTERED", KNOWN_UNREGISTERED, 18);
   });
 });

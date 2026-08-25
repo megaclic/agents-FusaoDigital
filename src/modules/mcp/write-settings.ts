@@ -31,6 +31,7 @@ import {
   err,
   gate,
   ok,
+  parseMcpId,
   recordMcpAudit,
   resolveSecretRef,
   truncForAudit,
@@ -46,14 +47,6 @@ import {
 function failOf(e: unknown): WriteResult {
   if (e instanceof AppError) return err(e.message);
   throw e;
-}
-
-function parseId(raw: string, label: string): bigint | WriteResult {
-  try {
-    return BigInt(raw);
-  } catch {
-    return err(`invalid ${label}`);
-  }
 }
 
 // ── A/B prompt experiments ──
@@ -86,10 +79,9 @@ export async function experimentCreate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
   let agentId: bigint | undefined;
   if (args.agent_id) {
-    const parsed = parseId(args.agent_id, "agent_id");
+    const parsed = parseMcpId(args.agent_id, "agent_id");
     if (typeof parsed !== "bigint") return parsed;
     agentId = parsed;
   }
@@ -108,7 +100,7 @@ export async function experimentCreate(
       });
     }
     const created = await createExperiment({
-      tenantId,
+      ctx,
       name: args.name,
       agentId,
       variants: mapVariants(args.variants),
@@ -145,8 +137,7 @@ export async function experimentUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
-  const id = parseId(args.experiment_id, "experiment_id");
+  const id = parseMcpId(args.experiment_id, "experiment_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -160,7 +151,7 @@ export async function experimentUpdate(
   if (args.agent_id !== undefined) {
     if (args.agent_id === null) patch.agentId = null;
     else {
-      const parsed = parseId(args.agent_id, "agent_id");
+      const parsed = parseMcpId(args.agent_id, "agent_id");
       if (typeof parsed !== "bigint") return parsed;
       patch.agentId = parsed;
     }
@@ -171,7 +162,7 @@ export async function experimentUpdate(
     );
   }
   try {
-    const current = await getExperiment(tenantId, id, base);
+    const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
     const beforeProj = {
       name: current.name,
@@ -188,7 +179,7 @@ export async function experimentUpdate(
         },
       });
     }
-    const updated = await updateExperiment({ tenantId, id, ...patch, base });
+    const updated = await updateExperiment({ ctx, id, ...patch, base });
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
@@ -215,11 +206,10 @@ export async function experimentDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
-  const id = parseId(args.experiment_id, "experiment_id");
+  const id = parseMcpId(args.experiment_id, "experiment_id");
   if (typeof id !== "bigint") return id;
   try {
-    const current = await getExperiment(tenantId, id, base);
+    const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
     const beforeProj = { id: String(current.id), name: current.name };
     if (args.dry_run !== false) {
@@ -230,7 +220,7 @@ export async function experimentDelete(
         current: beforeProj,
       });
     }
-    await deleteExperiment(tenantId, id, base);
+    await deleteExperiment(ctx, id, base);
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
@@ -329,7 +319,7 @@ export async function businessHoursUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.business_hours_id, "business_hours_id");
+  const id = parseMcpId(args.business_hours_id, "business_hours_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -396,7 +386,7 @@ export async function businessHoursDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.business_hours_id, "business_hours_id");
+  const id = parseMcpId(args.business_hours_id, "business_hours_id");
   if (typeof id !== "bigint") return id;
   try {
     const current = await getBusinessHours(ctx, id, base);
@@ -694,7 +684,7 @@ export async function apiKeyRevoke(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.api_key_id, "api_key_id");
+  const id = parseMcpId(args.api_key_id, "api_key_id");
   if (typeof id !== "bigint") return id;
   const target = `api_key:${id}`;
   try {

@@ -174,7 +174,7 @@ export const zproAdminController = new Elysia({
         });
         if (existing && existing.disconnectedAt === null) {
           throw new ConflictError(
-            "whatsappId already in use by an active instance",
+            "whatsappId already in use by another instance",
             "errors.zproWhatsappIdInUse",
           );
         }

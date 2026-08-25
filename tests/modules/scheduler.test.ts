@@ -1,15 +1,21 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, PrismaClient } from "@/../generated/prisma/client";
+import { runScopedOn } from "@/lib/tenancy";
 import {
+  type ClaimedJob,
   claimDueCompactionJobs,
   claimDueJobs,
   claimDueTrafficJobs,
   completeJob,
   enqueueJob,
   failJob,
+  jobNotRetiredSql,
+  jobRetired,
+  jobRetiredStrict,
   reapStaleJobs,
   rescheduleJob,
+  retireJobsByDedupeKey,
 } from "@/modules/scheduler/service";
 import { registerJobHandler, runClaimed } from "@/modules/scheduler/worker";
 
@@ -363,6 +369,192 @@ describe.skipIf(!dbUp)("scheduler", () => {
     });
     await failJob(tenantId, id, await seqOf(id), 4, "boom again", appDb);
     expect((await statusOf(id)).status).toBe("DEAD");
+  });
+
+  // The tombstone calls off a RUN, so it reaches the two statuses that have one. A DEAD row does not:
+  // nothing is executing it for the claim_seq bump to fence, and DONE would erase the classification
+  // an operator reads to know the work was definitively lost — the reason revokeJobsByKeyPrefixOn
+  // spares it too, and the invariant memory/compact.ts already writes down ("a DEAD row is not
+  // PENDING and reset leaves it alone").
+  test("retire calls off PENDING and CLAIMED runs, and spares a DEAD row", async () => {
+    const ids: Record<string, bigint> = {};
+    for (const [key, status] of [
+      ["dk-retire-pending", "PENDING"],
+      ["dk-retire-claimed", "CLAIMED"],
+      ["dk-retire-dead", "DEAD"],
+    ] as const) {
+      ids[key] = await enqueueJob({
+        tenantId,
+        kind: "FOLLOWUP",
+        dedupeKey: key,
+        runAt: past(),
+        base: appDb,
+      });
+      if (status !== "PENDING") {
+        await suDb.schedulerJob.update({
+          where: { id: ids[key] },
+          data: { status, lastError: status === "DEAD" ? "boom" : null },
+        });
+      }
+      await retireJobsByDedupeKey(tenantId, "FOLLOWUP", key, appDb);
+    }
+
+    expect((await statusOf(ids["dk-retire-pending"] as bigint)).status).toBe(
+      "DONE",
+    );
+    expect((await statusOf(ids["dk-retire-claimed"] as bigint)).status).toBe(
+      "DONE",
+    );
+
+    const dead = await suDb.schedulerJob.findUniqueOrThrow({
+      where: { id: ids["dk-retire-dead"] as bigint },
+      select: { status: true, lastError: true, payload: true },
+    });
+    expect(dead.status).toBe("DEAD");
+    expect(dead.lastError).toBe("boom");
+    // Not even the stamp: for this kind `cancelledAt` is read only by jobRetired, which asks about a
+    // run — writing it on a row nobody runs says nothing and only muddies the record.
+    expect(
+      (dead.payload as { cancelledAt?: unknown }).cancelledAt,
+    ).toBeUndefined();
+  });
+
+  // "Is this run retired?" is written twice — once as a read (`jobRetired`) and once as a SQL
+  // predicate (`jobNotRetiredSql`), because one caller has to evaluate it inside the statement that
+  // writes. Two expressions of one rule is how a rule starts drifting, so this pins them to the same
+  // answer on every state a row can be in. The absent row is in the table on purpose: both must say
+  // NOT retired there, since an unknown is not a retirement.
+  test("the retirement predicate agrees with the retirement read, in both forms", async () => {
+    const claimOf = async (dedupeKey: string): Promise<ClaimedJob> => {
+      const id = await enqueueJob({
+        tenantId,
+        kind: "FOLLOWUP",
+        dedupeKey,
+        runAt: past(),
+        base: appDb,
+      });
+      const [claimed] = await claimDueJobs(1, appDb, new Date(), tenantId);
+      if (!claimed || claimed.id !== id) {
+        throw new Error(`claim did not return ${dedupeKey}`);
+      }
+      return claimed;
+    };
+    const sqlSaysRetired = async (job: ClaimedJob): Promise<boolean> => {
+      const rows = await suDb.$queryRaw<Array<{ live: boolean }>>(
+        Prisma.sql`SELECT ${jobNotRetiredSql(job)} AS live`,
+      );
+      return !rows[0]?.live;
+    };
+
+    // (a) claimed and untouched
+    const live = await claimOf("dk-pred-live");
+    expect(await jobRetired(live, appDb)).toBe(false);
+    expect(await sqlSaysRetired(live)).toBe(false);
+
+    // (b) tombstoned by the command
+    const tombstoned = await claimOf("dk-pred-tomb");
+    await retireJobsByDedupeKey(tenantId, "FOLLOWUP", "dk-pred-tomb", appDb);
+    expect(await jobRetired(tombstoned, appDb)).toBe(true);
+    expect(await sqlSaysRetired(tombstoned)).toBe(true);
+
+    // (c) token moved with no tombstone — a re-arm this run was superseded by, which is the half a
+    // condition written from the stamp alone would miss.
+    const superseded = await claimOf("dk-pred-seq");
+    await suDb.schedulerJob.update({
+      where: { id: superseded.id },
+      data: { claimSeq: superseded.claimSeq + 1 },
+    });
+    expect(await jobRetired(superseded, appDb)).toBe(true);
+    expect(await sqlSaysRetired(superseded)).toBe(true);
+
+    // (e) stamped with the token untouched. Not hypothetical: the per-event appointment cancel
+    // (cancelAppointmentReminders) writes exactly this shape — `cancelledAt` on every row of an
+    // event, no claim_seq bump — so a predicate written from the token alone would read a cancelled
+    // booking as a live run.
+    const stamped = await claimOf("dk-pred-stamp");
+    await suDb.$executeRaw`
+      UPDATE scheduler_jobs
+         SET payload = payload || '{"cancelledAt":"2026-01-01T00:00:00.000Z"}'::jsonb
+       WHERE id = ${stamped.id}`;
+    expect(await jobRetired(stamped, appDb)).toBe(true);
+    expect(await sqlSaysRetired(stamped)).toBe(true);
+
+    // (d) absent
+    const gone = await claimOf("dk-pred-gone");
+    await suDb.schedulerJob.delete({ where: { id: gone.id } });
+    expect(await jobRetired(gone, appDb)).toBe(false);
+    expect(await sqlSaysRetired(gone)).toBe(false);
+  });
+
+  // The reason jobRetired takes a connection at all, measured rather than argued. runScopedOn opens
+  // a $transaction, which PINS a pooled connection, and withEntityLock's advisory lock is held by
+  // that same transaction — so a retirement read that opens its own asks a pinned pool for a second
+  // connection. `DB_POOL_MAX=1` is a supported setting, and there the read does not wait: it fails.
+  // Which would be survivable if it were loud, and it is not — jobRetired swallows a failed read as
+  // NOT retired (deliberately: an unknown must not drop a legitimate message), so on that setting
+  // the fence inside the claim would answer "keep going" every single time.
+  test("the retirement read answers inside a pinned transaction, on a pool of one", async () => {
+    const id = await enqueueJob({
+      tenantId,
+      kind: "FOLLOWUP",
+      dedupeKey: "dk-pool-one",
+      runAt: past(),
+      base: appDb,
+    });
+    const [job] = await claimDueJobs(1, appDb, new Date(), tenantId);
+    if (!job || job.id !== id)
+      throw new Error("claim did not return dk-pool-one");
+    await retireJobsByDedupeKey(tenantId, "FOLLOWUP", "dk-pool-one", appDb);
+
+    const onePool = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl as string, max: 1 }),
+    });
+    try {
+      const answers = await runScopedOn(
+        onePool,
+        { tenantId, userId: null, role: "SUPER_ADMIN" } as never,
+        async (scoped) => ({
+          // Handed the transaction's own connection: reads the row and sees the tombstone.
+          shared: await jobRetired(job, onePool, scoped),
+          // Opening its own from in here is the bug: the read cannot run, and the swallow turns
+          // that into "not retired" — the fence silently off.
+          own: await jobRetired(job, onePool),
+        }),
+      );
+      expect(answers.shared).toBe(true);
+      expect(answers.own).toBe(false);
+
+      // THE STRICT VARIANT REFUSES TO GUESS. Same unreadable read, and it propagates instead of
+      // reporting "not retired". That is what the thread's critical section asks, because there the
+      // wrong guess recreates the graph state /reset just cleared, and no later fence catches it.
+      await expect(
+        runScopedOn(
+          onePool,
+          { tenantId, userId: null, role: "SUPER_ADMIN" } as never,
+          async () => jobRetiredStrict(job, onePool),
+        ),
+      ).rejects.toThrow();
+    } finally {
+      await onePool.$disconnect();
+    }
+  });
+
+  // Strict is only about the UNREADABLE case: on a readable row it answers exactly like the lenient
+  // one, so swapping it in at a call site does not change the ordinary path.
+  test("the strict probe still answers when the read succeeds", async () => {
+    const id = await enqueueJob({
+      tenantId,
+      kind: "FOLLOWUP",
+      dedupeKey: "dk-strict-ok",
+      runAt: past(),
+      base: appDb,
+    });
+    const [job] = await claimDueJobs(1, appDb, new Date(), tenantId);
+    if (!job || job.id !== id)
+      throw new Error("claim did not return dk-strict-ok");
+    expect(await jobRetiredStrict(job, appDb)).toBe(false);
+    await retireJobsByDedupeKey(tenantId, "FOLLOWUP", "dk-strict-ok", appDb);
+    expect(await jobRetiredStrict(job, appDb)).toBe(true);
   });
 
   test("reaper requeues a stranded CLAIMED job", async () => {

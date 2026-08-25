@@ -9,6 +9,7 @@ import {
 } from "@/graph/runtime";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
+import { describeClosedGate } from "@/modules/chatwoot/gate-close";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
   buildQuoteResolver,
@@ -32,7 +33,11 @@ import {
 import { announceFailedTurn } from "@/modules/conversations/failure-note";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import type { FlowStage } from "@/modules/flowlog/stages";
-import type { ClaimedJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  jobRetired,
+  jobRetiredStrict,
+} from "@/modules/scheduler/service";
 import {
   type JobResult,
   registerDeadLetterHandler,
@@ -86,6 +91,10 @@ export interface CoalesceTurnContext {
   selectPending: (
     messages: ChatwootMessageRow[],
   ) => ChatwootMessageRow[] | Promise<ChatwootMessageRow[]>;
+  // Whether the run that queued this turn is still wanted, handed straight to `runLoadedTurn`,
+  // which asks it inside the `ingest:` lock and again before each post. REQUIRED and nullable so a
+  // future caller has to answer it: `null` says "nothing queued this, nothing can call it off".
+  stillWanted: ((opts: { strict: boolean }) => Promise<boolean>) | null;
   // Label for the single summary log line ("debounce flush" / "reengage").
   label: string;
   // When set (the debounce flush passes "debounce"), emit a flow line for the coalescing under the
@@ -216,6 +225,7 @@ export async function coalesceAndRunTurn(
     );
   }
   const outcome = await runLoadedTurn({
+    stillWanted: ctx.stillWanted,
     loaded,
     authContext: ctx.authContext,
     tenantId,
@@ -239,7 +249,15 @@ export async function coalesceAndRunTurn(
   // #8: the pre-handoff backlog was re-coalesced — and the bot re-transferred for the old reason —
   // after a human returned the conversation). "superseded" stays put by design: the re-armed flush
   // answers the FULL burst.
-  if (outcome !== "superseded") {
+  // "stale" stays put too, and NOT by the same reasoning: superseded means a newer message will
+  // re-answer this burst, while stale means the burst was withdrawn with the thread the command
+  // cleared. Advancing on it would declare handled a set of messages nothing ever answered, and the
+  // next inbound would arm a flush that starts after them.
+  // NOTE: Which this skip can only preserve where the CAS has not already run. A retirement that
+  // lands inside `shouldPost` is caught by the ask after it, and by then the claim has advanced —
+  // skipping here is a no-op for that one window. Accepted where it stands: the alternative is a
+  // reply posted into a conversation the customer just reset.
+  if (outcome !== "superseded" && outcome !== "stale") {
     await advanceHandledWatermark({
       tenantId,
       conversationDbId: convDbId,
@@ -298,6 +316,18 @@ export async function flushDebounceJob(
       },
     });
     if (!conv?.inboxId) return null;
+    // NOTE: Read above the gate so a gate that CLOSES can still say whose conversation it was: the
+    // line it writes is filtered by agent on the Logs page, and one written without an agent id is
+    // invisible in exactly the view an operator investigating one agent is looking at.
+    //
+    // NOTE: the unbound-inbox bail stays BELOW the gate, where it was. Above it, a closed gate on an
+    // inbox that lost its agent would leave without advancing the watermark, and the burst it was
+    // holding would be re-coalesced and answered after a later rebind. Attribution is worth a
+    // nullable id here; it is not worth changing what the gate does.
+    const inbox = await db.inbox.findUnique({
+      where: { id: conv.inboxId },
+      select: { agentId: true, chatwootInboxId: true },
+    });
     // Gate: only the bot still owns it (pending, no human / our bot).
     if (
       !shouldBotHandle(
@@ -309,12 +339,18 @@ export async function flushDebounceJob(
         { ourAgentBotId: agentBotId },
       )
     ) {
-      return { gateClosed: true as const, convDbId: conv.id };
+      return {
+        // NOTE: Classified WITH the gate, not after it: a second read would answer about a
+        // different moment, and the whole point of the line is which state closed THIS gate.
+        gateClosed: describeClosedGate({
+          assigneeType: conv.assigneeType,
+          status: conv.status,
+        }),
+        convDbId: conv.id,
+        inboxDbId: conv.inboxId,
+        agentId: inbox?.agentId ?? null,
+      };
     }
-    const inbox = await db.inbox.findUnique({
-      where: { id: conv.inboxId },
-      select: { agentId: true, chatwootInboxId: true },
-    });
     if (!inbox?.agentId) return null;
     const agentRow = await db.agent.findUnique({
       where: { id: inbox.agentId },
@@ -338,12 +374,34 @@ export async function flushDebounceJob(
   });
   // No agent / unbound inbox → nothing to do (not a failure).
   if (ctx === null) return { outcome: "done" };
-  // Human took over between the arm and this flush: the burst is the human's to answer now, so it
-  // still counts as handled. The arm path kept the burst's newest message id in the payload
-  // precisely so this advance needs no network fetch (issue #8) — without it, the burst would sit
-  // below the watermark and the first flush after the human returns the conversation would
-  // re-answer it.
+  // NOTE: The gate closed between the arm and this flush, and TWO different events wear that exit:
+  // a human took the conversation, or it left `pending` with nobody on the other side — most often
+  // Chatwoot escalating after a slow ack. Either way the burst counts as handled: the arm path kept
+  // its newest message id in the payload precisely so this advance needs no network fetch (issue
+  // #8), because without it the burst would sit below the watermark and the first flush after the
+  // human returns the conversation would re-answer it.
+  //
+  // NOTE: the line is what this branch was missing (issue #271). The escalation closes THIS gate
+  // rather than the runtime's recheck — no turn ever starts — so without a line here the case the
+  // distinction exists for is the one case nothing records.
   if ("gateClosed" in ctx) {
+    emitFlowEvent(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        conversationId: ctx.convDbId,
+        agentId: ctx.agentId,
+        inboxId: ctx.inboxDbId,
+        threadId,
+        base,
+      },
+      {
+        stage: "handoff",
+        status: "ok",
+        detail: ctx.gateClosed,
+      },
+    );
     const last = readLastMessageId(job.payload);
     if (last !== null) {
       await advanceHandledWatermark({
@@ -427,7 +485,7 @@ export async function flushDebounceJob(
     // over their shoulder: the post gate withholds the reply, but the tools have run by then. Same
     // question as the gate above, asked again against the mirror; the burst still counts as handled,
     // exactly as it does when the gate was already closed on the way in.
-    const stillOurs = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const recheck = await runScopedOn(base, sysCtx(tenantId), async (db) => {
       const conv = await db.conversation.findUnique({
         where: {
           tenantId_chatwootInstanceId_chatwootConversationId: {
@@ -436,24 +494,48 @@ export async function flushDebounceJob(
             chatwootConversationId: conversationId,
           },
         },
-        // assigneeId is part of the question, not decoration: without it shouldBotHandle cannot
-        // tell OUR bot from another one, and a conversation handed to a different bot during the
-        // authorization call would read as still ours.
+        // NOTE: assigneeId is part of the question, not decoration: without it shouldBotHandle
+        // cannot tell OUR bot from another one, and a conversation handed to a different bot during
+        // the authorization call would read as still ours.
         select: { status: true, assigneeType: true, assigneeId: true },
       });
-      return shouldBotHandle(
-        {
+      return {
+        ours: shouldBotHandle(
+          {
+            assigneeType: conv?.assigneeType ?? null,
+            assigneeId: conv?.assigneeId ?? null,
+            status: conv?.status ?? null,
+          },
+          { ourAgentBotId: agentBotId },
+        ),
+        closed: describeClosedGate({
           assigneeType: conv?.assigneeType ?? null,
-          assigneeId: conv?.assigneeId ?? null,
           status: conv?.status ?? null,
-        },
-        { ourAgentBotId: agentBotId },
-      );
+        }),
+      };
     });
-    if (!stillOurs) {
+    if (!recheck.ours) {
+      // NOTE: the same exit as the gate on the way in, so it says the same thing. The old line here
+      // asserted a human takeover, which is the reading issue #225 measured as wrong: the ten
+      // seconds this fence exists for are ten seconds in which Chatwoot can escalate the
+      // conversation out of `pending` with nobody on it.
+      emitFlowEvent(
+        {
+          tenantId,
+          turnId: crypto.randomUUID(),
+          source: "inbox",
+          conversationId: ctx.convDbId,
+          agentId: ctx.loaded.agentId,
+          inboxId: ctx.loaded.inboxDbId,
+          threadId,
+          base,
+        },
+        { stage: "handoff", status: "ok", detail: recheck.closed },
+      );
       logger.info(
-        "debounce flush: a human took the conversation during the authorization call (conv=%s)",
+        "debounce flush: the conversation left the bot during the authorization call (conv=%s reason=%s)",
         String(conversationId),
+        recheck.closed.outcome,
       );
       const last = readLastMessageId(job.payload);
       if (last !== null) {
@@ -484,6 +566,21 @@ export async function flushDebounceJob(
         convDbId: ctx.convDbId,
         loaded: ctx.loaded,
         settings: ctx.settings,
+        // The command's fence. Every cancel reaches PENDING rows only, so a flush already CLAIMED
+        // when /reset arrived is past all of them — and it is a queued TURN: coalescing the burst
+        // and invoking rewrites the very thread the command cleared, with the operator having been
+        // told the conversation was started over. The reply is the smaller half; the checkpoint is
+        // the one that outlives the command.
+        //
+        // Handed down rather than asked here, because here is not where the turn writes. Asked at
+        // the top it would answer about a moment before the message fetch, the burst selection and
+        // the model — all waits the command lands inside — and the run would still recreate the
+        // thread. `runLoadedTurn` asks it inside the `ingest:` lock, which is the boundary the
+        // divider and the claim are written at, and again before each post.
+        stillWanted: async ({ strict }) =>
+          !(await (strict
+            ? jobRetiredStrict(job, base)
+            : jobRetired(job, base))),
         authContext,
         // Re-read, not the value captured before the authorization call: that call is a round-trip
         // to somebody else's endpoint with a ceiling of ten seconds, and a message that arrived and
@@ -522,13 +619,24 @@ export async function flushDebounceJob(
     }
     return { outcome: "done" };
   } catch (e) {
-    await recordConversationError({
-      tenantId,
-      instanceId,
-      chatwootConversationId: conversationId,
-      error: e,
-      base,
-    });
+    // The same ask the clean paths make, on the branch that reaches this write without passing any of
+    // them: a throw from the invoke, the TTS call or a Chatwoot send unwinds past every `stillWanted`
+    // above and lands here. `lastError`/`lastErrorAt` are state /reset clears, so recording a retired
+    // run's failure puts back the failure banner the operator was just told had been cleared — and it
+    // is about a turn that will never be retried, because the claim token this run holds was bumped.
+    //
+    // Asked HERE and not carried down from the fence above: everything between them is I/O, which is
+    // exactly the stretch the answer decays over. Unreadable stays "not retired", the same direction
+    // `jobRetired` takes everywhere else — an unknown must not swallow a real failure silently.
+    if (!(await jobRetired(job, base))) {
+      await recordConversationError({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conversationId,
+        error: e,
+        base,
+      });
+    }
     throw e;
   }
 }

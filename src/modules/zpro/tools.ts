@@ -20,8 +20,10 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import config from "@/config";
+import { DEFAULT_TIMEZONE } from "@/graph/time";
 import { buildHttpTools, loadToolSelections } from "@/graph/tools/assemble";
 import type { NativeToolName } from "@/graph/tools/catalog";
+import { buildDocumentTools } from "@/graph/tools/documents";
 import { loadMcpToolsForAgent } from "@/graph/tools/mcp";
 import { buildNativeTools, utilityNativeAllow } from "@/graph/tools/native";
 import { buildRagTools } from "@/graph/tools/rag";
@@ -264,6 +266,24 @@ export async function loadZproAgentTools(
     },
   });
 
+  // Same builder Chatwoot uses (src/graph/tools/documents.ts), unconditionally — it needs no
+  // ChatwootClient and queues on TurnState.pendingAttachments exactly like send_image, so there is no
+  // Z-PRO-specific variant to write. Delivery (runtime.ts) sends the queued PDF via
+  // ZproClient.sendBase64 instead of Chatwoot's sendFileAttachment. No per-agent business-hours
+  // timezone exists on this path yet (see composeSystemPrompt's own DEFAULT_TIMEZONE fallback just
+  // above in runtime.ts) — the document is dated in DEFAULT_TIMEZONE for the same reason. Never
+  // simulated here — this function only ever runs a REAL turn (runtime.ts); the playground takes a
+  // wholly separate path (buildToolset in src/graph/prepare.ts, simulateDocuments: true there).
+  const documentTools = buildDocumentTools(selections.documentSelections, {
+    tenantId,
+    turnState: params.turnState,
+    threadId,
+    conversationDbId: conversationId,
+    base,
+    storageDir: config.documentsStorageDir,
+    timezone: DEFAULT_TIMEZONE,
+  });
+
   // The only network call in this function so far — deliberately OUTSIDE the scoped read above.
   const mcpTools = await loadMcpToolsForAgent(
     tenantId,
@@ -438,6 +458,7 @@ export async function loadZproAgentTools(
       ...toolpackTools,
       ...ragTools,
       ...httpTools,
+      ...documentTools,
       ...mcpTools,
       ...utilityTools,
     ],

@@ -59,6 +59,7 @@ function pendingCredentialError(ref: string): AppError {
     `vault secret "${ref}" has not been filled yet`,
     409,
     "errors.credentialPending",
+    { ref },
   );
 }
 
@@ -243,12 +244,20 @@ export async function resolveVaultRefByName(
 export async function requireVaultRef(
   db: ScopedDb,
   ref: string,
+  // The server's own name for the input this ref arrived in, when the caller has one — a dotted path
+  // into a bag it owns (`settings.tts.normalizeCredentialRef`). Optional because most callers refuse
+  // a column the client already named in the patch it sent; the agent's two bags are the ones that
+  // need it, where a ref can be any of eight fields across three editor tabs and the sentence alone
+  // would leave the console guessing which input to mark. See src/api/lib/refusal.ts.
+  field?: string,
 ): Promise<string> {
   const malformed = () =>
     new AppError(
       `"${ref}" is not a vault reference (expected vault:<id>)`,
       400,
       "errors.invalidVaultRef",
+      { ref },
+      field,
     );
   if (!ref.startsWith(VAULT_REF_PREFIX)) throw malformed();
   const raw = ref.slice(VAULT_REF_PREFIX.length);
@@ -268,6 +277,8 @@ export async function requireVaultRef(
       `vault secret "${ref}" not found`,
       400,
       "errors.vaultRefNotFound",
+      { ref },
+      field,
     );
   }
   return formatVaultRef(entry.id);
@@ -376,6 +387,11 @@ function validateVaultValue(kind: string, value: unknown): void {
           `value.${key} must be a non-empty string`,
           400,
           "errors.invalidVaultValue",
+          undefined,
+          // NOTE: the credential form renders one input per declared field and keys it by exactly this
+          // (`fieldValues[f.key]`, src/client/components/CredentialForm.tsx), so the key IS the
+          // console's name for the input that was refused.
+          key,
         );
       }
     }

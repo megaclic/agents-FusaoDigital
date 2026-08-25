@@ -421,6 +421,98 @@ async function applyDeferredZproResolve(
   }
 }
 
+export interface ZproAttachmentDelivery {
+  // Something reached the customer.
+  sent: boolean;
+  // It was attempted and did not get through (not a revocation, not "nothing queued").
+  failed: boolean;
+}
+
+// Z-PRO analog of src/graph/runtime.ts's deliverPendingAttachments, sized to what this side actually
+// queues: only DOCUMENT ever lands in TurnState.pendingAttachments here (send_image sends immediately
+// inside its own tool call — see native-tools.ts's header), and buildDocumentTools's own
+// documentsInFlight ceiling caps the queue at one entry per turn, so this delivers a single item
+// rather than looping/sorting a batch the way Chatwoot's version has to.
+export async function deliverZproPendingDocument(
+  client: ZproClient,
+  contactNumber: string,
+  turnState: TurnState,
+  flow: FlowContext,
+  document: { tenantId: bigint; base: PrismaClient },
+): Promise<ZproAttachmentDelivery> {
+  const queued = turnState.pendingAttachments.splice(0);
+  const file = queued[0];
+  if (!file) return { sent: false, failed: false };
+  // Same revocation recheck as Chatwoot's delivery loop, and for the identical reason: the tool
+  // queues BYTES, which cannot say whether the row is still deliverable, and an operator can revoke
+  // in the seconds between the tool call and this loop running.
+  if (file.documentId) {
+    const live = await runScopedOn(
+      document.base,
+      sysCtx(document.tenantId),
+      (db) =>
+        db.issuedDocument.findUnique({
+          where: { id: file.documentId as bigint },
+          select: { revoked: true },
+        }),
+    ).catch((e: unknown) => {
+      logger.warn(
+        "zpro document %s: revocation recheck failed before delivery — not sending: %s",
+        String(file.documentId),
+        e instanceof Error ? e.message : String(e),
+      );
+      return null;
+    });
+    if (live?.revoked !== false) {
+      const revoked = live?.revoked === true;
+      emitFlowEvent(flow, {
+        stage: "tool",
+        ...(revoked
+          ? {
+              status: "skipped" as const,
+              detail: { tool: file.tool, outcome: "revoked_before_delivery" },
+            }
+          : {
+              level: "warn" as const,
+              status: "error" as const,
+              detail: { tool: file.tool, outcome: "revocation_unknown" },
+              errorMessage:
+                "could not confirm whether this document was revoked; it was not sent",
+            }),
+      });
+      return { sent: false, failed: !revoked };
+    }
+  }
+  try {
+    // sendBase64 is the generic Z-PRO file endpoint (confirmed live via tts.ts's sendZproVoiceReply —
+    // sendMediaUrl needs a public URL we would otherwise have to host the PDF behind).
+    await client.sendBase64(
+      contactNumber,
+      Buffer.from(file.bytes).toString("base64"),
+      file.mime,
+      file.fileName,
+      file.caption,
+    );
+    emitFlowEvent(flow, {
+      stage: "tool",
+      status: "ok",
+      detail: { tool: file.tool, outcome: "sent" },
+    });
+    return { sent: true, failed: false };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn("zpro %s delivery failed: %s", file.tool, msg);
+    emitFlowEvent(flow, {
+      stage: "tool",
+      level: "warn",
+      status: "error",
+      detail: { tool: file.tool, outcome: "failed" },
+      errorMessage: msg,
+    });
+    return { sent: false, failed: true };
+  }
+}
+
 // The shared turn tail: build → invoke → recheck → post. Reused by runZproAgentTurn (direct) and
 // flushZproDebounceJob (debounce). Does NOT touch turn-in-flight bookkeeping or any delivery/
 // watermark ledger — that is each caller's own concurrency guard (see the module header).
@@ -524,7 +616,13 @@ export async function runLoadedZproTurn(
     // (search_knowledge concedida) alimentar composeSystemPrompt abaixo, mesma ordem do Chatwoot.
     // Mutable per-turn state shared with the native tools (deferred resolve intent) — mirrors
     // src/graph/runtime.ts's own turnState exactly.
-    const turnState: TurnState = { resolveRequested: false };
+    const turnState: TurnState = {
+      resolveRequested: false,
+      pendingAttachments: [],
+      documentsInFlight: 0,
+      imagesInFlight: 0,
+      attachmentsSeq: 0,
+    };
     // Operator guidance per tool (agent.settings.toolGuidance), plus the handoff transfer guidance
     // (agent.settings.handoff.instructions) and the CRM funnel guidance (agent.settings.zproCrm.
     // instructions) folded onto handoff_to_human/kanban_move_card specifically — mirrors
@@ -758,25 +856,61 @@ export async function runLoadedZproTurn(
       if (params.shouldPost && !(await params.shouldPost()))
         return "superseded";
 
-      // Empty reply: nothing to post, but a deferred resolve intent still applies (resolve with no
-      // final text is a legitimate shape) — mirrors src/graph/runtime.ts's exact placement, AFTER the
-      // recheck and the supersede gate (resolving under a takeover/superseded turn would be wrong).
+      // OUTPUT guardrail: screen the model's reply BEFORE delivery — together with anything a queued
+      // document tool wrote (field values / line-item descriptions the customer reads on the PDF, via
+      // PendingAttachment.screenText). Runs even when `reply` is empty and a document is queued (a
+      // document-only turn is a legitimate shape and its text still needs screening); `screened` is
+      // "" and the call is skipped when there is truly nothing on either side, same as before this
+      // composite existed. Mirrors src/graph/runtime.ts's own placement, ahead of the empty-reply
+      // branch below (a violation must drop the queued document too, not just the reply).
+      const modelWritten = turnState.pendingAttachments
+        .map((a) => a.screenText?.trim())
+        .filter((c): c is string => !!c);
+      const screened = [reply, ...modelWritten].filter(Boolean).join("\n");
+      const outGuard = screened ? await runGuardrail("output", screened) : null;
+      if (outGuard) {
+        if (outGuard.reply === null) {
+          turnState.pendingAttachments.length = 0;
+          return "blocked";
+        }
+        reply = outGuard.reply;
+      }
+
+      // Empty reply: nothing to post as TEXT, but a queued document + a deferred resolve intent are
+      // still legitimate shapes — mirrors src/graph/runtime.ts's exact placement, AFTER the recheck
+      // and the supersede gate (resolving under a takeover/superseded turn would be wrong). Ported
+      // from Chatwoot's own "empty reply, attachment still applies" handling, missing here before:
+      // a document tool call with no accompanying text used to lose the PDF silently and report
+      // "empty" on a turn that DID answer the customer.
       if (!reply) {
+        const { sent } = await deliverZproPendingDocument(
+          client,
+          ev.contactNumber,
+          turnState,
+          flow,
+          { tenantId, base },
+        );
         await applyDeferredZproResolve(client, ticketId, turnState, flow, {
           tenantId,
           zproInstanceId,
           base,
         });
-        return "empty";
+        return sent ? "posted" : "empty";
       }
 
-      // OUTPUT guardrail: screen the model's reply BEFORE delivery. A violation either replaces the
-      // reply (template / a guardrails-generated safe reply) or suppresses the send entirely.
-      const outGuard = await runGuardrail("output", reply);
-      if (outGuard) {
-        if (outGuard.reply === null) return "blocked";
-        reply = outGuard.reply;
-      }
+      // The document lands before the text reply that talks about it, same ordering Chatwoot's
+      // runtime uses. Best-effort: a delivery failure here does not block the text reply below —
+      // losing the customer's answer over a PDF would be the worse outcome.
+      await deliverZproPendingDocument(
+        client,
+        ev.contactNumber,
+        turnState,
+        flow,
+        {
+          tenantId,
+          base,
+        },
+      );
 
       // PROACTIVE-only WhatsApp 24h window gate (runZproAgentNudge sets `proactive`; the reactive
       // webhook/debounce paths never do, so `mode` is always "freeform" there). Outside the window on

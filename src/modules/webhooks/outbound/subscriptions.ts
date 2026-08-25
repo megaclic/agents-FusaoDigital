@@ -67,6 +67,7 @@ function assertKnownEvents(events: string[]): OutboundEvent[] {
         `unknown webhook event: ${e}`,
         400,
         "errors.unknownWebhookEvent",
+        { event: e },
       );
     }
     if (!seen.has(e)) {
@@ -167,7 +168,7 @@ export async function updateWebhookSubscription(
   if (parsed.enabled !== undefined) data.enabled = parsed.enabled;
   if (Object.keys(data).length === 0) {
     throw new AppError(
-      "no updatable fields provided",
+      "No updatable fields provided",
       400,
       "errors.noUpdatableFields",
     );

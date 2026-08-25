@@ -6,6 +6,7 @@ import { type AgentNudge, runAgentNudge } from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { AppError, UnauthorizedError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { makeStorableDeep, unstorableProblem } from "@/lib/text";
 import { getMapper } from "@/modules/integrations/mappers";
 import {
   type ResolvedInboundRoute,
@@ -32,6 +33,25 @@ import {
 // processing completes within seconds of receipt). Attempts are capped to stop poison loops.
 const PROCESSING_STALE_MS = 5 * 60_000;
 const MAX_PROCESS_ATTEMPTS = 5;
+
+// What an identity field is allowed to be, and it is a REFUSAL rather than a truncation: cutting an
+// identity is the same lossy-identity defect as repairing one. Measured against this database, a
+// `dedupeKey` that does not compress fails its own unique index at ~2704 bytes ("index row size
+// 6432 exceeds btree version 4 maximum 2704"), which is the same 500-with-no-record as an
+// unstorable character, reached by a different road. 512 characters is far above any provider id
+// (Asaas sends ~20, and the mapper already caps `externalReference` at 128) and far below the index
+// limit even if every character were 4 bytes.
+const MAX_IDENTITY_CHARS = 512;
+
+// The two things an identity field must be for the row to exist: storable, and short enough for the
+// index that enforces idempotency on it. Same verdict shape as `unstorableProblem`, whose message
+// this passes through, because the caller does the same thing with either answer.
+function identityProblem(value: string, what: string): string | null {
+  if (value.length > MAX_IDENTITY_CHARS) {
+    return `${what} is ${value.length} characters, over the ${MAX_IDENTITY_CHARS} an identity field may hold.`;
+  }
+  return unstorableProblem(value, what);
+}
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -198,6 +218,37 @@ export async function receiveInbound(
     };
   }
 
+  // An identity field the row cannot carry is NOT repaired or cut: both are lossy,
+  // and lossy on an identity is how a payment lands in the wrong conversation. `ref\u0000` repaired
+  // to `ref` MATCHES the ref an unrelated conversation registered, and `dispatchConversion` would
+  // credit the conversion there and nudge that customer, the one outcome this module says it never
+  // produces. Two distinct provider ids that differ only by such a character would likewise collapse
+  // into one `dedupeKey` and silently drop a real delivery. So a malformed identity takes the
+  // fail-closed path that already exists for a payload we cannot process: a durable FAILED record
+  // and a 2xx, which is what stops the sender's retry loop. The payload itself is display and
+  // diagnostics, and IS repaired (below).
+  const badIdentity =
+    identityProblem(result.event.dedupeKey, "dedupeKey") ??
+    identityProblem(result.event.externalId, "externalId");
+  if (badIdentity) {
+    logger.warn(
+      "inbound: %s identity field cannot be stored (instance %s): %s",
+      route.catalogType,
+      String(route.id),
+      badIdentity,
+    );
+    const failedId = await persistFailed(base, route, params.rawBody, {
+      reason: "unstorable-identity",
+      issues: badIdentity,
+    });
+    return {
+      ack: true,
+      deliveryId: failedId,
+      tenantId: route.tenantId,
+      outcome: "invalid",
+    };
+  }
+
   const { id, duplicate } = await persistInbound(base, route, result.event);
   return {
     ack: true,
@@ -248,12 +299,21 @@ async function persistFailed(
 
 // create-then-catch across two transactions (a unique violation aborts its own transaction,
 // so the existence re-read must run in a fresh one). Handles concurrent identical deliveries.
+//
+// The mapper is pure and knows nothing about columns; this is where its output becomes a row, so it
+// is where a third party's characters have to survive the write. Measured against Postgres, the
+// `jsonb` payload refuses a lone surrogate (`invalid input syntax for type json`) and a NUL (22P05),
+// and the refusal escapes `receiveInbound`, which nothing above catches: a 500 with no delivery row
+// and no FAILED record either, and a sender retrying a body that can never succeed. The payload is
+// display and diagnostics, so it is REPAIRED. The identity fields, which the `text` columns refuse
+// just as flatly (22021), are not repairable without changing what they identify, and the caller has
+// already turned those away.
 async function persistInbound(
   base: PrismaClient,
   route: ResolvedInboundRoute,
   n: NormalizedInboundEvent,
 ): Promise<{ id: bigint; duplicate: boolean }> {
-  const payload = toStoredPayload(n);
+  const payload = makeStorableDeep(toStoredPayload(n));
   try {
     const row = await runScopedOn(base, sysCtx(route.tenantId), (db) =>
       db.inboundDelivery.create({

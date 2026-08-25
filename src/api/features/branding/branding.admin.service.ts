@@ -136,7 +136,7 @@ export async function setBrandingAsset(
 ): Promise<GlobalBrandingDto> {
   if (!ALLOWED_ASSET_TYPES.includes(file.type)) {
     throw new AppError(
-      "Unsupported image type",
+      "Unsupported image type — must be a PNG or JPEG",
       400,
       "errors.unsupportedImageType",
     );

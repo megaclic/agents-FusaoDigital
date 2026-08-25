@@ -1,12 +1,13 @@
 import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { sanitizeErrorMessage } from "@/lib/redact";
 import {
   asSuperAdminOn,
   runScopedOn,
   type ScopedDb,
   type TenantContext,
 } from "@/lib/tenancy";
-import { clipText } from "@/lib/text";
 import {
   JOB_DELETE_ON_DONE,
   kindsInLane,
@@ -187,13 +188,170 @@ export async function cancelPendingJobsByPrefix(
   });
 }
 
+// One step further than the two cancels above: PENDING **and** CLAIMED rows under one dedupe key. They
+// leave a claimed job to its own gate, and for an ordinary cancel that is right — the run holding the
+// claim is the one doing the work. It is wrong for a command like /reset, where the claimed row is
+// precisely the one already on its way to posting at the customer. A status change is something that
+// run will never look at, so this leaves a tombstone it can SEE, via `jobRetired` below.
+//
+// One step SHORT of `revokeJobsByKeyPrefixOn`, which follows: the row here survives, because its key
+// is reusable and the work behind it may legitimately come back. A revoked ingestion cannot — its row
+// holds the message body itself, so there the row is deleted rather than marked.
+//
+// Two marks, because neither survives alone. `cancelledAt` is the direct answer, and a re-arm wipes
+// it: `enqueueJob`'s upsert replaces the payload wholesale, so a customer who books again would make
+// the retired run "wanted" once more. `claim_seq` survives that rewrite, and a token that moved says
+// the same thing in one word — this run was superseded. The bump also fences whatever the run writes
+// at the end, since completeJob/rescheduleJob/failJob all CAS on the token the claim handed out.
+//
+// One atomic statement, never read-modify-write, so a concurrent re-arm's payload is stamped or
+// replaced whole. Unconditional over ARM TIME by design: a caller that cannot afford to retire work
+// armed after it asked runs this BEFORE its slow steps, so that re-arm lands afterwards and revives
+// its own row.
+//
+// Fenced on STATUS, though: only a queued or in-flight row has a run to call off. A DEAD row is left
+// alone because marking it DONE would erase the dead-letter an operator may still need to read, and
+// nothing is executing it for the claim_seq bump to fence — the same rule revokeJobsByKeyPrefixOn
+// states below. The fence is safe here because this stamp has exactly one reader, jobRetired, which
+// asks about a RUN. It is not safe everywhere: cancelThreadAppointmentReminders writes the same shape
+// and cannot use it, because there `cancelledAt` also marks the APPOINTMENT cancelled and is read by
+// projectAppointmentEvents / the follow-up sweep, for whom a DEAD row is still a live appointment.
+// Returns the number of rows retired.
+export async function retireJobsByDedupeKey(
+  tenantId: bigint,
+  kind: SchedulerJobKind,
+  dedupeKey: string,
+  base: PrismaClient = basePrisma,
+): Promise<number> {
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const stamp = JSON.stringify({ cancelledAt: new Date().toISOString() });
+    return db.$executeRaw`
+      UPDATE scheduler_jobs
+         SET status = 'DONE',
+             payload = payload || ${stamp}::jsonb,
+             claim_seq = claim_seq + 1,
+             updated_at = now()
+       WHERE tenant_id = ${tenantId}
+         AND kind = ${kind}::"SchedulerJobKind"
+         AND dedupe_key = ${dedupeKey}
+         AND status IN ('PENDING', 'CLAIMED')`;
+  });
+}
+
+function readJobRetirement(
+  job: ClaimedJob,
+  base: PrismaClient,
+  scoped?: ScopedDb,
+): Promise<{ payload: unknown; claimSeq: number } | null> {
+  const read = (db: ScopedDb) =>
+    db.schedulerJob.findUnique({
+      where: { id: job.id },
+      select: { payload: true, claimSeq: true },
+    });
+  return scoped ? read(scoped) : runScopedOn(base, sysCtx(job.tenantId), read);
+}
+
+function isRetired(
+  job: ClaimedJob,
+  row: { payload: unknown; claimSeq: number } | null,
+): boolean {
+  if (!row) return false;
+  const retired =
+    (row.payload as { cancelledAt?: unknown } | null)?.cancelledAt != null ||
+    row.claimSeq !== job.claimSeq;
+  if (retired) {
+    logger.info(
+      "scheduler: claimed job retired, standing down (kind=%s job=%s)",
+      job.kind,
+      String(job.id),
+    );
+  }
+  return retired;
+}
+
+// The other half of the tombstone, for the handler holding the claim: has this run been superseded
+// while it worked? Re-READ rather than trusted from `job.payload`, because that snapshot is from
+// claim time, which is exactly the moment before a stamp would land.
+//
+// Unreadable is NOT retired. An unknown must not silently drop a customer-facing message that was
+// legitimately armed — the caller asks this to withhold work, so the uncertain answer is the one that
+// lets it proceed and be fenced by the CAS at the end. `jobRetiredStrict` is for the callers whose
+// fence comes BEFORE that one and cannot afford the guess.
+export async function jobRetired(
+  job: ClaimedJob,
+  base: PrismaClient = basePrisma,
+  // The connection to read on, when the caller already holds one. No production caller does since the
+  // thread's critical section stopped being one long transaction (issue #225), so every `stillWanted`
+  // now opens its own short scope. Kept, and kept tested, because the rule it encodes still binds
+  // anything asked from inside a transaction: opening a second connection there stalls on an
+  // exhausted pool while still holding the lock, and `DB_POOL_MAX=1` is a supported setting.
+  scoped?: ScopedDb,
+): Promise<boolean> {
+  const row = await readJobRetirement(job, base, scoped).catch(
+    (err: unknown) => {
+      logger.warn(
+        "scheduler: could not re-read the retirement of a claimed job (kind=%s job=%s): %s",
+        job.kind,
+        String(job.id),
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    },
+  );
+  return isRetired(job, row);
+}
+
+// THE SAME QUESTION, ASKED WHERE A GUESS IS THE EXPENSIVE ANSWER. `jobRetired` swallows an
+// unreadable row as "still wanted" because for most callers the cost of guessing wrong is a message
+// sent one time too many, fenced later by the CAS. Inside the thread's critical section the cost is
+// the opposite and it lands before any fence: the run recreates the graph state /reset just cleared,
+// and the operator is told the conversation was wiped while the agent keeps answering from it.
+//
+// The read can now fail where it could not before. It used to borrow the enclosing transaction's live
+// connection; since that transaction is gone (issue #225) it opens its own short scope, which can
+// exhaust `maxWait` under exactly the pool pressure this whole change is about. Propagating sends the
+// job back through the scheduler's own bounded retry (worker.ts `fail`), which is what an unknown
+// deserves here.
+export async function jobRetiredStrict(
+  job: ClaimedJob,
+  base: PrismaClient = basePrisma,
+  // Same connection rule as the lenient probe above. The redirect ladder's composite fence asks from
+  // inside its own read, and a second connection opened there would be a round trip this question
+  // does not need.
+  scoped?: ScopedDb,
+): Promise<boolean> {
+  return isRetired(job, await readJobRetirement(job, base, scoped));
+}
+
+// The SAME question as a SQL predicate, for the one caller that cannot ask it and then act: a write
+// whose condition has to be evaluated by the statement that writes, because the command it races
+// does two things in order (retire, then clear what the write would restore) and any read/act pair
+// can be split between them.
+//
+// It lives HERE, touching the function above, because the two are one rule written twice and that is
+// how a rule starts drifting. tests/modules/scheduler.test.ts asserts they agree on every state a
+// row can be in — including the absent one, where both answer "not retired" for the reason the
+// function documents: an unknown is not a retirement.
+export function jobNotRetiredSql(job: ClaimedJob): Prisma.Sql {
+  return Prisma.sql`NOT EXISTS (
+    SELECT 1
+      FROM scheduler_jobs sj
+     WHERE sj.id = ${job.id}
+       AND sj.tenant_id = ${job.tenantId}
+       AND (
+         sj.claim_seq <> ${job.claimSeq}
+         OR sj.payload->>'cancelledAt' IS NOT NULL
+       ))`;
+}
+
 // REVOKED, not merely cancelled: PENDING **and** CLAIMED rows under a dedupeKey prefix are retired.
 //
-// The difference from the two above is deliberate and is the whole reason this exists separately.
-// They leave a CLAIMED job to its own gate, because there the work is still wanted and the in-flight
-// run is the one doing it. Here the work has been REVOKED — a memory reset means the operator asked
-// for everything queued against this thread to stop existing, including the message a job claimed a
-// second ago and is holding while it waits on the reset's own lock.
+// The last and strongest of the four, and the difference is deliberate. The two cancels reach PENDING
+// rows only. `retireJobsByDedupeKey` reaches the claimed one too but LEAVES it, because its key is
+// reusable and the work may legitimately be armed again. Here the work has been REVOKED — a memory
+// reset means the operator asked for everything queued against this thread to stop existing,
+// including the message a job claimed a second ago and is holding while it waits on the reset's own
+// lock — and the row goes with it.
 //
 // Retiring the row is only half of that: it does not stop a handler already running in memory. The
 // other half is the handler re-asking, under the lock, whether its own row is still CLAIMED by it
@@ -501,7 +659,34 @@ export async function rescheduleJob(
   runAt: Date,
   payload?: Record<string, unknown>,
   base: PrismaClient = basePrisma,
+  // Merged into the row's CURRENT payload (jsonb `||`) inside the same compare-and-set, instead of
+  // replacing it. The difference matters on a row another writer stamps while the handler runs: the
+  // per-event reminder cancel merges `cancelledAt` onto rows of ANY status without bumping the claim
+  // token, so a replacement written from the claim-time snapshot passes the CAS and erases the
+  // tombstone, re-arming a cancelled reminder (issue #281's review). A handler that only needs to
+  // carry a counter forward has no business overwriting what it never read.
+  payloadPatch?: Record<string, unknown>,
 ): Promise<{ applied: boolean }> {
+  if (payloadPatch !== undefined) {
+    const patch = JSON.stringify(payloadPatch);
+    const count = await runScopedOn(
+      base,
+      sysCtx(tenantId),
+      (db) =>
+        db.$executeRaw`
+        UPDATE scheduler_jobs
+           SET status = 'PENDING'::"SchedulerJobStatus",
+               run_at = ${runAt},
+               last_error = NULL,
+               payload = payload || ${patch}::jsonb,
+               updated_at = now()
+         WHERE id = ${id}
+           AND tenant_id = ${tenantId}
+           AND status = 'CLAIMED'
+           AND claim_seq = ${claimSeq}`,
+    );
+    return { applied: count > 0 };
+  }
   const { count } = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.schedulerJob.updateMany({
       where: { id, status: "CLAIMED", claimSeq },
@@ -519,6 +704,13 @@ export async function rescheduleJob(
 }
 
 // Failure: attempts++; retry with backoff until the cap, then DEAD.
+//
+// `sanitizeErrorMessage`, not a bare cut: `error` is whatever a job handler threw, and THIS write is
+// the transition itself. A character Postgres refuses (a NUL, an orphan surrogate) takes the whole
+// statement with it, and then the row keeps its CLAIMED status and its old `attempts`: nothing
+// reclaims it and nothing reports it. What used to guard this column was every handler's own habit
+// of not quoting a third party, never anything stated here (issue #243). The same call is what keeps
+// a credential-shaped substring out of the column.
 // Returns whether this call is the one that DEAD-LETTERED the job — the attempt count alone does not
 // say so. The CAS is on `status = 'CLAIMED'` AND on the claim's own token, so a job re-armed mid-run
 // (`armDebounce` upserts the claimed row back to PENDING) fails to match on either count: the row
@@ -540,12 +732,16 @@ export async function failJob(
     db.schedulerJob.updateMany({
       where: { id, status: "CLAIMED", claimSeq },
       data: dead
-        ? { status: "DEAD", attempts: next, lastError: clipText(error, 500) }
+        ? {
+            status: "DEAD",
+            attempts: next,
+            lastError: sanitizeErrorMessage(error),
+          }
         : {
             status: "PENDING",
             attempts: next,
             runAt: new Date(now.getTime() + backoffMs(next)),
-            lastError: clipText(error, 500),
+            lastError: sanitizeErrorMessage(error),
           },
     }),
   );

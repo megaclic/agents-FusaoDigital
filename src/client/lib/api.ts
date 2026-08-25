@@ -2,6 +2,7 @@ import { treaty } from "@elysiajs/eden";
 import type { App } from "@/app";
 import { getActiveTenantId } from "@/client/lib/activeTenant";
 import i18n from "@/client/lib/i18n";
+import { recoverFromRejectedSelector } from "@/client/lib/tenantSelectorRecovery";
 
 // NOTE: `parseDate: false` disables Eden treaty's default JSON reviver that
 // auto-converts any string matching an ISO 8601 / RFC 1123 / dd-mm-yyyy regex
@@ -29,6 +30,11 @@ export const api = treaty<App>(window.location.origin, {
       // Surfaced as a coalesced global toast (see GlobalApiToasts) so every page gets clear
       // rate-limit feedback, not just the ones that read err.status into a DataBoundary.
       window.dispatchEvent(new CustomEvent("api:rate-limited"));
+    } else {
+      // NOTE: keyed on the header the boundary sets and never on the status: a 404 is also how an
+      // agent, a document or a tenant the page NAMED comes back missing, and none of those says
+      // anything about what the browser is holding. `mediaFetch` answers the same header.
+      recoverFromRejectedSelector(response);
     }
   },
   parseDate: false,

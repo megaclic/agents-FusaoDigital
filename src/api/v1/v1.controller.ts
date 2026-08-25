@@ -32,6 +32,14 @@ import {
 } from "./tenants.admin.service";
 import { getTenant, listTenants, type TenantUpdate } from "./tenants.service";
 
+// The error catalog this controller's routes answer with. `bun i18n:extract` materialises
+// src/api/locales/*.json from these lines and prunes anything nothing references, and
+// `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
+// throw site rather than an English sentence on a pt-BR caller's screen.
+// translate('errors.conversationNotFound', 'Conversation not found.')
+// translate('errors.reengageNoAgent', 'No agent is bound to the inbox of this conversation.')
+// translate('errors.tenantConfirmMismatch', 'The name confirmation does not match.')
+
 // NOTE: requireAuth guarantees a user, and tenancyPlugin derives tenantContext from it, so
 // a null context here is an impossible state — throw (handled by onError as 403) rather
 // than return an error body, keeping each success response a single shape for the treaty.
@@ -303,7 +311,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Conversations"],
       },
-      response: errors(400, 401),
+      response: errors(400, 401, 404),
     },
   )
   .get(
@@ -543,11 +551,14 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
   .post(
     "/conversations/:id/return",
     async ({ tenantContext, params }) => {
-      await returnConversationToAgent(
+      const outcome = await returnConversationToAgent(
         ctxOrThrow(tenantContext),
         BigInt(params.id),
       );
-      return { instance: instanceIdentity, success: true };
+      // The call succeeded either way — the conversation is pending and the mirror is correct. The
+      // outcome says whether the unassign happened, because "taken-over" means a human claimed it
+      // mid-request and still holds it, and a bare success would read as the agent having it back.
+      return { instance: instanceIdentity, success: true, outcome };
     },
     {
       requireAuth: true,
@@ -665,7 +676,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(400, 401),
+      response: errors(400, 401, 404),
     },
   )
   .get(
@@ -694,7 +705,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(401),
+      response: errors(401, 404),
     },
   )
   .get(
@@ -737,7 +748,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(400, 401),
+      response: errors(400, 401, 404),
     },
   )
   .get(
@@ -766,6 +777,6 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(401),
+      response: errors(401, 404),
     },
   );

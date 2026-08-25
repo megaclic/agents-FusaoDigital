@@ -69,6 +69,7 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
         "agent_tool_selections",
         "integration_instances",
         "tool_definitions",
+        "document_templates",
         "knowledge_bases",
         "mcp_server_connections",
         "zpro_conversations",
@@ -293,6 +294,45 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
     });
     expect(result.tools.map((t) => t.name)).toContain("search_knowledge");
     expect(result.grounded).toBe(true);
+  });
+
+  test("DOCUMENT: a granted template exposes its send_<slug> tool (channel-agnostic buildDocumentTools, no Z-PRO-specific variant)", async () => {
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Document agent",
+        systemPrompt: "You are a support assistant.",
+      },
+    });
+    const tpl = await suDb.documentTemplate.create({
+      data: {
+        tenantId,
+        name: "Orçamento",
+        slug: "orcamento",
+        blocks: [{ id: "b1", type: "text", text: "Olá {{cliente}}" }],
+        fields: [{ name: "cliente", label: "Cliente", type: "text" }],
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "DOCUMENT",
+        documentTemplateId: tpl.id,
+        enabledTools: [],
+        knowledgeBaseIds: [],
+      },
+    });
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 1005,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:1005`,
+    });
+    expect(result.tools.map((t) => t.name)).toContain("send_orcamento");
   });
 
   test("HTTP: a granted custom tool is exposed", async () => {

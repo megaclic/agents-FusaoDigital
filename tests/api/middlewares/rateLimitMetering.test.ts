@@ -29,8 +29,11 @@ beforeAll(async () => {
   // in the order it installed them. There is no unauthenticated route in the app that throws a
   // 404 to borrow for this, and rebuilding an equivalent app would pin the test's own ordering
   // instead of the app's. Cache-busted import (not the plain `@/app` singleton), so the route this
-  // adds and the `.listen()` below land on a private copy: other test files (tests/api/v1/*) import
-  // the plain specifier and call `.handle()` on it expecting a never-listened, never-extended app.
+  // adds and the `.listen()` below land on a private copy: other test files (tests/api/v1/*,
+  // refusal-wire.test.ts) import the plain specifier and call `.handle()` on it, expecting a
+  // never-listened, never-extended app — `.listen()` on the shared singleton previously corrupted
+  // those (`TypeError: Expected Request object`, Bun's `Server.requestIP()` rejecting a manually-
+  // built Request once the server had actually listened).
   const cacheBust: string = "rate-limit-metering-test";
   const app = (await import(`@/app?${cacheBust}`)).default;
   app.get("/__metering/thrown-404", () => {

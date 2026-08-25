@@ -90,7 +90,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import type { NativeToolName } from "@/graph/tools/catalog";
 import { toolFailure } from "@/graph/tools/failure";
-import { simulatedTool } from "@/graph/tools/native";
+import { type PendingAttachment, simulatedTool } from "@/graph/tools/native";
 import { runScopedOn } from "@/lib/tenancy";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
 import type { HandoffConfig } from "@/modules/handoff/settings";
@@ -120,10 +120,27 @@ import { buildSetVoicePreferenceTool } from "./tts";
 const DEFAULT_TAG_COLOR = "#6b7280";
 
 // Mutable per-turn state shared with runLoadedZproTurn (deferred resolve). Structural twin of
-// src/graph/tools/native.ts's TurnState — kept separate on purpose (no cross-import), same rationale
-// as src/graph/prepare.ts's own structural mirror of it.
+// src/graph/tools/native.ts's TurnState — kept separate on purpose (no cross-import of the type
+// itself, though PendingAttachment above is imported since it is already channel-agnostic and a
+// second copy of ITS shape would be the very drift this file's separation is meant to avoid), same
+// rationale as src/graph/prepare.ts's own structural mirror of it.
 export interface TurnState {
   resolveRequested: boolean;
+  // The shared document tool (src/graph/tools/documents.ts, built once for both channels — see
+  // tools.ts) queues here exactly as it does for Chatwoot; only DOCUMENT ever lands in this queue on
+  // the Z-PRO side (send_image sends immediately inside its own tool call instead, see this file's
+  // header comment), so runtime.ts's delivery step never needs Chatwoot's multi-item batching.
+  pendingAttachments: PendingAttachment[];
+  // Same reservation-before-await ceiling as Chatwoot's, and for the identical reason (a batch of
+  // tool calls runs under Promise.all, so a check reading only the queue is read by all of them
+  // while it is still empty).
+  documentsInFlight: number;
+  // Present, but never incremented on this side: buildDocumentTools's DocumentToolDeps.turnState is
+  // typed as src/graph/tools/native.ts's TurnState (structural, not this file's own), which requires
+  // it. send_image's own budget tracking stays local to that immediate-send path and never touches
+  // this field.
+  imagesInFlight: number;
+  attachmentsSeq: number;
 }
 
 export interface ZproToolCtx {

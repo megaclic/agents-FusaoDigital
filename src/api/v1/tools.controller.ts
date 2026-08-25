@@ -15,6 +15,13 @@ import {
   updateToolDefinition,
 } from "@/modules/tool-definitions/service";
 
+// The error catalog this controller's routes answer with. `bun i18n:extract` materialises
+// src/api/locales/*.json from these lines and prunes anything nothing references, and
+// `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
+// throw site rather than an English sentence on a pt-BR caller's screen.
+// translate('errors.toolDefinitionNotFound', 'Tool definition not found.')
+// translate('errors.toolNameTaken', 'That tool name is already in use.')
+
 // Custom HTTP tool definitions (per-tenant). TENANT_ADMIN; the scoped service is the hard
 // boundary. The deeper field validation lives in the service zod schema; the credential is a vault
 // reference (never the secret itself).
@@ -147,7 +154,7 @@ export const toolsController = new Elysia({
         "List tools",
         "List all custom HTTP tool definitions for the current tenant.",
       ),
-      response: errors(401, 403),
+      response: errors(401, 403, 404),
     },
   )
   .get(
@@ -211,7 +218,7 @@ export const toolsController = new Elysia({
         "Create tool",
         "Create a custom HTTP tool definition for the current tenant.",
       ),
-      response: errors(400, 401, 403, 409),
+      response: errors(400, 401, 403, 404, 409),
       body: writeBody,
     },
   )

@@ -1,4 +1,4 @@
-import { clipText, replaceLoneSurrogates } from "@/lib/text";
+import { clipText, makeStorable } from "@/lib/text";
 
 // Non-throwing secret redaction for human-facing debug surfaces (the agent playground trace and
 // the conversation `lastError` shown to the operator). This is the REPLACE-and-continue cousin of
@@ -49,7 +49,12 @@ export function redactSecretsDeep(value: unknown, depth = 0): unknown {
   if (depth > MAX_DEPTH) return "‹…›";
   if (value == null) return null;
   if (typeof value === "string") {
-    return replaceLoneSurrogates(redactSecretsInText(truncate(value)));
+    // NOTE: The repair runs BEFORE the scrub, and the order is the rule. A NUL inside a token breaks
+    // the pattern, so a scrub that ran first would find nothing, and the repair would then DELETE
+    // that NUL and store the token whole: `sk-<NUL>abcdefghijklmnop` came back as
+    // `sk-abcdefghijklmnop`. The cut stays first because it is the cheap bound, and `clipText`
+    // cannot manufacture an orphan half for the repair to have to catch.
+    return redactSecretsInText(makeStorable(truncate(value)));
   }
   if (typeof value === "number" || typeof value === "boolean") return value;
   if (typeof value === "bigint") return value.toString();
@@ -62,11 +67,25 @@ export function redactSecretsDeep(value: unknown, depth = 0): unknown {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
       // NOTE: The KEY gets the same repair as the values. A key is written by whoever produced the
-      // object — a model's tool-call arguments, a third party's JSON response — and one orphan half
+      // object (a model's tool-call arguments, a third party's JSON response), and one orphan half
       // anywhere in the document is enough for Postgres to refuse the whole `jsonb` write.
-      out[replaceLoneSurrogates(k)] = SECRET_KEY_RE.test(k)
-        ? REDACTED
-        : redactSecretsDeep(v, depth + 1);
+      //
+      // NOTE: The credential rule reads the REPAIRED key, for the same reason the value is repaired
+      // before it is scrubbed: `pass<NUL>word` does not match, and the repair then stores it as
+      // `password` with its value intact. Testing the stored name is what closes that.
+      const key = makeStorable(k);
+      // NOTE: `defineProperty`, not assignment: `JSON.parse` yields `__proto__` as an ordinary own
+      // property, and assigning to that key invokes the legacy prototype setter instead. The
+      // serialization that reaches the column enumerates inherited properties, so the contents of
+      // `__proto__` would be written as top-level fields of the log record.
+      Object.defineProperty(out, key, {
+        value: SECRET_KEY_RE.test(key)
+          ? REDACTED
+          : redactSecretsDeep(v, depth + 1),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
     }
     return out;
   }
@@ -74,8 +93,24 @@ export function redactSecretsDeep(value: unknown, depth = 0): unknown {
 }
 
 // A short, safe one-line string for an error surfaced to the operator (conversation lastError):
-// the message only, secret-scrubbed and length-bounded — never a stack trace or raw provider body.
+// the message only, secret-scrubbed and length-bounded, never a stack trace or raw provider body.
+//
+// Also the ONE place the storability rule is applied to error text, because every column that holds
+// an error message is written through here. A `text` column refuses a NUL outright, and a lone
+// surrogate costs a character off the tail before it either lands corrupted or refuses. What the
+// refusal costs is not the string: `failJob`'s write IS the transition that schedules the retry or
+// dead-letters the job, so refused, the row stops moving. tests/lib/storable-write-sweep.test.ts is
+// the ledger of these columns, and carries how a third party's bytes reach one (issue #243).
+//
+// `makeStorable` runs BEFORE the scrub, never after. It DELETES the NUL rather than replacing it,
+// so a token the pattern missed only because a NUL sat inside it (`sk-<NUL>abcd…`) would be handed
+// back whole by a repair that ran second (issue #241 review). The cut stays last: it cannot
+// manufacture an orphan half for the repair to have to catch, and repairing first is what makes
+// the length it measures the length that gets stored.
 export function sanitizeErrorMessage(err: unknown, max = 500): string {
   const raw = err instanceof Error ? err.message : String(err);
-  return truncate(redactSecretsInText(raw.replace(/\s+/g, " ").trim()), max);
+  return truncate(
+    redactSecretsInText(makeStorable(raw.replace(/\s+/g, " ").trim())),
+    max,
+  );
 }

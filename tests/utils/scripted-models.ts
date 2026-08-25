@@ -27,6 +27,27 @@ export class EmptyThenReplyModel extends BaseChatModel {
   }
 }
 
+// Runs a side effect INSIDE the generate call, then answers. The point is the window: a fence that
+// only exists before the model and after it cannot be told apart from a correct one unless something
+// happens while the model is running, and the model call is the widest wait on the turn.
+export class SideEffectModel extends BaseChatModel {
+  constructor(
+    private readonly during: () => Promise<void>,
+    private readonly reply = "olá!",
+  ) {
+    super({});
+  }
+  _llmType() {
+    return "fake-side-effect";
+  }
+  async _generate(): Promise<ChatResult> {
+    await this.during();
+    return {
+      generations: [{ text: this.reply, message: new AIMessage(this.reply) }],
+    };
+  }
+}
+
 // Answers from a queue and REPORTS token usage on every call. Reporting is the point: UsageCapture
 // drops a call whose counts are all zero, so a model that reports nothing looks exactly like a call
 // that never happened, and a test for "this call is billed" would pass with the billing broken.
@@ -453,3 +474,42 @@ export const guardrailModel = (
       },
     }),
   }) as unknown as BaseChatModel;
+
+// Issues a document, then answers. The reply does not repeat the prices, which is what the tool's
+// own description asks for — so the assertion is about ORDER: the customer receives the PDF and then
+// the sentence about it, never the other way round.
+export class SendDocumentThenReplyModel {
+  constructor(
+    private reply: string,
+    private toolName: string,
+    private args: Record<string, unknown>,
+    // Runs between the tool call and the final message — the window in which a document has been
+    // issued and queued but not yet delivered. Lets a test act inside it.
+    private betweenTurns?: () => Promise<void>,
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage(this.reply);
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 2) await self.betweenTurns?.();
+        return n === 1
+          ? new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: self.toolName,
+                  args: self.args,
+                  id: "call_send_document",
+                },
+              ],
+            })
+          : new AIMessage(self.reply);
+      },
+    };
+  }
+}

@@ -1,9 +1,10 @@
-import type { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { isTurnInFlight } from "@/graph/inflight";
 import { parseThreadId, runAgentNudge } from "@/graph/nudge";
+import { isRepairableNudgeRefusal, nextNudgeRetry } from "@/graph/nudge-retry";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { hasLiveAppointment } from "@/modules/appointments/reminders";
@@ -15,7 +16,13 @@ import {
 } from "@/modules/business-hours/hours";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { isFollowUpLive } from "@/modules/followups/eligibility";
-import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  enqueueJob,
+  jobNotRetiredSql,
+  jobRetired,
+  jobRetiredStrict,
+} from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { ZproClient } from "@/modules/zpro/client";
 import { loadZproTags } from "@/modules/zpro/crm";
@@ -48,16 +55,6 @@ const IN_FLIGHT_BACKOFF_MS = 30_000;
 // cancelled. Coarse (1h) because the sweep already filters these out — this only catches a FOLLOWUP
 // that was in flight before the booking.
 const APPOINTMENT_BACKOFF_MS = 3_600_000;
-// NOTE: Back-off when the nudge could not run to completion without posting anything: the live-state GET
-// failed (fail-closed) or a pending human-in-the-loop interrupt deferred it. Retry the SAME step —
-// nothing was sent, so the watermark must not advance.
-const NUDGE_RETRY_BACKOFF_MS = 900_000;
-// NOTE: Cap on consecutive same-step retries (payload `nudgeRetries`, reset when the step advances).
-// A conversation whose live GET fails forever (e.g. deleted in Chatwoot) must not stay PENDING
-// indefinitely. On exhaustion the CURRENT EPISODE is abandoned by stamping lastFollowUpAt WITHOUT
-// posting — dead-lettering alone would loop, because the sweep re-enqueues any conversation with
-// no stamp; the stamp keeps it away until the customer speaks again (which starts a new episode).
-const NUDGE_RETRY_LIMIT = 8;
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -367,6 +364,11 @@ export async function followUpHandler(
         testActivatedAt: conv.testActivatedAt,
         status: conv.status,
         assigneeType: conv.assigneeType,
+        // This path never decides WHICH bot holds the conversation from the mirror: `agentNudge`
+        // runs with `requireLiveBotOwnership`, which GETs the real conversation, reconciles the
+        // stale assignee and refuses to send before any model spend. Answering from the mirror here
+        // would drop a follow-up the probe was about to allow (issue #214).
+        mirrorHolder: "not-asked",
       })
     ) {
       return null;
@@ -452,6 +454,38 @@ export async function followUpHandler(
     }
   }
 
+  // The tombstone question, asked in this handler and not only inside runAgentNudge. Three writes
+  // below touch the CONVERSATION directly — the never-opening schedule, the retry exhaustion, and the
+  // watermark after the nudge — and `lastFollowUpAt` is exactly the column /reset clears. A stamp
+  // landing after the command puts the sweep's anchor back on a conversation the operator was told
+  // was cleared, and the third one also arms the next step, reviving the sequence the command ended.
+  //
+  // Read immediately before each write rather than once at the top: the command arrives whenever it
+  // arrives, and the interesting moment is precisely while the nudge's model call runs. Returns
+  // whether the stamp landed, so a caller that would continue the sequence can stop instead.
+  //
+  // ONE statement, not a read then a write. Everywhere else the two marks are read to decide whether
+  // to keep going, and the gap between deciding and acting is covered by there being no I/O in it.
+  // Here the gap cannot be closed that way, because the command does two things in ORDER: it retires
+  // the job first and clears `last_follow_up_at` later, so a stamp that reads between them finds the
+  // job live, and writes after the clear. The condition therefore has to be evaluated by the same
+  // statement that writes — then the stamp lands strictly before the retirement or not at all.
+  //
+  // The condition is `jobNotRetiredSql`, the scheduler's own predicate, and not a copy of it written
+  // here: the JS reader and this one are one rule, and they are kept side by side there so a change
+  // to either is a change in front of the other. NOT-retired rather than live, so an absent row
+  // still stamps — an unknown is not a retirement.
+  const stampUnlessRetired = async (): Promise<boolean> => {
+    const stamped = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.$executeRaw(Prisma.sql`
+        UPDATE conversations
+           SET last_follow_up_at = now()
+         WHERE id = ${ctx.conv.id}
+           AND ${jobNotRetiredSql(job)}`),
+    );
+    return stamped > 0;
+  };
+
   // Business hours: reschedule into the next open window rather than messaging out of hours (same
   // payload — the step index is preserved).
   if (ctx.hours) {
@@ -472,12 +506,7 @@ export async function followUpHandler(
         stepIndex,
         threadId,
       );
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
-          where: { id: ctx.conv.id },
-          data: { lastFollowUpAt: new Date() },
-        }),
-      );
+      await stampUnlessRetired();
       return { outcome: "done" };
     }
   }
@@ -518,6 +547,13 @@ export async function followUpHandler(
     // be stale forever (a lost resolve webhook has no reconciliation), and following up a resolved
     // conversation was the community-reported incident this gate exists for.
     requireLiveBotOwnership: true,
+    // NOTE: And the live gate is not enough on its own, because it asks about OWNERSHIP and /reset can
+    // give ownership back. A follow-up already inside the model call has passed the first probe; the
+    // operator resets, which returns the conversation to the agent, and the second probe then finds
+    // it bot-owned again and posts a nudge from the episode that was just erased. The tombstone is
+    // the question the hand-back cannot answer yes to.
+    stillWanted: async ({ strict }) =>
+      !(await (strict ? jobRetiredStrict(job, base) : jobRetired(job, base))),
     base,
     deps,
   });
@@ -525,47 +561,35 @@ export async function followUpHandler(
   // NOTE: Live gate: the conversation is no longer bot-owned in Chatwoot (resolved / human took over) —
   // the episode is moot. No watermark, no next step; the reconciled mirror keeps the sweep away.
   if (nudgeOutcome === "stale") return { outcome: "done" };
-  // NOTE: Nothing was posted: the live-state GET failed (fail-closed) or a pending human-in-the-loop
-  // interrupt deferred the nudge. Retry the SAME step later instead of stamping a follow-up that
-  // never happened — but bounded (NUDGE_RETRY_LIMIT): on exhaustion, abandon the episode with a
-  // stamp so the sweep stays away until the customer speaks again.
-  if (nudgeOutcome === "live-unavailable" || nudgeOutcome === "deferred") {
-    const priorRetries =
-      typeof job.payload.nudgeRetries === "number" &&
-      Number.isInteger(job.payload.nudgeRetries)
-        ? job.payload.nudgeRetries
-        : 0;
-    if (priorRetries + 1 >= NUDGE_RETRY_LIMIT) {
+  // NOTE: Nothing was posted, for a reason that may not hold next time (the shared predicate names the
+  // three). Retry the SAME step later instead of stamping a follow-up that never happened, but
+  // bounded (NUDGE_RETRY_LIMIT): on exhaustion, abandon the episode with a stamp so the sweep stays
+  // away until the customer speaks again. Dead-lettering alone would loop, because the sweep
+  // re-enqueues any conversation with no stamp.
+  if (isRepairableNudgeRefusal(nudgeOutcome)) {
+    const retry = nextNudgeRetry(job.payload);
+    if (!retry.retry) {
       logger.warn(
         "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
         stepIndex,
-        priorRetries + 1,
+        retry.attempt,
         nudgeOutcome,
         threadId,
       );
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
-          where: { id: ctx.conv.id },
-          data: { lastFollowUpAt: new Date() },
-        }),
-      );
+      await stampUnlessRetired();
       return { outcome: "done" };
     }
     return {
       outcome: "reschedule",
-      runAt: new Date(Date.now() + NUDGE_RETRY_BACKOFF_MS),
-      payload: { ...job.payload, nudgeRetries: priorRetries + 1 },
+      runAt: retry.runAt,
+      payload: { ...job.payload, nudgeRetries: retry.attempt },
     };
   }
 
   // Watermark: stamp regardless of whether the nudge sent or stayed silent, so the next step's
-  // cadence anchors here and the episode-interruption check works.
-  await runScopedOn(base, sysCtx(tenantId), (db) =>
-    db.conversation.update({
-      where: { id: ctx.conv.id },
-      data: { lastFollowUpAt: new Date() },
-    }),
-  );
+  // cadence anchors here and the episode-interruption check works. A retire that landed while the
+  // nudge ran ends the episode here instead — no stamp, and no next step.
+  if (!(await stampUnlessRetired())) return { outcome: "done" };
 
   // NOTE: The outside-window fallback note ENDS the sequence: with no usable template, every further step
   // would be equally undeliverable (only a customer reply reopens the 24h window, and that reply

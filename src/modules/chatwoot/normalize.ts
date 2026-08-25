@@ -34,6 +34,35 @@ function attrs(v: unknown): Record<string, unknown> | undefined {
   return isRecord(v) ? v : undefined;
 }
 
+// Chatwoot serializes each event's own SUBJECT, and every subject renders its own table id under the
+// same `id` key: `Conversations::EventDataPresenter#push_data` puts the conversation's DISPLAY id
+// there, while `Message`, `Contact`, `ContactInbox`, `Inbox` and the Kanban card all put a primary
+// key. So the body only says which id it holds if you already know which object it is, and the event
+// name is the only thing that says so.
+//
+// Treating "not a message event" as "the body IS the conversation" put a foreign row id on
+// `conversationId`, and the mirror keys `chatwoot_conversation_id` off exactly that — which opened a
+// SECOND row for a conversation that already had one (issue #257; measured against the fork, 7 of 19
+// event shapes). Hence two allowlists and no fallback: an unknown event identifies no conversation,
+// the mirror writes nothing for it, and the next real event refreshes the row. Failing the other way
+// is what creates the duplicate, and a duplicate does not heal.
+
+// Bodies that ARE a conversation (`conversation.webhook_data`). conversation_created reaches only an
+// account webhook, never an agent bot, but its body is the same one and it costs nothing to name.
+const CONVERSATION_BODY_EVENTS = new Set([
+  "conversation_created",
+  "conversation_opened",
+  "conversation_resolved",
+  "conversation_status_changed",
+  "conversation_updated",
+]);
+
+// Bodies that are a MESSAGE (`Message#webhook_data`), carrying the conversation nested under
+// `conversation`. Deliberately NOT the account webhook's message_incoming/message_outgoing: they are
+// the same body redelivered under a second name, so accepting them would mirror each message twice
+// and hand `isNewIncomingMessage` a class of event it has never seen.
+const MESSAGE_BODY_EVENTS = new Set(["message_created", "message_updated"]);
+
 export function normalizeChatwootEvent(
   payload: unknown,
 ): NormalizedChatwootEvent | null {
@@ -41,12 +70,16 @@ export function normalizeChatwootEvent(
   const event = str(payload.event);
   if (!event) return null;
 
-  const isMessage = event === "message_created" || event === "message_updated";
+  const isMessage = MESSAGE_BODY_EVENTS.has(event);
+  // WHICH OBJECT the body is, decided by the event name and never by looking at the body. See
+  // CONVERSATION_BODY_EVENTS: an event we do not know is an event whose `id` we cannot name.
   const conv = isMessage
     ? isRecord(payload.conversation)
       ? payload.conversation
       : null
-    : payload;
+    : CONVERSATION_BODY_EVENTS.has(event)
+      ? payload
+      : null;
   const meta = conv && isRecord(conv.meta) ? conv.meta : null;
   const assignee = meta && isRecord(meta.assignee) ? meta.assignee : null;
   const sender = meta && isRecord(meta.sender) ? meta.sender : null;
@@ -221,6 +254,28 @@ export function parseLiveConversation(
 // events for a conversation OWNED by a DIFFERENT bot. When `ourAgentBotId` is provided we act
 // only if the conversation is unassigned (assignee_type null) or assigned to OUR bot, never to
 // another AgentBot. Omitting the option preserves the loose attribution-only gate.
+// The ASSIGNEE half of the question below, on its own because two different questions are built from
+// it and only one of them is about status. "Somebody else is holding this" is a human, or a bot that
+// is not ours — Chatwoot keeps User and AgentBot in separate id namespaces, so the comparison is the
+// whole identity and never the number alone.
+//
+// Split out rather than restated: the console asks it to decide which ownership action to offer, and
+// a conversation held by ANOTHER persona's bot is the case a "is the assignee a User?" test reads
+// backwards — the inbox's own agent cannot answer there either, so it needs the same hand-back the
+// human case needs. A second copy is how that case came to be missing in the first place.
+export function heldByAnotherParty(
+  e: { assigneeType: string | null; assigneeId?: number | null },
+  opts: { ourAgentBotId?: number | null } = {},
+): boolean {
+  if (e.assigneeType === "User") return true;
+  return (
+    e.assigneeType === "AgentBot" &&
+    opts.ourAgentBotId != null &&
+    e.assigneeId != null &&
+    e.assigneeId !== opts.ourAgentBotId
+  );
+}
+
 export function shouldBotHandle(
   e: {
     assigneeType: string | null;
@@ -230,16 +285,7 @@ export function shouldBotHandle(
   opts: { ourAgentBotId?: number | null } = {},
 ): boolean {
   if (e.status !== "pending") return false;
-  if (e.assigneeType === "User") return false;
-  if (
-    e.assigneeType === "AgentBot" &&
-    opts.ourAgentBotId != null &&
-    e.assigneeId != null &&
-    e.assigneeId !== opts.ourAgentBotId
-  ) {
-    return false;
-  }
-  return true;
+  return !heldByAnotherParty(e, opts);
 }
 
 export function isIncomingMessage(e: NormalizedChatwootEvent): boolean {

@@ -13,6 +13,7 @@ import {
 import basePrisma from "@/api/lib/prisma";
 import { updateTenant } from "@/api/v1/tenants.admin.service";
 import { getTenant } from "@/api/v1/tenants.service";
+import { parseDbId } from "@/lib/db-id";
 import { AppError } from "@/lib/errors";
 import {
   asSuperAdminOn,
@@ -20,7 +21,7 @@ import {
   type ScopedDb,
   type TenantContext,
 } from "@/lib/tenancy";
-import { clipText, replaceLoneSurrogates } from "@/lib/text";
+import { clipText, makeStorable } from "@/lib/text";
 import {
   type BehaviorSettingsPatch,
   mergeBehaviorSettings,
@@ -72,6 +73,23 @@ export interface WriteDeps {
   base?: PrismaClient;
 }
 
+// The one id parser for every MCP surface, read and write alike.
+//
+// The pattern, not just the throw. `BigInt("")` is 0n and `BigInt(" 17 ")` is 17n, so an id a caller
+// typed wrong does not fail — it becomes a VALID id for some other row, and a write with dry_run
+// false then edits or deletes that one. An id is a run of digits or a mistake worth reporting.
+//
+// One function because it was eight, byte for byte, and a defect fixed in one of eight copies is a
+// defect fixed nowhere: the round that added this rule to the READ parser left the seven writes
+// exactly as they were.
+export function parseMcpId(raw: string, label: string): bigint | WriteResult {
+  // Range as well as spelling. `BigInt` is arbitrary precision, so an id past 2^63-1 parses here and
+  // is refused by POSTGRES when the query binds it — a tool call that answers with a database error
+  // instead of "invalid <label>". `parseDbId` holds both halves; see lib/db-id.ts.
+  const id = parseDbId(raw);
+  return id === null ? err(`invalid ${label}`) : id;
+}
+
 // Field-level diff: only keys whose JSON projection changed appear (before → after).
 export function diffFields(
   before: Record<string, unknown>,
@@ -95,7 +113,8 @@ const AUDIT_STR_MAX = 4000;
 // the whole write. Here the cost is worse than a lost log line — the change has already committed by
 // the time this row is written, so it lands, the tool reports a failure, and the record of who made
 // it is the only thing missing. Hence both repairs: `clipText` so the cut cannot manufacture an
-// orphan, and `replaceLoneSurrogates` for one that arrived with the value — a projection carries some
+// orphan, and `makeStorable` for one that arrived with the value (or for a NUL, which the same
+// column refuses just as flatly): a projection carries some
 // arguments as the MCP client sent them (`args.name`, `args.title`, `args.content`), and that JSON
 // can spell one out.
 //
@@ -106,7 +125,7 @@ const AUDIT_STR_MAX = 4000;
 // walker repairs come from a model's tool-call arguments and from third parties' response bodies.
 export function truncForAudit(v: unknown): unknown {
   if (typeof v === "string") {
-    return replaceLoneSurrogates(
+    return makeStorable(
       v.length > AUDIT_STR_MAX
         ? `${clipText(v, AUDIT_STR_MAX)}…[truncated]`
         : v,
@@ -115,7 +134,19 @@ export function truncForAudit(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(truncForAudit);
   if (v && typeof v === "object") {
     const o: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) o[k] = truncForAudit(val);
+    for (const [k, val] of Object.entries(v)) {
+      // NOTE: `defineProperty`, not assignment. `JSON.parse` yields `__proto__` as an ordinary own
+      // property, and assigning to that key invokes the legacy prototype setter instead; Prisma's
+      // serialization enumerates inherited properties, so its contents would be written as
+      // top-level fields of the audit row. Unlike the repair above, this one is not about what the
+      // column refuses: the write succeeds, carrying a field nobody wrote.
+      Object.defineProperty(o, k, {
+        value: truncForAudit(val),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
     return o;
   }
   return v;
@@ -364,12 +395,8 @@ export async function promptSet(
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
 
-  let agentId: bigint;
-  try {
-    agentId = BigInt(args.agent_id);
-  } catch {
-    return err("invalid agent_id");
-  }
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
 
   try {
     // NOTE: checked here (not only inside updateAgent) so the DRY-RUN path enforces the cap too —
@@ -449,12 +476,8 @@ export async function agentSettingsGet(
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
 
-  let agentId: bigint;
-  try {
-    agentId = BigInt(args.agent_id);
-  } catch {
-    return err("invalid agent_id");
-  }
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
 
   try {
     const agent = await getAgent(ctx, agentId, base);
@@ -498,12 +521,8 @@ export async function agentSettingsSet(
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
 
-  let agentId: bigint;
-  try {
-    agentId = BigInt(args.agent_id);
-  } catch {
-    return err("invalid agent_id");
-  }
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
 
   const patch: BehaviorSettingsPatch = {};
   if (args.debounce !== undefined) patch.debounce = args.debounce;

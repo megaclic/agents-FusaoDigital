@@ -50,13 +50,29 @@ import {
 import { listTtsOptions } from "@/modules/tts/listing";
 
 // translate('errors.agentConfirmMismatch', 'The agent name does not match')
+// translate('errors.agentModifiedElsewhere', 'This agent was changed somewhere else. Reload it and try again.')
+// translate('errors.agentNotRunnable', 'This agent has no runnable model configured.')
 // translate('errors.audioTooLarge', 'Audio file is too large')
 // translate('errors.baseUrlRequired', 'A base URL is required for this provider.')
 // translate('errors.credentialRequired', 'A credential is required to list provider models.')
+// translate('errors.emptyMessage', 'The message is empty.')
 // translate('errors.fileTooLarge', 'File is too large')
+// translate('errors.invalidAgentExport', 'This file is not a valid agent export.')
+// translate('errors.invalidModelConfig', 'The model configuration must be an object.')
+// translate('errors.invalidModelConfigDetail', 'The model configuration is not valid: {{reason}}')
 // translate('errors.promptTooLong', 'System prompt is too long: {{len}} characters (limit {{max}}).')
 // translate('errors.providerModelsFailed', 'Failed to retrieve model list from provider.')
+// translate('errors.sessionNotFound', 'Playground session not found.')
 // translate('errors.settingsTextTooLong', 'The text in {{field}} is too long: {{len}} characters (limit {{max}}).')
+// translate('errors.sttCredentialMissing', 'The transcription credential was not found.')
+// translate('errors.sttFailed', 'Transcription failed: {{detail}}')
+// translate('errors.sttNotConfigured', 'Speech-to-text is not configured for this workspace.')
+// translate('errors.toolGrantDuplicate', 'This agent already has a {{source}} tool grant.')
+// translate('errors.toolGrantIdInvalid', '{{field}} must be a numeric id.')
+// translate('errors.toolGrantIdRequired', '{{field}} is required.')
+// translate('errors.toolGrantToolNotInIntegration', 'The tool {{tool}} is not available for the {{integration}} integration.')
+// translate('errors.toolGrantUnknownSource', 'Unknown tool source: {{source}}.')
+// translate('errors.toolGrantUnknownTool', 'Unknown {{source}} tool: {{tool}}.')
 // translate('errors.unknownProvider', 'Unknown model provider.')
 // translate('errors.unsupportedAudioType', 'Unsupported audio type')
 // translate('errors.visionCredentialMissing', 'Vision credential not found')
@@ -253,7 +269,7 @@ export const agentsController = new Elysia({
         "List agents",
         "Returns a paginated list of agents for the tenant.",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       query: t.Object({
         q: t.Optional(
@@ -377,7 +393,7 @@ export const agentsController = new Elysia({
         "List inboxes that answer out of hours",
         'The agent\'s bound inboxes whose Chatwoot inbox-level out-of-office reply is configured (working hours enabled AND a message set), read live from Chatwoot. Chatwoot\'s schedule is keyed on the day of the week alone, so it cannot express the dated closures this product\'s business hours can: the two calendars disagree on holidays by construction. An inbox on an unreachable Chatwoot account is omitted rather than reported, so an empty list means "nothing found", not "nothing to find".',
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -394,7 +410,7 @@ export const agentsController = new Elysia({
     }),
     {
       detail: doc("Create agent", "Creates a new agent for the tenant."),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         name: t.String({
@@ -430,13 +446,13 @@ export const agentsController = new Elysia({
         modelConfig: t.Optional(
           t.Record(t.String(), t.Unknown(), {
             description:
-              "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
+              "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.). `credentialRef` is a vault reference (`vault:<id>`, from GET /v1/vault): never the secret itself, and never an entry name.",
           }),
         ),
         settings: t.Optional(
           t.Record(t.String(), t.Unknown(), {
             description:
-              "Behavior settings bag (debounce, stt, tts, split, serviceWindow, and similar).",
+              "Behavior settings bag (debounce, stt, tts, split, serviceWindow, and similar). Every `credentialRef` in it is a vault reference (`vault:<id>`, from GET /v1/vault): never the secret itself, and never an entry name.",
           }),
         ),
         businessHoursId: t.Optional(
@@ -516,13 +532,13 @@ export const agentsController = new Elysia({
         modelConfig: t.Optional(
           t.Record(t.String(), t.Unknown(), {
             description:
-              "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.); secrets are referenced, never inlined.",
+              "Model settings (provider, model, credentialRef, temperature, reasoningEffort, etc.). `credentialRef` is a vault reference (`vault:<id>`, from GET /v1/vault): never the secret itself, and never an entry name.",
           }),
         ),
         settings: t.Optional(
           t.Record(t.String(), t.Unknown(), {
             description:
-              "Behavior settings bag (debounce, stt, tts, split, serviceWindow, and similar).",
+              "Behavior settings bag (debounce, stt, tts, split, serviceWindow, and similar). Every `credentialRef` in it is a vault reference (`vault:<id>`, from GET /v1/vault): never the secret itself, and never an entry name.",
           }),
         ),
         businessHoursId: t.Optional(
@@ -692,7 +708,7 @@ export const agentsController = new Elysia({
         "Import agent config",
         "Recreates an agent (disabled) from an exported config, resolving references by name.",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         export: t.Unknown({
@@ -740,7 +756,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         ...(await runPlaygroundTurn({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
           message: b.message,
           threadId: b.threadId,
@@ -774,7 +790,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         tools: await listPlaygroundTools({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
         }),
       };
@@ -808,7 +824,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         ...(await runPlaygroundFollowup({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
           threadId: b.threadId,
           context: b.context,
@@ -843,7 +859,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         ...(await runPlaygroundTranscribe({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
           file: b.file,
           overrides: parseDraft(b.draft),
@@ -894,7 +910,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         ...(await runPlaygroundAudioTurn({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
           file: b.file,
           threadId: b.threadId,
@@ -964,7 +980,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         ...(await runPlaygroundExtract({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
           file: b.file,
           overrides: parseDraft(b.draft),
@@ -1016,7 +1032,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         ...(await runPlaygroundFileTurn({
-          tenantId: ctx.tenantId as bigint,
+          ctx,
           agentId: BigInt(params.id),
           file: b.file,
           threadId: b.threadId,
@@ -1093,7 +1109,7 @@ export const agentsController = new Elysia({
         set.status = 404;
         return { error: "Not Found" };
       }
-      const blob = await getPlaygroundMedia(ctx.tenantId as bigint, mediaId);
+      const blob = await getPlaygroundMedia(ctx, mediaId);
       if (!blob) {
         set.status = 404;
         return { error: "Not Found" };
@@ -1129,10 +1145,7 @@ export const agentsController = new Elysia({
       const ctx = ctxOrThrow(tenantContext);
       return {
         instance: instanceIdentity,
-        sessions: await listPlaygroundSessions(
-          ctx.tenantId as bigint,
-          BigInt(params.id),
-        ),
+        sessions: await listPlaygroundSessions(ctx, BigInt(params.id)),
       };
     },
     {
@@ -1156,7 +1169,7 @@ export const agentsController = new Elysia({
       return {
         instance: instanceIdentity,
         turns: await getPlaygroundSessionTurns(
-          ctx.tenantId as bigint,
+          ctx,
           BigInt(params.id),
           params.threadId,
         ),
@@ -1184,11 +1197,7 @@ export const agentsController = new Elysia({
     "/:id/playground/sessions/:threadId",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      await deletePlaygroundSession(
-        ctx.tenantId as bigint,
-        BigInt(params.id),
-        params.threadId,
-      );
+      await deletePlaygroundSession(ctx, BigInt(params.id), params.threadId);
       return { instance: instanceIdentity, ok: true };
     },
     {
@@ -1235,7 +1244,7 @@ export const agentsController = new Elysia({
         "List provider models",
         "Lists the available models for a model provider, using a vault credential reference.",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         provider: t.String({
@@ -1296,7 +1305,7 @@ export const agentsController = new Elysia({
         "List TTS voices/models",
         "Lists the voices or models for a text-to-speech provider. OpenAI returns a curated set; ElevenLabs is fetched live with the vault credential.",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         provider: t.String({
@@ -1358,10 +1367,11 @@ export const agentsController = new Elysia({
                 t.Literal("HTTP"),
                 t.Literal("MCP"),
                 t.Literal("INTEGRATION"),
+                t.Literal("DOCUMENT"),
               ],
               {
                 description:
-                  "Grant source: NATIVE (built-in tools), RAG (knowledge bases), HTTP (custom tool), MCP (MCP server connection), or INTEGRATION (integration instance).",
+                  "Grant source: NATIVE (built-in tools), RAG (knowledge bases), HTTP (custom tool), MCP (MCP server connection), INTEGRATION (integration instance), or DOCUMENT (document template).",
               },
             ),
             toolDefinitionId: t.Optional(
@@ -1380,6 +1390,12 @@ export const agentsController = new Elysia({
               t.Union([t.String(), t.Null()], {
                 description:
                   "Integration instance id (BigInt string) for INTEGRATION grants, or null.",
+              }),
+            ),
+            documentTemplateId: t.Optional(
+              t.Union([t.String(), t.Null()], {
+                description:
+                  "Document template id (BigInt string) for DOCUMENT grants, or null.",
               }),
             ),
             knowledgeBaseIds: t.Optional(

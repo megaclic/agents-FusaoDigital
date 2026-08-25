@@ -207,8 +207,17 @@ if (config.compactionWorker.enabled) {
   startCompactionWorker();
 }
 
+// NOTE: reached through the EventEmitter surface because `process.on("SIGTERM", …)` no longer
+// type-checks. @types/node 25 declares `Process extends InternalEventEmitter<ProcessEventMap>`, so
+// the signal handlers are INHERITED from an event map rather than declared as overloads, and
+// bun-types 1.4.0 augments `NodeJS.Process` with an explicit `on(event: "memoryPressure", …)`. A
+// member declared on the interface shadows the inherited one, so `on` narrows to "memoryPressure"
+// alone. Measured against this tsconfig: the literal call, `node:process`, a `NodeJS.Signals` cast,
+// `addListener` and `once` all fail; only the EventEmitter surface compiles. Upstream bug in
+// bun-types, not in this code — drop the cast once it declares these as overloads.
+const processEvents = process as NodeJS.EventEmitter;
 for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  process.on(signal, () => {
+  processEvents.on(signal, () => {
     stopOutboundWorker();
     stopScheduler();
     stopDebounceWorker();
