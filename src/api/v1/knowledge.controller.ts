@@ -29,6 +29,7 @@ import {
   searchKnowledge,
   updateKnowledgeBase,
 } from "@/modules/rag/service";
+import type { ChunkHit } from "@/modules/rag/sql";
 
 // Knowledge base + human-approval REST surface (same core the agent tools and MCP project over).
 // Reads need auth; mutations and approvals require TENANT_ADMIN (the approval gate is the
@@ -57,6 +58,27 @@ export function readerSafeBlock(
   block: EmbeddingBlock | null,
 ): { reason: EmbeddingBlock["reason"] } | null {
   return block ? { reason: block.reason } : null;
+}
+
+// ChunkHit carries THREE bigints (id, knowledgeBaseId, documentId) but only the first two were ever
+// stringified here — id/knowledgeBaseId were set explicitly while documentId rode through on the
+// `...h` spread unconverted, so Elysia's response serializer 500ed on every call ("JSON.stringify
+// cannot serialize BigInt") the moment a real hit came back. A search that returns nothing never hit
+// it, which is why this shipped untested (tests/api/v1/knowledge-controller.test.ts).
+export function toSearchHitDto(h: ChunkHit): Omit<
+  ChunkHit,
+  "id" | "knowledgeBaseId" | "documentId"
+> & {
+  id: string;
+  knowledgeBaseId: string;
+  documentId: string;
+} {
+  return {
+    ...h,
+    id: String(h.id),
+    knowledgeBaseId: String(h.knowledgeBaseId),
+    documentId: String(h.documentId),
+  };
 }
 
 export const knowledgeController = new Elysia({
@@ -509,11 +531,7 @@ export const knowledgeController = new Elysia({
       });
       return {
         instance: instanceIdentity,
-        hits: hits.map((h) => ({
-          ...h,
-          id: String(h.id),
-          knowledgeBaseId: String(h.knowledgeBaseId),
-        })),
+        hits: hits.map(toSearchHitDto),
       };
     },
     {
