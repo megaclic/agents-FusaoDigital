@@ -1,4 +1,4 @@
-import type { RenderableLocation } from "./render";
+import type { RenderableLocation, RenderableMessage } from "./render";
 import type {
   NormalizedChatwootAttachment,
   NormalizedChatwootEvent,
@@ -26,6 +26,30 @@ function str(v: unknown): string | null {
 // (it parses ids). Numbers only: the fork's serializer never sends coordinates as strings.
 function float(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+// A Chatwoot timestamp field that is NOT one of the push_timestamps trio, read off the conversation
+// payload. Two spellings reach us for the same column and both are Chatwoot's own: the jbuilder
+// partials render `created_at` as epoch seconds (`.to_i`), while `first_reply_created_at` is a
+// plain ActiveRecord attribute and serializes as an ISO-8601 string. Accept either, reject anything
+// that does not parse — a field we cannot read must read as absent, never as the epoch.
+function ts(v: unknown): Date | null {
+  // NOTE: every branch exits through here. `Number.isFinite` and `> 0` both pass for an epoch far
+  // outside the range a Date can hold (1e20, or a digit string of the same size), and what comes
+  // back is an Invalid Date, which Prisma refuses — failing the WHOLE delivery over an optional
+  // field, and failing it again on every retry because the payload never changes. A reading this
+  // cannot use has to read as absent, on the same terms as a field the payload never carried.
+  const held = (d: Date): Date | null => (Number.isNaN(d.getTime()) ? null : d);
+  if (typeof v === "number" && Number.isFinite(v))
+    return v > 0 ? held(new Date(v * 1000)) : null;
+  if (typeof v === "string") {
+    if (/^\d+$/.test(v)) {
+      const sec = Number(v);
+      return sec > 0 ? held(new Date(sec * 1000)) : null;
+    }
+    return held(new Date(v));
+  }
+  return null;
 }
 
 // NOTE: undefined means "this payload said nothing", so the mirror keeps the stored bag instead of
@@ -63,6 +87,13 @@ const CONVERSATION_BODY_EVENTS = new Set([
 // and hand `isNewIncomingMessage` a class of event it has never seen.
 const MESSAGE_BODY_EVENTS = new Set(["message_created", "message_updated"]);
 
+// The ONE event name that can owe a customer an answer, named because two very different readers
+// need the same answer and must not drift: `isNewIncomingMessage` below, which decides whether a
+// live event drives a turn, and ./stranded-delivery.ts, which asks of a ledger row whether anything
+// was ever owed on it. A `message_updated` is our own write-back coming around and drives nothing,
+// which is why the two questions have one answer.
+export const TURN_BEARING_EVENT = "message_created";
+
 export function normalizeChatwootEvent(
   payload: unknown,
 ): NormalizedChatwootEvent | null {
@@ -88,6 +119,10 @@ export function normalizeChatwootEvent(
   const contactInbox =
     conv && isRecord(conv.contact_inbox) ? conv.contact_inbox : null;
 
+  // NOTE: The message's own inbox object (Message#webhook_data → inbox: {id, name}); conversation events
+  // do not carry it. Read for both halves: the name, and the id when the conversation scalar is gone.
+  const inboxObj = isMessage && isRecord(payload.inbox) ? payload.inbox : null;
+
   const normalized: NormalizedChatwootEvent = {
     event,
     conversationId: conv ? num(conv.id) : null,
@@ -96,7 +131,13 @@ export function normalizeChatwootEvent(
       : conv
         ? num(conv.contact_inbox_id)
         : null,
-    inboxId: conv ? num(conv.inbox_id) : null,
+    // NOTE: `conversation.inbox_id` first, then the message's own top-level `inbox` object. They name the
+    // same inbox and the fork sends both, but only the second survives a payload that carries the
+    // message without the conversation's scalar — and an inbox the payload named at either spot is
+    // an answer, so nothing downstream should go looking for an older one (issue #270).
+    inboxId:
+      (conv ? num(conv.inbox_id) : null) ??
+      (inboxObj ? num(inboxObj.id) : null),
     status: conv ? str(conv.status) : null,
     // NOTE: No meta ⇒ undefined ("said nothing", the mirror preserves); meta without an assignee ⇒
     // explicit null (a real unassign). Mirrors the attrs() sentinel above.
@@ -181,8 +222,18 @@ export function normalizeChatwootEvent(
     ? attrs(kanbanTask.custom_attributes)
     : undefined;
   if (taskAttrs) normalized.kanbanAttributes = taskAttrs;
-  // Inbox name only ships on message events (Message#webhook_data → inbox: {id, name}).
-  const inboxObj = isMessage && isRecord(payload.inbox) ? payload.inbox : null;
+  // The redirect episode's other half, when the fork wrote one. Absent rather than null on everything
+  // that is not the widget side of an episode, so a payload that says nothing never clears a pairing
+  // an earlier one established (issue #222).
+  // PRESENCE of the key is the statement, not the value: the fork always ships it (nil included) and
+  // a Chatwoot without it never does, so `in` is what separates "there is no pairing" from "this
+  // instance does not speak about pairings". A present-but-unusable value (0, a string, a negative)
+  // reads as none rather than as silence — the sender did speak, it just said nothing usable.
+  if (conv && "redirect_origin_display_id" in conv) {
+    const redirectOrigin = num(conv.redirect_origin_display_id);
+    normalized.redirectOriginDisplayId =
+      redirectOrigin !== null && redirectOrigin > 0 ? redirectOrigin : null;
+  }
   normalized.inboxName = inboxObj ? str(inboxObj.name) : null;
   // `channel` (channel_type) is exposed by EventDataPresenter on conversation events.
   normalized.channel = conv ? str(conv.channel) : null;
@@ -190,6 +241,12 @@ export function normalizeChatwootEvent(
   // NOTE: float() and not num() — `updated_at` ships as `to_f`, so it carries a fraction, and num()
   // parses ids (its string branch is integers only).
   normalized.conversationUpdatedAt = conv ? float(conv.updated_at) : null;
+  // The service level of the human half of an attendance, as CHATWOOT computes it — see the field
+  // notes in types.ts for why these two are read instead of derived from the events we receive.
+  normalized.conversationCreatedAt = conv ? ts(conv.created_at) : null;
+  normalized.firstReplyCreatedAt = conv
+    ? ts(conv.first_reply_created_at)
+    : null;
   return normalized;
 }
 
@@ -300,7 +357,7 @@ export function isIncomingMessage(e: NormalizedChatwootEvent): boolean {
 // loop forever (the voice-note infinite loop). The media is present at creation (baileys attaches
 // it before the single `save!`), so gating on message_created loses nothing.
 export function isNewIncomingMessage(e: NormalizedChatwootEvent): boolean {
-  return e.event === "message_created" && isIncomingMessage(e);
+  return e.event === TURN_BEARING_EVENT && isIncomingMessage(e);
 }
 
 // A message the BUSINESS sent to the customer, typed by a HUMAN agent rather than produced by a bot.
@@ -384,6 +441,29 @@ export function firstAudioAttachment(e: NormalizedChatwootEvent): {
 // still carry a usable fallback_title (place name + address). Neither ⇒ null, and the render falls
 // back to the generic attachment marker. Shared by the direct webhook path and the debounce
 // re-fetch (issue #45).
+// THE ONE MAPPING FROM A NORMALIZED EVENT TO WHAT THE AGENT WOULD READ. Two callers ask it and one
+// of them is not running a turn: the spend-ceiling gate has to know whether the message it is about
+// to refuse would have reached a model at all, and `runAgentTurn` answers `skipped` — before any
+// billed call — for a message that renders to nothing (blank content, an attachment type we do not
+// recognise, a reaction). Asking that there with a second copy of this shape would be a second
+// answer to one question, and the two would drift the first time a marker or a field is added.
+export function incomingRenderable(
+  n: NormalizedChatwootEvent,
+): RenderableMessage {
+  return {
+    text: n.message?.content ?? "",
+    transcribedText: n.message?.transcribedText,
+    imageDescription: n.message?.imageDescription,
+    extractedText: n.message?.extractedText,
+    attachmentTypes: (n.message?.attachments ?? [])
+      .map((a) => a.fileType)
+      .filter((t): t is string => t !== null),
+    location: firstLocationAttachment(n.message?.attachments),
+    inReplyTo: n.message?.inReplyTo,
+    isReaction: n.message?.isReaction,
+  };
+}
+
 export function firstLocationAttachment(
   attachments:
     | Array<

@@ -18,6 +18,7 @@ import {
 } from "@/client/components";
 import { ServiceLogo } from "@/client/components/icons/ServiceLogo";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 
 type DeploymentData = Awaited<
   ReturnType<typeof api.api.v1.chatwoot.deployment.get>
@@ -128,9 +129,10 @@ export function ChannelsTab({
       });
       showToast(t("channels.bound", "Inbox updated."), "success");
       onBindingChanged?.();
-    } catch {
+    } catch (e) {
       showToast(
-        t("channels.bindError", "Could not update the inbox."),
+        apiErrorMessage(e) ||
+          t("channels.bindError", "Could not update the inbox."),
         "error",
       );
     } finally {
@@ -172,9 +174,10 @@ export function ChannelsTab({
       if (err) throw err;
       setBotStatus((prev) => ({ ...prev, [inboxId]: "active" }));
       showToast(t("channels.reconnected", "Bot reconnected."), "success");
-    } catch {
+    } catch (e) {
       showToast(
-        t("channels.reconnectError", "Could not reconnect the bot."),
+        apiErrorMessage(e) ||
+          t("channels.reconnectError", "Could not reconnect the bot."),
         "error",
       );
     } finally {
@@ -390,8 +393,11 @@ function ZproInstancesForAgent({ agentId }: { agentId: string }) {
         ),
       );
       showToast(t("zpro.bound", "Instance updated."), "success");
-    } catch {
-      showToast(t("zpro.bindError", "Could not bind the agent."), "error");
+    } catch (err) {
+      showToast(
+        apiErrorMessage(err) || t("zpro.bindError", "Could not bind the agent."),
+        "error",
+      );
     } finally {
       setPending(null);
     }

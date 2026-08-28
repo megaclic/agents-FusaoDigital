@@ -7,7 +7,9 @@ import { encryptJson } from "@/api/lib/crypto";
 import type { TenantContext } from "@/lib/tenancy";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { reengageConversation } from "@/modules/conversations/reengage";
+import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { flowLogRows } from "../utils/flowlog";
 import { PromptCapturingModel } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -49,9 +51,22 @@ function ctx(): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-function makeStub(opts: { page: unknown; sent: Array<[number, string]> }) {
+// `pages` serves a DIFFERENT thread per `getMessages` call, which is how a delivery landing between
+// two reads of the same conversation is told. Without it the stub is a Chatwoot frozen in time, and
+// every re-read in the code under test is answered by the state it already saw.
+function makeStub(opts: {
+  page?: unknown;
+  pages?: unknown[];
+  sent: Array<[number, string]>;
+}) {
+  let i = 0;
   const client = {
-    getMessages: async () => opts.page,
+    getMessages: async () => {
+      if (!opts.pages) return opts.page;
+      const p = opts.pages[Math.min(i, opts.pages.length - 1)];
+      i += 1;
+      return p;
+    },
     sendMessage: async (conversationId: number, content: string) => {
       opts.sent.push([conversationId, content]);
       return {};
@@ -612,6 +627,182 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(res.outcome).toBe("not-authorized");
       expect(calls.n).toBe(0);
       expect(sent).toEqual([]);
+    });
+  });
+
+  // The re-engage button is a billed call like any other, and nothing above it in this path is
+  // (issue #146). Unlike the customer-facing seams it REPORTS rather than going quiet: an operator
+  // is looking at the button, and the reason is one they can act on from the settings page.
+  describe("with the spend ceiling reached", () => {
+    let previousTenantSettings: unknown = null;
+
+    beforeAll(async () => {
+      const before = await suDb.tenant.findUniqueOrThrow({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      previousTenantSettings = before.settings;
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            spendCeiling: { enabled: true, monthlyInboxTokens: 1000 },
+          },
+        },
+      });
+      await suDb.llmUsage.create({
+        data: {
+          tenantId,
+          model: "gpt-4o-mini",
+          source: "inbox",
+          promptTokens: 1200,
+          completionTokens: 0,
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await suDb.llmUsage.deleteMany({ where: { tenantId } });
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: { settings: previousTenantSettings as object },
+      });
+    });
+
+    test("the button reports the ceiling instead of spending a turn", async () => {
+      const id = await seedConversation(920);
+      const sent: Array<[number, string]> = [];
+      const res = await reengageConversation(
+        ctx(),
+        id,
+        {
+          // The assertion is the factory: a re-engage that reaches the model at all fails here.
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeStub({
+            page: page([{ id: 1, content: "oi" }]),
+            sent,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+        appDb,
+      );
+      expect(res.outcome).toBe("over-ceiling");
+      expect(sent).toEqual([]);
+    });
+
+    // A CLICK WITH NOTHING TO ANSWER WAS NEVER A TURN, so the ceiling has nothing to refuse. The
+    // button reporting a spent budget here tells the operator to raise a number that would change
+    // nothing, and writes an `error` line saying a turn was skipped when none was ever going to run.
+    // THE SAME QUESTION, ASKED AGAIN WHERE THE ANSWER IS USED. The pre-fetch above proves there was
+    // a tail; the verdict underneath it is two database reads deep, and the conversation is live the
+    // whole time. A delivery that answers the tail inside that window leaves this click nothing to
+    // run, so a refusal would tell the operator to raise a ceiling for work that no longer exists.
+    test("a tail answered while the ceiling was being read is empty, not refused", async () => {
+      const id = await seedConversation(923);
+      const sent: Array<[number, string]> = [];
+      const res = await reengageConversation(
+        ctx(),
+        id,
+        {
+          makeModel: () => {
+            throw new Error("the model must not be invoked");
+          },
+          makeClient: makeStub({
+            pages: [
+              // The pre-fetch sees an unanswered tail...
+              page([{ id: 1, content: "oi", type: 0 }]),
+              // ...and by the re-read another delivery has answered it.
+              page([
+                { id: 1, content: "oi", type: 0 },
+                { id: 2, content: "já respondi", type: 1 },
+              ]),
+            ],
+            sent,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+        appDb,
+      );
+      expect(res.outcome).toBe("empty");
+      expect(sent).toEqual([]);
+      await settleFlowEvents();
+      const rows = await flowLogRows(suDb, {
+        where: {
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:923`,
+          stage: "spend_ceiling",
+        },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+    });
+
+    test("with nothing unanswered the button says so, not that the budget stopped it", async () => {
+      const id = await seedConversation(922);
+      const sent: Array<[number, string]> = [];
+      const res = await reengageConversation(
+        ctx(),
+        id,
+        {
+          makeModel: () => {
+            throw new Error("the model must not be invoked");
+          },
+          makeClient: makeStub({
+            page: page([
+              { id: 1, content: "oi", type: 0 },
+              { id: 2, content: "já respondi", type: 1 },
+            ]),
+            sent,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+        appDb,
+      );
+      expect(res.outcome).toBe("empty");
+      expect(sent).toEqual([]);
+      // ...and no refusal on the record, because nothing was refused.
+      await settleFlowEvents();
+      const rows = await flowLogRows(suDb, {
+        where: {
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:922`,
+          stage: "spend_ceiling",
+        },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+    });
+
+    test("under the ceiling the button still answers", async () => {
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...(previousTenantSettings as object),
+            spendCeiling: { enabled: true, monthlyInboxTokens: 1_000_000 },
+          },
+        },
+      });
+      const id = await seedConversation(921);
+      const sent: Array<[number, string]> = [];
+      const res = await reengageConversation(
+        ctx(),
+        id,
+        {
+          makeModel: fakeModel,
+          makeClient: makeStub({
+            page: page([{ id: 1, content: "oi" }]),
+            sent,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+        appDb,
+      );
+      expect(res.outcome).toBe("posted");
+      expect(sent.length).toBe(1);
     });
   });
 });

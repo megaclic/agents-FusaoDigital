@@ -170,7 +170,7 @@ const baseAuthController = new Elysia({
         ),
         security: [],
       },
-      response: errors(400, 401, 409),
+      response: errors(400, 401, 409, 422),
     },
   )
   .post(
@@ -196,6 +196,9 @@ const baseAuthController = new Elysia({
         set.status = 400;
         return {
           error: translate("errors.emailInUse", "Email already in use"),
+          // The one input the operator fixes, named the way every other refusal names one (#231).
+          // Built by hand here rather than raised as an AppError, so `refusalBody` never sees it.
+          field: "email",
         };
       }
 
@@ -252,7 +255,7 @@ const baseAuthController = new Elysia({
         ),
         security: [],
       },
-      response: errors(400, 403),
+      response: errors(400, 403, 422),
     },
   )
   .post(
@@ -318,7 +321,7 @@ const baseAuthController = new Elysia({
         ),
         security: [],
       },
-      response: errors(400, 401),
+      response: errors(400, 401, 422),
     },
   )
   .get(
@@ -420,6 +423,9 @@ const baseAuthController = new Elysia({
               "errors.currentPasswordIncorrect",
               "Current password is incorrect",
             ),
+            // The form has two password boxes and this refusal is about exactly one of them. Built by
+            // hand here rather than raised as an AppError, so `refusalBody` never sees it.
+            field: "currentPassword",
           };
         }
         throw error;
@@ -444,7 +450,7 @@ const baseAuthController = new Elysia({
         "Change own password",
         "Verifies the current password and stores a new one for the authenticated user. Returns 400 for Google-only accounts (no local password) or an incorrect current password.",
       ),
-      response: errors(400, 401),
+      response: errors(400, 401, 422),
     },
   )
   // ── invitation acceptance (public: the invitee has no account yet) ──
@@ -480,7 +486,7 @@ const baseAuthController = new Elysia({
         ),
         security: [],
       },
-      response: errors(400, 404),
+      response: errors(400, 404, 422),
     },
   )
   // Consume the invite: create the user (tenant + role bound to the invite row, never the
@@ -510,6 +516,7 @@ const baseAuthController = new Elysia({
           set.status = 409;
           return {
             error: translate("errors.emailInUse", "Email already in use"),
+            field: "email",
           };
         }
         throw error;
@@ -555,7 +562,7 @@ const baseAuthController = new Elysia({
         ),
         security: [],
       },
-      response: errors(400, 409, 410),
+      response: errors(400, 409, 410, 422),
     },
   )
   .post(
@@ -666,7 +673,7 @@ const googleAuthController = baseAuthController.post(
       ),
       security: [],
     },
-    response: errors(400, 401, 403),
+    response: errors(400, 401, 403, 422),
   },
 );
 

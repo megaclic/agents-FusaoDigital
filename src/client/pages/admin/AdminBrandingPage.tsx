@@ -15,6 +15,7 @@ import {
 import { useAuth } from "@/client/contexts/AuthContext";
 import { useBranding } from "@/client/contexts/BrandingContext";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 
 // Branding tab: white-label editor for the GLOBAL identity (name, colors, footer links, logo,
 // favicon). This fork does NOT gate branding writes behind a Pro edition (see
@@ -90,7 +91,8 @@ export function AdminBrandingPage() {
       });
       if (error) {
         showToast(
-          t("branding.savedError", "Failed to save branding settings."),
+          apiErrorMessage(error) ||
+            t("branding.savedError", "Failed to save branding settings."),
           "error",
         );
         return;
@@ -115,7 +117,8 @@ export function AdminBrandingPage() {
         .put({ file });
       if (error) {
         showToast(
-          t("branding.uploadError", "Failed to upload the file."),
+          apiErrorMessage(error) ||
+            t("branding.uploadError", "Failed to upload the file."),
           "error",
         );
         return;
@@ -132,7 +135,8 @@ export function AdminBrandingPage() {
       .delete();
     if (error) {
       showToast(
-        t("branding.uploadError", "Failed to upload the file."),
+        apiErrorMessage(error) ||
+          t("branding.uploadError", "Failed to upload the file."),
         "error",
       );
       return;

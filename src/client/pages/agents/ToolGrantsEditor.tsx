@@ -34,6 +34,7 @@ import {
   McpToolArgs,
 } from "@/client/components/mcp/DiscoveredMcpTools";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { nativeToolMeta } from "@/client/lib/nativeTools";
 import {
   toolpackToolMeta,
@@ -53,6 +54,7 @@ import type {
   GrantState,
   HandoffUiState,
   ToolCatalog,
+  ToolRefusals,
 } from "./types";
 
 // Service-logo adapters so a toolpack integration shows its brand mark in the SelectableCard's
@@ -152,6 +154,8 @@ interface Props {
   // Operator-authored guidance for set_custom_attribute + assign_label (when to use each scope/label/
   // attribute), appended to their model-facing descriptions. Persisted in agent.settings.toolGuidance.
   customAttributeInstructions: string;
+  // The refused note this editor draws, if the standing refusal is about one -- see ToolRefusals.
+  refusals: ToolRefusals;
   setCustomAttributeInstructions: (v: string) => void;
   labelInstructions: string;
   setLabelInstructions: (v: string) => void;
@@ -493,6 +497,7 @@ export function ToolGrantsEditor({
   zproCrmPipelineId,
   setZproCrmPipelineId,
   customAttributeInstructions,
+  refusals,
   setCustomAttributeInstructions,
   labelInstructions,
   setLabelInstructions,
@@ -832,7 +837,11 @@ export function ToolGrantsEditor({
       if (session !== documentSession.current) return;
       if (err || !data) {
         showToast(
-          t("editor.tools.documentOpenError", "Could not open this template."),
+          apiErrorMessage(err) ||
+            t(
+              "editor.tools.documentOpenError",
+              "Could not open this template.",
+            ),
           "error",
         );
         return;
@@ -889,7 +898,8 @@ export function ToolGrantsEditor({
       }).discover.post();
       if (error || !data) {
         showToast(
-          t("mcp.discoverError", "Could not reach the server."),
+          apiErrorMessage(error) ||
+            t("mcp.discoverError", "Could not reach the server."),
           "error",
         );
         return;
@@ -1621,6 +1631,7 @@ export function ToolGrantsEditor({
             )}
             <FormField
               label={t("editor.handoffInstructions", "Transfer instructions")}
+              error={refusals.handoffInstructions}
               group
               description={t(
                 "editor.handoffInstructionsHint",
@@ -1668,6 +1679,7 @@ export function ToolGrantsEditor({
                       )
                     : t("editor.kanbanInstructions", "Funnel guidance")
                 }
+                error={refusals.kanbanInstructions}
                 group
                 description={t(
                   "editor.kanbanInstructionsHint",
@@ -1744,6 +1756,7 @@ export function ToolGrantsEditor({
           >
             <FormField
               label={t("editor.updateKanbanInstructions", "Usage guidance")}
+              error={refusals.updateKanbanInstructions}
               group
               description={t(
                 "editor.updateKanbanInstructionsHint",
@@ -1776,6 +1789,7 @@ export function ToolGrantsEditor({
           >
             <FormField
               label={t("editor.attrInstructions", "Usage guidance")}
+              error={refusals.attributeInstructions}
               group
               description={t(
                 "editor.attrInstructionsHint",
@@ -1806,6 +1820,7 @@ export function ToolGrantsEditor({
           >
             <FormField
               label={t("editor.labelInstructions", "Usage guidance")}
+              error={refusals.labelInstructions}
               group
               description={t(
                 "editor.labelInstructionsHint",

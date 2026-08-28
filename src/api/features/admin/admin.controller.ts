@@ -10,7 +10,9 @@ import {
 import { type AuthUser, authPlugin } from "@/api/lib/auth";
 import { translate } from "@/api/lib/i18n";
 import { doc, errors } from "@/api/lib/openapi";
+import { parseQueryCount, parseQueryId } from "@/api/lib/query-filters";
 import config from "@/config";
+import { optionalDbId, requireDbId } from "@/lib/db-id";
 import { UnauthorizedError } from "@/lib/errors";
 import {
   CannotDeleteSelfError,
@@ -36,7 +38,12 @@ function resolveScope(
   paramTenantId: string | undefined,
 ): bigint | null {
   if (user.role === "SUPER_ADMIN") {
-    return paramTenantId ? BigInt(paramTenantId) : null;
+    // NOTE: `=== undefined`, not truthiness. `?tenantId=` is what the Users-tab filter submits when
+    // its select is cleared, and reading it as "no filter" answers a request narrowed to one tenant
+    // with the WHOLE FLEET. And `parseQueryId`, never `BigInt`: that spelling accepts an id past
+    // 2^63-1 and lets Postgres answer the malformed value with a 500.
+    if (paramTenantId === undefined) return null;
+    return parseQueryId(paramTenantId, "tenantId") ?? null;
   }
   return user.tenantId;
 }
@@ -84,7 +91,7 @@ export const adminController = new Elysia({
         "Admin stats",
         "Return user and admin counts for the resolved tenant scope.",
       ),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .get(
@@ -94,7 +101,7 @@ export const adminController = new Elysia({
       // response stays a single shape and the treaty type for `data.users` is non-optional.
       const user = await getAuthUser();
       if (!user) throw new UnauthorizedError();
-      const page = Number(query.page) || 1;
+      const page = parseQueryCount(query.page, "page") ?? 1;
       const search = query.search?.trim() || undefined;
       const result = await getUsers(
         resolveScope(user, query.tenantId),
@@ -136,7 +143,7 @@ export const adminController = new Elysia({
         "List users",
         "Return a paginated, optionally filtered list of users.",
       ),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .patch(
@@ -147,7 +154,11 @@ export const adminController = new Elysia({
         set.status = 401;
         return { error: translate("errors.unauthorized", "Unauthorized") };
       }
-      if (user.id.toString() === params.id && body.role === "AGENT") {
+      // NOTE: the PARSED id, not the path segment. `parseDbId` accepts leading zeros, so `007`
+      // addresses row 7 while failing string equality against `"7"`, and comparing the raw segment
+      // let a caller past the guard that exists to stop them locking themselves out. Issue #371.
+      const targetId = requireDbId(params.id);
+      if (user.id === targetId && body.role === "AGENT") {
         set.status = 403;
         return {
           error: translate("errors.cannotDemoteSelf", "Cannot demote yourself"),
@@ -158,7 +169,7 @@ export const adminController = new Elysia({
         // a TENANT_ADMIN is fenced to its own tenant.
         const updated = await updateUserRole(
           user.tenantId,
-          BigInt(params.id),
+          targetId,
           body.role,
         );
         return {
@@ -191,7 +202,7 @@ export const adminController = new Elysia({
         "Update user role",
         "Change a user's role within the caller's tenant scope.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   // Permanently delete a user (within the caller's tenant scope). Step-up: the acting admin re-enters
@@ -217,7 +228,7 @@ export const adminController = new Elysia({
       try {
         await deleteUser(
           resolveScope(user, undefined),
-          BigInt(params.id),
+          requireDbId(params.id),
           user.id,
         );
         return { success: true };
@@ -261,7 +272,7 @@ export const adminController = new Elysia({
         "Delete user",
         "Permanently delete a user within the caller's tenant scope. Requires the acting admin's password; cannot delete yourself or the last admin.",
       ),
-      response: errors(401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   // Invite a user into a tenant. A SUPER_ADMIN targets one explicitly via body.tenantId (400 if
@@ -277,9 +288,7 @@ export const adminController = new Elysia({
       }
       const targetTenantId =
         user.role === "SUPER_ADMIN"
-          ? body.tenantId
-            ? BigInt(body.tenantId)
-            : null
+          ? (optionalDbId(body.tenantId, "tenantId") ?? null)
           : user.tenantId;
       if (targetTenantId === null) {
         set.status = 400;
@@ -311,6 +320,7 @@ export const adminController = new Elysia({
           set.status = 409;
           return {
             error: translate("errors.emailInUse", "Email already in use"),
+            field: "email",
           };
         }
         throw error;
@@ -337,7 +347,7 @@ export const adminController = new Elysia({
         "Create invitation",
         "Invite a user into a tenant and return an accept link.",
       ),
-      response: errors(400, 401, 403, 409),
+      response: errors(400, 401, 403, 409, 422),
     },
   )
   .get(
@@ -361,7 +371,7 @@ export const adminController = new Elysia({
         "List invitations",
         "Return pending invitations for the resolved tenant scope.",
       ),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .delete(
@@ -370,7 +380,7 @@ export const adminController = new Elysia({
       const user = await getAuthUser();
       try {
         // SUPER_ADMIN may revoke any invite (own tenant null → unscoped); others are fenced.
-        await revokeInvite(user?.tenantId ?? null, BigInt(params.id));
+        await revokeInvite(user?.tenantId ?? null, requireDbId(params.id));
         return { success: true };
       } catch (error) {
         if (error instanceof InviteNotFoundError) {

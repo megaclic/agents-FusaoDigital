@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DEBUG_MAX_STRING } from "@/modules/flowlog/service";
 
 // THE GUARD AGAINST THE NEXT CAP THAT CUTS A CHARACTER IN HALF.
 //
@@ -37,6 +38,11 @@ function straddling(cap: number): string {
 // Each entry names a cap, and runs the REAL function that applies it. The padding is swept a few
 // units either side of the cap so an entry stays honest when the cut is not exactly at `cap` (an
 // ellipsis suffix, a `max - 1`, an inner cap one unit wider than the outer one).
+// Every start in this file already carries an offset, so there is nothing for the resolver to
+// decide: it says "this value is already unambiguous". The resolution itself is exercised where
+// the timezone actually lives (tests/graph/tools-http-appointment.test.ts).
+const KEEP = (wall: string) => wall;
+
 const CAPS: {
   name: string;
   cap: number;
@@ -50,6 +56,34 @@ const CAPS: {
     run: async (s) => {
       const { sanitizePromptValue, VALUE_MAX } = await import("@/graph/prompt");
       return sanitizePromptValue(s, VALUE_MAX);
+    },
+  },
+  {
+    // The title an operator's own booking system answers with, on its way into the appointment record
+    // and from there into EVERY later turn's prompt block (#352). Customer-adjacent: plenty of
+    // booking systems put the patient's own name in the appointment title.
+    name: "appointment: extractAppointment summary",
+    cap: 200,
+    run: async (s) => {
+      const { extractAppointment, readAppointmentDeclaration } = await import(
+        "@/modules/tool-definitions/appointment"
+      );
+      const decl = readAppointmentDeclaration({
+        action: "book",
+        idPath: "id",
+        startPath: "start",
+        summaryPath: "title",
+      });
+      const r = extractAppointment(
+        decl as never,
+        {
+          id: "ap_1",
+          start: "2026-09-02T14:00:00-03:00",
+          title: s,
+        },
+        KEEP,
+      );
+      return r.ok ? (r.value.summary ?? "") : "";
     },
   },
   {
@@ -69,6 +103,19 @@ const CAPS: {
     run: async (s) => {
       const { redactSecretsDeep } = await import("@/lib/redact");
       return (redactSecretsDeep({ t: s }) as { t: string }).t;
+    },
+  },
+  {
+    // The SAME function under the log debug mode (#58), which raises the ceiling rather than
+    // removing it. It is a second cap through one code path, which is precisely the shape this file
+    // exists to catch: the entry above would keep passing while the raised one cut a character in
+    // half, because nothing about a higher number makes a slice safe.
+    name: "redact: redactSecretsDeep under the log debug ceiling",
+    cap: DEBUG_MAX_STRING,
+    run: async (s) => {
+      const { redactSecretsDeep } = await import("@/lib/redact");
+      return (redactSecretsDeep({ t: s }, 0, DEBUG_MAX_STRING) as { t: string })
+        .t;
     },
   },
   {
@@ -202,7 +249,7 @@ const CAPS: {
     name: "mcp: audit projection",
     cap: 4000,
     run: async (s) => {
-      const { truncForAudit } = await import("@/modules/mcp/write");
+      const { truncForAudit } = await import("@/modules/audit/projection");
       return String(
         (truncForAudit({ systemPrompt: s }) as { systemPrompt: string })
           .systemPrompt,
@@ -371,14 +418,14 @@ const BARE_SLICES: Record<
   "src/client/contexts/ThemeContext.tsx": [1, "index"],
   "src/client/lib/breadcrumbs.ts": [1, "array"],
   "src/client/pages/LogsPage.tsx": [1, "array"],
-  "src/client/pages/agents/AgentEditorPage.tsx": [1, "array"],
   "src/client/pages/agents/CapabilityMap.tsx": [1, "array"],
   "src/client/pages/agents/PlaygroundChat.tsx": [1, "array"],
   "src/client/pages/agents/PromptPanel.tsx": [1, "index"],
+  "src/client/pages/agents/followUpFormState.ts": [1, "array"],
   "src/client/pages/resources/ToolEditModal.tsx": [1, "index"],
   // The idempotency key's tail is a hex digest.
   "src/graph/tools/documents.ts": [1, "ascii"],
-  "src/graph/tools/mcp.ts": [4, "ascii"],
+  "src/graph/tools/mcp.ts": [5, "ascii"],
   "src/graph/tools/native.ts": [4, "array"],
   "src/graph/tools/toolName.ts": [1, "ascii"],
   "src/graph/trace.ts": [2, "array + index"],
@@ -387,6 +434,9 @@ const BARE_SLICES: Record<
   "src/lib/text.ts": [3, "the-cut"],
   "src/modules/agents/credential-paths.ts": [2, "array"],
   "src/modules/agents/text-caps.ts": [1, "array"],
+  // `countNotStoredAsWritten`: the bundled entries a schedule cap lets through, so the ones past it
+  // count as loss rather than being tested. An array of JSON entries, never a string.
+  "src/modules/agents/transfer.ts": [1, "array"],
   "src/modules/analytics/langfuse-costs.ts": [2, "fixed-format"],
   "src/modules/api-keys/verify.ts": [1, "ascii"],
   "src/modules/appointments/settings.ts": [1, "array"],
@@ -394,7 +444,7 @@ const BARE_SLICES: Record<
   "src/modules/business-hours/hours.ts": [1, "fixed-format"],
   "src/modules/chatwoot/attributes.ts": [1, "array"],
   "src/modules/conversations/service.ts": [1, "array"],
-  "src/modules/debounce/handler.ts": [1, "array"],
+  "src/modules/debounce/handler.ts": [2, "array"],
   // The logo's one-shot download token is hex from randomUUID.
   "src/modules/documents/company.ts": [1, "ascii"],
   // The legacy date fallback reads a fixed ISO prefix; the file name was already reduced to
@@ -407,6 +457,11 @@ const BARE_SLICES: Record<
   "src/modules/documents/slug.ts": [2, "ascii"],
   "src/modules/flowlog/export.ts": [2, "fixed-format + array"],
   "src/modules/flowlog/read.ts": [1, "array"],
+  // `parseIsoInstant`: the date half of an ISO instant, to check a calendar `Date.parse` would
+  // silently normalise instead (February 30 → March 2). Position 10 is the format's own boundary,
+  // and the string was already matched against an ASCII-only pattern, so there is no character
+  // there for a cut to land inside of.
+  "src/modules/flowlog/settings.ts": [1, "fixed-format"],
   "src/modules/followups/settings.ts": [1, "array"],
   "src/modules/images/fetch.ts": [1, "array"],
   // The five response-body caps below all feed `JSON.parse` and nothing else. When one of them
@@ -418,6 +473,9 @@ const BARE_SLICES: Record<
     2,
     "parse-only + fixed-format",
   ],
+  // The refusal a calendar write answers with lists the nearest bookable slots; the cut bounds that
+  // LIST, and each entry is a slot object this code built, never received text.
+  "src/modules/integrations/toolpacks/calendar-slots.ts": [1, "array"],
   "src/modules/integrations/toolpacks/google-calendar.ts": [1, "parse-only"],
   "src/modules/integrations/toolpacks/google-drive.ts": [1, "parse-only"],
   // Zod issue PATHS, which name our own schema's keys, never the received values.
@@ -426,11 +484,17 @@ const BARE_SLICES: Record<
   "src/modules/memory/cut.ts": [2, "index + array"],
   "src/modules/playground/service.ts": [1, "array"],
   "src/modules/split/service.ts": [1, "array"],
+  // The audit fingerprint of the over-ceiling sentence: a hex digest, so the cut cannot land inside
+  // a surrogate pair.
+  "src/modules/tenant-settings/service.ts": [1, "ascii"],
   "src/modules/tool-definitions/body-shape.ts": [1, "array"],
   "src/modules/updates/semver.ts": [1, "array"],
   // Read only to be substring-matched against the provider's auth-failure shapes, then dropped:
   // never stored, never shown, never sent anywhere.
   "src/modules/vault/secret-test.ts": [1, "parse-only"],
+  // The page's own overshoot row, dropped: the list takes `limit + 1` to learn whether a next page
+  // exists. Same shape as flowlog/read.ts, and it cuts an array of rows, never a string.
+  "src/modules/webhooks/outbound/deliveries.ts": [1, "array"],
   // Caps the in-memory burst BUFFER to the last N messages, not a string.
   "src/modules/zpro/debounce.ts": [1, "array"],
   // Caps the tag-name list rendered into `<existing_labels>` to the first 40 names, not a string.

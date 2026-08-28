@@ -3,6 +3,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { requireVaultRef } from "@/modules/vault/service";
@@ -139,12 +140,12 @@ export async function createAlertChannel(
 ): Promise<AlertChannelDto> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
-  const parsed = alertChannelCreateSchema.parse(input);
+  const parsed = parseInput(alertChannelCreateSchema, input);
   await assertSafeOutboundUrl(parsed.url);
   const stages = assertStages(parsed.stages ?? []);
   const row = await runScopedOn(base, ctx, async (db) => {
     const secretRef = parsed.secretRef
-      ? await requireVaultRef(db, parsed.secretRef)
+      ? await requireVaultRef(db, parsed.secretRef, "secretRef")
       : null;
     return db.alertChannel.create({
       data: {
@@ -183,7 +184,7 @@ export async function updateAlertChannel(
   patch: AlertChannelUpdate,
   base: PrismaClient = basePrisma,
 ): Promise<AlertChannelDto> {
-  const parsed = alertChannelUpdateSchema.parse(patch);
+  const parsed = parseInput(alertChannelUpdateSchema, patch);
   const data: Record<string, unknown> = {};
   if (parsed.name !== undefined) data.name = parsed.name;
   if (parsed.type !== undefined) data.type = parsed.type;
@@ -206,7 +207,7 @@ export async function updateAlertChannel(
   const row = await runScopedOn(base, ctx, async (db) => {
     // Canonicalized inside the tx, so the entry cannot be deleted between the check and the write.
     if (typeof data.secretRef === "string") {
-      data.secretRef = await requireVaultRef(db, data.secretRef);
+      data.secretRef = await requireVaultRef(db, data.secretRef, "secretRef");
     }
     // updateMany → count 0 for a foreign/missing id under RLS → NotFound (never a cross-tenant write).
     const res = await db.alertChannel.updateMany({ where: { id }, data });

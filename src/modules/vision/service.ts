@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { recordDirectUsage } from "@/graph/usage";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { stashMediaAnnotation } from "@/modules/chatwoot/annotations";
@@ -11,12 +12,27 @@ import {
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
+import {
+  announceSpendCeilingWarning,
+  assertPlaygroundSpendCeiling,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { visionAcceptsDocuments } from "./document-support";
 import {
   getVisionProvider,
   type VisionKind,
+  type VisionProvider,
+  type VisionRequest,
+  type VisionResult,
   visionKindForMime,
 } from "./providers";
+import {
+  attemptBudgetMs,
+  isTransientVisionFailure,
+  retryDelayMs,
+  VISION_MAX_ATTEMPTS,
+} from "./retry";
 import { readVisionConfig, type VisionConfig } from "./settings";
 
 // Image/document extraction orchestration (the vision mirror of stt/service): download the file,
@@ -64,6 +80,98 @@ export async function resolveVisionConfig(
   return cfg;
 }
 
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// One extraction, asked as many times as the policy in ./retry allows. A transient provider failure
+// used to end the attachment for good — `extract` was called once and the caller degraded to the
+// "couldn't extract" marker, which is what enters the conversation history (issue #319).
+//
+// The flow span is INSIDE the loop, so each attempt is its own `vision` line carrying its own
+// `attempt` and duration. That is what makes a retried failure readable on the Logs page: three
+// lines saying 503 name an endpoint that is down, while one line summarising them reads like one
+// bad call. A first-attempt success is unchanged — a single line, now with `attempt: 1`.
+export async function extractWithRetry(args: {
+  provider: VisionProvider;
+  req: Omit<VisionRequest, "timeoutMs">;
+  flow?: FlowContext;
+  providerName: string;
+  model: string;
+  sleep?: (ms: number) => Promise<void>;
+  // Injectable together with `sleep`, and for the same reason: what this loop spends is TIME, and a
+  // battery that cannot move the clock cannot tell a budget read before the wait from one read
+  // after it.
+  now?: () => number;
+}): Promise<VisionResult> {
+  const { kind } = args.req;
+  // NOTE: A `baseURL` means the operator chose the endpoint, so the latency is their hardware's and
+  // none of our measurements describe it — the ceiling stands down and the attempt keeps the total.
+  const customEndpoint = args.req.baseURL !== null;
+  const sleep = args.sleep ?? realSleep;
+  // NOTE: `performance.now`, not `Date.now`: this is a hard deadline, and a wall clock can move
+  // BACKWARD (an NTP correction, a VM resuming from a snapshot — this project has seen the Docker
+  // VM's clock drift after sleep). A negative elapsed would hand an attempt more than the total has
+  // left. The monotonic source cannot, and only differences are read here, so its arbitrary origin
+  // does not matter.
+  const now = args.now ?? (() => performance.now());
+  const startedAt = now();
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= VISION_MAX_ATTEMPTS; attempt++) {
+    const delayMs = retryDelayMs(attempt);
+    if (delayMs === null) break;
+    // NOTE: Two readings of the same question, because the wait sits between them. The first asks
+    // whether waiting is worth it AT ALL — a wait that lands past the total costs the turn hundreds
+    // of milliseconds to buy nothing.
+    if (
+      attemptBudgetMs({
+        kind,
+        attempt,
+        elapsedMs: now() - startedAt + delayMs,
+        customEndpoint,
+      }) === null
+    )
+      break;
+    if (delayMs > 0) await sleep(delayMs);
+    // NOTE: The second is the one the provider gets, and it is read AFTER the wait: `sleep` is what
+    // a stalled or suspended process oversleeps, and a deadline computed from the nominal delay
+    // would hand that process time the total no longer has.
+    const budgetMs = attemptBudgetMs({
+      kind,
+      attempt,
+      elapsedMs: now() - startedAt,
+      customEndpoint,
+    });
+    if (budgetMs === null) break;
+    try {
+      return await withFlowStage(
+        args.flow,
+        "vision",
+        {
+          provider: args.providerName,
+          model: args.model,
+          // NOTE: `budgetMs` is what THIS attempt was allowed, and the two lines of one extraction
+          // do not carry the same number: the last attempt gets what is left of the total. Without
+          // it a 39s timeout reads as a slow provider rather than as the budget running out.
+          detail: { kind, attempt, budgetMs },
+          // NOTE: Recovered (→ "couldn't extract" marker), so a failure reads as an advisory, not
+          // a red error — same contract as TTS.
+          errorLevel: "warn",
+        },
+        () => args.provider.extract({ ...args.req, timeoutMs: budgetMs }),
+      );
+    } catch (err) {
+      // NOTE: A permanent failure (a bad key, a model id that does not exist, a file the provider
+      // rejects) answers the same way every time, so asking again only makes the turn slower.
+      if (!isTransientVisionFailure(err)) throw err;
+      lastErr = err;
+    }
+  }
+  // NOTE: Reached when the attempts or the budget ran out, and by the loop's own bound — so
+  // stopping never depends only on a rule that lives elsewhere. `lastErr` is always set here:
+  // attempt 1 is asked at zero elapsed, so it always gets a budget and either returns or fills it.
+  throw lastErr;
+}
+
 export interface ExtractInboundParams {
   tenantId: bigint;
   instanceId: bigint;
@@ -73,7 +181,12 @@ export interface ExtractInboundParams {
   dataUrl: string;
   cfg: VisionConfig;
   base?: PrismaClient;
-  deps?: { makeClient?: MakeClient; fetchImpl?: typeof fetch };
+  deps?: {
+    makeClient?: MakeClient;
+    fetchImpl?: typeof fetch;
+    // Injectable so the retry battery does not actually wait out the backoff.
+    sleep?: (ms: number) => Promise<void>;
+  };
   // Optional execution-flow context: when present, the extraction is logged as a `vision` stage
   // (mirrors STT), so a skip/failure is visible on the Logs page instead of vanishing.
   flow?: FlowContext;
@@ -162,38 +275,86 @@ export async function extractInboundFile(
   }
   const kind = visionKindForMime(contentType);
   if (!kind) return skip("unsupported_mime"); // unsupported mime → marker
-  if (kind === "document" && !provider.supportsDocuments)
+  // The ENDPOINT decides, not the provider name: the same base URL that the call below posts to is
+  // what has to be known to read a PDF (see ./document-support).
+  if (
+    kind === "document" &&
+    !visionAcceptsDocuments(cfg.provider, entry.baseUrl ?? cfg.baseURL)
+  )
     return skip("document_not_supported");
 
-  let text: string;
+  // THE SPEND CEILING, asked here and not by the caller. Vision runs on the incoming attachment
+  // BEFORE the webhook's gates decide anything, so the turn ceiling upstream has not run yet and
+  // an image sent into a spent month would be billed with nothing to stop it.
+  //
+  // ASKED ONCE THE CALL IS KNOWN TO BE POSSIBLE, immediately before it, and not at the top of this
+  // function. A refusal says that spend was what stood in the way, and everything above — an unknown
+  // provider, a missing credential, a type this endpoint cannot read — is a reason the provider was
+  // never going to be called at all, so a `vision` line saying the attachment was skipped for budget
+  // would name a cause that was not operative. The download above is a Chatwoot fetch, not a billed
+  // one, and it is what tells this function the attachment's type in the first place.
+  //
+  // It is the REFUSAL half that this ordering is for. The warning is a statement about the MONTH,
+  // true whether or not this particular call runs, so a window it claims early costs at most a
+  // staler percentage in the line the operator reads — see the waiver in `.codex-review-waived`,
+  // which is where that adjudication lives.
+  //
+  // IT ANNOUNCES THE WARNING AND NOT THE REFUSAL, which is the one thing this gate does differently
+  // from the other four, and the asymmetry is what the two halves leave behind.
+  //
+  // `spend_ceiling` `over` is written per refused MESSAGE, and this runs on the same message the
+  // webhook gate refuses moments later: writing it here would put two refusal rows and two alert
+  // bumps on the Logs page for one customer message, and the count of refusals is the number an
+  // operator reads off that page. Nothing is lost by staying quiet, because the `vision` line below
+  // says `skipped` with `spend_ceiling` as its reason, which is the stage the reader filters by when
+  // they are asking why an attachment was never read.
+  //
+  // The WARNING leaves no such trace: the call proceeds, the attachment is read, and no line
+  // anywhere says the month crossed its fraction. And the gate that would have said it may never
+  // run — vision is upstream of every one of them, so a human-owned conversation, a silenced agent,
+  // a redirect or an hour outside the schedule consumes the delivery first, and this billed call is
+  // the only thing that happened. It cannot double-write: the warning's window is claimed once, so
+  // a gate that follows and asks the same question writes nothing.
+  //
+  // The playground's own file path asks in the same place, for the same reason, and differs only in
+  // what it does with the answer: it goes through `assertPlaygroundSpendCeiling`, where no webhook
+  // gate follows it and both halves are its own to announce.
+  const ceiling = await spendCeilingVerdict({
+    tenantId: params.tenantId,
+    source: "inbox",
+    base,
+  });
+  announceSpendCeilingWarning(params.flow, ceiling, "inbox", params.tenantId);
+  if (ceiling.state === "over") {
+    logger.info(
+      "vision: spend ceiling reached (tenant=%s used=%s ceiling=%s) — the attachment was not read",
+      String(params.tenantId),
+      String(ceiling.usedTokens),
+      String(ceiling.ceilingTokens),
+    );
+    return skip("spend_ceiling");
+  }
+
+  let extracted: VisionResult;
   try {
-    text = (
-      await withFlowStage(
-        params.flow,
-        "vision",
-        {
-          provider: cfg.provider,
-          model: cfg.model || provider.defaultModel,
-          detail: { kind },
-          // Recovered (→ "couldn't extract" marker), so a failure reads as an advisory, not a red
-          // error — same contract as TTS.
-          errorLevel: "warn",
-        },
-        () =>
-          provider.extract({
-            bytes,
-            mimeType:
-              contentType ??
-              (kind === "image" ? "image/jpeg" : "application/pdf"),
-            kind,
-            prompt: cfg.extractionPrompt,
-            model: cfg.model || provider.defaultModel,
-            apiKey: entry.secret,
-            baseURL: entry.baseUrl ?? cfg.baseURL,
-            fetchImpl: params.deps?.fetchImpl ?? fetch,
-          }),
-      )
-    ).trim();
+    extracted = await extractWithRetry({
+      provider,
+      providerName: cfg.provider,
+      model: cfg.model || provider.defaultModel,
+      flow: params.flow,
+      sleep: params.deps?.sleep,
+      req: {
+        bytes,
+        mimeType:
+          contentType ?? (kind === "image" ? "image/jpeg" : "application/pdf"),
+        kind,
+        prompt: cfg.extractionPrompt,
+        model: cfg.model || provider.defaultModel,
+        apiKey: entry.secret,
+        baseURL: entry.baseUrl ?? cfg.baseURL,
+        fetchImpl: params.deps?.fetchImpl ?? fetch,
+      },
+    });
   } catch (e) {
     // Best-effort: a provider error must not strand delivery. Log at error-level (ops alert channel)
     // and leave the attachment unextracted → the agent sees the "couldn't extract" marker.
@@ -208,6 +369,17 @@ export async function extractInboundFile(
       "inbound vision extraction failed; leaving attachment unextracted",
     );
     return null;
+  }
+  const text = extracted.text.trim();
+  // The row is written whether or not the extraction yielded text: a call that came back empty was
+  // billed exactly like one that came back full, and the early return below used to end the
+  // function before anything could record it.
+  if (params.flow && extracted.usage) {
+    await recordDirectUsage(params.flow, {
+      model: cfg.model || provider.defaultModel,
+      node: "vision",
+      ...extracted.usage,
+    });
   }
   if (!text) return null;
 
@@ -265,7 +437,7 @@ export interface PlaygroundExtractParams {
   // so a freshly-set credential can be tested WITHOUT saving first.
   settings?: unknown;
   base?: PrismaClient;
-  deps?: { fetchImpl?: typeof fetch };
+  deps?: { fetchImpl?: typeof fetch; sleep?: (ms: number) => Promise<void> };
   // Optional execution-flow context: when present, the extraction is logged as a `vision` stage
   // (source=playground), so the operator sees it on the Logs page.
   flow?: FlowContext;
@@ -317,38 +489,60 @@ export async function extractPlaygroundFile(
     );
   }
 
+  // CAN WE READ THIS AT ALL, asked before the ceiling. A ceiling refusal is a statement that spend
+  // was the thing standing in the way, and for a file whose type this provider cannot read there
+  // was never any spend to refuse — the extraction returns `unsupported` in a month with budget to
+  // spare, so a 429 in a spent one reports a refusal that did not happen and sends the operator
+  // looking at their budget over a file that would have been rejected either way. The check needs
+  // `entry`, because whether documents are accepted depends on the resolved base URL, which is why
+  // the credential resolution moves up with it: an unreadable credential is a configuration error
+  // like the `!cfg.enabled` one already above the ceiling, not something the budget decided.
   const kind = visionKindForMime(params.mimeType);
-  if (!kind || (kind === "document" && !provider.supportsDocuments)) {
+  if (
+    !kind ||
+    (kind === "document" &&
+      !visionAcceptsDocuments(cfg.provider, entry.baseUrl ?? cfg.baseURL))
+  ) {
     return { kind: "unsupported", text: "" };
   }
 
+  // The playground's own ceiling, asked once the file is known to be extractable and before the
+  // provider round trip. It throws (see `assertPlaygroundSpendCeiling`), so an operator uploading a
+  // file into a spent month is told why instead of watching the extraction produce nothing.
+  await assertPlaygroundSpendCeiling({
+    tenantId: params.ctx.tenantId as bigint,
+    base,
+    flow: params.flow,
+  });
+
   try {
-    const text = (
-      await withFlowStage(
-        params.flow,
-        "vision",
-        {
-          provider: cfg.provider,
-          model: cfg.model || provider.defaultModel,
-          detail: { kind },
-          errorLevel: "warn",
-        },
-        () =>
-          provider.extract({
-            bytes: params.file,
-            mimeType:
-              params.mimeType ??
-              (kind === "image" ? "image/jpeg" : "application/pdf"),
-            kind,
-            prompt: cfg.extractionPrompt,
-            model: cfg.model || provider.defaultModel,
-            apiKey: entry.secret,
-            baseURL: entry.baseUrl ?? cfg.baseURL,
-            fetchImpl: params.deps?.fetchImpl ?? fetch,
-          }),
-      )
-    ).trim();
-    return { kind, text };
+    const extracted = await extractWithRetry({
+      provider,
+      providerName: cfg.provider,
+      model: cfg.model || provider.defaultModel,
+      flow: params.flow,
+      sleep: params.deps?.sleep,
+      req: {
+        bytes: params.file,
+        mimeType:
+          params.mimeType ??
+          (kind === "image" ? "image/jpeg" : "application/pdf"),
+        kind,
+        prompt: cfg.extractionPrompt,
+        model: cfg.model || provider.defaultModel,
+        apiKey: entry.secret,
+        baseURL: entry.baseUrl ?? cfg.baseURL,
+        fetchImpl: params.deps?.fetchImpl ?? fetch,
+      },
+    });
+    if (params.flow && extracted.usage) {
+      await recordDirectUsage(params.flow, {
+        model: cfg.model || provider.defaultModel,
+        node: "vision",
+        ...extracted.usage,
+      });
+    }
+    return { kind, text: extracted.text.trim() };
   } catch (e) {
     // Provider error (bad file, model refusal, timeout) must NOT interrupt the turn: log at
     // error-level (the ops alert channel — no Sentry here) and degrade to the "couldn't extract"

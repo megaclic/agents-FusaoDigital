@@ -168,7 +168,7 @@ describe("both buckets exist on the real app", () => {
 
   test("everything else stays on the global bucket", async () => {
     const response = await Bun.fetch(`${base}/api/auth/me`);
-    expect(response.headers.get("ratelimit-limit")).toBe("600");
+    expect(response.headers.get("ratelimit-limit")).toBe("1000000");
   });
 });
 

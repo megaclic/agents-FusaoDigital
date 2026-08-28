@@ -143,7 +143,7 @@ export const documentTemplatesController = new Elysia({
         "Create document template",
         "Creates a document template from blocks, fields and style.",
       ),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .post(
@@ -229,7 +229,7 @@ export const documentTemplatesController = new Elysia({
       // write takes for a template a newer build wrote (`documentTemplateUnreadable`). Create and
       // patch both declared it; nothing at runtime told anyone this one did not, because Elysia
       // answers the 409 either way and only the generated client is left holding the wrong union.
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .get(
@@ -245,7 +245,6 @@ export const documentTemplatesController = new Elysia({
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
-          pattern: "^[0-9]+$",
           description: "Template id (BigInt string).",
         }),
       }),
@@ -266,7 +265,6 @@ export const documentTemplatesController = new Elysia({
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
-          pattern: "^[0-9]+$",
           description: "Template id (BigInt string).",
         }),
       }),
@@ -291,7 +289,6 @@ export const documentTemplatesController = new Elysia({
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
-          pattern: "^[0-9]+$",
           description: "Template id (BigInt string).",
         }),
       }),
@@ -301,7 +298,7 @@ export const documentTemplatesController = new Elysia({
         "Patches a document template; omitted fields keep their value.",
       ),
       // 409 for a slug already taken, and for a stored template this version cannot read.
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .delete(
@@ -317,7 +314,6 @@ export const documentTemplatesController = new Elysia({
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
-          pattern: "^[0-9]+$",
           description: "Template id (BigInt string).",
         }),
       }),

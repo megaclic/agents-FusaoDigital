@@ -33,16 +33,28 @@ import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { getCheckpointer } from "@/graph/checkpointer";
-import { buildAgentGraph, lastAssistantText } from "@/graph/graph";
+import {
+  type FallbackConfig,
+  hasModelFallback,
+  readModelFallbackConfig,
+  resolveFallbackModel,
+} from "@/graph/fallback-settings";
+import {
+  buildAgentGraph,
+  type FallbackModel,
+  lastAssistantText,
+} from "@/graph/graph";
 import {
   clearTurnInFlight,
   isTurnInFlight,
   markTurnInFlight,
 } from "@/graph/inflight";
+import { PRIMARY_MAX_RETRIES, PRIMARY_TIMEOUT_MS } from "@/graph/model-fallback";
 import {
   createChatModel,
   type ModelConfig,
   parseModelConfig,
+  type ResolvedModelConfig,
 } from "@/graph/models";
 import {
   FOLLOWUP_SKIP_SENTINEL,
@@ -173,6 +185,12 @@ export interface LoadedZproAgent {
   guardrails: GuardrailsConfig;
   guardrailsApiKey: string;
   guardrailsCredentialBaseUrl: string | null;
+  // The second provider behind this agent's own (agent.settings.modelFallback — issue #143), same
+  // generic resolveFallbackModel/hasModelFallback Chatwoot's buildModelAndGraph uses. Resolved
+  // eagerly here so runLoadedZproTurn never has to touch the DB again for it.
+  modelFallback: FallbackConfig;
+  modelFallbackApiKey: string;
+  modelFallbackCredentialBaseUrl: string | null;
   // WhatsApp 24h window/HSM gate for PROACTIVE sends only (nudges — see runZproAgentNudge). Never
   // applied to the reactive turn tail below (always in-window by construction). See
   // docs/service-window.md.
@@ -197,6 +215,12 @@ export interface LoadedZproAgent {
   // agent.settings.observability.logToolValues key + reader Chatwoot's ToolFlowLogger wiring uses
   // (src/graph/prepare.ts) — see docs/zpro.md's "Tool-call flowlog" section.
   logToolValues: boolean;
+  // Whether the operator's own debug window is open right now (agent.settings.observability.
+  // fullDetail/fullDetailUntil — the same resolved flag Chatwoot's FlowContext carries), which lifts
+  // the 2,000-character cut on ExecutionLog.detail for the whole turn. Read alongside logToolValues,
+  // from the same readObservabilityConfig call, and threaded onto every FlowContext this module
+  // builds (both the direct turn and the debounce flush).
+  fullDetail: boolean;
   // Per-TENANT Langfuse config (Tenant.settings.langfuse + a vault key pair — src/graph/
   // observability.ts's resolveLangfuseConfig, fully channel-agnostic). null when tracing is off/
   // unconfigured for this tenant. See docs/zpro.md's "Langfuse tracing" section.
@@ -289,11 +313,37 @@ export async function loadZproAgent(
       }
     }
 
+    // The fallback provider's own credential. Same fail-open shape as guardrails above: without a
+    // key the fallback is simply not built, so the turn behaves exactly as an agent with none
+    // configured — mirrors src/graph/prepare.ts's loadAgentConfig exactly.
+    const modelFallback = readModelFallbackConfig(agent.settings);
+    let modelFallbackApiKey = "";
+    let modelFallbackCredentialBaseUrl: string | null = null;
+    if (hasModelFallback(modelFallback) && modelFallback.credentialRef) {
+      const fEntry = await tryResolveVaultEntry<string>(
+        db,
+        modelFallback.credentialRef,
+      );
+      if (fEntry) {
+        modelFallbackApiKey = fEntry.secret;
+        modelFallbackCredentialBaseUrl = fEntry.baseUrl;
+      } else {
+        logger.warn(
+          "zpro: agent %s model fallback credentialRef %s did not resolve — there is nothing behind the provider",
+          String(agent.id),
+          modelFallback.credentialRef,
+        );
+      }
+    }
+
     // Nome da empresa para a variável {{nome_empresa}} — mesma fonte que prepare.ts usa para o
     // Chatwoot (tenant.name sob RLS).
     const tenant = await db.tenant.findFirst({ select: { name: true } });
     // Per-tenant, channel-agnostic — same reader src/graph/prepare.ts's Chatwoot path uses.
     const langfuseCfg = await resolveLangfuseConfig(db, tenantId);
+    // ONE call, like prepare.ts's own `obs` — two reads of the same settings bag could disagree
+    // about `fullDetail` across the (rare) instant its window closes between them.
+    const obs = readObservabilityConfig(agent.settings);
 
     return {
       agentId: agent.id,
@@ -308,11 +358,15 @@ export async function loadZproAgent(
       splitConfig: readSplitConfig(agent.settings),
       maxDistance: readMaxDistance(agent.settings),
       sendImageConfig: readSendImageConfig(agent.settings),
-      logToolValues: readObservabilityConfig(agent.settings).logToolValues,
+      logToolValues: obs.logToolValues,
+      fullDetail: obs.fullDetail,
       langfuseCfg,
       guardrails,
       guardrailsApiKey,
       guardrailsCredentialBaseUrl,
+      modelFallback,
+      modelFallbackApiKey,
+      modelFallbackCredentialBaseUrl,
       transferWithSummary: agent.transferWithSummary,
       toolGuidance: readToolGuidance(agent.settings),
       crmConfig: readZproCrmConfig(agent.settings),
@@ -544,6 +598,7 @@ export async function runLoadedZproTurn(
     agentId: loaded.agentId,
     threadId,
     base,
+    fullDetail: loaded.fullDetail,
   };
 
   // Keeps "digitando..." alive for the WHOLE turn (guardrails + generation + tool calls can run
@@ -600,10 +655,82 @@ export async function runLoadedZproTurn(
       return "blocked";
     }
 
+    // The second provider behind this agent's own (issue #143) — same resolution
+    // src/graph/prepare.ts's buildFallbackModel uses, just sourced from LoadedZproAgent instead of
+    // AgentConfig. Absent for every agent that configured none (which stays every agent's default
+    // behavior: unbounded retries, no second attempt).
+    const fallback = ((): FallbackModel | undefined => {
+      if (!hasModelFallback(loaded.modelFallback)) return undefined;
+      const unavailable = (reason: string): undefined => {
+        logger.warn(
+          "zpro: agent %s a model fallback is configured but cannot run (%s), so the provider has nothing behind it",
+          String(loaded.agentId),
+          reason,
+        );
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider: loaded.modelFallback.provider ?? undefined,
+          model: loaded.modelFallback.model ?? undefined,
+          detail: { fallbackUnavailable: reason },
+        });
+        return undefined;
+      };
+      const resolved = resolveFallbackModel(
+        loaded.modelFallback,
+        {
+          provider: loaded.mc.provider,
+          model: loaded.mc.model,
+          baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
+        },
+        { ownCredentialBaseURL: loaded.modelFallbackCredentialBaseUrl },
+      );
+      if (!resolved.runnable)
+        return unavailable(resolved.reason ?? "not_runnable");
+      const own = resolved.credential === "own";
+      if (own && !loaded.modelFallbackApiKey)
+        return unavailable("credential_not_found");
+      const fmc: ResolvedModelConfig = {
+        provider: resolved.provider as ModelConfig["provider"],
+        model: resolved.model,
+        apiKey:
+          resolved.credential === "own"
+            ? loaded.modelFallbackApiKey
+            : resolved.credential === "agent"
+              ? loaded.apiKey
+              : "",
+        baseURL: resolved.baseURL ?? undefined,
+        temperature: loaded.mc.temperature,
+        ...(resolved.provider === loaded.mc.provider && loaded.mc.reasoningEffort
+          ? { reasoningEffort: loaded.mc.reasoningEffort }
+          : {}),
+        maxRetries: PRIMARY_MAX_RETRIES,
+        timeoutMs: PRIMARY_TIMEOUT_MS,
+      };
+      try {
+        return {
+          model: createChatModel(fmc),
+          provider: fmc.provider,
+          modelId: fmc.model,
+        };
+      } catch (err) {
+        logger.warn(
+          { err, agentId: String(loaded.agentId) },
+          "zpro: model fallback config is not runnable",
+        );
+        return undefined;
+      }
+    })();
     const model = createChatModel({
       ...loaded.mc,
       apiKey: loaded.apiKey,
       baseURL: loaded.credentialBaseUrl ?? loaded.mc.baseURL,
+      // Bounded ONLY when something was actually built behind it — an agent with no fallback keeps
+      // the unbounded default retry/wait, byte for byte (see src/graph/model-fallback.ts).
+      ...(fallback
+        ? { maxRetries: PRIMARY_MAX_RETRIES, timeoutMs: PRIMARY_TIMEOUT_MS }
+        : {}),
     });
     const checkpointer = await getCheckpointer();
     // Ferramentas concedidas ao agente vinculado a esta instância — RAG/HTTP/MCP/INTEGRATION +
@@ -712,6 +839,8 @@ export async function runLoadedZproTurn(
       systemPrompt,
       checkpointer,
       tools,
+      primary: { provider: loaded.mc.provider, model: loaded.mc.model },
+      fallback,
       // Mirrors src/graph/runtime.ts's onModelRetry wiring (upstream #68): a turn recovered from a
       // provider answering 200 with no completion must not read like a clean one, or the fault rate
       // is invisible. Z-PRO calls buildAgentGraph directly (not through prepare.ts's
@@ -724,6 +853,28 @@ export async function runLoadedZproTurn(
           provider: loaded.mc.provider,
           model: loaded.mc.model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      // A fallback that ANSWERS produces a successful turn, so this is the operator's one signal that
+      // a provider they are paying for is not taking their traffic — mirrors src/graph/runtime.ts.
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackFrom: loaded.mc.provider, fallbackReason: reason },
+        }),
+      // Attribution, not a second alarm (see src/graph/runtime.ts's own comment on this line): the
+      // `generate` stage's own error already carries the alert, this just says WHICH model died.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
         }),
       // Same reason as onModelRetry above: buildAgentGraph is called directly here, so the per-turn
       // tool-call cap and history-token ceiling (agent.settings.limits) need their own wiring rather

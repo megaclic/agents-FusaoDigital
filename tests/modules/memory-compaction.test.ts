@@ -35,12 +35,10 @@ import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { runScopedOn } from "@/lib/tenancy";
 import { type CompactPayload, runCompaction } from "@/modules/memory/compact";
 import { MEMORY_HEAD_MAX_ATTENDANCES } from "@/modules/memory/cut";
-import {
-  getJobHandler,
-  type JobResult,
-  registerJobHandler,
-} from "@/modules/scheduler/worker";
+import type { JobResult } from "@/modules/scheduler/worker";
+import { withJobHandler } from "@/tests/utils/job-registry";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { flowLogCount, flowLogRow } from "../utils/flowlog";
 import { UsageReportingModel } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -245,7 +243,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
   }
 
   function countFlowLines(threadId: string) {
-    return suDb.executionLog.count({
+    return flowLogCount(suDb, {
       where: { tenantId, stage: "memory", threadId },
     });
   }
@@ -373,22 +371,18 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     // checkpointer they write to. In production every reader of a thread shares one; letting the
     // drain write to the process checkpointer here would assert against a store nothing else in this
     // test reads, and the summariser would see an empty thread no matter what the fence decided.
-    const previous = getJobHandler("INGEST_MESSAGE");
-    registerJobHandler("INGEST_MESSAGE", (job, jobBase) =>
-      ingestHandler(job, jobBase, saver),
-    );
     const model = new SummarizerModel("A cliente pediu o cartão da consulta.");
-    let res: JobResult;
-    try {
-      res = await runCompaction(
-        tenantId,
-        payload(contactInboxId, 710, "resolved"),
-        appDb,
-        { checkpointer: saver, makeModel: () => model },
-      );
-    } finally {
-      if (previous) registerJobHandler("INGEST_MESSAGE", previous);
-    }
+    const res = await withJobHandler(
+      "INGEST_MESSAGE",
+      (job, jobBase) => ingestHandler(job, jobBase, saver),
+      () =>
+        runCompaction(
+          tenantId,
+          payload(contactInboxId, 710, "resolved"),
+          appDb,
+          { checkpointer: saver, makeModel: () => model },
+        ),
+    );
 
     expect(res).toEqual({ outcome: "done" });
     // The owed message became real before the fence decided, so there IS an attendance here and it is
@@ -1036,7 +1030,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     // The trail names the attendance that was actually folded, not the one this job was armed for.
     // Those differ exactly on a retry, which is when an operator most needs the line to be right.
     await waitForFlowLines(threadId, 1);
-    const trail = await suDb.executionLog.findFirst({
+    const trail = await flowLogRow(suDb, {
       where: { tenantId, stage: "memory", threadId },
     });
     expect(JSON.stringify(trail?.detail ?? {})).toContain(
@@ -1894,7 +1888,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     );
 
     await waitForFlowLines(threadId, 1);
-    const row = await suDb.executionLog.findFirst({
+    const row = await flowLogRow(suDb, {
       where: { tenantId, stage: "memory", threadId },
     });
     expect(row).not.toBeNull();

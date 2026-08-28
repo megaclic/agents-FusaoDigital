@@ -10,6 +10,7 @@ import { AppError, NotFoundError } from "@/lib/errors";
 import { sanitizeErrorMessage } from "@/lib/redact";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { firstUnstorableField } from "@/lib/text";
+import { emitDeadLetter } from "@/modules/flowlog/dead-letter";
 import { cancelPendingJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
@@ -137,10 +138,17 @@ export function refuseUnstorable(
     // and `message` is only the untranslated fallback, so interpolating an English sentence into a
     // pt-BR template would answer in two languages at once. What stays English either way is the
     // field name, which names the request field to change the way a schema path does.
-    throw new AppError(bad.message, 400, "errors.unstorableText", {
-      field: bad.what,
-      codePoints: bad.codePoints.join(" "),
-    });
+    throw new AppError(
+      bad.message,
+      400,
+      "errors.unstorableText",
+      { field: bad.what, codePoints: bad.codePoints.join(" ") },
+      // On the WIRE as well, and not only interpolated into the sentence. The params are what the
+      // locale template reads; `field` is what a console keys on to put the sentence under the box
+      // holding the character (#231). Without it every one of these answered `{ error }` alone and
+      // the four titles/texts this helper guards could not be placed anywhere.
+      bad.what,
+    );
   }
 }
 
@@ -205,6 +213,10 @@ export async function createDocument(
     kind: "RAG_INGEST",
     dedupeKey: `doc:${doc.id}`,
     runAt: new Date(),
+    // NOTE: A document that was just created: no row can exist under this key yet, so the answer is
+    // only ever about the insert. It is still stated, because a field nobody has to answer is a
+    // default.
+    rearm: "new-work",
     payload: { documentId: String(doc.id) },
     base,
   });
@@ -355,6 +367,10 @@ export async function updateDocument(
       kind: "RAG_INGEST",
       dedupeKey: `doc:${id}`,
       runAt: new Date(),
+      // NOTE: The document's CONTENT changed, so this is a different index of a different text. The
+      // key is the document and lives as long as it does, so without the reset an ingest that
+      // failed once would follow the document through every edit it ever gets.
+      rearm: "new-work",
       payload: { documentId: String(id) },
       base,
     });
@@ -400,6 +416,10 @@ export async function retryDocument(
     kind: "RAG_INGEST",
     dedupeKey: `doc:${id}`,
     runAt: new Date(),
+    // NOTE: An operator asked for this, on a document sitting in FAILED or UNINDEXED. FAILED is
+    // reached by exhausting the budget, so without the reset the retry button is worth exactly one
+    // attempt, and every press after the first fails straight back to DEAD.
+    rearm: "new-work",
     payload: { documentId: String(id) },
     base,
   });
@@ -518,6 +538,10 @@ export async function reindexKnowledgeBase(
       kind: "RAG_INGEST",
       dedupeKey: `doc:${d.id}`,
       runAt: new Date(),
+      // NOTE: Same as the single-document retry, in bulk: an operator asked for the whole base to
+      // be indexed again, and a document that failed on a previous embedding provider is exactly
+      // the one this is for.
+      rearm: "new-work",
       payload: { documentId: String(d.id) },
       base,
     });
@@ -690,6 +714,29 @@ async function runIngestJobForTenant(
         documentId: String(documentId),
         status: "FAILED",
         error: message,
+      });
+      // NOTE: TERMINAL, which is not obvious from here — the row is now FAILED, the re-armed job re-reads
+      // it, finds it is no longer PENDING and returns `done`, so this document is never indexed
+      // again without somebody asking. The broadcast above reaches a console that is OPEN right now
+      // and nothing else; the trail is what is left for the operator who was not watching, and the
+      // only thing an alert channel can subscribe to (issue #356).
+      //
+      // `warn`, and it is the one site of the four that is: the document list shows FAILED with the
+      // stored reason and offers a re-index, so the operator has their own way back to it. The
+      // others lost work with no surface at all.
+      emitDeadLetter({
+        tenantId,
+        unit: "knowledge_document",
+        level: "warn",
+        // NOTE: either the i18n key of a known AppError or the sanitized provider text, whichever
+        // the row itself stores — the two say different things to a reader and the line must not
+        // diverge from the column beside it.
+        error: message,
+        detail: {
+          documentId: String(documentId),
+          knowledgeBaseId: String(doc.knowledgeBaseId),
+        },
+        base,
       });
     }
     return { outcome: "fail", error: message };

@@ -96,6 +96,17 @@ describe("inbound auth header resolution", () => {
       authHeader: "asaas-access-token",
       signatureHeader: DEFAULT_SIGNATURE_HEADER,
     },
+    // Review round 1 of #370. An empty override IS a configured name, and dropping it here sent the
+    // gate the DEFAULT — which is the one thing the refusal exists to prevent: comparing the secret
+    // against `x-webhook-token` on an instance whose operator asked for something else. The write
+    // refuses `""` like any other unusable name; this is the row already written.
+    {
+      name: "an empty override reaches the gate rather than falling back",
+      catalogType: "ASAAS",
+      config: { authHeader: "" },
+      authHeader: "",
+      signatureHeader: DEFAULT_SIGNATURE_HEADER,
+    },
     {
       name: "the signature header is overridable per instance too",
       catalogType: "ASAAS",
@@ -130,6 +141,23 @@ describe("inbound auth", () => {
     (h: Record<string, string>) =>
     (n: string): string | null =>
       h[n] ?? null;
+  // The record lookup above answers every name, including ones no HTTP stack accepts. The receptor's
+  // real reader is `request.headers.get`, which THROWS on a name outside the RFC 7230 token — issue
+  // #362 — so the cases about an unusable name have to go through the real thing or they prove
+  // nothing about the caller.
+  //
+  // And the global `Headers` here is NOT the real thing: happy-dom replaces it, and its version
+  // accepts every name and answers null, so the first version of these two cases failed on the
+  // expected value rather than on the throw they exist to pin. `globalThis.BunRequest` is the native
+  // constructor tests/dom-setup.ts stashes before the replacement, which is what the route holds.
+  const nativeRequest = (globalThis as { BunRequest?: typeof Request })
+    .BunRequest;
+  const realHdr =
+    (h: Record<string, string>) =>
+    (n: string): string | null => {
+      const R = nativeRequest ?? Request;
+      return new R("https://example.com/", { headers: h }).headers.get(n);
+    };
   const none = (): string | null => null;
 
   const cases: Array<{
@@ -137,6 +165,7 @@ describe("inbound auth", () => {
     strategy: InboundAuthStrategy;
     secret: InboundSecretResolution;
     getHeader: (name: string) => string | null;
+    config?: { authHeader?: string; signatureHeader?: string };
     expected: InboundAuthOutcome;
   }> = [
     // NONE never consults the secret, in any state.
@@ -257,6 +286,40 @@ describe("inbound auth", () => {
       getHeader: hdr({ [DEFAULT_SIGNATURE_HEADER]: sig }),
       expected: { ok: true },
     },
+    // Issue #362. `config.authHeader` is operator text that becomes a header NAME, and a value with a
+    // space around it made `Headers.get` throw inside the gate — answering the delivery 500 where
+    // every other refusal gives 401, which is itself the oracle the uniform 401 exists to deny. The
+    // refusal has to be a refusal, on both strategies, and it must NOT fall back to the default name:
+    // comparing against a header the operator never chose is a worse failure than refusing.
+    {
+      name: "STATIC_HEADER refuses a configured name no HTTP stack accepts",
+      strategy: "STATIC_HEADER",
+      secret: filled(token),
+      config: { authHeader: "asaas-access-token " },
+      getHeader: realHdr({
+        "asaas-access-token": token,
+        [DEFAULT_STATIC_HEADER]: token,
+      }),
+      expected: { ok: false, reason: "header_name_unusable" },
+    },
+    {
+      name: "HMAC_SHA256 refuses a configured signature name no HTTP stack accepts",
+      strategy: "HMAC_SHA256",
+      secret: filled(token),
+      config: { signatureHeader: "x-sig " },
+      getHeader: realHdr({ "x-sig": sig, [DEFAULT_SIGNATURE_HEADER]: sig }),
+      expected: { ok: false, reason: "header_name_unusable" },
+    },
+    // The control, and it is the one that says the refusal is about the NAME and not about custom
+    // names at all: a legal one the provider dictates still reads, through the same real reader.
+    {
+      name: "STATIC_HEADER reads a legal custom name through a real Headers",
+      strategy: "STATIC_HEADER",
+      secret: filled(token),
+      config: { authHeader: "asaas-access-token" },
+      getHeader: realHdr({ "asaas-access-token": token }),
+      expected: { ok: true },
+    },
     {
       name: "HMAC_SHA256 accepts the sha256= prefix",
       strategy: "HMAC_SHA256",
@@ -274,6 +337,7 @@ describe("inbound auth", () => {
           secret: c.secret,
           rawBody: body,
           getHeader: c.getHeader,
+          config: c.config,
         }),
       ).toEqual(c.expected);
     });
@@ -466,6 +530,12 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       kind: "agent_nudge",
       source: "ASAAS",
       value: 100,
+      // WHICH OCCASION, named by the delivery row. Nothing else in an inbound descriptor separates
+      // two events on one conversation — no `step`, no `refs` — so without this the second one
+      // refused by the spend ceiling inside the first's two-hour window loses its flow line and its
+      // alert. Asserted at the WIRING and not only on `nudgeOccasionKey`, because the key function
+      // cannot fail on a field the dispatcher never set.
+      occasionId: `delivery:${r.deliveryId}`,
     });
 
     // The conversion is still recorded (durable barrier) and the delivery ends PROCESSED.
@@ -1066,6 +1136,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
     strategy: InboundAuthStrategy;
     secretRef?: string | null;
     enabled?: boolean;
+    config?: Record<string, string>;
   }): Promise<{ token: string; id: bigint }> {
     const minted = generateRouteToken();
     const row = await suDb.integrationInstance.create({
@@ -1074,7 +1145,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
         catalogType: "ASAAS",
         name: `diag-${minted.hash.slice(0, 10)}`,
         enabled: spec.enabled ?? true,
-        config: {},
+        config: spec.config ?? {},
         inboundAuthStrategy: spec.strategy,
         inboundSecretRef: spec.secretRef ?? null,
         routeTokenHash: minted.hash,
@@ -1241,6 +1312,119 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       reason: "route_disabled",
       instanceId: String(id),
     });
+  });
+
+  // Issue #362, end to end and through the reader the route actually holds. Written against a row
+  // created directly, because that is the case the write-side refusal cannot reach: rows already
+  // carry whatever they carry.
+  test("names the cause when the configured header name is not one, and still answers 401", async () => {
+    const entry = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name: "unusable-header-name",
+        secret: encryptJson("the-secret"),
+      },
+      select: { id: true },
+    });
+    const { token } = await rawInstance({
+      strategy: "STATIC_HEADER",
+      secretRef: `vault:${entry.id}`,
+      config: { authHeader: "asaas-access-token " },
+    });
+    const cap = captureWarnings();
+
+    // The native reader, not `headersFrom`: happy-dom's Headers accepts every name, so the record
+    // lookup would answer null and this would pass on `header_missing` — the wrong reason, and the
+    // 500 it exists to pin would never happen.
+    const R =
+      (globalThis as { BunRequest?: typeof Request }).BunRequest ?? Request;
+    const nativeHeaders = new R("https://example.com/", {
+      headers: {
+        "asaas-access-token": "the-secret",
+        [DEFAULT_STATIC_HEADER]: "the-secret",
+      },
+    }).headers;
+
+    await expect(
+      receiveInbound({
+        routeToken: token,
+        rawBody: diagBody,
+        getHeader: (n) => nativeHeaders.get(n),
+        base: appDb,
+        deps: cap.deps,
+      }),
+      // 401, not the 500 the TypeError produced. The status is the whole defect: a caller holding a
+      // route token and no valid secret got 500 where every other refusal gives 401, so the status
+      // itself said "this token resolves to a live instance that is misconfigured".
+    ).rejects.toMatchObject({ statusCode: 401 });
+
+    expect(cap.seen[0]).toMatchObject({ reason: "header_name_unusable" });
+  });
+
+  // And the half that a fallback would quietly break: the correct secret IS present under the
+  // default name in the request above. Authenticating on it would be a 200 on a header the operator
+  // never chose.
+  test("an unusable configured name does not fall back to the default header", async () => {
+    const entry = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name: "no-fallback",
+        secret: encryptJson("the-secret"),
+      },
+      select: { id: true },
+    });
+    const { token } = await rawInstance({
+      strategy: "STATIC_HEADER",
+      secretRef: `vault:${entry.id}`,
+      config: { authHeader: "x tok" },
+    });
+    const R =
+      (globalThis as { BunRequest?: typeof Request }).BunRequest ?? Request;
+    const nativeHeaders = new R("https://example.com/", {
+      headers: { [DEFAULT_STATIC_HEADER]: "the-secret" },
+    }).headers;
+
+    await expect(
+      receiveInbound({
+        routeToken: token,
+        rawBody: diagBody,
+        getHeader: (n) => nativeHeaders.get(n),
+        base: appDb,
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  // Review round 1 of #370, and the same rule as the two above through a different door: an empty
+  // string is a configured name, and it used to be dropped one layer earlier — so the gate never saw
+  // it and authenticated against `x-webhook-token`, which the row's operator never chose.
+  test("an empty configured name refuses too, and does not authenticate on the default", async () => {
+    const entry = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name: "empty-header-name",
+        secret: encryptJson("the-secret"),
+      },
+      select: { id: true },
+    });
+    const { token } = await rawInstance({
+      strategy: "STATIC_HEADER",
+      secretRef: `vault:${entry.id}`,
+      config: { authHeader: "" },
+    });
+    const cap = captureWarnings();
+
+    await expect(
+      receiveInbound({
+        routeToken: token,
+        rawBody: diagBody,
+        // The correct secret, under the default name. A fallback would answer 200 here.
+        getHeader: headersFrom({ [DEFAULT_STATIC_HEADER]: "the-secret" }),
+        base: appDb,
+        deps: cap.deps,
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+
+    expect(cap.seen[0]).toMatchObject({ reason: "header_name_unusable" });
   });
 
   test("the response is identical whichever cause produced it", async () => {

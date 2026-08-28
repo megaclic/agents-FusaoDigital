@@ -28,11 +28,14 @@ import {
   renderNudge,
   runAgentNudge,
 } from "@/graph/nudge";
+import { claimIngestWrite, releaseIngestWrite } from "@/graph/thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
+import { MAX_DB_ID } from "@/lib/db-id";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { selectClosedPrefix } from "@/modules/memory/cut";
-import { getJobHandler, registerJobHandler } from "@/modules/scheduler/worker";
+import { withJobHandler } from "@/tests/utils/job-registry";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { flowLogRows } from "../utils/flowlog";
 import {
   EmptyThenReplyModel,
   guardrailModel,
@@ -115,6 +118,31 @@ describe("parseThreadId", () => {
     expect(parseThreadId("nope")).toBeNull();
     expect(parseThreadId("1:2")).toBeNull();
     expect(parseThreadId("a:b:c")).toBeNull();
+  });
+
+  // The half a `try` around `BigInt` could not see: each of these CONVERTS. Every caller of this
+  // function checks the first segment against the job's own tenant and then puts the SECOND into a
+  // query, so a thread id whose tenant is real and whose instance is past 2^63-1 passed the fence
+  // and reached Postgres as a bind error. A thread id is built from `String(bigint)`, so there is
+  // no lenient spelling to keep working here. Issue #407.
+  test("rejects a segment BigInt would convert but a bigint column would not", () => {
+    const past = (MAX_DB_ID + 1n).toString();
+    expect(parseThreadId(`12:${past}:900`)).toBeNull();
+    expect(parseThreadId(`${past}:3:900`)).toBeNull();
+    for (const raw of ["0x11", " 3 ", "+3", "1e3", "-3", ""]) {
+      expect(parseThreadId(`12:${raw}:900`)).toBeNull();
+      expect(parseThreadId(`${raw}:3:900`)).toBeNull();
+    }
+  });
+
+  // The control: the largest id a column holds is still an id, so the bound is a bound and not an
+  // off-by-one that drops the last real row.
+  test("the largest id the column holds still parses", () => {
+    expect(parseThreadId(`${MAX_DB_ID}:${MAX_DB_ID}:900`)).toEqual({
+      tenantId: MAX_DB_ID,
+      instanceId: MAX_DB_ID,
+      conversationId: 900,
+    });
   });
 });
 
@@ -506,10 +534,6 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     // One checkpointer for both, as production has: the drain runs its job through the scheduler's
     // registry, so this is where a test says which store it writes to.
     const saver = new MemorySaver();
-    const previous = getJobHandler("INGEST_MESSAGE");
-    registerJobHandler("INGEST_MESSAGE", (job, jobBase) =>
-      ingestHandler(job, jobBase, saver),
-    );
     const seen: string[] = [];
     class ContextObservingModel extends BaseChatModel {
       constructor() {
@@ -528,23 +552,23 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       }
     }
     const s = stub();
-    let outcome: string;
-    try {
-      outcome = await runAgentNudge({
-        tenantId,
-        threadId: `${tenantId}:${instanceId}:917`,
-        nudge: { source: "followup", kind: "inactivity", step: 1 },
-        base: appDb,
-        deps: {
-          makeModel: () => new ContextObservingModel(),
-          makeClient: s.makeClient,
-          checkpointer: saver,
-          persistUsage: async () => {},
-        },
-      });
-    } finally {
-      if (previous) registerJobHandler("INGEST_MESSAGE", previous);
-    }
+    const outcome = await withJobHandler(
+      "INGEST_MESSAGE",
+      (job, jobBase) => ingestHandler(job, jobBase, saver),
+      () =>
+        runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:917`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          base: appDb,
+          deps: {
+            makeModel: () => new ContextObservingModel(),
+            makeClient: s.makeClient,
+            checkpointer: saver,
+            persistUsage: async () => {},
+          },
+        }),
+    );
 
     expect(outcome).toBe("messaged");
     // The customer's owed words were in the context the nudge was written from.
@@ -851,6 +875,74 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       },
     });
     expect(row?.lastConversationId).toBe(942);
+  });
+
+  // Issue #203, the seam the DURABLE claim opened. `stillWanted({strict:true})` is asked before the
+  // claim, and back when the claim was a synchronous Map write that was the whole window. The row
+  // claim WAITS: on an append's lease, and on the row lock /reset itself takes. So a reset can
+  // retire this run and clear the thread while the call sits in that wait, and the lock case is
+  // worse than a coincidence, since a reset holding the row releases it straight into this waiter.
+  //
+  // The wait is personified by an append that holds the write claim; the retirement lands on the ask
+  // that immediately precedes the claim, which is exactly the answer that goes stale. What proves
+  // the fix is the thread's STATE, not the outcome: both versions end on "stale" (the fence after
+  // the invoke catches it), and only the broken one has written the marker back by then.
+  test("a run retired while the durable claim waits writes nothing", async () => {
+    const contactInboxId = 8815;
+    await seedConv(948, null, new Date(), contactInboxId);
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+    const key = {
+      tenantId_chatwootInstanceId_contactInboxId: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+      },
+    };
+    const append = await claimIngestWrite(owner, appDb);
+    expect(append.state).not.toBe("busy");
+    let wanted = true;
+    let strictAsks = 0;
+    let releasing: Promise<void> | null = null;
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:948`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      // The ask right before the claim still answers yes, and /reset lands on that same instant.
+      // The append finishes shortly after, so the claim is granted into a thread that was cleared.
+      stillWanted: async ({ strict }) => {
+        if (!strict) return wanted;
+        strictAsks += 1;
+        if (strictAsks > 1) return wanted;
+        wanted = false;
+        releasing = Bun.sleep(150).then(() =>
+          releaseIngestWrite(owner, appDb, append),
+        );
+        return true;
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    await releasing;
+    // The consequence first: a marker advanced here is a cleared thread recreated, and it is what
+    // arms compaction on the attendance the operator just wiped.
+    const row = await suDb.agentThread.findUnique({ where: key });
+    expect(row?.lastConversationId ?? null).toBeNull();
+    expect(outcome).toBe("stale");
+    expect(s.messages).toEqual([]);
+    // And the claim really was waited out, so the ask above is the one AFTER the wait rather than a
+    // second copy of the one before it.
+    expect(strictAsks).toBeGreaterThan(1);
   });
 
   // ORDER, and observed at the only moment that proves it. The divider used to ride in the nudge's
@@ -1535,7 +1627,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       // Scoped to this nudge's own thread: 76 tests share the tenant, and `outcome`/`step` are
       // values several of them write. Filtered by tenant alone this poll can exit on a neighbour's
       // row and report a trail this turn never left (#258).
-      const rows = await suDb.executionLog.findMany({
+      const rows = await flowLogRows(suDb, {
         where: {
           tenantId,
           stage: "generate",
@@ -1752,7 +1844,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(s.resolved).toEqual([9908]);
     // And the trail carries no `messaged` line for this step. Checked after the run returned, so
     // there is no write left in flight: markFollowUp is called synchronously or not at all.
-    const rows = await suDb.executionLog.findMany({
+    const rows = await flowLogRows(suDb, {
       where: {
         tenantId,
         stage: "generate",
@@ -3611,7 +3703,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     // emitFlowEvent is fire-and-forget, so poll for the row instead of racing it.
     let logged = false;
     for (let i = 0; i < 30 && !logged; i++) {
-      const rows = await suDb.executionLog.findMany({
+      const rows = await flowLogRows(suDb, {
         where: {
           tenantId,
           stage: "generate",

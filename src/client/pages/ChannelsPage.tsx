@@ -21,6 +21,8 @@ import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
+  type ConfirmPayload,
   DataBoundary,
   EmptyState,
   FormField,
@@ -37,7 +39,9 @@ import {
 } from "@/client/components";
 import { ServiceLogo } from "@/client/components/icons/ServiceLogo";
 import { useAuth } from "@/client/contexts/AuthContext";
+import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { chatwootInboxNewUrl } from "@/client/lib/chatwootLinks";
 import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
@@ -206,6 +210,12 @@ function ChannelsSkeleton() {
   );
 }
 
+// Three writes on this page, three forms. The names are the keys of each body, which is what the
+// route refuses by (`refused body.baseUrl`, `refused body.accountIds.0`).
+const CONNECT_FIELDS = ["baseUrl", "adminToken"] as const;
+const TOKEN_FIELDS = ["adminToken"] as const;
+const ACCOUNTS_FIELDS = ["accountIds"] as const;
+
 export function ChannelsPage() {
   const { t } = useTranslation();
   const { showToast } = useToast();
@@ -226,10 +236,22 @@ export function ChannelsPage() {
   // Strong confirmation (backup warning + re-typed name + password) for the two irreversible,
   // SUPER_ADMIN-only actions: tearing down the whole instance, and removing one account (to move it).
   const strongConfirm = useModalController<StrongConfirmPayload>();
+  const confirm = useModalController<ConfirmPayload>();
 
   // Connect form (base URL + admin token, entered once).
   const [baseUrl, setBaseUrl] = useState("");
   const [adminToken, setAdminToken] = useState("");
+  // Three writes, three forms, three holders: the connect modal, the token modal, and the account
+  // picker each save on their own, and a refusal about one must not mark another's input.
+  const connectRefusal = useFieldRefusal(
+    connectModal.isOpen ? CONNECT_FIELDS : [],
+  );
+  const tokenRefusal = useFieldRefusal(tokenModal.isOpen ? TOKEN_FIELDS : []);
+  const accountsRefusal = useFieldRefusal(
+    manageModal.isOpen ? ACCOUNTS_FIELDS : [],
+  );
+  const connectRef = useRef({ baseUrl, adminToken });
+  connectRef.current = { baseUrl, adminToken };
   const [connecting, setConnecting] = useState(false);
 
   // Every account the deployment's token can reach (from /profile), listed inline under the instance
@@ -242,6 +264,8 @@ export function ChannelsPage() {
 
   // Rotate-token modal.
   const [newToken, setNewToken] = useState("");
+  const newTokenRef = useRef(newToken);
+  newTokenRef.current = newToken;
   const [savingToken, setSavingToken] = useState(false);
 
   // Per-inbox bot existence on Chatwoot (live reconcile). "missing" = bound here but the persona's
@@ -250,6 +274,7 @@ export function ChannelsPage() {
     Record<string, "active" | "missing">
   >({});
   const [reconnecting, setReconnecting] = useState<string | null>(null);
+  const [removingInbox, setRemovingInbox] = useState<string | null>(null);
 
   const loadBotStatus = useCallback(async () => {
     try {
@@ -387,6 +412,8 @@ export function ChannelsPage() {
           : `https://${connectParam}`,
       );
       setAdminToken("");
+      // The component outlives the dialog, so a mark from the last session is still held here.
+      connectRefusal.clear();
       connectModal.open();
     }
     setSearchParams(
@@ -413,6 +440,10 @@ export function ChannelsPage() {
   function openConnect() {
     setBaseUrl("");
     setAdminToken("");
+    // Every opening, not just the one driven by `?connect=`. The mark expires by VALUE, so a holder
+    // carried across a cancel comes back the moment the operator retypes the URL that was refused —
+    // an old server sentence under a box, before anything has been sent.
+    connectRefusal.clear();
     connectModal.open();
   }
 
@@ -423,25 +454,37 @@ export function ChannelsPage() {
     if (!baseUrl.trim() || !adminToken.trim()) return;
     setConnecting(true);
     try {
-      const { data, error: err } = await api.api.v1.chatwoot.deployment.post({
+      const sent = {
         baseUrl: baseUrl.trim(),
         adminToken: adminToken.trim(),
-      });
+      };
+      const { data, error: err } =
+        await api.api.v1.chatwoot.deployment.post(sent);
       if (err || !data) {
         const status =
           typeof err === "object" && err && "status" in err
             ? (err as { status?: number }).status
             : undefined;
+        // Asked first, and only for WHERE: the toast below words the 409 better than the server
+        // does (it names the affordance — disconnect first — which the server cannot know about),
+        // so the fallback here is never shown. A null answer means the sentence is already on the
+        // input and the toast must stay silent.
+        const placed = connectRefusal.capture(err, "", sent, {
+          baseUrl: connectRef.current.baseUrl.trim(),
+          adminToken: connectRef.current.adminToken.trim(),
+        });
+        if (placed === null) return;
         showToast(
-          status === 409
-            ? t(
-                "channels.connectDifferent",
-                "This tenant is already connected to a different Chatwoot. Disconnect it first to switch servers.",
-              )
-            : t(
-                "channels.connectError",
-                "Could not connect. Check the URL and token.",
-              ),
+          apiErrorMessage(err) ||
+            (status === 409
+              ? t(
+                  "channels.connectDifferent",
+                  "This tenant is already connected to a different Chatwoot. Disconnect it first to switch servers.",
+                )
+              : t(
+                  "channels.connectError",
+                  "Could not connect. Check the URL and token.",
+                )),
           "error",
         );
         return;
@@ -478,12 +521,13 @@ export function ChannelsPage() {
         t("channels.accountsResynced", "Account list updated."),
         "success",
       );
-    } catch {
+    } catch (e) {
       showToast(
-        t(
-          "channels.accountsError",
-          "Could not list accounts. Check the URL and token.",
-        ),
+        apiErrorMessage(e) ||
+          t(
+            "channels.accountsError",
+            "Could not list accounts. Check the URL and token.",
+          ),
         "error",
       );
     } finally {
@@ -496,6 +540,8 @@ export function ChannelsPage() {
   // removing happens from the list (a hard, slot-freeing delete that returns the account to this picker).
   function openManage() {
     setSelected(new Set());
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    accountsRefusal.clear();
     manageModal.open();
     void loadReachable();
   }
@@ -512,11 +558,22 @@ export function ChannelsPage() {
   // Enable the newly-picked accounts. Sends the UNION of the already-active ids and the selection, so the
   // diff applier only ever CONNECTS here (it never drops an active account — removal is the explicit
   // hard-delete on the list). Connecting syncs each account's inboxes.
+  // The list the picker would send: the accounts already active, plus whatever is checked. Computed
+  // where it is also READ, so the mark keyed by this value matches what the save carried.
+  const wantedAccountIds = [
+    ...new Set([
+      ...accounts.filter((a) => !a.disconnectedAt).map((a) => a.accountId),
+      ...selected,
+    ]),
+  ];
+  // Readable from inside a PUT that started before it. The rows stay live while the save is out, so
+  // the list the request carried and the list the checkboxes hold are two different answers — which
+  // is the whole of what the staleness check compares.
+  const wantedRef = useRef(wantedAccountIds);
+  wantedRef.current = wantedAccountIds;
+
   async function applySelection() {
-    const activeIds = accounts
-      .filter((a) => !a.disconnectedAt)
-      .map((a) => a.accountId);
-    const wanted = [...new Set([...activeIds, ...selected])];
+    const wanted = wantedAccountIds;
     setApplying(true);
     try {
       const { data, error: err } =
@@ -524,16 +581,20 @@ export function ChannelsPage() {
           accountIds: wanted,
         });
       if (err || !data) throw err ?? new Error("no data");
+      accountsRefusal.clear();
       setAccounts([...data.accounts]);
       await refreshInboxes();
       manageModal.close();
       setSelected(new Set());
       showToast(t("channels.accountsEnabled", "Accounts updated."), "success");
-    } catch {
-      showToast(
+    } catch (e) {
+      const toast = accountsRefusal.capture(
+        e,
         t("channels.accountsSaveError", "Could not update the accounts."),
-        "error",
+        { accountIds: wanted },
+        { accountIds: wantedRef.current },
       );
+      if (toast) showToast(toast, "error");
     } finally {
       setApplying(false);
     }
@@ -541,6 +602,8 @@ export function ChannelsPage() {
 
   function openToken() {
     setNewToken("");
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    tokenRefusal.clear();
     tokenModal.open();
   }
 
@@ -548,18 +611,21 @@ export function ChannelsPage() {
     if (!newToken.trim()) return;
     setSavingToken(true);
     try {
-      const { error: err } = await api.api.v1.chatwoot.deployment.patch({
-        adminToken: newToken.trim(),
-      });
+      const sent = { adminToken: newToken.trim() };
+      const { error: err } = await api.api.v1.chatwoot.deployment.patch(sent);
       if (err) throw err;
+      tokenRefusal.clear();
       showToast(t("channels.tokenSaved", "Token updated."), "success");
       tokenModal.close();
       void load();
-    } catch {
-      showToast(
+    } catch (e) {
+      const toast = tokenRefusal.capture(
+        e,
         t("channels.tokenSaveError", "Could not update the token (check it)."),
-        "error",
+        { adminToken: newToken.trim() },
+        { adminToken: newTokenRef.current.trim() },
       );
+      if (toast) showToast(toast, "error");
     } finally {
       setSavingToken(false);
     }
@@ -591,10 +657,11 @@ export function ChannelsPage() {
         });
         if (err) {
           showToast(
-            t(
-              "channels.teardownError",
-              "Could not disconnect. Check your password and try again.",
-            ),
+            apiErrorMessage(err) ||
+              t(
+                "channels.teardownError",
+                "Could not disconnect. Check your password and try again.",
+              ),
             "error",
           );
           throw err; // keep the dialog open
@@ -639,10 +706,11 @@ export function ChannelsPage() {
           .remove.post({ confirmName: phrase, password });
         if (err) {
           showToast(
-            t(
-              "channels.removeAccountError",
-              "Could not remove the account. Check your password and try again.",
-            ),
+            apiErrorMessage(err) ||
+              t(
+                "channels.removeAccountError",
+                "Could not remove the account. Check your password and try again.",
+              ),
             "error",
           );
           throw err; // keep the dialog open
@@ -673,8 +741,12 @@ export function ChannelsPage() {
         "success",
       );
       await refreshInboxes();
-    } catch {
-      showToast(t("channels.syncError", "Could not sync inboxes."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("channels.syncError", "Could not sync inboxes."),
+        "error",
+      );
     } finally {
       syncInFlight.current.delete(account.id);
       setBusy(false);
@@ -690,7 +762,8 @@ export function ChannelsPage() {
       .patch({ agentId });
     if (err) {
       showToast(
-        t("channels.bindError", "Could not update the inbox."),
+        apiErrorMessage(err) ||
+          t("channels.bindError", "Could not update the inbox."),
         "error",
       );
       throw err;
@@ -716,14 +789,57 @@ export function ChannelsPage() {
       if (err) throw err;
       setBotStatus((prev) => ({ ...prev, [inboxId]: "active" }));
       showToast(t("channels.reconnected", "Bot reconnected."), "success");
-    } catch {
+    } catch (e) {
       showToast(
-        t("channels.reconnectError", "Could not reconnect the bot."),
+        apiErrorMessage(e) ||
+          t("channels.reconnectError", "Could not reconnect the bot."),
         "error",
       );
     } finally {
       setReconnecting(null);
     }
+  }
+
+  // Remove one inbox's local mirror. Only ever succeeds for an inbox that no longer exists in
+  // Chatwoot; a live one comes back 409 and the toast says so, which is the only place an operator
+  // learns why the row is still there. Kept out of the agent editor's Channels tab on purpose.
+  function removeInboxMirror(inbox: { id: string; name: string }) {
+    confirm.open({
+      title: t("channels.removeInboxTitle", "Remove inbox mirror"),
+      message: t(
+        "channels.removeInboxWarning",
+        "This removes the local copy of an inbox that was deleted in Chatwoot. Past conversations are kept and stop naming an inbox; past usage and log lines are kept. It cannot be undone, and only works once the inbox is gone from Chatwoot.",
+      ),
+      danger: true,
+      confirmLabel: t("channels.removeInboxAction", "Remove mirror"),
+      onConfirm: async () => {
+        setRemovingInbox(inbox.id);
+        try {
+          const { error: err } = await api.api.v1.chatwoot
+            .inboxes({ id: inbox.id })
+            .delete();
+          if (err) throw err;
+          setInboxes((prev) => prev.filter((i) => i.id !== inbox.id));
+          showToast(
+            t("channels.removedInbox", "Inbox mirror removed."),
+            "success",
+          );
+        } catch (e) {
+          // The server's own sentence, because it is the one that TEACHES: a live inbox comes back
+          // 409 "This inbox still exists in Chatwoot. Delete it there first.", already localized. The
+          // fallback covers a transport failure with no server behind it, which is the case a bare
+          // `if (err)` never reaches — the await rejects before `err` is ever assigned (docs/ui.md).
+          showToast(
+            apiErrorMessage(e) ??
+              t("channels.removeInboxError", "Could not remove the inbox."),
+            "error",
+          );
+          throw e;
+        } finally {
+          setRemovingInbox(null);
+        }
+      },
+    });
   }
 
   const baseUrlInvalid = !isValidHttpUrl(baseUrl);
@@ -1090,6 +1206,8 @@ export function ChannelsPage() {
                           }
                           reconnecting={reconnecting === ib.id}
                           onReconnect={() => reconnectBot(ib.id)}
+                          removing={removingInbox === ib.id}
+                          onRemove={() => removeInboxMirror(ib)}
                         >
                           {disconnected ? (
                             <span className="shrink-0 text-text-muted text-xs">
@@ -1161,7 +1279,7 @@ export function ChannelsPage() {
             error={
               baseUrlInvalid && baseUrl.trim()
                 ? t("common.invalidUrl", "Must be a valid http(s) URL.")
-                : null
+                : connectRefusal.at("baseUrl", baseUrl.trim())
             }
           >
             <Input
@@ -1177,6 +1295,7 @@ export function ChannelsPage() {
               "channels.adminTokenHint",
               "Stored encrypted, never shown again.",
             )}
+            error={connectRefusal.at("adminToken", adminToken.trim())}
           >
             <Input
               type="password"
@@ -1225,6 +1344,7 @@ export function ChannelsPage() {
               "channels.adminTokenHint",
               "Stored encrypted, never shown again.",
             )}
+            error={tokenRefusal.at("adminToken", newToken.trim())}
           >
             <Input
               type="password"
@@ -1278,6 +1398,11 @@ export function ChannelsPage() {
               {t("channels.resync", "Resync")}
             </Button>
           </div>
+          {accountsRefusal.at("accountIds", wantedAccountIds) && (
+            <p className="text-error text-xs">
+              {accountsRefusal.at("accountIds", wantedAccountIds)}
+            </p>
+          )}
           {manageRows.length === 0 ? (
             <p className="py-6 text-center text-sm text-text-muted">
               {t(
@@ -1353,6 +1478,7 @@ export function ChannelsPage() {
       </Modal>
 
       <StrongConfirmModal modal={strongConfirm} />
+      <ConfirmDialog modal={confirm} />
     </PageContainer>
   );
 }

@@ -1,4 +1,12 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  test,
+} from "bun:test";
 import config from "@/config";
 import {
   mockCreate,
@@ -13,12 +21,38 @@ import {
 
 setupPrismaMock();
 
-const mockJwtVerify = mock(() => Promise.resolve({ payload: {} as unknown }));
+// `mock.module` is process-global and PERMANENT: it rewrites the module for every file that runs
+// after this one, not just for this file's tests, and nothing in the runner puts it back. So this
+// stub answers every JWT verification in the process from here on, including session cookies in
+// files this one knows nothing about.
+//
+// What follows is load-bearing: `jwtVerify` DELEGATES to the real implementation unless a test
+// overrides it for its own call, which is why `beforeEach` below clears rather than resets. Only
+// the exports NAMED here are replaced — measured, `SignJWT` and the rest survive on their own — so
+// delegation is the whole of what keeps the leak harmless. A bare `mockReset()` leaves this
+// function returning `undefined`, and
+// `undefined` is not a failed verification — it is a TypeError one `.payload` later, which each
+// caller's catch reports as an ordinary invalid token. Measured on 2026-08-27 (issue #420): it
+// turned every session cookie into a 401 for the files that ran after this one, and the failure
+// named the cookie rather than the mock.
+// A PLAIN SNAPSHOT, taken before the mock is installed. `await import()` hands back the LIVE
+// namespace, which Bun rewrites in place when `mock.module` runs — so a namespace captured here and
+// handed back in `afterAll` would re-register the stub rather than undo it, and the spread below
+// would copy the stub instead of the real exports.
+const realJose = { ...(await import("jose")) };
+
+const mockJwtVerify = mock(
+  realJose.jwtVerify as unknown as (...args: unknown[]) => Promise<unknown>,
+);
 
 mock.module("jose", () => ({
   createRemoteJWKSet: () => null,
   jwtVerify: mockJwtVerify,
 }));
+
+afterAll(() => {
+  mock.module("jose", () => realJose);
+});
 
 const {
   verifyGoogleIdToken,
@@ -38,14 +72,52 @@ const { completeSetup, initSetupState } = await import(
 
 const originalSignupEnabled = config.signupEnabled;
 
+// The snapshot is what `afterAll` hands back, so it has to still hold the REAL exports after the
+// mock is installed. A live namespace does not: Bun rewrites it in place, and restoring it would
+// re-register the stub while reading as a teardown. Asserted rather than commented, because the two
+// spellings differ by three characters and behave identically until the day someone imports `jose`
+// after this file has run.
+describe("the jose snapshot survives its own mock", () => {
+  test("the snapshot's jwtVerify is not the stub", () => {
+    expect(realJose.jwtVerify).not.toBe(
+      mockJwtVerify as unknown as typeof realJose.jwtVerify,
+    );
+  });
+
+  test("the snapshot still carries the exports the stub does not replace", () => {
+    expect(typeof realJose.SignJWT).toBe("function");
+  });
+});
+
 describe("google.service", () => {
   beforeEach(() => {
     resetPrismaMocks();
-    mockJwtVerify.mockReset();
+    // `mockReset` would strip the delegation above and leave this returning `undefined` for the
+    // rest of the process. Clear the call log, keep the real implementation.
+    mockJwtVerify.mockClear();
     // NOTE: Default to "setup done, signup open" so the existing creation tests
     // pass the registration gate; specific tests override these.
     completeSetup();
     config.signupEnabled = true;
+  });
+
+  // The property the leak violates, asserted from inside this file because that is the only place
+  // it can be reached before the damage lands somewhere else. `mock.module` is permanent, so from
+  // here on THIS function answers every JWT verification in the process — including session cookies
+  // in files that stub nothing. It must therefore still verify a real token after `beforeEach` has
+  // run, which is exactly what a `mockReset()` or a non-delegating stub would take away.
+  //
+  // Without it the failure surfaces hundreds of files later, as a 401 that names the cookie.
+  test("a caller that is not this file still gets a working jwtVerify", async () => {
+    const { SignJWT, jwtVerify } = await import("jose");
+    const key = new TextEncoder().encode("a-throwaway-key-32-chars-long!!!");
+    const token = await new SignJWT({ marker: "round-trip" })
+      .setProtectedHeader({ alg: "HS256" })
+      .setExpirationTime("5m")
+      .sign(key);
+
+    const { payload } = await jwtVerify(token, key);
+    expect(payload.marker).toBe("round-trip");
   });
 
   afterEach(() => {

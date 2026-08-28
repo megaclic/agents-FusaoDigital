@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -44,7 +45,7 @@ import type { ChunkHit } from "@/modules/rag/sql";
 // translate('errors.embeddingNotConfigured', 'Embeddings are not configured for this workspace.')
 // translate('errors.embeddingPending', 'The embedding credential is not filled in yet.')
 // translate('errors.knowledgeBaseNotFound', 'Knowledge base not found.')
-// translate('errors.noExtractableText', 'No extractable text found in this file')
+// translate('errors.noExtractableText', 'No extractable text found in this {{kind}} file')
 // translate('errors.unstorableText', '{{field}} contains characters that cannot be stored ({{codePoints}})')
 // translate('errors.unsupportedFileType', 'Unsupported file type: {{type}}')
 
@@ -127,7 +128,7 @@ export const knowledgeController = new Elysia({
         "Create knowledge base",
         "Create a new knowledge base for the current tenant.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       body: t.Object({
         name: t.String({
           minLength: 1,
@@ -152,7 +153,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params }) => {
       const kb = await getKnowledgeBase({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
       });
       return {
         instance: instanceIdentity,
@@ -175,7 +176,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params, body }) => {
       await updateKnowledgeBase({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
         name: body.name,
         description: body.description,
         chunkSize: body.chunkSize,
@@ -189,7 +190,7 @@ export const knowledgeController = new Elysia({
         "Update knowledge base",
         "Update a knowledge base name, description, or chunking parameters.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({
           description: "Knowledge base id (BigInt as a string).",
@@ -231,7 +232,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params }) => {
       await deleteKnowledgeBase({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
       });
       return { instance: instanceIdentity, success: true };
     },
@@ -275,7 +276,7 @@ export const knowledgeController = new Elysia({
     "/bases/:id/documents",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const docs = await listDocuments(ctx, BigInt(params.id));
+      const docs = await listDocuments(ctx, requireDbId(params.id));
       const block = await readEmbeddingBlock(ctx);
       return {
         instance: instanceIdentity,
@@ -307,7 +308,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params, body }) => {
       const doc = await createDocument({
         ctx: ctxOrThrow(tenantContext),
-        knowledgeBaseId: BigInt(params.id),
+        knowledgeBaseId: requireDbId(params.id),
         title: body.title,
         text: body.text,
         sourceType: "text",
@@ -323,7 +324,7 @@ export const knowledgeController = new Elysia({
         "Add text document",
         "Add a plain-text document to a knowledge base for embedding.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({
           description: "Knowledge base id (BigInt as a string).",
@@ -353,7 +354,7 @@ export const knowledgeController = new Elysia({
       });
       const doc = await createDocument({
         ctx: ctxOrThrow(tenantContext),
-        knowledgeBaseId: BigInt(params.id),
+        knowledgeBaseId: requireDbId(params.id),
         title: body.title ?? file.name,
         text,
         sourceType: "file",
@@ -395,7 +396,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params }) => {
       const doc = await getDocument(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       return {
         instance: instanceIdentity,
@@ -423,7 +424,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params, body }) => {
       const doc = await updateDocument(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         {
           title: body.title,
           text: body.text,
@@ -440,7 +441,7 @@ export const knowledgeController = new Elysia({
         "Update document",
         "Edit a document's title and/or text. Changing the text re-ingests and re-embeds it.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({ description: "Document id (BigInt as a string)." }),
       }),
@@ -463,7 +464,7 @@ export const knowledgeController = new Elysia({
   .delete(
     "/documents/:id",
     async ({ tenantContext, params }) => {
-      await deleteDocument(ctxOrThrow(tenantContext), BigInt(params.id));
+      await deleteDocument(ctxOrThrow(tenantContext), requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
     {
@@ -481,7 +482,7 @@ export const knowledgeController = new Elysia({
   .post(
     "/documents/:id/retry",
     async ({ tenantContext, params }) => {
-      await retryDocument(ctxOrThrow(tenantContext), BigInt(params.id));
+      await retryDocument(ctxOrThrow(tenantContext), requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
     {
@@ -501,7 +502,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, params, query }) => {
       const result = await reindexKnowledgeBase(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         undefined,
         { includeFailed: query.includeFailed === true },
       );
@@ -513,7 +514,7 @@ export const knowledgeController = new Elysia({
         "Index pending knowledge-base documents",
         "Queue ingestion + embedding for every not-yet-indexed (UNINDEXED) document in the base, e.g. after importing an agent that bundled its documents. Pass includeFailed=true to also re-queue FAILED documents (bulk recovery). If the tenant's embedding credential is unconfigured or its secret is not filled yet, nothing is queued and `blocked` explains why (the documents keep their status).",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({
           description: "Knowledge base id (BigInt as a string).",
@@ -535,7 +536,9 @@ export const knowledgeController = new Elysia({
       const hits = await searchKnowledge({
         ctx: ctxOrThrow(tenantContext),
         query: body.query,
-        knowledgeBaseIds: body.knowledgeBaseIds?.map((s) => BigInt(s)),
+        knowledgeBaseIds: body.knowledgeBaseIds?.map((s) =>
+          requireDbId(s, "knowledgeBaseIds"),
+        ),
         limit: body.limit,
       });
       return { instance: instanceIdentity, hits: hits.map(searchHitDto) };
@@ -546,7 +549,7 @@ export const knowledgeController = new Elysia({
         "Search knowledge",
         "Run a semantic search across one or more knowledge bases and return ranked chunks.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       body: t.Object({
         query: t.String({
           minLength: 1,
@@ -573,7 +576,7 @@ export const knowledgeController = new Elysia({
     async ({ tenantContext, body }) => {
       const suggestion = await createSuggestion({
         ctx: ctxOrThrow(tenantContext),
-        knowledgeBaseId: BigInt(body.knowledgeBaseId),
+        knowledgeBaseId: requireDbId(body.knowledgeBaseId, "knowledgeBaseId"),
         proposedContent: body.content,
         proposedTitle: body.title,
         rationale: body.rationale,
@@ -589,7 +592,7 @@ export const knowledgeController = new Elysia({
         "Suggest knowledge entry",
         "Create a pending suggestion to add an entry to a knowledge base, awaiting human approval.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       body: t.Object({
         knowledgeBaseId: t.String({
           description: "Target knowledge base id (BigInt as a string).",
@@ -628,7 +631,7 @@ export const knowledgeController = new Elysia({
       instance: instanceIdentity,
       result: await editApprovalItem({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
         proposedTitle: body.title,
         proposedContent: body.content,
         rationale: body.rationale,
@@ -640,7 +643,7 @@ export const knowledgeController = new Elysia({
         "Edit pending approval",
         "Edit the title, content, or rationale of a pending knowledge-base suggestion before approving it.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({ description: "Approval item id (BigInt as a string)." }),
       }),
@@ -663,7 +666,7 @@ export const knowledgeController = new Elysia({
       instance: instanceIdentity,
       result: await approveApprovalItem({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
       }),
     }),
     {
@@ -684,7 +687,7 @@ export const knowledgeController = new Elysia({
       instance: instanceIdentity,
       result: await rejectApprovalItem({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
       }),
     }),
     {

@@ -54,6 +54,7 @@ import {
 } from "@/client/components";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { cn, formatRelativeTime } from "@/client/lib/utils";
 
 // Eden-derived types for the dynamic /conversations/:id routes (metadata shell + the separate
@@ -1429,8 +1430,11 @@ export function ConversationDetailPage() {
       showToast(successMsg, "success");
       void loadMeta({ background: true });
       void loadMessages({ background: true });
-    } catch {
-      showToast(t("conversation.opError", "Action failed."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) || t("conversation.opError", "Action failed."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -1468,8 +1472,11 @@ export function ConversationDetailPage() {
       }
       void loadMeta();
       void loadMessages();
-    } catch {
-      showToast(t("conversation.opError", "Action failed."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) || t("conversation.opError", "Action failed."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -1507,6 +1514,14 @@ export function ConversationDetailPage() {
           ),
           "warning",
         );
+      } else if (data.outcome === "over-ceiling") {
+        showToast(
+          t(
+            "conversation.reengage.overCeiling",
+            "This month's token ceiling has been reached, so the AI did not reply. Raise it in Settings or wait for the next month.",
+          ),
+          "warning",
+        );
       } else if (data.outcome === "empty") {
         showToast(
           t("conversation.reengage.empty", "Nothing new to answer."),
@@ -1520,8 +1535,12 @@ export function ConversationDetailPage() {
       }
       void loadMeta({ background: true });
       void loadMessages({ background: true });
-    } catch {
-      showToast(t("conversation.reengage.error", "Re-engage failed."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("conversation.reengage.error", "Re-engage failed."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }

@@ -37,6 +37,7 @@ import {
 } from "@/client/components";
 import { useAuth } from "@/client/contexts/AuthContext";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { isAdminRole } from "@/client/lib/roles";
 import { cn } from "@/client/lib/utils";
 import { extractZproCredentialsFromUrl } from "@/client/lib/zpro";
@@ -326,9 +327,10 @@ export function ZproSection() {
       showToast(t("zpro.instanceAdded", "Z-PRO instance added."), "success");
       addModal.close();
       void load();
-    } catch {
+    } catch (err) {
       showToast(
-        t("zpro.instanceAddError", "Could not add the instance."),
+        apiErrorMessage(err) ||
+          t("zpro.instanceAddError", "Could not add the instance."),
         "error",
       );
     } finally {
@@ -360,9 +362,10 @@ export function ZproSection() {
       showToast(t("zpro.instanceAdded", "Z-PRO instance added."), "success");
       addModal.close();
       void load();
-    } catch {
+    } catch (err) {
       showToast(
-        t("zpro.instanceAddError", "Could not add the instance."),
+        apiErrorMessage(err) ||
+          t("zpro.instanceAddError", "Could not add the instance."),
         "error",
       );
     } finally {
@@ -415,9 +418,10 @@ export function ZproSection() {
       showToast(t("zpro.instanceUpdated", "Instance updated."), "success");
       editModal.close();
       void load();
-    } catch {
+    } catch (err) {
       showToast(
-        t("zpro.instanceUpdateError", "Could not update the instance."),
+        apiErrorMessage(err) ||
+          t("zpro.instanceUpdateError", "Could not update the instance."),
         "error",
       );
     } finally {
@@ -441,10 +445,11 @@ export function ZproSection() {
           .delete();
         if (err) {
           showToast(
-            t(
-              "zpro.instanceDisconnectError",
-              "Could not disconnect the instance.",
-            ),
+            apiErrorMessage(err) ||
+              t(
+                "zpro.instanceDisconnectError",
+                "Could not disconnect the instance.",
+              ),
             "error",
           );
           throw err; // keep the dialog open
@@ -474,7 +479,10 @@ export function ZproSection() {
       .instances({ id: instanceId })
       .bind.post({ agentId });
     if (err) {
-      showToast(t("zpro.bindError", "Could not bind the agent."), "error");
+      showToast(
+        apiErrorMessage(err) || t("zpro.bindError", "Could not bind the agent."),
+        "error",
+      );
       throw err;
     }
     const agentName = agentId

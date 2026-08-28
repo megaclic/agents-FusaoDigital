@@ -1,9 +1,16 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { auditMutation } from "@/modules/audit/service";
 import { unprintableProblem } from "@/modules/documents/printable";
+import {
+  readSpendCeilingConfig,
+  type SpendCeilingConfig,
+  spendCeilingSettingsSchema,
+} from "@/modules/spend-ceiling/settings";
 import { requireVaultRef, vaultRefWhere } from "@/modules/vault/service";
 
 // Per-tenant settings live in the Tenant.settings JSON column. RLS scopes the row to the active
@@ -153,6 +160,7 @@ export interface TenantSettingsDto {
   embedding: EmbeddingSettings;
   langfuse: LangfuseSettings;
   company: CompanySettings;
+  spendCeiling: SpendCeilingConfig;
 }
 
 export async function getTenantSettings(
@@ -166,8 +174,23 @@ export async function getTenantSettings(
       embedding: parseEmbeddingSettings(raw),
       langfuse: parseLangfuseSettings(raw),
       company: parseCompanySettings(raw),
+      // Read with the RUNTIME's own lenient reader, not a schema of this module's: the console has
+      // to show the operator the numbers the gate will actually apply, and a second parser here
+      // would be a second answer to that question the day one of them clamps differently.
+      spendCeiling: readSpendCeilingConfig(raw),
     };
   });
+}
+
+// The usual projection: the same allowlist read off each side. A block whose trail can carry its own
+// values says so here, in one function, instead of twice.
+function sides<T>(
+  of: (raw: Record<string, unknown>) => T,
+): (
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+) => { before: T; after: T } {
+  return (before, after) => ({ before: of(before), after: of(after) });
 }
 
 // Read, merge and write in ONE transaction, with the tenant row locked.
@@ -181,15 +204,39 @@ export async function getTenantSettings(
 //
 // The merge runs INSIDE the lock and is handed the raw settings, so what it merges into is what is
 // about to be written and never a snapshot from before someone else's write.
+//
+// The audit row is written here, under the same lock and in the same transaction, for the same
+// reason the merge is: this is the one place that holds both the value being replaced and the value
+// replacing it. Every block writer goes through here, so none of them can ship without a record.
+// `project` is handed the raw settings both times, so each caller decides in ONE function what its
+// block's trail says, and a block whose projection would carry a secret cannot accidentally get the
+// default (a credential is a `vault:<id>` reference here, never a value; that is the vault rule this
+// column has been held to since #124).
 async function patchBlock<
-  T extends EmbeddingSettings | LangfuseSettings | CompanySettings,
+  T extends
+    | EmbeddingSettings
+    | LangfuseSettings
+    | CompanySettings
+    | SpendCeilingConfig,
 >(
   ctx: TenantContext,
   base: PrismaClient,
-  key: "embedding" | "langfuse" | "company",
-  // May be async, so a caller that has to read or do something UNDER THE LOCK, before the commit,
-  // can do it here. The logo upload is the one: it needs the key it is about to supersede, and the
-  // block it reads outside the lock is already stale by the time it writes.
+  key: "embedding" | "langfuse" | "company" | "spendCeiling",
+  // Handed BOTH states, the one being replaced and the one replacing it, so a block can report what
+  // MOVED without carrying what it holds. The company profile is the block that needs the
+  // difference: see `sides` below for the shape the other three use.
+  audit: {
+    action: string;
+    target: string;
+    project: (
+      before: Record<string, unknown>,
+      after: Record<string, unknown>,
+    ) => { before: unknown; after: unknown };
+  },
+  // Last so it stays a trailing callback at every call site. May be async, so a caller that has to
+  // read or do something UNDER THE LOCK, before the commit, can do it here. The logo upload is the
+  // one: it needs the key it is about to supersede, and the block it reads outside the lock is
+  // already stale by the time it writes.
   merge: (raw: Record<string, unknown>) => T | Promise<T>,
 ): Promise<T> {
   const tenantId = requireTenantId(ctx);
@@ -197,9 +244,15 @@ async function patchBlock<
     await db.$queryRaw`SELECT 1 FROM "tenants" WHERE "id" = ${tenantId} FOR UPDATE`;
     const raw = await readRawSettings(db, tenantId);
     const value = await merge(raw);
+    const settings = { ...raw, [key]: value };
     await db.tenant.update({
       where: { id: tenantId },
-      data: { settings: { ...raw, [key]: value } as Prisma.InputJsonValue },
+      data: { settings: settings as Prisma.InputJsonValue },
+    });
+    await auditMutation(db, ctx, {
+      action: audit.action,
+      target: audit.target,
+      ...audit.project(raw, settings),
     });
     return value;
   });
@@ -222,18 +275,37 @@ export async function updateEmbeddingSettings(
       : await runScopedOn(base, ctx, (db) =>
           requireVaultRef(db, incoming, "embedding.credentialRef"),
         );
-  return patchBlock(ctx, base, "embedding", (raw) => {
-    const current = parseEmbeddingSettings(raw);
-    // LOCKED to EMBEDDING_DEFAULTS (OpenAI + text-embedding-3-small) until the flexible-embeddings
-    // feature ships (configurable dimension + provider registry). Only the
-    // credential is honored; provider/model/baseURL from the patch are ignored. Unlocking = restore
-    // the `{ ...current, ...patch }` merge.
-    return embeddingSettingsSchema.parse({
-      ...EMBEDDING_DEFAULTS,
-      credentialRef:
-        credentialRef !== undefined ? credentialRef : current.credentialRef,
-    });
-  });
+  return patchBlock(
+    ctx,
+    base,
+    "embedding",
+    {
+      action: "tenant_settings.embedding_set",
+      target: "tenant_settings:embedding",
+      project: sides((raw) => {
+        const b = parseEmbeddingSettings(raw);
+        return {
+          provider: b.provider,
+          model: b.model,
+          credentialRef: b.credentialRef,
+          baseURL: b.baseURL,
+        };
+      }),
+    },
+    (raw) => {
+      const current = parseEmbeddingSettings(raw);
+      // LOCKED to EMBEDDING_DEFAULTS (OpenAI + text-embedding-3-small) until the flexible-embeddings
+      // feature ships (configurable dimension + provider registry). Only the
+      // credential is honored; provider/model/baseURL from the patch are ignored. Unlocking = restore
+      // the `{ ...current, ...patch }` merge.
+      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      return embeddingSettingsSchema.parse({
+        ...EMBEDDING_DEFAULTS,
+        credentialRef:
+          credentialRef !== undefined ? credentialRef : current.credentialRef,
+      });
+    },
+  );
 }
 
 export interface LangfuseUpdateInput {
@@ -294,17 +366,41 @@ export async function updateLangfuse(
     }
   }
 
-  return patchBlock(ctx, base, "langfuse", (raw) => {
-    const live = parseLangfuseSettings(raw);
-    return langfuseSettingsSchema.parse({
-      enabled: input.enabled ?? live.enabled,
-      // The live value when this request did not mention one, like every other field here.
-      credentialRef:
-        input.credentialRef !== undefined ? credentialRef : live.credentialRef,
-      sendContent: input.sendContent ?? live.sendContent,
-      debug: input.debug ?? live.debug,
-    });
-  });
+  return patchBlock(
+    ctx,
+    base,
+    "langfuse",
+    {
+      action: "tenant_settings.langfuse_set",
+      target: "tenant_settings:langfuse",
+      // `sendContent` is the field an operator answers for: it opts the tenant's raw prompts and
+      // completions into leaving for a third party. The ref names the credential; the keys are in the
+      // vault, encrypted, and never here.
+      project: sides((raw) => {
+        const b = parseLangfuseSettings(raw);
+        return {
+          enabled: b.enabled,
+          credentialRef: b.credentialRef,
+          sendContent: b.sendContent,
+          debug: b.debug,
+        };
+      }),
+    },
+    (raw) => {
+      const live = parseLangfuseSettings(raw);
+      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      return langfuseSettingsSchema.parse({
+        enabled: input.enabled ?? live.enabled,
+        // The live value when this request did not mention one, like every other field here.
+        credentialRef:
+          input.credentialRef !== undefined
+            ? credentialRef
+            : live.credentialRef,
+        sendContent: input.sendContent ?? live.sendContent,
+        debug: input.debug ?? live.debug,
+      });
+    },
+  );
 }
 
 export type CompanyUpdateInput = Partial<
@@ -336,8 +432,37 @@ export async function updateCompanySettings(
         field,
       );
   }
-  return patchBlock(ctx, base, "company", (raw) =>
-    companySettingsSchema.parse({ ...parseCompanySettings(raw), ...patch }),
+  return patchBlock(
+    ctx,
+    base,
+    "company",
+    {
+      action: "tenant_settings.company_set",
+      target: "tenant_settings:company",
+      // WHICH fields moved, and never what they hold. This block is the operator's own identity, and
+      // for a sole trader that is a CPF, a home address and a personal phone: `AuditEntry` forbids
+      // PII in the clear because a tenant admin reads these rows, and unlike the profile itself a row
+      // KEEPS the value after the profile that held it was corrected or cleared. Counted rather than
+      // assumed before choosing: of the 32 distinct fields every other audited action projects, not
+      // one is a person's document, address, phone or email.
+      //
+      // Keys and not an allowlist of the safe ones, so a field added to `companySettingsSchema` later
+      // cannot arrive projected in the clear by default. The current value is always readable from
+      // `GET /v1/tenant-settings`; what a trail owes is who changed it and when.
+      project: (before, after) => {
+        const b = parseCompanySettings(before);
+        const a = parseCompanySettings(after);
+        // No exclusion for the logo half: `CompanyUpdateInput` omits both of its fields and the merge
+        // carries them over, so they cannot differ here. A guard against it survived being deleted.
+        const changed = (
+          Object.keys(COMPANY_DEFAULTS) as (keyof CompanySettings)[]
+        ).filter((k) => b[k] !== a[k]);
+        return { before: null, after: { changed } };
+      },
+    },
+    (raw) =>
+      // not-caller-input: the STORED block merged with the patch; the patch's own fields are refused above with errors.invalidCompanyField
+      companySettingsSchema.parse({ ...parseCompanySettings(raw), ...patch }),
   );
 }
 
@@ -373,15 +498,92 @@ export async function setCompanyLogoKey(
   // aborts the write.
   publish?: (current: CompanySettings) => Promise<void>,
 ): Promise<CompanySettings> {
-  return patchBlock(ctx, base, "company", async (raw) => {
-    const current = parseCompanySettings(raw);
-    await publish?.(current);
-    return companySettingsSchema.parse({
-      ...current,
-      logoKey,
-      // Strictly increasing even if two writes land in the same millisecond, which is what a cache
-      // buster has to be to mean anything.
-      logoVersion: Math.max(now, current.logoVersion + 1),
-    });
-  });
+  return patchBlock(
+    ctx,
+    base,
+    "company",
+    {
+      // Derived from the argument, so the two acts cannot be recorded under each other's name: this
+      // one function is both the upload and the removal, and only the value says which.
+      action: logoKey === null ? "company_logo.clear" : "company_logo.set",
+      target: "company_logo",
+      // Metadata only, never the image: the bytes live on disk, and the version is what tells a
+      // replacement of the same file apart from no write at all.
+      project: sides((raw) => {
+        const b = parseCompanySettings(raw);
+        return { logoKey: b.logoKey, logoVersion: b.logoVersion };
+      }),
+    },
+    async (raw) => {
+      const current = parseCompanySettings(raw);
+      await publish?.(current);
+      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      return companySettingsSchema.parse({
+        ...current,
+        logoKey,
+        // Strictly increasing even if two writes land in the same millisecond, which is what a cache
+        // buster has to be to mean anything.
+        logoVersion: Math.max(now, current.logoVersion + 1),
+      });
+    },
+  );
+}
+
+export type SpendCeilingUpdateInput = Partial<SpendCeilingConfig>;
+
+// Updates the spend-ceiling block. Validated on the way IN (see `spendCeilingSettingsSchema`) so a
+// ceiling typed with an extra zero comes back as a 422 the operator can read, rather than as a
+// silently clamped number that would only surface as a month of unmetered traffic.
+//
+// Merged under the row lock, like every other block here: the ceiling screen and the alert-channel
+// screen are different requests against one JSON column, and a merge outside the lock is how one
+// save erases the other.
+export async function updateSpendCeiling(
+  ctx: TenantContext,
+  patch: SpendCeilingUpdateInput,
+  base: PrismaClient = basePrisma,
+): Promise<SpendCeilingConfig> {
+  return patchBlock(
+    ctx,
+    base,
+    "spendCeiling",
+    {
+      action: "tenant_settings.spend_ceiling_set",
+      target: "tenant_settings:spendCeiling",
+      // THE NUMBERS THEMSELVES, because they are what the trail is about: this block decides whether
+      // the agent answers a customer at all, and "somebody moved the ceiling" is unanswerable without
+      // saying from what to what. None of them is a secret or PII — a token count, a percentage, two
+      // switches and a cooldown.
+      //
+      // The customer-facing sentence is the exception, and it is FINGERPRINTED rather than quoted:
+      // it is free text an operator writes, so quoting it would paste a paragraph into every row for
+      // a field the console reads back in full anyway. A bare "set" cannot answer the question the
+      // trail is actually asked — one sentence replaced by another read as unchanged on both sides —
+      // so what goes in is a short digest, which differs exactly when the text differs and carries
+      // none of it back. `null` stays `null`, because "cleared" is a state and not a value.
+      project: sides((raw) => {
+        const b = readSpendCeilingConfig(raw);
+        return {
+          enabled: b.enabled,
+          monthlyInboxTokens: b.monthlyInboxTokens,
+          monthlyPlaygroundTokens: b.monthlyPlaygroundTokens,
+          warnAtPercent: b.warnAtPercent,
+          handoffEnabled: b.handoffEnabled,
+          noticeCooldownSeconds: b.noticeCooldownSeconds,
+          overCeilingMessage:
+            b.overCeilingMessage === null
+              ? null
+              : createHash("sha256")
+                  .update(b.overCeilingMessage)
+                  .digest("hex")
+                  .slice(0, 12),
+        };
+      }),
+    },
+    (raw) => {
+      const current = readSpendCeilingConfig(raw);
+      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      return spendCeilingSettingsSchema.parse({ ...current, ...patch });
+    },
+  );
 }

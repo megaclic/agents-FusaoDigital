@@ -3,11 +3,15 @@ import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { parseDbId } from "@/lib/db-id";
 import { AppError, NotFoundError } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { auditMutation } from "@/modules/audit/service";
 import {
   isOpenAt,
   isRangeOrdered,
   isRealDate,
+  MAX_SCHEDULE_EXCEPTIONS,
+  MAX_SCHEDULE_WINDOWS,
   parseExceptions,
   parseSchedule,
   parseWindows,
@@ -136,8 +140,11 @@ export const businessHoursCreateSchema = z
   .object({
     name: z.string().min(1).max(200),
     timezone: z.string().min(1).max(64).optional(),
-    windows: z.array(windowSpecSchema).max(200).optional(),
-    exceptions: z.array(scheduleExceptionSchema).max(400).optional(),
+    windows: z.array(windowSpecSchema).max(MAX_SCHEDULE_WINDOWS).optional(),
+    exceptions: z
+      .array(scheduleExceptionSchema)
+      .max(MAX_SCHEDULE_EXCEPTIONS)
+      .optional(),
   })
   .strict();
 export type BusinessHoursCreate = z.infer<typeof businessHoursCreateSchema>;
@@ -146,6 +153,17 @@ export const businessHoursUpdateSchema = businessHoursCreateSchema
   .partial()
   .strict();
 export type BusinessHoursUpdate = z.infer<typeof businessHoursUpdateSchema>;
+
+// What the audit row carries: the schedule as the operator sees it, minus the identifiers and
+// timestamps the row already holds in its own columns.
+function auditProjection(dto: BusinessHoursDto) {
+  return {
+    name: dto.name,
+    timezone: dto.timezone,
+    windows: dto.windows,
+    exceptions: dto.exceptions,
+  };
+}
 
 export async function listBusinessHours(
   ctx: TenantContext,
@@ -201,7 +219,7 @@ export async function createBusinessHours(
 ): Promise<BusinessHoursDto> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
-  const data = businessHoursCreateSchema.parse(input);
+  const data = parseInput(businessHoursCreateSchema, input);
   if (data.timezone) assertValidTimezone(data.timezone);
   if (data.windows) assertValidWindows(data.windows);
   if (data.exceptions) assertValidExceptions(data.exceptions);
@@ -217,7 +235,13 @@ export async function createBusinessHours(
       },
       select: SELECT,
     });
-    return toDto(row);
+    const dto = toDto(row);
+    await auditMutation(db, ctx, {
+      action: "business_hours.create",
+      target: `business_hours:${dto.id}`,
+      after: auditProjection(dto),
+    });
+    return dto;
   });
 }
 
@@ -227,14 +251,14 @@ export async function updateBusinessHours(
   patch: BusinessHoursUpdate,
   base: PrismaClient = basePrisma,
 ): Promise<BusinessHoursDto> {
-  const data = businessHoursUpdateSchema.parse(patch);
+  const data = parseInput(businessHoursUpdateSchema, patch);
   if (data.timezone) assertValidTimezone(data.timezone);
   if (data.windows) assertValidWindows(data.windows);
   if (data.exceptions) assertValidExceptions(data.exceptions);
   return runScopedOn(base, ctx, async (db) => {
     const current = await db.businessHours.findUnique({
       where: { id },
-      select: { id: true },
+      select: SELECT,
     });
     if (!current) {
       throw new NotFoundError(
@@ -242,6 +266,7 @@ export async function updateBusinessHours(
         "errors.businessHoursNotFound",
       );
     }
+    const before = toDto(current);
     await db.businessHours.update({
       where: { id },
       data: {
@@ -259,7 +284,14 @@ export async function updateBusinessHours(
       where: { id },
       select: SELECT,
     });
-    return toDto(row);
+    const dto = toDto(row);
+    await auditMutation(db, ctx, {
+      action: "business_hours.update",
+      target: `business_hours:${dto.id}`,
+      before: auditProjection(before),
+      after: auditProjection(dto),
+    });
+    return dto;
   });
 }
 
@@ -274,13 +306,24 @@ export async function deleteBusinessHours(
       where: { businessHoursId: id },
       data: { businessHoursId: null },
     });
+    // Read before the delete: the row is what the audit records, and after `deleteMany` there is
+    // nothing left to name what was removed.
+    const current = await db.businessHours.findUnique({
+      where: { id },
+      select: SELECT,
+    });
     const res = await db.businessHours.deleteMany({ where: { id } });
-    if (res.count === 0) {
+    if (res.count === 0 || !current) {
       throw new NotFoundError(
         "business hours not found",
         "errors.businessHoursNotFound",
       );
     }
+    await auditMutation(db, ctx, {
+      action: "business_hours.delete",
+      target: `business_hours:${id}`,
+      before: auditProjection(toDto(current)),
+    });
   });
 }
 

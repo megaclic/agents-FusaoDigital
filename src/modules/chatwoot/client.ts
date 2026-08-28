@@ -858,6 +858,17 @@ export class ChatwootClient {
     return this.request(this.config.adminToken, "GET", "/inboxes");
   }
 
+  // One inbox's detail (admin token). Exists to answer ONE question before a mirror row is
+  // destroyed: does this inbox still exist in Chatwoot? `fetch_inbox` resolves it with
+  // `Current.account.inboxes.find(params[:id])` and only THEN runs `authorize @inbox, :show?`, so an
+  // inbox that is gone raises RecordNotFound before any policy check and Rails answers 404.
+  // Measured live against the fork (2026-08-25): live id → 200 with the inbox JSON, absent id → 404
+  // {"error":"Resource could not be found"}, missing token → 401. Deliberately NOT parsed here — the
+  // caller wants the STATUS, and any body we could parse would be a second thing to be wrong about.
+  getInbox(inboxId: number): Promise<unknown> {
+    return this.request(this.config.adminToken, "GET", `/inboxes/${inboxId}`);
+  }
+
   // WhatsApp Cloud (official) HSM templates of an inbox, read from the inbox detail's
   // `message_templates` (admin token), returned as { name, category, language } (approved only when a
   // status is present). NOTE: baileys/zapi inboxes are also `Channel::Whatsapp` but with an unofficial
@@ -1097,11 +1108,26 @@ export class ChatwootClient {
     );
   }
 
+  // NOTE: `originDisplayId` is the conversation the link is being SENT ON (the WhatsApp entry
+  // thread), and the mint is the only moment the two halves of a redirect episode are known
+  // together — the resolve endpoint identifies the CONTACT, and a contact does not say which of its
+  // conversations minted the link (issue #222). The fork carries it in the token and stamps it on
+  // the widget conversation, where it reaches us on the webhook payload. It authorizes the value
+  // against the caller: an origin this token cannot see is REFUSED (404/401), not dropped, so a
+  // link whose episode could not be paired is never handed back.
   async mintRedirectToken(p: {
     inboxId: number;
     identifier: string;
+    // WHOSE identity this link carries. The identifier cannot answer it: `fzwa:<X>` is derived from a
+    // sequential contact id, so it is guessable, and it can move off the contact between the mint and
+    // a click a day later. When it has moved, the widget side finds nobody holding it and hands the
+    // value to the browser session instead of merging onto this lead, which leaves the lead with two
+    // contacts and lets the second one squat the identifier every later redirect needs (issue #286).
+    // The mint is admin-authenticated, so naming the contact here is a fact the widget side can spend.
+    contactId: number;
     message?: string;
     ttlSeconds?: number;
+    originDisplayId?: number;
   }): Promise<{ token: string; websiteUrl: string | null }> {
     const res = (await this.request(
       this.config.adminToken,
@@ -1110,8 +1136,10 @@ export class ChatwootClient {
       {
         inbox_id: p.inboxId,
         identifier: p.identifier,
+        contact_id: p.contactId,
         message: p.message,
         ttl_seconds: p.ttlSeconds,
+        origin_display_id: p.originDisplayId,
       },
     )) as { token?: string; website_url?: string | null } | null;
     if (!res?.token) {

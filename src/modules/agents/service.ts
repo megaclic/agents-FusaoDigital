@@ -4,22 +4,38 @@ import { broadcastAgentConfigEvent } from "@/api/features/realtime/realtime.serv
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { DEFAULT_MODEL_CONFIG, modelConfigSchema } from "@/graph/model-config";
+import { modelOptionalFor } from "@/graph/model-defaults";
 import { NATIVE_TOOL_NAMES, RAG_TOOL_NAMES } from "@/graph/tools/catalog";
-import { parseDbId } from "@/lib/db-id";
+import { parseDbId, requireDbId } from "@/lib/db-id";
 import {
   AppError,
-  type ErrorTranslationKey,
   NotFoundError,
   TenantTargetRequiredError,
 } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  agentUpdateAudit,
+  auditSafe,
+  grantSetChanged,
+} from "@/modules/agents/audit-projection";
 import { collectCredentialRefWrites } from "@/modules/agents/credential-paths";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
+import {
+  invalidToolPreconditions,
+  parseToolPrecondition,
+} from "@/modules/agents/tool-preconditions";
+import { auditMutation } from "@/modules/audit/service";
 import { isOutOfHoursNow, parseSchedule } from "@/modules/business-hours/hours";
 import { renameAgentBots } from "@/modules/chatwoot/provisioning";
 import { invalidateRouteTokenCache } from "@/modules/chatwoot/route-token-cache";
 import { documentToolName } from "@/modules/documents/slug";
 import { parseTemplateContent } from "@/modules/documents/validate";
+import {
+  FULL_DETAIL_MAX_HOURS,
+  isFullDetailWindowOpen,
+  parseIsoInstant,
+} from "@/modules/flowlog/settings";
 import { ensureTenantSweep } from "@/modules/followups/handlers";
 import { readFollowUpConfig } from "@/modules/followups/settings";
 import { normalizeSettingsForStorage } from "@/modules/images/settings";
@@ -309,6 +325,276 @@ export function assertSettingsTextSizes(
   }
 }
 
+// The debug window's write boundary, and it sits beside the text-size one for the same reason: this
+// is where every transport that writes an agent's settings converges (REST create, REST update, and
+// the MCP patch, which imports it from here).
+//
+// The READER also refuses a deadline past the horizon, but that comparison MOVES: a value 48h ahead
+// is refused today and, twenty-five hours later, sits comfortably inside `now + 24h` and arms the
+// mode for the rest of its window. A read-time bound can only ever DELAY such a value, never refuse
+// it, because nothing in a lone deadline says when it was armed. Refusing the write is what makes it
+// permanent for everything this platform stores.
+//
+// Same shape as the text rule: only a value the write INTRODUCES or CHANGES is refused, so a bag
+// that already holds one does not block an unrelated save.
+export class DebugWindowTooLongError extends AppError {
+  constructor(hours: number) {
+    super(
+      `observability.fullDetailUntil is further than ${hours}h ahead`,
+      400,
+      "errors.debugWindowTooLong",
+      { hours },
+      "observability.fullDetailUntil",
+    );
+  }
+}
+
+export class InvalidToolPreconditionError extends AppError {
+  constructor(toolName: string) {
+    super(
+      `settings.toolPreconditions.${toolName} is not a valid precondition`,
+      400,
+      "errors.invalidToolPrecondition",
+      { tool: toolName },
+      `toolPreconditions.${toolName}`,
+    );
+  }
+}
+
+// A precondition that does not parse is REFUSED here rather than dropped at turn time, and the two
+// halves are the same parse on purpose. The cost of the other arrangement is specific: the operator
+// saves a rule, the console shows it saved, and the runtime treats the tool as ungoverned — a tool
+// the operator believes is fenced and is not, which is worse than never having offered the fence.
+//
+// Only what the write CHANGES is refused. A bag stored before this shipped keeps its bad entries
+// (dropped at read time) and an unrelated PATCH is not the moment to make the operator fix them,
+// because the field they would have to fix is not the field they came to edit.
+export function assertSettingsToolPreconditions(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const next = invalidToolPreconditions(settings);
+  if (next.length === 0) return;
+  // NOTE: Compared by VALUE, not by name. A name that was already invalid and is now invalid DIFFERENTLY
+  // is an edit, and an edit is exactly what this refuses: comparing name membership would accept the
+  // operator rewriting a broken rule into another broken rule and reading it as saved.
+  // NOTE: The BAG itself being the wrong shape is not a per-name question — `invalidToolPreconditions`
+  // answers it with a synthetic name that appears in neither value map, so a name-wise comparison
+  // finds "unchanged" and lets an array or a string through. Compared as a whole, once.
+  if (next.length === 1 && next[0] === "toolPreconditions") {
+    const nextBag = JSON.stringify(rawPreconditionBag(settings));
+    if (nextBag === JSON.stringify(rawPreconditionBag(stored))) return;
+    throw new InvalidToolPreconditionError("toolPreconditions");
+  }
+  const before = storedPreconditionValues(stored);
+  const now = storedPreconditionValues(settings);
+  const introduced = next.find(
+    (name) =>
+      now.get(name) !== before.get(name) &&
+      !removesAStoredRule(name, now, before),
+  );
+  if (introduced === undefined) return;
+  throw new InvalidToolPreconditionError(introduced);
+}
+
+// A TOMBSTONE FOR A RULE THAT IS ACTUALLY THERE, which the catalog restriction must not block.
+//
+// The restriction is about what may be CREATED: outside the native catalog the exposed tool name is
+// not stable identity, so a rule written on one can follow the name onto another tool or stop
+// matching (issue #389). It is NOT about what may be removed — and a non-native rule can genuinely
+// exist, because an agent import copies the settings bag verbatim and the RUNTIME enforces whatever
+// name matches (only the write boundary filters by catalog). Refusing its tombstone left a caller
+// able to READ an active guard and unable to delete it.
+//
+// Both halves matter. A tombstone for a name with nothing stored under it is still refused: there is
+// nothing to delete, so accepting it would report success for a no-op — and that is exactly the
+// shape a caller sends while believing they had created something.
+function removesAStoredRule(
+  name: string,
+  now: Map<string, string>,
+  before: Map<string, string>,
+): boolean {
+  return now.get(name) === "null" && before.get(name) !== undefined;
+}
+
+// The raw entries, serialized, so "did this one change?" is one comparison. `undefined` for a name
+// that is not there, which is what makes an ADDED invalid entry differ from an absent one.
+function rawPreconditionBag(settings: unknown): unknown {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return undefined;
+  }
+  return (settings as Record<string, unknown>).toolPreconditions;
+}
+
+function storedPreconditionValues(settings: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return out;
+  }
+  const bag = (settings as Record<string, unknown>).toolPreconditions;
+  if (!bag || typeof bag !== "object" || Array.isArray(bag)) return out;
+  for (const [name, raw] of Object.entries(bag as Record<string, unknown>)) {
+    out.set(name, canonicalPrecondition(raw));
+  }
+  return out;
+}
+
+// "IS THIS THE SAME RULE?", which is not the same question as "are these the same bytes".
+//
+// This comparison decides whether a write CHANGED an entry, and an unchanged one is exempt from the
+// catalog restriction — that exemption is what lets a caller read the config and write it back. But
+// `JSON.stringify` compares SPELLING: jsonb does not promise property order, and what
+// `agent_settings_get` returns is the reader's normalized shape, not the bytes that were stored. So
+// the same rule, read back and sent again, serialized differently and was refused as an edit.
+//
+// Parsed first, so two spellings of one rule collapse; falls back to the raw serialization for an
+// entry that does not parse, which is the case the by-value comparison was written for in the first
+// place (an already-broken entry re-sent untouched must not be refused).
+function canonicalPrecondition(raw: unknown): string {
+  if (raw === null) return "null";
+  const parsed = parseToolPrecondition(raw);
+  if (parsed) {
+    return JSON.stringify([
+      parsed.kind,
+      parsed.scope,
+      parsed.key,
+      parsed.equals ?? null,
+    ]);
+  }
+  return `raw:${JSON.stringify(raw) ?? "undefined"}`;
+}
+
+// A FALLBACK IS A PROVIDER AND A MODEL, OR IT IS NOTHING — and the write is the only place that can
+// say so, because every reader downstream agrees a half-named block is no fallback and none of them
+// has anywhere to say it.
+//
+// Measured on the stored bag: naming a provider and saving without a model persists
+// `{provider: "openai", model: null}`, `hasModelFallback` answers false, and the form reader maps it
+// straight back to "No fallback". So the operator's provider is gone on the next load, with no error
+// and nothing in the row to explain it, and the same bag reaches the MCP patch as a diff showing
+// `provider: openai` for a fallback that does not exist. That is the ONE difference from the two
+// other `*Required` fields this editor renders — theirs survive the round trip and come back with
+// their error still on screen.
+//
+// Refused rather than repaired for the reason the whole block exists: repairing means choosing which
+// half to drop, and both choices throw away something the operator typed. Whoever receives this can
+// fix it — the operator picks a model, the MCP caller sends one — which is the test for whether a
+// refusal belongs at a write boundary at all.
+//
+// Same shape as the two rules beside it: only a pair this write INTRODUCES or CHANGES is refused, so
+// a bag that already holds a half-named block does not freeze every later save. Per field, because
+// `mergeBehaviorSettings` merges a block one level deep: a patch naming only the model is a complete
+// statement when the stored block already names a provider.
+export class HalfConfiguredFallbackError extends AppError {
+  constructor(missing: "provider" | "model") {
+    // Names WHICH half, and does not promise both: the model is not required for every provider (see
+    // `modelOptionalFor`), so "needs a provider and a model" would send an operator on
+    // `openai-compatible` looking for a field they do not need. ONE literal with one placeholder,
+    // matching the catalog entry and sitting directly after `super(` — the error-catalog reader
+    // pairs the sentence with the key by regex, and it can span neither a ternary of two literals
+    // nor a comment between the paren and the string.
+    super(
+      `settings.modelFallback is only half configured: ${missing} is missing`,
+      400,
+      "errors.halfConfiguredFallback",
+      { missing },
+      `settings.modelFallback.${missing}`,
+    );
+  }
+}
+
+// The two fields, plus whether the bag MENTIONED each of them. A key that is absent is a key this
+// write says nothing about, which only matters on the path that merges.
+function fallbackPair(settings: unknown): {
+  provider: unknown;
+  model: unknown;
+  sets: { provider: boolean; model: boolean };
+} | null {
+  const bag =
+    settings && typeof settings === "object"
+      ? (settings as Record<string, unknown>).modelFallback
+      : undefined;
+  if (!bag || typeof bag !== "object" || Array.isArray(bag)) return null;
+  const o = bag as Record<string, unknown>;
+  return {
+    provider: o.provider,
+    model: o.model,
+    sets: { provider: "provider" in o, model: "model" in o },
+  };
+}
+
+// One spelling for "not named", so a blank string, a null and an absent key compare equal — the
+// editor trims before it stores and the readers treat all three as no fallback.
+const namedOrNull = (v: unknown): string | null =>
+  typeof v === "string" && v.trim() ? v.trim() : null;
+
+// WHAT THE WRITE WILL ACTUALLY STORE, which is not the same question on the two transports and was
+// the defect in the first version of this: REST REPLACES the settings column with the bag it was
+// handed (`updateData = { ...rest }`), while the MCP patch runs `mergeBehaviorSettings` first and
+// merges a block one level deep. Asking the merge question on the replace path lets
+// `settings: { modelFallback: { model: "new" } }` borrow the stored provider to pass the check and
+// then store a bag that has none — the exact half-named row this rule exists to refuse.
+export type SettingsWriteMode = "replace" | "merge";
+
+export function assertSettingsModelFallback(
+  settings: unknown,
+  stored: unknown,
+  mode: SettingsWriteMode,
+): void {
+  const next = fallbackPair(settings);
+  if (!next) return;
+  const prev = fallbackPair(stored);
+  const inherit = mode === "merge";
+  const provider = namedOrNull(
+    inherit && !next.sets.provider ? prev?.provider : next.provider,
+  );
+  const model = namedOrNull(
+    inherit && !next.sets.model ? prev?.model : next.model,
+  );
+  // The model is required for every provider that needs one, which is not all of them: an
+  // `openai-compatible` endpoint that serves a single model discards the name it is sent, and the
+  // repo has said so since the primary's own schema. `modelOptionalFor` is that one predicate.
+  if (provider !== null && (model !== null || modelOptionalFor(provider)))
+    return;
+  if (provider === null && model === null) return;
+  // ONLY WHAT THE WRITE CHANGES. A bag that already holds a half-named pair is re-sent untouched by
+  // every save that edits some other section, and refusing those would freeze the agent on a field
+  // nobody is editing. By VALUE, not by which half is filled: swapping the provider of a broken
+  // pair for another provider edits it and leaves it just as broken, so "same shape" would wave
+  // through a write that is not the one this exemption is for.
+  if (
+    provider === namedOrNull(prev?.provider) &&
+    model === namedOrNull(prev?.model)
+  ) {
+    return;
+  }
+  throw new HalfConfiguredFallbackError(
+    provider !== null ? "model" : "provider",
+  );
+}
+
+export function assertSettingsDebugWindow(
+  settings: unknown,
+  stored: unknown,
+  now: Date = new Date(),
+): void {
+  const next = rawFullDetailUntil(settings);
+  if (next === undefined || next === rawFullDetailUntil(stored)) return;
+  const at = parseIsoInstant(next);
+  if (at !== null && isFullDetailWindowOpen(at, now)) return;
+  // A value that reads as OFF is allowed through only when it is genuinely off — past, absent, or
+  // unreadable. What is refused is the one that is off TODAY and arms itself later.
+  if (at === null || at.getTime() <= now.getTime()) return;
+  throw new DebugWindowTooLongError(FULL_DETAIL_MAX_HOURS);
+}
+
+function rawFullDetailUntil(settings: unknown): unknown {
+  if (!settings || typeof settings !== "object") return undefined;
+  const o = (settings as Record<string, unknown>).observability;
+  if (!o || typeof o !== "object") return undefined;
+  return (o as Record<string, unknown>).fullDetailUntil;
+}
+
 // The write boundary for the agent's credential refs, and the only place a `vault:<id>` enters
 // either JSON bag. `requireVaultRef` is what the other six ref columns have been held to since #124;
 // the agent's two bags were left out of that sweep because they have no column to grep for, so a
@@ -361,16 +647,6 @@ export const agentUpdateSchema = z
 
 export type AgentUpdate = z.infer<typeof agentUpdateSchema>;
 
-function refOrThrow(v: string, notFoundKey: ErrorTranslationKey): bigint {
-  try {
-    return BigInt(v);
-  } catch {
-    // A non-numeric id certainly does not exist; collapse into the same NotFound the DB check
-    // would raise, so the caller gets one consistent error.
-    throw new NotFoundError("not found", notFoundKey);
-  }
-}
-
 export async function updateAgent(
   ctx: TenantContext,
   id: bigint,
@@ -382,7 +658,7 @@ export async function updateAgent(
   opts: { expectedUpdatedAt?: Date } = {},
 ): Promise<AgentDto> {
   assertPromptSize(patch.systemPrompt);
-  const data = agentUpdateSchema.parse(patch);
+  const data = parseInput(agentUpdateSchema, patch);
   validateModelConfigForWrite(data.modelConfig);
   const { businessHoursId, followUpHoursId, ...rest } = data;
   const hasBh = businessHoursId !== undefined;
@@ -394,13 +670,17 @@ export async function updateAgent(
       "errors.noUpdatableFields",
     );
   }
+  // NOTE: refused, not collapsed into the NotFound the ownership check below raises. This used
+  // to answer 404 for a non-numeric id, which tells a caller who mistyped that the row is gone —
+  // and the same file already answered 400 for a malformed tool-grant id (`bigOrThrow`), so one
+  // mistake got two answers depending on which field carried it. Issue #407.
   const bhId =
     hasBh && businessHoursId !== null
-      ? refOrThrow(businessHoursId, "errors.businessHoursNotFound")
+      ? requireDbId(businessHoursId, "businessHoursId")
       : null;
   const fuhId =
     hasFuh && followUpHoursId !== null
-      ? refOrThrow(followUpHoursId, "errors.businessHoursNotFound")
+      ? requireDbId(followUpHoursId, "followUpHoursId")
       : null;
   const dto = await runScopedOn(base, ctx, async (db) => {
     if (bhId !== null) {
@@ -445,6 +725,17 @@ export async function updateAgent(
       }>
     >`SELECT enabled, mode, settings, model_config, updated_at FROM agents WHERE id = ${id} FOR UPDATE`;
     const before = beforeRows[0];
+    // NOTE: read AFTER the lock, and that order is the whole point. The raw lock above reads the
+    // four columns the follow-up fence needs; the trail answers for every column an operator can
+    // write, and which of the three actions this call IS comes from comparing them
+    // (audit-projection.ts). Taken BEFORE the lock, this read can observe state A, wait on the lock
+    // while another save commits B, and then have its own write applied against B while the row
+    // says A — and a write that restores A would compare equal and go unrecorded entirely, which is
+    // the one outcome an audit trail cannot have.
+    const beforeRow = await db.agent.findUnique({
+      where: { id },
+      select: AGENT_SELECT,
+    });
     // NOTE: The optimistic-concurrency check comes FIRST, on the locked row. A stale editor resends
     // the settings it loaded, so if the other writer edited a capped field our copy of it is an edit
     // too — validating first would answer 400 "text too long" to what is really a 409, and the
@@ -464,6 +755,9 @@ export async function updateAgent(
     // NOTE: Inside the lock, against the row this write replaces — reading the stored bag separately
     // would compare against a value another writer could have changed in between.
     assertSettingsTextSizes(rest.settings, before?.settings);
+    assertSettingsDebugWindow(rest.settings, before?.settings);
+    assertSettingsModelFallback(rest.settings, before?.settings, "replace");
+    assertSettingsToolPreconditions(rest.settings, before?.settings);
     // NOTE: Inside the lock and against the same row, for the reason above: "did this write change
     // the ref" has to be asked of the value this write replaces. It also rewrites `rest` in place,
     // so the normalization below copies the canonical bag rather than the submitted one.
@@ -524,7 +818,22 @@ export async function updateAgent(
       where: { id },
       select: AGENT_SELECT,
     });
-    return toDto(row);
+    const applied = toDto(row);
+    if (beforeRow) {
+      const audit = agentUpdateAudit(
+        toDto(beforeRow) as unknown as Record<string, unknown>,
+        applied as unknown as Record<string, unknown>,
+      );
+      if (audit) {
+        await auditMutation(db, ctx, {
+          action: audit.action,
+          target: `agent:${id}`,
+          before: audit.before,
+          after: audit.after,
+        });
+      }
+    }
+    return applied;
   });
   // Arm the sweep if settings were updated and follow-up is now enabled (idempotent).
   if (rest.settings !== undefined && ctx.tenantId !== null) {
@@ -597,12 +906,19 @@ export async function createAgent(
   const tenantId = requireTenant(ctx);
   assertPromptSize(input.systemPrompt);
   assertSettingsTextSizes(input.settings, undefined);
-  const data = agentCreateSchema.parse(input);
+  assertSettingsDebugWindow(input.settings, undefined);
+  assertSettingsModelFallback(input.settings, undefined, "replace");
+  assertSettingsToolPreconditions(input.settings, undefined);
+  const data = parseInput(agentCreateSchema, input);
   validateModelConfigForWrite(data.modelConfig);
   const bhId =
-    data.businessHoursId != null ? BigInt(data.businessHoursId) : null;
+    data.businessHoursId != null
+      ? requireDbId(data.businessHoursId, "businessHoursId")
+      : null;
   const fuhId =
-    data.followUpHoursId != null ? BigInt(data.followUpHoursId) : null;
+    data.followUpHoursId != null
+      ? requireDbId(data.followUpHoursId, "followUpHoursId")
+      : null;
   const dto = await runScopedOn(base, ctx, async (db) => {
     if (bhId !== null) {
       const bh = await db.businessHours.findUnique({
@@ -660,7 +976,17 @@ export async function createAgent(
       },
       select: AGENT_SELECT,
     });
-    return toDto(row);
+    const created = toDto(row);
+    await auditMutation(db, ctx, {
+      action: "agent.create",
+      target: `agent:${created.id}`,
+      after: auditSafe({
+        id: created.id,
+        name: created.name,
+        enabled: created.enabled,
+      }),
+    });
+    return created;
   });
   // Arm the sweep if follow-up is enabled on the new agent (idempotent).
   const followUpCfg = readFollowUpConfig(dto.settings);
@@ -674,6 +1000,13 @@ export async function deleteAgent(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Read inside the transaction that deletes AND under its lock: the row is what the record is
+    // OF, and after the statement there is nothing left to name it with. Unlocked, a rename that
+    // commits between this read and the delete leaves an `agent.update` saying A→B followed by an
+    // `agent.delete` claiming A was what went.
+    const doomedRows = await db.$queryRaw<Array<{ name: string }>>`
+      SELECT name FROM agents WHERE id = ${id} FOR UPDATE`;
+    const doomed = doomedRows[0];
     // Inbox.agentId and Experiment.agentId are plain references (no FK cascade) — null them so a
     // deleted agent leaves no dangling binding. AgentToolSelection cascades via its FK.
     await db.inbox.updateMany({
@@ -688,6 +1021,12 @@ export async function deleteAgent(
     if (res.count === 0) {
       throw new NotFoundError("agent not found", "errors.agentNotFound");
     }
+    await auditMutation(db, ctx, {
+      action: "agent.delete",
+      target: `agent:${id}`,
+      before: auditSafe({ id: String(id), name: doomed?.name }),
+      after: null,
+    });
   });
   // NOTE: ChatwootAgentBot cascades off the agent (schema.prisma: `onDelete: Cascade`), so deleting a
   // persona retires its route token without this module ever naming one. The receiver caches
@@ -762,7 +1101,17 @@ export async function cloneAgent(
         })),
       });
     }
-    return toDto(created);
+    const clone = toDto(created);
+    await auditMutation(db, ctx, {
+      action: "agent.clone",
+      target: `agent:${clone.id}`,
+      after: auditSafe({
+        id: clone.id,
+        name: clone.name,
+        clonedFrom: String(id),
+      }),
+    });
+    return clone;
   });
 }
 
@@ -1105,6 +1454,30 @@ function toGrantDto(g: {
   };
 }
 
+// Just the granted set, for the audit snapshot. `buildToolSelectionView` answers a different
+// question — it also loads every tool definition, MCP connection, integration, knowledge base and
+// document template, plus a tenant-wide groupBy for unindexed documents — and the snapshot is taken
+// while holding the agent's row lock, where that catalog would be paid twice and held open.
+async function readGrantSet(
+  db: ScopedDb,
+  agentId: bigint,
+): Promise<ToolGrantDto[]> {
+  const grants = await db.agentToolSelection.findMany({
+    where: { agentId },
+    select: {
+      source: true,
+      toolDefinitionId: true,
+      mcpServerConnectionId: true,
+      integrationInstanceId: true,
+      documentTemplateId: true,
+      knowledgeBaseIds: true,
+      enabledTools: true,
+    },
+    orderBy: { id: "asc" },
+  });
+  return grants.map(toGrantDto);
+}
+
 async function buildToolSelectionView(
   db: ScopedDb,
   agentId: bigint,
@@ -1251,10 +1624,15 @@ export async function replaceAgentToolSelections(
   const tenantId = requireTenant(ctx);
   const grants = normalizeGrants(input);
   const view = await runScopedOn(base, ctx, async (db) => {
-    const agent = await db.agent.findUnique({
-      where: { id: agentId },
-      select: { id: true, updatedAt: true },
-    });
+    // NOTE: the agent row is LOCKED before its version is read, and the grant snapshot below is
+    // taken under that lock. The set lives in another table with no version of its own, so this row
+    // is what serializes two replacements against each other: unlocked, one call can read set A,
+    // wait while another commits B, and then write A back while its audit row claims A→A. The
+    // agent is also what `expectedUpdatedAt` is checked against, so the precondition and the
+    // snapshot now answer for the same instant. RLS still applies to the raw read.
+    const locked = await db.$queryRaw<Array<{ updated_at: Date }>>`
+      SELECT updated_at FROM agents WHERE id = ${agentId} FOR UPDATE`;
+    const agent = locked[0] ? { updatedAt: locked[0].updated_at } : null;
     if (!agent) {
       throw new NotFoundError("agent not found", "errors.agentNotFound");
     }
@@ -1375,6 +1753,9 @@ export async function replaceAgentToolSelections(
       }
     }
 
+    // The set as it stands, read before the delete-and-recreate replaces it. Same shape the view
+    // returns, so the row's two halves are comparable.
+    const grantsBefore = await readGrantSet(db, agentId);
     await db.agentToolSelection.deleteMany({ where: { agentId } });
     if (grants.length > 0) {
       await db.agentToolSelection.createMany({
@@ -1398,7 +1779,18 @@ export async function replaceAgentToolSelections(
       where: { id: agentId },
       data: { updatedAt: new Date() },
     });
-    return buildToolSelectionView(db, agentId);
+    const next = await buildToolSelectionView(db, agentId);
+    // Same rule the update path follows: the trail records changes, and the editor resubmits the
+    // whole set on every save of the Tools tab.
+    if (grantSetChanged(grantsBefore, next.grants)) {
+      await auditMutation(db, ctx, {
+        action: "agent.tools_set",
+        target: `agent:${agentId}`,
+        before: auditSafe({ grants: grantsBefore }),
+        after: auditSafe({ grants: next.grants }),
+      });
+    }
+    return next;
   });
   // Heads-up for any open editor (other tab / another operator) — best-effort, metadata-only.
   if (ctx.tenantId !== null && view.agentUpdatedAt) {

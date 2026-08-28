@@ -60,6 +60,9 @@ export async function scheduleMessage(
     kind: "SCHEDULED_MESSAGE",
     dedupeKey: `scheduled-message:${args.threadId}:${crypto.randomUUID()}`,
     runAt,
+    // Always a fresh unit of work: the dedupeKey is unique per call (see the comment above), so this
+    // never actually re-arms an existing row — but the caller still has to answer the question.
+    rearm: "new-work",
     payload: {
       threadId: args.threadId,
       instructions: clipText(args.instructions.trim(), MAX_INSTRUCTIONS_LEN),

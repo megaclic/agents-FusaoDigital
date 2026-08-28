@@ -17,7 +17,7 @@ import {
 } from "@/modules/chatwoot/messages";
 import {
   firstAudioAttachment,
-  firstLocationAttachment,
+  incomingRenderable,
   isIncomingMessage,
   shouldBotHandle,
 } from "@/modules/chatwoot/normalize";
@@ -58,11 +58,7 @@ import {
   resolveGraphThreadId,
 } from "./checkpointer";
 import { lastAssistantText } from "./graph";
-import {
-  clearTurnInFlight,
-  isTurnInFlight,
-  markTurnInFlight,
-} from "./inflight";
+import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
 import { conversationDividerMessage, conversationStamp } from "./markers";
 import type { ResolvedModelConfig } from "./models";
@@ -74,7 +70,14 @@ import {
   buildToolset,
   loadAgentConfig,
 } from "./prepare";
+import { undoRefusedTurn } from "./refused-turn";
 import { AgentStatusReporter } from "./status";
+import {
+  clearTurnOwning,
+  markTurnOwning,
+  type ThreadOwner,
+  type TurnHold,
+} from "./thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 import { ToolFlowLogger } from "./tool-flowlog";
 import type { McpLoadDeps } from "./tools/mcp";
@@ -102,7 +105,13 @@ function sysCtx(tenantId: bigint): TenantContext {
 export type RunAgentTurnOutcome =
   | "posted"
   | "skipped"
+  // NO AGENT IS BOUND to this inbox. The mirror creates a row for any inbox that sends traffic, so
+  // this is the state a channel connected in Chatwoot and never bound here sits in, and the caller
+  // reports it (issue #318). Its sibling below is the binding that EXISTS and cannot answer.
   | "no-agent"
+  // Bound, and the config would not load: the agent is switched off (the common one, and deliberate)
+  // or its row is gone. Same silence, different repair, and deliberately not the same word.
+  | "agent-unavailable"
   | "empty"
   | "taken-over"
   // The run was CALLED OFF while it worked — today only by /reset retiring the job that queued it.
@@ -446,6 +455,7 @@ export async function runLoadedTurn(
     inboxId: loaded.inboxDbId,
     threadId,
     base,
+    fullDetail: loaded.fullDetail,
   };
 
   // Load the client + tools (network, outside the tx). The bot token is the PERSONA's, so replies are
@@ -539,14 +549,64 @@ export async function runLoadedTurn(
     // A turn recovered from an empty provider response must not read like a clean one: without this
     // line the fault is invisible and its rate (issue #63 measured 1 in 184 on one install) can
     // never be told apart from a turn that simply worked.
-    onModelRetry: ({ attempt }) =>
+    onModelRetry: ({ attempt, provider, model }) =>
       emitFlowEvent(flow, {
         stage: "generate",
         level: "warn",
         status: "ok",
-        provider: loaded.mc.provider,
-        model: loaded.mc.model,
+        // NOTE: the retry can happen on either model, and the row names the one that made it. The
+        // labels ride on the event rather than being defaulted here, so there is no default to get
+        // wrong — which is what two of the four emitters did while they were optional.
+        provider,
+        model,
         detail: { retriedEmptyResponse: attempt },
+      }),
+    // A fallback that ANSWERS produces a successful turn, so nothing else on it would ever say the
+    // primary was down: the reply went out, the customer was served, and the only trace would be a
+    // usage row under another model's name. Warn rather than info — this is the operator's one
+    // signal that a provider they are paying for is not taking their traffic.
+    onModelFallback: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        provider,
+        model,
+        detail: { fallbackFrom: loaded.mc.provider, fallbackReason: reason },
+      }),
+    // The turn's real ending when there was a second provider and it failed too. `error` rather
+    // than `warn`: the customer got nothing. The stage line that wraps the call is labelled with the
+    // primary by construction, so without this the last thing an operator reads is an error against
+    // the model that never made the second call.
+    // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+    // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+    // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+    // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+    // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+    // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+    // labelled with the primary by construction and would otherwise blame the model that never made
+    // the second call. `status` stays "error": the call did fail.
+    onModelFallbackFailed: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "info",
+        status: "error",
+        provider,
+        model,
+        detail: { fallbackFailed: reason },
+      }),
+    // The mirror image, and it fires BEFORE any failure: a fallback the operator configured and that
+    // cannot be built leaves the turn with nothing behind it, which is indistinguishable from having
+    // configured none. Reported once per turn build rather than on the failure, because by then it
+    // is too late to be the warning it needs to be.
+    onModelFallbackUnavailable: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        provider,
+        model,
+        detail: { fallbackUnavailable: reason },
       }),
     // The history ceiling dropped older attendances from this turn. INFO, not warn: emitFlowEvent
     // fans warn/error out to the alert channels, and a correctly configured ceiling trims on nearly
@@ -614,6 +674,9 @@ export async function runLoadedTurn(
     // words would make it judge the reply against something nobody said.
     customerMessage: text,
     makeModel: params.deps?.makeModel,
+    // The same sink the turn's own callbacks use. A test that injects one and leaves guardrails on
+    // would otherwise capture the agent's row and send the guardrail's to the real database.
+    persistUsage: params.deps?.persistUsage,
   });
 
   // One piece of customer-facing text, delivered the way this agent delivers text: as audio when the
@@ -791,7 +854,11 @@ export async function runLoadedTurn(
   // above it: `getCheckpointer`, the divider write and the marker upsert can all throw, and a claim
   // that outlives its turn keeps every follow-up and every compaction for this contact backing off
   // until the process restarts.
-  let claimedGraphThread = false;
+  // The thread this turn holds against a concurrent append, DURABLY (issue #203). Null until the
+  // claim is taken, and it is what the `finally` releases: the contact-inbox id it needs goes out of
+  // scope long before then.
+  let graphOwner: ThreadOwner | null = null;
+  let graphHold: TurnHold | null = null;
   // Set inside the `ingest:` lock when the ask below says this run was called off. A flag and not a
   // throw: the lock's transaction has to commit and release before this function can return.
   let calledOff = false;
@@ -868,6 +935,43 @@ export async function runLoadedTurn(
               contactInboxId,
             },
           };
+          // Claim the thread against a memory-compaction rewrite, inside the critical section the
+          // rewrite also enters while it checks. That makes the two exclusive rather than merely
+          // staggered: the rewrite either completes before this claim, and the invoke below then
+          // loads the rewritten channel, or it finds the thread claimed and stands down. Claimed for
+          // EVERY turn, not only the ones that cross a boundary, because what has to be excluded is
+          // the invoke, and every turn has one. Released in the `finally` below, on every exit.
+          // Taken in the ROW as well as in this process, so a replica that does not share this Map
+          // still reads the thread as busy. It also WAITS OUT an append in flight, which is what
+          // makes the two exclusive rather than merely staggered across processes: the append's
+          // check and its write are not one step (../graph/thread-claim.ts).
+          const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+          graphHold = await markTurnOwning(owner, base);
+          graphOwner = owner;
+          // ASKED AGAIN, because the claim above can WAIT. The ask before it is still the right
+          // first ask (a run already retired takes no claim it would have to release), but
+          // `markTurnOwning` blocks on an append's lease and on the row lock /reset itself takes,
+          // so by the time the claim lands its answer can be dozens of seconds old. The lock case
+          // is not merely possible, it is ORDERED: a reset holding that row releases it straight
+          // into this waiter, so the turn resumes IMMEDIATELY after the clear and writes the
+          // divider and the marker back over it, arming compaction on a thread the operator was
+          // told was cleared. Everything below writes, so this is the last moment the question is
+          // still about a turn that has written nothing. The `finally` releases the claim:
+          // `graphOwner` is set above.
+          if (
+            params.stillWanted &&
+            !(await params.stillWanted({ strict: true }))
+          ) {
+            calledOff = true;
+            return null;
+          }
+          // READ AFTER THE CLAIM, never before it. `markTurnOwning` can wait out an append that is
+          // mid-flight on another replica, and that append writes exactly these markers: a row read
+          // before the wait is stale by the time it is used, and writing it back walks
+          // `lastSyncedMessageId` backwards, which is the frontier regression the markers exist to
+          // prevent. Whether ANOTHER invoke was already reading comes from the claim itself, for the
+          // reason ../graph/thread-claim.ts gives: two replicas starting together both read "nobody"
+          // if they ask separately.
           const existing = await runScopedOn(base, sysCtx(tenantId), (db) =>
             db.agentThread.findUnique({
               where: key,
@@ -877,17 +981,7 @@ export async function runLoadedTurn(
               },
             }),
           );
-          // Read BEFORE this turn adds its own claim: what matters is whether some OTHER invoke
-          // is mid-flight on this thread (./attendance-boundary.ts, case 1).
-          const anotherInvokeIsReading = isTurnInFlight(graphThreadId);
-          // Claim the thread against a memory-compaction rewrite, inside the critical section the
-          // rewrite also enters while it checks. That makes the two exclusive rather than merely staggered: the
-          // rewrite either completes before this claim — and the invoke below then loads the
-          // rewritten channel — or it finds the thread claimed and stands down. Claimed for EVERY
-          // turn, not only the ones that cross a boundary, because what has to be excluded is the
-          // invoke, and every turn has one. Released in the `finally` below, on every exit.
-          markTurnInFlight(graphThreadId);
-          claimedGraphThread = true;
+          const anotherInvokeIsReading = graphHold.heldBefore;
           const prev = existing?.lastConversationId ?? null;
           const alreadyStarted = needsAttendanceStartProbe(
             prev,
@@ -1076,6 +1170,56 @@ export async function runLoadedTurn(
       await deliverHandoffPromise();
       throw e;
     });
+    // EVERY REFUSAL FROM HERE DOWN GOES OUT THROUGH THIS, and the fence in
+    // tests/graph/refused-turn-callsites.test.ts is what keeps that true.
+    //
+    // The invoke above checkpointed as it ran, so the customer's message and the assistant's answer
+    // are in the thread's history the moment it returned. Everything below suppresses the SEND and
+    // nothing removes what was written: an operator took the conversation, a newer message arrived
+    // mid-turn, a `/reset` retired the run, the output guardrail replaced the reply with nothing. The
+    // customer never received it and the next turn reads it as something they were told — on
+    // `superseded` that next turn is guaranteed, because the re-armed flush answers the whole burst
+    // with the abandoned reply already in its context (issue #315).
+    //
+    // It never decides WHETHER to roll back: `undoRefusedTurn` reads the channel and answers that,
+    // so a refusal is one word here and the judgement lives in one place.
+    const refuse = async (
+      outcome: RunAgentTurnOutcome,
+    ): Promise<RunAgentTurnOutcome> => {
+      const plan = await undoRefusedTurn({
+        checkpointer: params.deps?.checkpointer ?? (await getCheckpointer()),
+        graphThreadId,
+        produced: result.messages,
+        kind: "reactive",
+      }).catch((err) => {
+        // NOTE: best-effort, and loudly. The send was already suppressed, so a failed rollback costs
+        // the next turn a message the customer never saw — the defect this exists to close, and
+        // nothing more. Throwing would turn a correct refusal into a retried turn.
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "turn: could not roll back the refused turn",
+        );
+        return null;
+      });
+      if (plan?.action === "remove") {
+        logger.info(
+          "turn rolled back a refused turn: conv=%s outcome=%s messages=%d",
+          String(conversationId),
+          outcome,
+          plan.ids.length,
+        );
+      } else if (plan?.reason === "another-invoke-is-reading") {
+        // NOTE: the one keep that is a MISS rather than a decision about this turn. The history still
+        // holds a message the customer never received. Logged at warn so the case has a name instead
+        // of looking like a rollback that ran.
+        logger.warn(
+          "turn could not roll back a refused turn, another invoke holds the thread: conv=%s outcome=%s",
+          String(conversationId),
+          outcome,
+        );
+      }
+      return outcome;
+    };
     let reply = lastAssistantText(result.messages).trim();
 
     // The deferred resolve falls with the TRANSFER, not with the suppression of the final text: a
@@ -1163,13 +1307,13 @@ export async function runLoadedTurn(
           status: recheck.observed.status,
         }),
       });
-      return "taken-over";
+      return refuse("taken-over");
     }
 
     // Last-moment supersede gate (debounce): a newer message arrived mid-turn → drop this reply
     // AND any deferred resolve intent (the re-armed flush re-decides over the full burst).
     const blocked = await postBlocked();
-    if (blocked) return blocked;
+    if (blocked) return refuse(blocked);
 
     // OUTPUT guardrail: screen the model's reply BEFORE delivery. On a violation, replace it with the
     // template / a guardrails-generated safe reply, or suppress the send entirely ("silent"). A
@@ -1190,11 +1334,11 @@ export async function runLoadedTurn(
     const outGuard = screened ? await runGuardrail("output", screened) : null;
     // Same wait, same reason: `postBlocked` answered before this model call, and the suppressed
     // branch below returns "blocked" without passing any later ask.
-    if (await writeCalledOff()) return "stale";
+    if (await writeCalledOff()) return refuse("stale");
     if (outGuard && guardrailTripped(outGuard)) {
       turnState.pendingAttachments.length = 0;
       const replacement = screenedText(outGuard, screened);
-      if (replacement === null) return "blocked";
+      if (replacement === null) return refuse("blocked");
       reply = replacement;
     }
 
@@ -1208,7 +1352,7 @@ export async function runLoadedTurn(
     // reported "empty" would leave a stale turn error on a conversation that was just answered.
     if (!reply) {
       // Nothing has left this turn yet on this branch, so the whole thing stands down.
-      if (await writeCalledOff()) return "stale";
+      if (await writeCalledOff()) return refuse("stale");
       const queued = turnState.pendingAttachments.length;
       const {
         sent,
@@ -1226,7 +1370,7 @@ export async function runLoadedTurn(
       // customer, and "stale" would leave the watermark where it is — handing the same burst to the
       // next flush, which would send that attachment again. What was delivered decides the word, the
       // same rule the reply below follows.
-      if (attachmentsCalledOff && !sent) return "stale";
+      if (attachmentsCalledOff && !sent) return refuse("stale");
       // NOTE: The attachments WERE the turn and none of them reached the customer. That is a failed
       // turn, not a silent one: returning "empty" here would let the deferred resolve close a
       // conversation nobody answered, and the callers only record a turn error (private note,
@@ -1264,7 +1408,7 @@ export async function runLoadedTurn(
 
     // The image lands before the text that talks about it, and before the TTS branch: an audio
     // reply must not swallow the attachment.
-    if (await writeCalledOff()) return "stale";
+    if (await writeCalledOff()) return refuse("stale");
     const attachments = await deliverPendingAttachments(
       client,
       conversationId,
@@ -1276,7 +1420,8 @@ export async function runLoadedTurn(
     // Called off mid-batch with something already out: the text below would stand down anyway, and
     // returning "stale" from there would replay a burst whose attachment the customer has. The turn
     // reports what it delivered and stops here.
-    if (attachments.calledOff) return attachments.sent ? "posted" : "stale";
+    if (attachments.calledOff)
+      return attachments.sent ? "posted" : refuse("stale");
 
     const delivered = await deliverText(reply, recheck.voiceReply);
     // Zero is the split loop standing down on its FIRST balloon: nothing reached the customer, so
@@ -1288,7 +1433,7 @@ export async function runLoadedTurn(
     // command landing in the text send leaves a customer holding part of the answer. "stale" would
     // hand the burst back to the next flush, which sends that attachment again.
     if (delivered === "stale" || delivered === 0) {
-      return attachments.sent ? "posted" : "stale";
+      return attachments.sent ? "posted" : refuse("stale");
     }
     deliveredBalloons = delivered;
     // Same rule as the branch above: the reply is out, the resolve is a separate write.
@@ -1304,7 +1449,26 @@ export async function runLoadedTurn(
     clearTurnInFlight(threadId);
     // Only what this turn actually took: releasing a claim we never made would release a CONCURRENT
     // turn's, and hand the thread to a compaction while that turn is still reading it.
-    if (claimedGraphThread) clearTurnInFlight(graphThreadId);
+    // NOTE: releasing is best-effort, and deliberately cannot fail the turn. By here the reply may
+    // already be with the customer; a throw from this line would skip `status.finished` and make the
+    // caller treat a delivered turn as failed, which a retry then answers a second time. The row
+    // carries a lease precisely so a release that never lands is recovered by expiry instead of by
+    // anyone waiting on it.
+    if (graphOwner) {
+      const heldOwner: ThreadOwner = graphOwner;
+      try {
+        await clearTurnOwning(
+          heldOwner,
+          base,
+          graphHold ?? { epoch: null, heldBefore: false },
+        );
+      } catch (err) {
+        logger.warn(
+          { err, thread: heldOwner.graphThreadId },
+          "failed to release the durable turn claim; its lease will expire",
+        );
+      }
+    }
     status.finished(deliveredBalloons);
   }
 }
@@ -1333,19 +1497,9 @@ export async function runAgentTurn(
   if (n.conversationId == null || n.inboxId == null) return "skipped";
   if (!isIncomingMessage(n)) return "skipped";
   // Render the message for the agent (text / transcribed audio / image-or-file marker), mirroring the
-  // flush. transcribedText is set by the eager STT pass.
-  const renderable = {
-    text: n.message?.content ?? "",
-    transcribedText: n.message?.transcribedText,
-    imageDescription: n.message?.imageDescription,
-    extractedText: n.message?.extractedText,
-    attachmentTypes: (n.message?.attachments ?? [])
-      .map((a) => a.fileType)
-      .filter((t): t is string => t !== null),
-    location: firstLocationAttachment(n.message?.attachments),
-    inReplyTo: n.message?.inReplyTo,
-    isReaction: n.message?.isReaction,
-  };
+  // flush. transcribedText is set by the eager STT pass. The shape itself is `incomingRenderable`,
+  // shared with the spend-ceiling gate, which has to ask this same question before it refuses.
+  const renderable = incomingRenderable(n);
   let text = renderInboundMessage(renderable);
   if (!text) return "skipped";
   const conversationId = n.conversationId;
@@ -1381,7 +1535,13 @@ export async function runAgentTurn(
   }
 
   // Scoped read (no network): resolve the inbox's Agent + config bundle.
-  const loaded = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  //
+  // The binding and the config are read in ONE scope and reported apart, because they are two facts
+  // an operator repairs differently and the caller writes a `route` line off the answer (issue #318).
+  // Classifying them anywhere else means reading the binding a second time, and a rebind landing
+  // between the two reads then reports the wrong one — the turn takes seconds, and gates, mirroring
+  // and media all run inside it.
+  const resolved = await runScopedOn(base, sysCtx(tenantId), async (db) => {
     const inbox = await db.inbox.findUnique({
       where: {
         tenantId_chatwootInstanceId_chatwootInboxId: {
@@ -1392,16 +1552,23 @@ export async function runAgentTurn(
       },
       select: { agentId: true },
     });
-    if (!inbox?.agentId) return null;
-    return loadAgentConfig(db, {
-      tenantId,
-      instanceId,
-      conversationId,
-      agentId: inbox.agentId,
-      threadId,
-    });
+    if (!inbox?.agentId) return { bound: false as const, config: null };
+    return {
+      bound: true as const,
+      config: await loadAgentConfig(db, {
+        tenantId,
+        instanceId,
+        conversationId,
+        agentId: inbox.agentId,
+        threadId,
+      }),
+    };
   });
-  if (!loaded) return "no-agent";
+  if (!resolved.bound) return "no-agent";
+  const loaded = resolved.config;
+  // A binding that exists and could not be loaded: the agent is switched off, or its row is gone.
+  // Switched off is a deliberate operator state, which is why it is NOT the silence above.
+  if (!loaded) return "agent-unavailable";
 
   // NOTE: Post gate, mirroring the debounce flush (issue #49): concurrent direct turns on the same
   // conversation (webhook deliveries are not serialized) each generate a reply — without this gate

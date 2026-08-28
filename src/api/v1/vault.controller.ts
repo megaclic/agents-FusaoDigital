@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -31,11 +32,15 @@ import {
 // translate('errors.invalidVaultName', 'Name must be 1 to 128 characters')
 // translate('errors.invalidVaultParamName', 'Param name contains invalid characters')
 // translate('errors.invalidVaultRef', '"{{ref}}" is not a vault reference: expected vault:<id>, not a credential name')
-// translate('errors.invalidVaultValue', 'Invalid secret value for this credential type')
+// translate('errors.invalidVaultValue', 'The secret value must be an object for this credential type')
+// translate('errors.vaultFieldRequired', 'The "{{field}}" field must not be empty')
+// translate('errors.vaultFieldUnknown', 'This credential type has no field called "{{field}}"')
 // translate('errors.vaultBaseUrlRequired', 'This credential type requires a base URL.')
 // translate('errors.vaultNameInUse', 'A secret with this name and type already exists')
 // translate('errors.vaultParamNameRequired', 'Param name is required for this credential type')
 // translate('errors.vaultRefNotFound', 'That vault reference does not point to any credential: {{ref}}')
+// translate('errors.vaultFieldWhitespace', 'The "{{field}}" field must not begin or end with a space or line break. Remove it and save again.')
+// translate('errors.vaultSecretWhitespace', 'A vault secret must not begin or end with a space or line break. Remove it and save again.')
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   if (!ctx) throw new ForbiddenError();
@@ -45,7 +50,6 @@ function ctxOrThrow(ctx: TenantContext | null): TenantContext {
 
 const idParams = t.Object({
   id: t.String({
-    pattern: "^\\d+$",
     description: "Vault entry id (BigInt serialized as a decimal string).",
   }),
 });
@@ -123,7 +127,7 @@ export const vaultController = new Elysia({
           }),
         ),
       }),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .put(
@@ -135,7 +139,7 @@ export const vaultController = new Elysia({
         baseUrl?: string | null;
         paramName?: string;
       };
-      const entryId = BigInt(params.id);
+      const entryId = requireDbId(params.id);
       const id = await updateVaultEntry(ctxOrThrow(tenantContext), entryId, b);
       return {
         instance: instanceIdentity,
@@ -177,7 +181,7 @@ export const vaultController = new Elysia({
           }),
         ),
       }),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .get(
@@ -186,7 +190,7 @@ export const vaultController = new Elysia({
       instance: instanceIdentity,
       references: await vaultReferences(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -196,7 +200,7 @@ export const vaultController = new Elysia({
         "Returns where a vault entry is referenced across the tenant's configuration.",
       ),
       params: idParams,
-      response: errors(401, 403, 404),
+      response: errors(400, 401, 403, 404),
     },
   )
   // Test-on-save: probe a typed value (pre-save) or a stored credential by id. Stateless for the
@@ -244,14 +248,14 @@ export const vaultController = new Elysia({
           }),
         ),
       }),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 422),
     },
   )
   .post(
     "/:id/test",
     async ({ tenantContext, params, body }) => {
       const b = (body ?? {}) as { baseURL?: string | null };
-      const ref = formatVaultRef(BigInt(params.id));
+      const ref = formatVaultRef(requireDbId(params.id));
       const result = await testStoredVaultEntry(
         ctxOrThrow(tenantContext),
         ref,
@@ -276,13 +280,13 @@ export const vaultController = new Elysia({
           ),
         }),
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .delete(
     "/:id",
     async ({ tenantContext, params }) => {
-      await deleteVaultEntry(ctxOrThrow(tenantContext), BigInt(params.id));
+      await deleteVaultEntry(ctxOrThrow(tenantContext), requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
     {
@@ -292,6 +296,6 @@ export const vaultController = new Elysia({
         "Permanently removes a tenant secret by id.",
       ),
       params: idParams,
-      response: errors(401, 403, 404),
+      response: errors(400, 401, 403, 404),
     },
   );

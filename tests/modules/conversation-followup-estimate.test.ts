@@ -2,6 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import type { TenantContext } from "@/lib/tenancy";
+import {
+  cancelAppointmentRecord,
+  recordAppointment,
+} from "@/modules/appointments/record";
 import { getConversationDetail } from "@/modules/conversations/service";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
@@ -60,6 +64,9 @@ let convOurBotArmed = 0n;
 let convForeignBotEstimate = 0n;
 let convOurBotEstimate = 0n;
 let convUnidentifiedBotArmed = 0n;
+let convStepOptOutEstimate = 0n;
+let convStepOptOutArmedStep1 = 0n;
+let convStepOptOutStepGone = 0n;
 let convNoBotRowArmed = 0n;
 
 // The redirect follow-up job's run time, asserted verbatim as the widget conversation's redirectNext.
@@ -483,6 +490,87 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
       startISO: new Date(Date.now() + 2 * 3_600_000).toISOString(),
     });
 
+    // A third persona whose opt-out is PER STEP (issue #103): step 0 fires through an appointment
+    // (a payment-deadline chase), step 1 does not (ordinary re-engagement). The agent-wide
+    // `pauseWhileAppointment` stays ON, which is the whole point.
+    const stepOptOutAgent = await suDb.agent.create({
+      data: {
+        tenantId: tenant,
+        name: "FU Step Opt-Out",
+        systemPrompt: "x",
+        followUpArmedAt: new Date("2026-01-01T00:00:00Z"),
+        mode: "production",
+        modelConfig: { provider: "openai", model: "gpt-4o-mini" },
+        settings: {
+          followUp: {
+            enabled: true,
+            pauseWhileAppointment: true,
+            steps: [
+              {
+                delayValue: 2,
+                delayUnit: "minutes",
+                instructions: "",
+                ignoreAppointmentPause: true,
+              },
+              { delayValue: 2, delayUnit: "days", instructions: "" },
+            ],
+          },
+        },
+      },
+    });
+    const stepOptOutInbox = await suDb.inbox.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: inst,
+        chatwootInboxId: 94,
+        name: "Sup pausa por etapa",
+        agentId: stepOptOutAgent.id,
+      },
+    });
+    convStepOptOutEstimate = await seedAppointmentConv(
+      330,
+      stepOptOutInbox.id,
+      { startISO: new Date(Date.now() + 2 * 3_600_000).toISOString() },
+    );
+    convStepOptOutArmedStep1 = await seedAppointmentConv(
+      331,
+      stepOptOutInbox.id,
+      { startISO: new Date(Date.now() + 2 * 3_600_000).toISOString() },
+      { lastFollowUpAt: FOLLOW_UP_AT },
+    );
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId: tenant,
+        kind: "FOLLOWUP",
+        dedupeKey: `followup:${tenant}:${inst}:331`,
+        status: "PENDING",
+        runAt: ARMED_STEP1_RUN_AT,
+        payload: { threadId: `${tenant}:${inst}:331`, stepIndex: 1 },
+      },
+    });
+
+    // Review round 2: an operator who SHORTENS a sequence leaves a pending job for a step that no
+    // longer exists. The handler answers `done` on its first look, so the console has to reach the
+    // same terminal answer — before this it counted down to a step that will never fire and, once
+    // the step decides the pause, reported the conversation as appointment-paused over a job that
+    // is about to end. stepIndex 4 on a two-step sequence.
+    convStepOptOutStepGone = await seedAppointmentConv(
+      332,
+      stepOptOutInbox.id,
+      { startISO: new Date(Date.now() + 2 * 3_600_000).toISOString() },
+      { lastFollowUpAt: FOLLOW_UP_AT },
+    );
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId: tenant,
+        kind: "FOLLOWUP",
+        dedupeKey: `followup:${tenant}:${inst}:332`,
+        status: "PENDING",
+        runAt: ARMED_STEP1_RUN_AT,
+        payload: { threadId: `${tenant}:${inst}:332`, stepIndex: 4 },
+      },
+    });
+
     // ── A PENDING job the handler will drop at claim time (issue #72). A multi-step sequence leaves
     //    one armed between steps with runAt days out, and nothing cancels it when the ground shifts.
     const twoStepSettings = {
@@ -733,38 +821,31 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
       },
     });
     if (reminder) {
-      await suDb.schedulerJob.create({
-        data: {
-          tenantId: tenant,
-          kind: "APPOINTMENT_REMINDER",
-          dedupeKey: `reminder:ev_${chatwootId}:1`,
-          // DONE on purpose: anchoring on PENDING rows alone went blind after the last reminder
-          // fired, which is what #39 fixed in the sweep. The indicator reads the same projection.
-          status: "DONE",
-          runAt: new Date(Date.now() - 3_600_000),
-          payload: {
-            threadId: `${tenant}:${inst}:${chatwootId}`,
-            eventId: `ev_${chatwootId}`,
-            calendarId: "cal_x@group.calendar.google.com",
-            credentialRef: null,
-            startISO: reminder.startISO,
-            offsetHours: 1,
-            isLast: true,
-            askConfirmation: false,
-            summary: "Consulta",
-            calendarLabel: "Agenda",
-            ...(reminder.cancelledAt
-              ? { cancelledAt: reminder.cancelledAt }
-              : {}),
-          },
-        },
+      // The RECORD, not a reminder job: the indicator reads the same one predicate the sweep and the
+      // handler do (issue #376). Its reminder is deliberately left unwritten — an appointment whose
+      // last reminder already fired, or whose integration never armed one, still stands.
+      await recordAppointment({
+        tenantId: tenant,
+        threadId: `${tenant}:${inst}:${chatwootId}`,
+        externalId: `ev_${chatwootId}`,
+        startISO: reminder.startISO,
+        summary: "Consulta",
+        calendarId: "cal_x@group.calendar.google.com",
+        calendarLabel: "Agenda",
+        base: appDb,
       });
+      if (reminder.cancelledAt) {
+        await cancelAppointmentRecord(tenant, `ev_${chatwootId}`, appDb);
+      }
     }
     return c.id;
   }
 
   afterAll(async () => {
     if (tenant) {
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM appointments WHERE tenant_id = ${tenant}`,
+      );
       await suDb.$executeRawUnsafe(
         `DELETE FROM scheduler_jobs WHERE tenant_id = ${tenant}`,
       );
@@ -975,6 +1056,51 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
     );
     expect(d.followUp?.pausedByAppointment).toBe(false);
     expect(d.followUp?.nextStep).toBe(1);
+  });
+
+  // ISSUE #103. The indicator changes no behaviour, only what the operator reads — which is exactly
+  // why it is the site that gets left behind: the suite stays green and the symptom shows up on the
+  // screen. Left out, the console says "paused by appointment" over a step that fires in two minutes.
+  //
+  // The pair is what proves it reads the RIGHT step rather than any step: same agent, same live
+  // appointment, and the answer flips with which step comes next.
+  test("(#103) the step about to fire opted out → the console does not claim it is paused", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convStepOptOutEstimate,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBe(1);
+    expect(d.followUp?.pausedByAppointment).toBe(false);
+    expect(d.followUp?.nextRunAt).not.toBeNull();
+  });
+
+  test("(#103) the NEXT step did not opt out → still paused, on the same agent", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convStepOptOutArmedStep1,
+      appDb,
+    );
+    expect(d.followUp?.pausedByAppointment).toBe(true);
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.nextRunAt).toBeNull();
+  });
+
+  // Review round 2, and it is a regression THIS PR introduced. Before the per-step read, the pause
+  // did not consult a step at all and the console's "paused" was accurate here, because the handler
+  // used to meet the appointment BEFORE it noticed the step was gone and rescheduled. Moving the
+  // gate below the step resolution made the handler end the sequence instead, so the same word on
+  // the screen became false. The console has to model the handler's terminal case, not just its
+  // pause.
+  test("(#103) a job past the end of a shrunk sequence reports no next step, and no pause", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convStepOptOutStepGone,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.nextRunAt).toBeNull();
+    expect(d.followUp?.pausedByAppointment).toBe(false);
   });
 
   // Issue #72: the pending-job branch reported whatever the row said, while the handler re-checks all

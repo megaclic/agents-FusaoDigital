@@ -11,12 +11,17 @@ import {
   MCP_STDIO_LAUNCHERS,
   stdioCommandLauncher,
 } from "@/lib/mcp-launchers";
+import { parseInput } from "@/lib/parse-input";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
 import { ensureFreshMcpAccessToken } from "@/modules/vault/mcp-oauth";
 import { isManagedOAuthKind } from "@/modules/vault/secret-types";
-import { requireVaultRef, tryResolveVaultEntry } from "@/modules/vault/service";
+import {
+  readVaultRefId,
+  requireVaultRef,
+  tryResolveVaultEntry,
+} from "@/modules/vault/service";
 
 // MCP server connections (per-tenant). The connection is the transport + endpoint + a vault
 // credential reference; the per-agent allowlist of discovered tools lives in AgentToolSelection
@@ -178,6 +183,7 @@ async function assertNameFree(
     throw new ConflictError(
       "mcp connection name already in use",
       "errors.mcpNameTaken",
+      "name",
     );
   }
 }
@@ -189,12 +195,12 @@ export async function createMcpConnection(
 ): Promise<McpConnectionDto> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
-  const data = mcpConnectionCreateSchema.parse(input);
+  const data = parseInput(mcpConnectionCreateSchema, input);
   await assertTransportValid(data);
   return runScopedOn(base, ctx, async (db) => {
     await assertNameFree(db, data.name);
     const credentialRef = data.credentialRef
-      ? await requireVaultRef(db, data.credentialRef)
+      ? await requireVaultRef(db, data.credentialRef, "credentialRef")
       : null;
     const row = await db.mcpServerConnection.create({
       data: {
@@ -218,7 +224,7 @@ export async function updateMcpConnection(
   patch: McpConnectionUpdate,
   base: PrismaClient = basePrisma,
 ): Promise<McpConnectionDto> {
-  const data = mcpConnectionUpdateSchema.parse(patch);
+  const data = parseInput(mcpConnectionUpdateSchema, patch);
   const current = await runScopedOn(base, ctx, (db) =>
     db.mcpServerConnection.findUnique({
       where: { id },
@@ -240,7 +246,7 @@ export async function updateMcpConnection(
   return runScopedOn(base, ctx, async (db) => {
     if (data.name) await assertNameFree(db, data.name, id);
     const credentialRef = data.credentialRef
-      ? await requireVaultRef(db, data.credentialRef)
+      ? await requireVaultRef(db, data.credentialRef, "credentialRef")
       : null;
     await db.mcpServerConnection.update({
       where: { id },
@@ -429,9 +435,7 @@ export async function discoverMcpTools(
   // connecting, so Discover authenticates the same way a live agent turn does.
   let secret = sel.secret;
   if (isManagedOAuthKind(sel.kind) && sel.credentialRef) {
-    const id2 = sel.credentialRef.startsWith("vault:")
-      ? BigInt(sel.credentialRef.slice("vault:".length))
-      : null;
+    const id2 = readVaultRefId(sel.credentialRef);
     if (id2 !== null) {
       secret =
         sel.kind === "mcp_oauth"

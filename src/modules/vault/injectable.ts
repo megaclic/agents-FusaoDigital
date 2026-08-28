@@ -1,6 +1,7 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { readVaultRefId } from "@/modules/vault/service";
 import { ensureFreshGoogleAccessToken } from "./google-oauth";
 import { ensureFreshMcpAccessToken } from "./mcp-oauth";
 import { tryResolveVaultEntry } from "./service";
@@ -36,9 +37,7 @@ export async function resolveInjectableCredentialEntry(
   );
   if (!entry) return null;
   if (entry.kind === "google_oauth" || entry.kind === "mcp_oauth") {
-    const id = ref.startsWith("vault:")
-      ? BigInt(ref.slice("vault:".length))
-      : null;
+    const id = readVaultRefId(ref);
     if (id === null) return null;
     // A refresh failure (revoked/expired grant, network hiccup) must not propagate as an unhandled
     // exception into the caller (a tool call, the contact authorization check) — it degrades to null

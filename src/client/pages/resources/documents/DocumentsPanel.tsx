@@ -26,6 +26,7 @@ import {
   useOnModalOpen,
   useToast,
 } from "@/client/components";
+import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { mediaFetch } from "@/client/lib/media";
@@ -64,6 +65,10 @@ function companySummary(
 // `{ error }` whose `value` is the parsed body, and a refusal here is written for the operator (which
 // template has the name, which rule the name breaks) — throwing it away for a generic string is how
 // a fixable mistake becomes a dead end.
+// The keys of the create body. `name` is the one an operator can act on here — a duplicate answers
+// with which template already holds it — and the rest come from the starter, not from an input.
+const STARTER_FIELDS = ["name"] as const;
+
 export function DocumentsPanel() {
   const { t, i18n } = useTranslation();
   // The route defaults an absent locale to pt-BR, so an English console would create Portuguese
@@ -88,6 +93,8 @@ export function DocumentsPanel() {
   const [naming, setNaming] = useState<Starter | null>(null);
   const [draftName, setDraftName] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
+  const draftRef = useRef(draftName);
+  draftRef.current = draftName;
   const [deleting, setDeleting] = useState(false);
   // null = still loading, "error" = the lookup failed. Two states, because collapsing them leaves a
   // dialog claiming to be checking something it has already given up on.
@@ -115,6 +122,10 @@ export function DocumentsPanel() {
   const editModal = useModalController<{ template: DocumentTemplate }>();
   const companyModal = useModalController();
   const starterModal = useModalController();
+  // The dialog has two steps and only the second draws a name box: the first is the starter list.
+  const refusal = useFieldRefusal(
+    starterModal.isOpen && naming ? STARTER_FIELDS : [],
+  );
   const refsModal = useModalController<{ name: string }>();
   const deleteModal = useModalController<{ id: string; name: string }>();
   const confirm = useModalController<ConfirmPayload>();
@@ -150,16 +161,25 @@ export function DocumentsPanel() {
   // Where a failed load is reported, which depends entirely on whether there is anything on screen
   // to lose. With nothing loaded, the retry card is the only thing that can say the panel is empty
   // because a request failed rather than because the account is.
-  const failed = useCallback(() => {
-    if (loadedOnce.current) {
-      showToast(
-        t("documents.refreshError", "Could not refresh this page."),
-        "error",
-      );
-      return;
-    }
-    setError(true);
-  }, [showToast, t]);
+  //
+  // `reason` is the response that failed, and it is passed rather than read here because the caller
+  // is the only one that knows WHICH of the four requests refused. Absent from the `catch` on
+  // purpose: Eden resolves a transport failure, so that one holds a fault of ours, with no sentence
+  // of the server's in it.
+  const failed = useCallback(
+    (reason?: unknown) => {
+      if (loadedOnce.current) {
+        showToast(
+          apiErrorMessage(reason) ||
+            t("documents.refreshError", "Could not refresh this page."),
+          "error",
+        );
+        return;
+      }
+      setError(true);
+    },
+    [showToast, t],
+  );
   const load = useCallback(async () => {
     const seq = ++loadSeq.current;
     const writes = companyWrites.current;
@@ -183,7 +203,7 @@ export function DocumentsPanel() {
       // be writing an answer to a question nobody is asking any more.
       if (!current()) return;
       if (list.error || !list.data || settings.error) {
-        failed();
+        failed(list.error ?? settings.error);
         return;
       }
       setTemplates([...list.data.templates]);
@@ -216,6 +236,8 @@ export function DocumentsPanel() {
   // naming step and reopens would otherwise be handed that step again, prefilled with the name they
   // just abandoned (docs/modals.md).
   useOnModalOpen(starterModal, () => {
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    refusal.clear();
     setNaming(null);
     setDraftName("");
     setCreateError(null);
@@ -228,29 +250,45 @@ export function DocumentsPanel() {
     setCreating(starter.key);
     setCreateError(null);
     try {
-      const { error: err } = await api.api.v1["document-templates"].post({
+      const sent = {
         name,
         description: starter.description,
         blocks: starter.blocks as Record<string, unknown>[],
         fields: starter.fields as Record<string, unknown>[],
         style: starter.style as unknown as Record<string, unknown>,
         numberPrefix: starter.numberPrefix,
-      });
+      };
+      const { error: err } = await api.api.v1["document-templates"].post(sent);
       if (err) {
-        // The server's own words, shown next to the field that caused them. It says which template
-        // already has the name, which a generic "could not create" cannot — and the operator is
-        // three characters away from fixing it.
-        setCreateError(apiErrorMessage(err));
+        // The server's own words, and the input they are about. It says which template already has
+        // the name, which a generic "could not create" cannot — and the operator is three characters
+        // away from fixing it. `capture` decides where it goes: the name box when the refusal is
+        // about the name, this line when it is about the starter's own blocks or style, which no
+        // control here edits.
+        setCreateError(
+          refusal.capture(
+            err,
+            t("documents.createError", "Could not create this template."),
+            sent,
+            { ...sent, name: draftRef.current.trim() },
+          ),
+        );
         return;
       }
+      refusal.clear();
       starterModal.close();
       showToast(t("documents.created", "Template created."), "success");
       void load();
-    } catch {
+    } catch (e) {
       // Eden REJECTS on a transport failure instead of answering `{ error }`, and only the second
       // was handled: offline, the button spun and then said nothing at all.
       setCreateError(
-        t("documents.createError", "Could not create this template."),
+        refusal.capture(
+          e,
+          t("documents.createError", "Could not create this template."),
+          { name },
+          { name: draftRef.current.trim() },
+        ),
       );
     } finally {
       setCreating(null);
@@ -304,7 +342,11 @@ export function DocumentsPanel() {
         id,
       }).delete();
       if (err) {
-        showToast(t("documents.deleteError", "Could not delete."), "error");
+        showToast(
+          apiErrorMessage(err) ||
+            t("documents.deleteError", "Could not delete."),
+          "error",
+        );
         return;
       }
       showToast(t("documents.deleted", "Deleted."), "success");
@@ -385,7 +427,10 @@ export function DocumentsPanel() {
         .revoke.post();
       if (err) throw err;
     } catch (e) {
-      showToast(t("documents.revokeError", "Could not revoke."), "error");
+      showToast(
+        apiErrorMessage(e) || t("documents.revokeError", "Could not revoke."),
+        "error",
+      );
       // Rethrown so the confirm dialog stays OPEN on failure, per its own contract: a revoke worth
       // asking about is worth retrying without hunting the row down in the list again. Eden
       // RESOLVES an HTTP error as `{ error }` and REJECTS on a transport failure, so both halves
@@ -714,7 +759,10 @@ export function DocumentsPanel() {
                 "This is what the agent's tool is called, so each template needs its own name.",
               )}
             </p>
-            <FormField label={t("documents.name", "Name")}>
+            <FormField
+              label={t("documents.name", "Name")}
+              error={refusal.at("name", draftName.trim())}
+            >
               <Input
                 autoFocus
                 value={draftName}

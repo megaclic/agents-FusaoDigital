@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -123,6 +124,12 @@ export const writeBody = t.Object({
         "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
     }),
   ),
+  appointment: t.Optional(
+    t.Union([t.Record(t.String(), t.Unknown()), t.Null()], {
+      description:
+        'What this tool\'s RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:"book"|"cancel", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: "data.items.0.id". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. "feegow"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: "google_calendar".',
+    }),
+  ),
   ackEnabled: t.Optional(
     t.Boolean({
       description:
@@ -136,6 +143,27 @@ export const writeBody = t.Object({
     }),
   ),
 });
+
+// The CREATE route's own body. `writeBody` above describes what a PATCH accepts, where every field
+// being optional is correct, and a POST that borrows it lets a request missing a required field
+// through the transport: the refusal then comes from the service's zod schema, whose `ZodError`
+// src/app.ts has no branch for, so the caller is told the server broke about a field they own
+// (issue #301, measured: `POST` with `{}` answered 500 `Something went wrong`).
+//
+// Composed rather than written out, so the descriptions and the field list stay in one place and a
+// field added to `writeBody` cannot be missing here. WHICH fields are required is not written twice
+// either: tests/api/v1/write-body-required.test.ts derives that set from the service's create schema
+// and fails if the two drift.
+const CREATE_REQUIRED = [
+  "name",
+  "label",
+  "urlTemplate",
+  "allowedHosts",
+] as const;
+const createBody = t.Composite([
+  t.Omit(writeBody, CREATE_REQUIRED),
+  t.Required(t.Pick(writeBody, CREATE_REQUIRED)),
+]);
 
 export const toolsController = new Elysia({
   prefix: "/v1/tools",
@@ -163,7 +191,7 @@ export const toolsController = new Elysia({
       instance: instanceIdentity,
       tool: await getToolDefinition(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -186,7 +214,7 @@ export const toolsController = new Elysia({
       instance: instanceIdentity,
       references: await toolReferences(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -218,8 +246,8 @@ export const toolsController = new Elysia({
         "Create tool",
         "Create a custom HTTP tool definition for the current tenant.",
       ),
-      response: errors(400, 401, 403, 404, 409),
-      body: writeBody,
+      response: errors(400, 401, 403, 404, 409, 422),
+      body: createBody,
     },
   )
   .patch(
@@ -228,7 +256,7 @@ export const toolsController = new Elysia({
       instance: instanceIdentity,
       tool: await updateToolDefinition(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body as ToolDefinitionUpdate,
       ),
     }),
@@ -238,7 +266,7 @@ export const toolsController = new Elysia({
         "Update tool",
         "Update fields of a custom HTTP tool definition.",
       ),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
       params: t.Object({
         id: t.String({
           description: "Tool definition id (BigInt as a string).",
@@ -250,7 +278,10 @@ export const toolsController = new Elysia({
   .delete(
     "/:id",
     async ({ tenantContext, params }) => {
-      await deleteToolDefinition(ctxOrThrow(tenantContext), BigInt(params.id));
+      await deleteToolDefinition(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      );
       return { instance: instanceIdentity, success: true };
     },
     {

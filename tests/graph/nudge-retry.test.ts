@@ -1,11 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import type { RunAgentNudgeOutcome } from "@/graph/nudge";
+import {
+  type AgentNudge,
+  nudgeOccasionKey,
+  type RunAgentNudgeOutcome,
+} from "@/graph/nudge";
 import {
   isRepairableNudgeRefusal,
   NUDGE_RETRY_BACKOFF_MS,
   NUDGE_RETRY_LIMIT,
   nextNudgeRetry,
 } from "@/graph/nudge-retry";
+import { chatFollowupNudge } from "@/modules/channel-redirect/followup";
+import { inactivityNudge } from "@/modules/followups/handlers";
 
 // Every outcome `runAgentNudge` can answer, and whether a caller that owns an occasion may spend it.
 // The `false` rows are the design decision, not filler: the two that mean "there is nothing here to
@@ -15,6 +21,12 @@ const TABLE: Array<[RunAgentNudgeOutcome, boolean]> = [
   ["agent-unavailable", true],
   ["live-unavailable", true],
   ["deferred", true],
+  // The month turns over on its own, and the operator can raise the number before it does. Spending
+  // the occasion immediately would lose a follow-up nobody resends. What it buys is BOUNDED by this
+  // ladder, which is the same one `agent-unavailable` rides: 8 attempts, 15 minutes apart, so a
+  // ceiling still standing two hours later spends the occasion anyway. That is the common case
+  // covered, not a promise that the occasion waits for the month to turn (issue #146).
+  ["over-ceiling", true],
   ["messaged", false],
   ["templated", false],
   ["noted", false],
@@ -89,4 +101,131 @@ describe("nextNudgeRetry", () => {
       expect(nextNudgeRetry({ nudgeRetries: bad }, now).attempt).toBe(1);
     });
   }
+});
+
+// WHICH SCHEDULED OCCASION A REFUSAL BELONGS TO, proved without a database. The `over` line the
+// ceiling writes is one per occasion, and the retry ladder is only half of what that has to mean:
+// the same conversation carries independent jobs, and collapsing them loses the second one's row and
+// its alert entirely.
+describe("the occasion a nudge refusal belongs to", () => {
+  const key = (nudge: AgentNudge) => nudgeOccasionKey(3n, 77, nudge);
+
+  test("the same job asked twice is one occasion", () => {
+    const job = { source: "followup", kind: "inactivity", step: 2 };
+    expect(key(job)).toBe(key({ ...job }));
+  });
+
+  test.each([
+    [
+      "a different source",
+      { source: "appointment_reminder", kind: "inactivity", step: 2 },
+    ],
+    ["a different kind", { source: "followup", kind: "resolved", step: 2 }],
+    ["a different step", { source: "followup", kind: "inactivity", step: 3 }],
+  ])("%s is a different occasion", (_name, other) => {
+    expect(key({ source: "followup", kind: "inactivity", step: 2 })).not.toBe(
+      key(other),
+    );
+  });
+
+  // Two reminders for two appointments on one conversation, which is an ordinary shape for a clinic.
+  test("two appointments are two occasions", () => {
+    const reminder = (eventId: string) => ({
+      source: "appointment_reminder",
+      kind: "reminder",
+      refs: { event_id: eventId, calendar_id: "cal-1" },
+    });
+    expect(key(reminder("evt-1"))).not.toBe(key(reminder("evt-2")));
+  });
+
+  // The key is a string built on whatever machine runs the job, so its parts cannot depend on
+  // insertion order or on a locale's collation.
+  test("the refs order does not change the key", () => {
+    const a = {
+      source: "appointment_reminder",
+      refs: { event_id: "e", calendar_id: "c" },
+    };
+    const b = {
+      source: "appointment_reminder",
+      refs: { calendar_id: "c", event_id: "e" },
+    };
+    expect(key(a)).toBe(key(b));
+  });
+
+  // The parts are separated unambiguously, which `k=v` joined by commas is not: refs are opaque
+  // strings from somebody else's calendar, and one carrying the delimiters would otherwise collide
+  // with a different set of refs entirely.
+  test("a ref that contains the delimiters is not a different occasion's key", () => {
+    const source = "appointment_reminder";
+    expect(key({ source, refs: { a: "x,b=y" } })).not.toBe(
+      key({ source, refs: { a: "x", b: "y" } }),
+    );
+  });
+
+  // AN INBOUND EVENT DESCRIBES ITSELF WITH NOTHING THE OTHER PARTS READ: `buildNudge` sets one
+  // `source`, a fixed `kind`, no `step` and no `refs`, so two separate deliveries on one conversation
+  // produced one key and the second refusal lost its row and its alert inside the first's two-hour
+  // window. The delivery row is the occasion, and the id is what says so.
+  test("two inbound deliveries are two occasions", () => {
+    const inbound = (deliveryId: string) => ({
+      source: "asaas",
+      kind: "agent_nudge",
+      occasionId: `delivery:${deliveryId}`,
+      status: "OVERDUE",
+    });
+    expect(key(inbound("41"))).not.toBe(key(inbound("42")));
+    // ...and the SAME delivery redelivered is the same occasion, which is the half that keeps this
+    // from being a per-attempt key wearing a different name.
+    expect(key(inbound("41"))).toBe(key(inbound("41")));
+  });
+
+  // And the conversation is still part of it: two tenants' worth of identical jobs must not share a
+  // window.
+  test("the conversation is part of the identity", () => {
+    const job = { source: "followup", kind: "inactivity", step: 1 };
+    expect(nudgeOccasionKey(3n, 77, job)).not.toBe(
+      nudgeOccasionKey(3n, 78, job),
+    );
+  });
+
+  // EVERY DESCRIPTOR THIS KEY IS ASKED ABOUT HAS TO ANSWER "WHICH OCCASION", and two of them said
+  // only "which rung". Asserted against the real builders rather than hand-written literals, because
+  // the key cannot fail on a field its caller never set — the same reason the inbound receptor's own
+  // wiring is asserted in its suite.
+  test("two follow-up episodes at the same step are two occasions", () => {
+    const step = (lastInboundAt: Date | null) =>
+      inactivityNudge({
+        idleMin: 30,
+        instructions: "diga oi",
+        step: 1,
+        lastInboundAt,
+      });
+    const first = new Date("2026-08-27T10:00:00.000Z");
+    const second = new Date("2026-08-27T11:00:00.000Z");
+    expect(key(step(first))).not.toBe(key(step(second)));
+    // ...and the rungs of ONE episode still keep their own windows apart from each other.
+    expect(key(step(first))).toBe(key(step(first)));
+    expect(key(step(first))).not.toBe(key({ ...step(first), step: 2 }));
+  });
+
+  test("two redirect episodes on one conversation are two occasions", () => {
+    expect(key(chatFollowupNudge("oi", 41))).not.toBe(
+      key(chatFollowupNudge("oi", 42)),
+    );
+    // The instructions are NOT part of the identity: the same episode reworded is one occasion.
+    expect(key(chatFollowupNudge("oi", 41))).toBe(
+      key(chatFollowupNudge("olá de novo", 41)),
+    );
+  });
+
+  // ...AND SO IS THE ACCOUNT THE NUMBER CAME FROM. Chatwoot conversation ids are account-local, so a
+  // tenant connected to two Chatwoot instances has two different conversations numbered 77, and the
+  // identical follow-up step on each is two occasions. Without this they shared one two-hour window
+  // and the second refusal lost its row and its alert.
+  test("the Chatwoot instance is part of the identity", () => {
+    const job = { source: "followup", kind: "inactivity", step: 1 };
+    expect(nudgeOccasionKey(3n, 77, job)).not.toBe(
+      nudgeOccasionKey(4n, 77, job),
+    );
+  });
 });

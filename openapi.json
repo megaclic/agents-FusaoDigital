@@ -302,6 +302,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postAuthSetup"
@@ -427,6 +449,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postAuthSignup"
@@ -537,6 +581,28 @@
               "application/json": {
                 "schema": {
                   "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -698,6 +764,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchAuthPassword",
@@ -766,6 +854,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -949,6 +1059,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postAuthAccept-invite"
@@ -1095,6 +1227,28 @@
               "application/json": {
                 "schema": {
                   "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -1381,6 +1535,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -1477,6 +1653,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -1698,6 +1896,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchAdminUsersByIdRole"
@@ -1783,6 +2003,28 @@
           }
         },
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -1855,6 +2097,28 @@
               "application/json": {
                 "schema": {
                   "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -2059,6 +2323,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postAdminInvitations",
@@ -2105,6 +2391,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -2692,6 +3000,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1Branding",
@@ -2773,6 +3103,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -2954,6 +3306,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "putV1BrandingAssetByKindByVariant"
@@ -3052,6 +3426,28 @@
               "application/json": {
                 "schema": {
                   "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -3351,6 +3747,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Tenants",
@@ -3628,6 +4046,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1TenantsById"
@@ -3798,6 +4238,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -4258,6 +4720,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "getV1ConversationsByIdMedia"
@@ -4523,6 +5007,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1ConversationsByIdReply"
@@ -4676,6 +5182,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -5050,6 +5578,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1ConversationsByIdStatus"
@@ -5068,7 +5618,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "description": "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
               "type": "string"
             }
           },
@@ -5162,6 +5712,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "getV1Metrics"
@@ -5180,7 +5752,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "description": "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
               "type": "string"
             }
           },
@@ -5197,6 +5769,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -5258,7 +5852,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "description": "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
               "type": "string"
             }
           },
@@ -5361,6 +5955,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "getV1MetricsTimeseries"
@@ -5379,7 +5995,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "description": "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
               "type": "string"
             }
           },
@@ -5396,6 +6012,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -5624,6 +6262,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -5940,6 +6600,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -6453,6 +7135,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1AgentsById"
@@ -6623,6 +7327,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -7145,6 +7871,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1AgentsByIdClone"
@@ -7414,6 +8162,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -7993,6 +8763,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "putV1AgentsByIdTool-selections"
@@ -8330,6 +9122,50 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
                   "type": "object",
                   "required": [
                     "error"
@@ -8795,6 +9631,50 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1AgentsByIdPlaygroundFollowup"
@@ -9120,6 +10000,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -9523,6 +10425,50 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1AgentsByIdPlaygroundAudio"
@@ -9848,6 +10794,50 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
                   "type": "object",
                   "required": [
                     "error"
@@ -10248,6 +11238,50 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Too many requests — rate limited, or a spend ceiling has been reached.",
                   "type": "object",
                   "required": [
                     "error"
@@ -10974,6 +12008,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1AgentsModelsList",
@@ -11185,6 +12241,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1AgentsTtsList",
@@ -11305,15 +12383,13 @@
             "application/json": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name",
+                  "label",
+                  "urlTemplate",
+                  "allowedHosts"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Tool name the agent sees when selecting tools.",
-                    "type": "string"
-                  },
-                  "label": {
-                    "description": "Human-friendly display name; the identifier (name) is derived from it.",
-                    "type": "string"
-                  },
                   "description": {
                     "description": "Tool description shown to the agent, or null to clear it.",
                     "anyOf": [
@@ -11334,17 +12410,6 @@
                       "PATCH",
                       "DELETE"
                     ]
-                  },
-                  "urlTemplate": {
-                    "description": "Request URL template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
-                    "type": "string"
-                  },
-                  "allowedHosts": {
-                    "description": "Hostnames the tool is permitted to call (SSRF allowlist).",
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
                   },
                   "headers": {
                     "description": "Static request headers; values may contain {{secret}} placeholders.",
@@ -11412,6 +12477,20 @@
                       ]
                     }
                   },
+                  "appointment": {
+                    "description": "What this tool's RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:\"book\"|\"cancel\", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: \"data.items.0.id\". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. \"feegow\"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: \"google_calendar\".",
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -11426,6 +12505,25 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "name": {
+                    "description": "Tool name the agent sees when selecting tools.",
+                    "type": "string"
+                  },
+                  "label": {
+                    "description": "Human-friendly display name; the identifier (name) is derived from it.",
+                    "type": "string"
+                  },
+                  "urlTemplate": {
+                    "description": "Request URL template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "type": "string"
+                  },
+                  "allowedHosts": {
+                    "description": "Hostnames the tool is permitted to call (SSRF allowlist).",
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -11433,15 +12531,13 @@
             "application/x-www-form-urlencoded": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name",
+                  "label",
+                  "urlTemplate",
+                  "allowedHosts"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Tool name the agent sees when selecting tools.",
-                    "type": "string"
-                  },
-                  "label": {
-                    "description": "Human-friendly display name; the identifier (name) is derived from it.",
-                    "type": "string"
-                  },
                   "description": {
                     "description": "Tool description shown to the agent, or null to clear it.",
                     "anyOf": [
@@ -11462,17 +12558,6 @@
                       "PATCH",
                       "DELETE"
                     ]
-                  },
-                  "urlTemplate": {
-                    "description": "Request URL template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
-                    "type": "string"
-                  },
-                  "allowedHosts": {
-                    "description": "Hostnames the tool is permitted to call (SSRF allowlist).",
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
                   },
                   "headers": {
                     "description": "Static request headers; values may contain {{secret}} placeholders.",
@@ -11540,6 +12625,20 @@
                       ]
                     }
                   },
+                  "appointment": {
+                    "description": "What this tool's RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:\"book\"|\"cancel\", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: \"data.items.0.id\". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. \"feegow\"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: \"google_calendar\".",
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -11554,6 +12653,25 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "name": {
+                    "description": "Tool name the agent sees when selecting tools.",
+                    "type": "string"
+                  },
+                  "label": {
+                    "description": "Human-friendly display name; the identifier (name) is derived from it.",
+                    "type": "string"
+                  },
+                  "urlTemplate": {
+                    "description": "Request URL template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "type": "string"
+                  },
+                  "allowedHosts": {
+                    "description": "Hostnames the tool is permitted to call (SSRF allowlist).",
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -11561,15 +12679,13 @@
             "multipart/form-data": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name",
+                  "label",
+                  "urlTemplate",
+                  "allowedHosts"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Tool name the agent sees when selecting tools.",
-                    "type": "string"
-                  },
-                  "label": {
-                    "description": "Human-friendly display name; the identifier (name) is derived from it.",
-                    "type": "string"
-                  },
                   "description": {
                     "description": "Tool description shown to the agent, or null to clear it.",
                     "anyOf": [
@@ -11590,17 +12706,6 @@
                       "PATCH",
                       "DELETE"
                     ]
-                  },
-                  "urlTemplate": {
-                    "description": "Request URL template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
-                    "type": "string"
-                  },
-                  "allowedHosts": {
-                    "description": "Hostnames the tool is permitted to call (SSRF allowlist).",
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
                   },
                   "headers": {
                     "description": "Static request headers; values may contain {{secret}} placeholders.",
@@ -11668,6 +12773,20 @@
                       ]
                     }
                   },
+                  "appointment": {
+                    "description": "What this tool's RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:\"book\"|\"cancel\", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: \"data.items.0.id\". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. \"feegow\"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: \"google_calendar\".",
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -11682,6 +12801,25 @@
                         "type": "null"
                       }
                     ]
+                  },
+                  "name": {
+                    "description": "Tool name the agent sees when selecting tools.",
+                    "type": "string"
+                  },
+                  "label": {
+                    "description": "Human-friendly display name; the identifier (name) is derived from it.",
+                    "type": "string"
+                  },
+                  "urlTemplate": {
+                    "description": "Request URL template; {{param}}, {{context}} and {{secret}} placeholders are interpolated at call time. Single-brace {param} is accepted and normalized when it matches a declared input field or context variable.",
+                    "type": "string"
+                  },
+                  "allowedHosts": {
+                    "description": "Hostnames the tool is permitted to call (SSRF allowlist).",
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -11783,6 +12921,28 @@
               "application/json": {
                 "schema": {
                   "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -12078,6 +13238,20 @@
                       ]
                     }
                   },
+                  "appointment": {
+                    "description": "What this tool's RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:\"book\"|\"cancel\", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: \"data.items.0.id\". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. \"feegow\"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: \"google_calendar\".",
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -12205,6 +13379,20 @@
                         }
                       ]
                     }
+                  },
+                  "appointment": {
+                    "description": "What this tool's RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:\"book\"|\"cancel\", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: \"data.items.0.id\". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. \"feegow\"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: \"google_calendar\".",
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
                   },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
@@ -12334,6 +13522,20 @@
                       ]
                     }
                   },
+                  "appointment": {
+                    "description": "What this tool's RESPONSE says about an appointment, so the platform can hold follow-ups while the booking stands and can remind ahead of it. Omit or null when the tool has nothing to do with appointments. Shape: {action:\"book\"|\"cancel\", idPath, startPath (book only), provider?, summaryPath?, reminderOffsetsHours?(hours before the start, e.g. [24,1]; at most 5, clamped to 1-8760h; absent arms no reminder), askConfirmationOnLast?}. A path is dot-separated keys, a numeric segment indexing an array: \"data.items.0.id\". The id has to be the same one the CANCEL tool answers with. `provider` names the booking system these ids belong to (lowercase slug, e.g. \"feegow\"): only needed when a tenant has MORE THAN ONE booking system, since an id is unique only within the system that issued it. The book and cancel tools of the same system must carry the SAME provider, or the cancel reaches no record. Reserved: \"google_calendar\".",
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "patternProperties": {
+                          "^(.*)$": {}
+                        }
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "ackEnabled": {
                     "description": "Whether the tool sends an acknowledgement message before executing.",
                     "type": "boolean"
@@ -12449,6 +13651,28 @@
               "application/json": {
                 "schema": {
                   "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -12813,19 +14037,11 @@
             "application/json": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name",
+                  "transport"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Display name for the MCP server connection.",
-                    "type": "string"
-                  },
-                  "transport": {
-                    "type": "string",
-                    "enum": [
-                      "streamableHttp",
-                      "sse",
-                      "stdio"
-                    ]
-                  },
                   "url": {
                     "description": "Server URL for the streamableHttp and sse transports; null for stdio.",
                     "anyOf": [
@@ -12862,6 +14078,18 @@
                   "enabled": {
                     "description": "Whether the connection is active.",
                     "type": "boolean"
+                  },
+                  "name": {
+                    "description": "Display name for the MCP server connection.",
+                    "type": "string"
+                  },
+                  "transport": {
+                    "type": "string",
+                    "enum": [
+                      "streamableHttp",
+                      "sse",
+                      "stdio"
+                    ]
                   }
                 }
               }
@@ -12869,19 +14097,11 @@
             "application/x-www-form-urlencoded": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name",
+                  "transport"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Display name for the MCP server connection.",
-                    "type": "string"
-                  },
-                  "transport": {
-                    "type": "string",
-                    "enum": [
-                      "streamableHttp",
-                      "sse",
-                      "stdio"
-                    ]
-                  },
                   "url": {
                     "description": "Server URL for the streamableHttp and sse transports; null for stdio.",
                     "anyOf": [
@@ -12918,6 +14138,18 @@
                   "enabled": {
                     "description": "Whether the connection is active.",
                     "type": "boolean"
+                  },
+                  "name": {
+                    "description": "Display name for the MCP server connection.",
+                    "type": "string"
+                  },
+                  "transport": {
+                    "type": "string",
+                    "enum": [
+                      "streamableHttp",
+                      "sse",
+                      "stdio"
+                    ]
                   }
                 }
               }
@@ -12925,19 +14157,11 @@
             "multipart/form-data": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name",
+                  "transport"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Display name for the MCP server connection.",
-                    "type": "string"
-                  },
-                  "transport": {
-                    "type": "string",
-                    "enum": [
-                      "streamableHttp",
-                      "sse",
-                      "stdio"
-                    ]
-                  },
                   "url": {
                     "description": "Server URL for the streamableHttp and sse transports; null for stdio.",
                     "anyOf": [
@@ -12974,6 +14198,18 @@
                   "enabled": {
                     "description": "Whether the connection is active.",
                     "type": "boolean"
+                  },
+                  "name": {
+                    "description": "Display name for the MCP server connection.",
+                    "type": "string"
+                  },
+                  "transport": {
+                    "type": "string",
+                    "enum": [
+                      "streamableHttp",
+                      "sse",
+                      "stdio"
+                    ]
                   }
                 }
               }
@@ -13068,6 +14304,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Mcp-connections",
@@ -13116,6 +14374,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -13459,6 +14739,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -13945,11 +15247,10 @@
             "application/json": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Human-readable name of the schedule.",
-                    "type": "string"
-                  },
                   "timezone": {
                     "description": "IANA timezone (e.g. America/Sao_Paulo) the windows are evaluated in.",
                     "type": "string"
@@ -14043,6 +15344,10 @@
                         }
                       }
                     }
+                  },
+                  "name": {
+                    "description": "Human-readable name of the schedule.",
+                    "type": "string"
                   }
                 }
               }
@@ -14050,11 +15355,10 @@
             "application/x-www-form-urlencoded": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Human-readable name of the schedule.",
-                    "type": "string"
-                  },
                   "timezone": {
                     "description": "IANA timezone (e.g. America/Sao_Paulo) the windows are evaluated in.",
                     "type": "string"
@@ -14148,6 +15452,10 @@
                         }
                       }
                     }
+                  },
+                  "name": {
+                    "description": "Human-readable name of the schedule.",
+                    "type": "string"
                   }
                 }
               }
@@ -14155,11 +15463,10 @@
             "multipart/form-data": {
               "schema": {
                 "type": "object",
+                "required": [
+                  "name"
+                ],
                 "properties": {
-                  "name": {
-                    "description": "Human-readable name of the schedule.",
-                    "type": "string"
-                  },
                   "timezone": {
                     "description": "IANA timezone (e.g. America/Sao_Paulo) the windows are evaluated in.",
                     "type": "string"
@@ -14253,6 +15560,10 @@
                         }
                       }
                     }
+                  },
+                  "name": {
+                    "description": "Human-readable name of the schedule.",
+                    "type": "string"
                   }
                 }
               }
@@ -14332,6 +15643,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -14922,6 +16255,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1Business-hoursById"
@@ -15191,7 +16546,8 @@
                           "type": "number"
                         },
                         "systemPrompt": {
-                          "description": "System prompt override applied when this variant is assigned.",
+                          "maxLength": 100000,
+                          "description": "System prompt override applied when this variant is assigned (up to 100000 characters, the same ceiling the agent's own prompt is held to).",
                           "type": "string"
                         }
                       }
@@ -15249,7 +16605,8 @@
                           "type": "number"
                         },
                         "systemPrompt": {
-                          "description": "System prompt override applied when this variant is assigned.",
+                          "maxLength": 100000,
+                          "description": "System prompt override applied when this variant is assigned (up to 100000 characters, the same ceiling the agent's own prompt is held to).",
                           "type": "string"
                         }
                       }
@@ -15307,7 +16664,8 @@
                           "type": "number"
                         },
                         "systemPrompt": {
-                          "description": "System prompt override applied when this variant is assigned.",
+                          "maxLength": 100000,
+                          "description": "System prompt override applied when this variant is assigned (up to 100000 characters, the same ceiling the agent's own prompt is held to).",
                           "type": "string"
                         }
                       }
@@ -15395,6 +16753,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -15621,7 +17001,8 @@
                           "type": "number"
                         },
                         "systemPrompt": {
-                          "description": "System prompt override applied when this variant is assigned.",
+                          "maxLength": 100000,
+                          "description": "System prompt override applied when this variant is assigned (up to 100000 characters, the same ceiling the agent's own prompt is held to).",
                           "type": "string"
                         }
                       }
@@ -15675,7 +17056,8 @@
                           "type": "number"
                         },
                         "systemPrompt": {
-                          "description": "System prompt override applied when this variant is assigned.",
+                          "maxLength": 100000,
+                          "description": "System prompt override applied when this variant is assigned (up to 100000 characters, the same ceiling the agent's own prompt is held to).",
                           "type": "string"
                         }
                       }
@@ -15729,7 +17111,8 @@
                           "type": "number"
                         },
                         "systemPrompt": {
-                          "description": "System prompt override applied when this variant is assigned.",
+                          "maxLength": 100000,
+                          "description": "System prompt override applied when this variant is assigned (up to 100000 characters, the same ceiling the agent's own prompt is held to).",
                           "type": "string"
                         }
                       }
@@ -15817,6 +17200,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -16443,6 +17848,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Vault",
@@ -16474,7 +17901,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -16735,6 +18161,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "putV1VaultById"
@@ -16751,7 +18199,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -16769,6 +18216,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -16852,7 +18321,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -16870,6 +18338,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -17144,6 +18634,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1VaultTest",
@@ -17175,7 +18687,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -17324,6 +18835,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -17357,7 +18890,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -17521,6 +19053,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1VaultByIdOauthGoogleAuthorize"
@@ -17539,7 +19093,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -17662,7 +19215,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -17884,7 +19436,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -18029,7 +19580,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -18152,7 +19702,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^\\d+$",
               "description": "Vault entry id (BigInt serialized as a decimal string).",
               "type": "string"
             }
@@ -18349,7 +19898,7 @@
           "Settings"
         ],
         "summary": "Get tenant settings",
-        "description": "Returns the tenant's embedding, Langfuse and company-profile settings.",
+        "description": "Returns the tenant's embedding, Langfuse, company-profile and token-ceiling settings.",
         "responses": {
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
@@ -18660,6 +20209,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "putV1Tenant-settingsEmbedding",
@@ -18868,9 +20439,559 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "putV1Tenant-settingsLangfuse",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
+      }
+    },
+    "/v1/tenant-settings/spend-ceiling/usage": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Get token-ceiling usage",
+        "description": "Tokens spent this calendar month per traffic source, against the configured ceiling. Returned for both sources whether or not a ceiling is set, so the number is available to whoever has to pick one.",
+        "responses": {
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1Tenant-settingsSpend-ceilingUsage",
+        "parameters": [
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ]
+      }
+    },
+    "/v1/tenant-settings/spend-ceiling": {
+      "put": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Update token-ceiling settings",
+        "description": "Updates the tenant's monthly token ceiling.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "description": "Whether the token ceiling is enforced.",
+                    "type": "boolean"
+                  },
+                  "monthlyInboxTokens": {
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                    "description": "Tokens (prompt + completion) allowed per calendar month for customer traffic. 0 = no ceiling on this half.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 1000000000000,
+                        "description": "Tokens (prompt + completion) allowed per calendar month for customer traffic. 0 = no ceiling on this half.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "monthlyPlaygroundTokens": {
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                    "description": "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 1000000000000,
+                        "description": "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "overCeilingMessage": {
+                    "description": "What the customer is told when a turn is refused. null says nothing.",
+                    "anyOf": [
+                      {
+                        "maxLength": 2000,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "handoffEnabled": {
+                    "description": "Whether a refused conversation is opened for humans to pick up.",
+                    "type": "boolean"
+                  },
+                  "noticeCooldownSeconds": {
+                    "minimum": 0,
+                    "maximum": 3600,
+                    "description": "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 3600,
+                        "description": "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "warnAtPercent": {
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "description": "Whether the token ceiling is enforced.",
+                    "type": "boolean"
+                  },
+                  "monthlyInboxTokens": {
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                    "description": "Tokens (prompt + completion) allowed per calendar month for customer traffic. 0 = no ceiling on this half.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 1000000000000,
+                        "description": "Tokens (prompt + completion) allowed per calendar month for customer traffic. 0 = no ceiling on this half.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "monthlyPlaygroundTokens": {
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                    "description": "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 1000000000000,
+                        "description": "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "overCeilingMessage": {
+                    "description": "What the customer is told when a turn is refused. null says nothing.",
+                    "anyOf": [
+                      {
+                        "maxLength": 2000,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "handoffEnabled": {
+                    "description": "Whether a refused conversation is opened for humans to pick up.",
+                    "type": "boolean"
+                  },
+                  "noticeCooldownSeconds": {
+                    "minimum": 0,
+                    "maximum": 3600,
+                    "description": "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 3600,
+                        "description": "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "warnAtPercent": {
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "description": "Whether the token ceiling is enforced.",
+                    "type": "boolean"
+                  },
+                  "monthlyInboxTokens": {
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                    "description": "Tokens (prompt + completion) allowed per calendar month for customer traffic. 0 = no ceiling on this half.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 1000000000000,
+                        "description": "Tokens (prompt + completion) allowed per calendar month for customer traffic. 0 = no ceiling on this half.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "monthlyPlaygroundTokens": {
+                    "minimum": 0,
+                    "maximum": 1000000000000,
+                    "description": "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 1000000000000,
+                        "description": "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "overCeilingMessage": {
+                    "description": "What the customer is told when a turn is refused. null says nothing.",
+                    "anyOf": [
+                      {
+                        "maxLength": 2000,
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "handoffEnabled": {
+                    "description": "Whether a refused conversation is opened for humans to pick up.",
+                    "type": "boolean"
+                  },
+                  "noticeCooldownSeconds": {
+                    "minimum": 0,
+                    "maximum": 3600,
+                    "description": "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 3600,
+                        "description": "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "warnAtPercent": {
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
+                    "anyOf": [
+                      {
+                        "format": "integer",
+                        "default": 0,
+                        "type": "string"
+                      },
+                      {
+                        "minimum": 0,
+                        "maximum": 100,
+                        "description": "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
+                        "type": "integer"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "putV1Tenant-settingsSpend-ceiling",
         "parameters": [
           {
             "name": "x-tenant-id",
@@ -19045,6 +21166,28 @@
               "application/json": {
                 "schema": {
                   "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -19289,6 +21432,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "putV1Tenant-settingsCompany",
@@ -19440,6 +21605,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -20035,6 +22222,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1WebhooksSubscriptions",
@@ -20274,6 +22483,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -20536,6 +22767,448 @@
         "operationId": "postV1WebhooksSubscriptionsByIdTest"
       }
     },
+    "/v1/webhooks/deliveries": {
+      "get": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "List webhook deliveries",
+        "description": "Lists this tenant's outbound webhook deliveries newest first, with keyset pagination. Returns delivery state (status, attempts, last error, the event and subscription it belongs to) and never the payload.",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Filter by delivery status: PENDING, SENDING, DELIVERED, DEAD. An unknown value is rejected with 400.",
+              "type": "string"
+            }
+          },
+          {
+            "name": "subscriptionId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Filter by webhook subscription id (BigInt serialized as a string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "event",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Filter by event name (from GET /events).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Lower bound on enqueue time, as an ISO 8601 instant with an offset (2026-01-01T00:00:00Z). A date alone is rejected with 400.",
+              "type": "string"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Upper bound on enqueue time, as an ISO 8601 instant with an offset (2026-01-01T00:00:00Z). A date alone is rejected with 400.",
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Max rows to return (positive integer string, default 50, capped at 200).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "description": "Keyset cursor (id of the last row from the previous page).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1WebhooksDeliveries"
+      }
+    },
+    "/v1/webhooks/deliveries/{id}": {
+      "get": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Get webhook delivery",
+        "description": "Returns one outbound webhook delivery by id; the payload is never included.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Webhook delivery id (BigInt serialized as a string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1WebhooksDeliveriesById"
+      }
+    },
+    "/v1/webhooks/deliveries/{id}/requeue": {
+      "post": {
+        "tags": [
+          "Webhooks"
+        ],
+        "summary": "Requeue webhook delivery",
+        "description": "Returns a dead delivery to the worker queue with its attempt count reset. Only a delivery in DEAD is accepted; any other status is refused with 409 naming it.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Webhook delivery id (BigInt serialized as a string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — a duplicate or a state conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "postV1WebhooksDeliveriesByIdRequeue"
+      }
+    },
     "/v1/api-keys": {
       "get": {
         "tags": [
@@ -20758,6 +23431,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -21057,7 +23752,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Lower bound on log time (ISO date).",
+              "description": "Lower bound on log time, as an ISO 8601 instant with an offset (2026-01-01T00:00:00Z). A date alone is rejected with 400.",
               "type": "string"
             }
           },
@@ -21066,7 +23761,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Upper bound on log time (ISO date).",
+              "description": "Upper bound on log time, as an ISO 8601 instant with an offset (2026-01-01T00:00:00Z). A date alone is rejected with 400.",
               "type": "string"
             }
           },
@@ -21269,7 +23964,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Lower bound on log time (ISO date).",
+              "description": "Lower bound on log time, as an ISO 8601 instant with an offset (2026-01-01T00:00:00Z). A date alone is rejected with 400.",
               "type": "string"
             }
           },
@@ -21278,7 +23973,7 @@
             "in": "query",
             "required": false,
             "schema": {
-              "description": "Upper bound on log time (ISO date).",
+              "description": "Upper bound on log time, as an ISO 8601 instant with an offset (2026-01-01T00:00:00Z). A date alone is rejected with 400.",
               "type": "string"
             }
           },
@@ -21912,6 +24607,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Alert-channels",
@@ -22208,6 +24925,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -22647,6 +25386,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "getV1IntegrationsGoogleCalendars"
@@ -22754,6 +25515,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -23134,6 +25917,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -23556,6 +26361,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -24076,6 +26903,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1KnowledgeBases",
@@ -24498,6 +27347,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -25019,6 +27890,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -25585,6 +28478,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1KnowledgeDocumentsById"
@@ -25980,6 +28895,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1KnowledgeBasesByIdReindex"
@@ -26205,6 +29142,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1KnowledgeSearch",
@@ -26392,6 +29351,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -26680,6 +29661,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -27514,6 +30517,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Document-templates",
@@ -27939,6 +30964,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Document-templatesPreview",
@@ -27970,7 +31017,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "Template id (BigInt string).",
               "type": "string"
             }
@@ -28091,7 +31137,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "Template id (BigInt string).",
               "type": "string"
             }
@@ -28460,6 +31505,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1Document-templatesById"
@@ -28476,7 +31543,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "Template id (BigInt string).",
               "type": "string"
             }
@@ -28599,7 +31665,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "Template id (BigInt string).",
               "type": "string"
             }
@@ -28831,6 +31896,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -29091,6 +32178,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1Documents",
@@ -29122,7 +32231,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "Document id (BigInt string).",
               "type": "string"
             }
@@ -29245,7 +32353,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "Document id (BigInt string).",
               "type": "string"
             }
@@ -29552,6 +32659,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1McpOauthRegister"
@@ -29691,6 +32820,28 @@
               "application/json": {
                 "schema": {
                   "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -29958,6 +33109,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1McpOauthConsentByReq"
@@ -30113,6 +33286,28 @@
                       "type": "string"
                     },
                     "error_description": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
                       "type": "string"
                     }
                   }
@@ -30784,6 +33979,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "postV1McpAdminClients",
@@ -31008,6 +34225,28 @@
                 }
               }
             }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "operationId": "patchV1McpAdminClientsByClientId"
@@ -31141,6 +34380,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -31371,7 +34632,6 @@
             "in": "path",
             "required": true,
             "schema": {
-              "pattern": "^[0-9]+$",
               "description": "The approval id.",
               "type": "string"
             }
@@ -31389,6 +34649,28 @@
           }
         ],
         "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
             "content": {
@@ -31836,6 +35118,28 @@
               }
             }
           },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "502": {
             "description": "Bad gateway — an upstream dependency failed.",
             "content": {
@@ -32003,6 +35307,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -32201,6 +35527,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -32530,6 +35878,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -32996,6 +36366,28 @@
               "application/json": {
                 "schema": {
                   "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
                   "type": "object",
                   "required": [
                     "error"
@@ -33958,7 +37350,7 @@
           "Channels"
         ],
         "summary": "Bind inbox to agent",
-        "description": "Set or clear which agent answers an inbox. Binding lazily provisions the instance's Agent Bot and connects it to the inbox on Chatwoot; unbinding disconnects it. 502 means Chatwoot was unreachable.",
+        "description": "Set or clear which agent answers an inbox. Binding lazily provisions the instance's Agent Bot and connects it to the inbox on Chatwoot; unbinding disconnects it. Unbinding an inbox that was deleted in Chatwoot still succeeds: there is no bot left to disconnect. 502 means Chatwoot was unreachable.",
         "parameters": [
           {
             "name": "id",
@@ -34138,6 +37530,28 @@
               }
             }
           },
+          "422": {
+            "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unprocessable — the input is syntactically valid but semantically rejected.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
           "502": {
             "description": "Bad gateway — an upstream dependency failed.",
             "content": {
@@ -34162,6 +37576,170 @@
           }
         },
         "operationId": "patchV1ChatwootInboxesById"
+      },
+      "delete": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "Remove inbox mirror",
+        "description": "Remove the local mirror of an inbox that was deleted in Chatwoot. Only allowed once Chatwoot answers that the inbox is gone: 409 while it still exists there (delete it in Chatwoot first), 502 when that could not be confirmed. Past conversations are kept and stop naming an inbox; past usage and log lines are kept and keep naming the removed one.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Inbox id (BigInt string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — a duplicate or a state conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Conflict — a duplicate or a state conflict.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Bad gateway — an upstream dependency failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad gateway — an upstream dependency failed.",
+                  "type": "object",
+                  "required": [
+                    "error"
+                  ],
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "field": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "operationId": "deleteV1ChatwootInboxesById"
       }
     },
     "/v1/chatwoot/inboxes/{id}/reconnect": {

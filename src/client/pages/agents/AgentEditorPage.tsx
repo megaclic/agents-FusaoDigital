@@ -47,10 +47,26 @@ import { BusinessHoursForm } from "@/client/components/BusinessHoursForm";
 import type { DiscoveredMcpTool } from "@/client/components/mcp/DiscoveredMcpTools";
 import { useBreadcrumbLabel } from "@/client/contexts/BreadcrumbContext";
 import { useNavGuard } from "@/client/contexts/NavGuardContext";
+import type { FieldRefusal } from "@/client/hooks/useFieldRefusal";
+import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { computeConfigIssues, issueHasAction } from "@/client/lib/configHealth";
+import {
+  type EditorControlsShown,
+  type EditorTab,
+  editorRefusalFields,
+  editorTargetFor,
+  followUpStepField,
+  hasNoConsoleControl,
+  sentFromPatch,
+} from "@/client/lib/editorRefusal";
+import {
+  firstRefusalAt,
+  readRefusal,
+  settlesRefusal,
+} from "@/client/lib/fieldRefusal";
 import { formatRelativeTime, slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
@@ -61,6 +77,8 @@ import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditMo
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
+import { readModelFallbackConfig } from "@/graph/fallback-settings";
+import { modelOptionalFor } from "@/graph/model-defaults";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import type { Schedule } from "@/modules/business-hours/hours";
 import {
@@ -68,8 +86,6 @@ import {
   type ChannelRedirectConfig,
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
-import { readObservabilityConfig } from "@/modules/flowlog/settings";
-import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
@@ -80,6 +96,7 @@ import {
   BehaviorTab,
   type ContactAuthState,
   type MemoryState,
+  type ModelFallbackState,
   type SendImageState,
 } from "./BehaviorTab";
 import {
@@ -88,13 +105,26 @@ import {
 } from "./ChannelRedirectTab";
 import { ChannelsTab } from "./ChannelsTab";
 import { ExportAgentModal } from "./ExportAgentModal";
+import { followUpToForm, followUpToStored } from "./followUpFormState";
 import { GeneralTab } from "./GeneralTab";
 import { GuardrailsTab } from "./GuardrailsTab";
 import { readGuardrailsFormState } from "./guardrailsFormState";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { memoryToForm, memoryToStored } from "./memoryFormState";
+import {
+  modelFallbackToForm,
+  modelFallbackToStored,
+} from "./modelFallbackFormState";
+import {
+  observabilityToForm,
+  observabilityToStored,
+} from "./observabilityFormState";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
+import {
+  parseToolPreconditionRows,
+  serializeToolPreconditions,
+} from "./ToolPreconditionsEditor";
 import { ToolsTab } from "./ToolsTab";
 import { readTtsFormState, ttsSettingsFrom } from "./ttsFormState";
 import type {
@@ -103,6 +133,7 @@ import type {
   HandoffUiState,
   Hours,
   ToolCatalog,
+  ToolPreconditionRow,
   ToolSelectionView,
   VaultEntry,
 } from "./types";
@@ -233,17 +264,6 @@ function str(v: unknown): string {
 function num(v: unknown): string {
   return typeof v === "number" ? String(v) : "";
 }
-// Read the follow-up step's labels: the new `assignLabels` array, falling back to the legacy single
-// `assignLabel` string so an agent saved before multi-label keeps its label in the editor.
-function stepLabels(st: Record<string, unknown>): string[] {
-  if (Array.isArray(st.assignLabels)) {
-    return st.assignLabels.filter((l): l is string => typeof l === "string");
-  }
-  return typeof st.assignLabel === "string" && st.assignLabel
-    ? [st.assignLabel]
-    : [];
-}
-
 // Split the editor's "agent:<id>" | "team:<id>" | "" target back into the stored handoff shape. Only
 // "pinned" carries a concrete target; the other modes null both out. Mirrors readBehaviorState's
 // inverse (which packs targetAgentId/targetTeamId into `target`).
@@ -284,23 +304,6 @@ function readModelState(a: Agent) {
   };
 }
 
-// Map the raw followUp bag into the editor's step list from the multi-step `steps` array. No
-// back-compat: a bag without a steps array yields one default step (the old flat config is not read).
-// Always returns at least one step.
-function readFollowUpSteps(fu: Record<string, unknown>) {
-  const rawSteps =
-    Array.isArray(fu.steps) && fu.steps.length > 0
-      ? (fu.steps as Record<string, unknown>[])
-      : [{}];
-  return rawSteps.slice(0, FOLLOW_UP_MAX_STEPS).map((st) => ({
-    delayValue: num(st.delayValue) || "30",
-    delayUnit: str(st.delayUnit) || "minutes",
-    instructions: str(st.instructions),
-    assignLabels: stepLabels(st),
-    resolve: st.resolve === true,
-  }));
-}
-
 function readBehaviorState(a: Agent) {
   const s = (a.settings ?? {}) as Record<string, unknown>;
   const d = (s.debounce ?? {}) as Record<string, unknown>;
@@ -308,7 +311,6 @@ function readBehaviorState(a: Agent) {
   const tt = (s.tts ?? {}) as Record<string, unknown>;
   const sp = (s.split ?? {}) as Record<string, unknown>;
   const sw = (s.serviceWindow ?? {}) as Record<string, unknown>;
-  const fu = (s.followUp ?? {}) as Record<string, unknown>;
   const vi = (s.vision ?? {}) as Record<string, unknown>;
   const ho = (s.handoff ?? {}) as Record<string, unknown>;
   const ka = (s.kanban ?? {}) as Record<string, unknown>;
@@ -331,6 +333,7 @@ function readBehaviorState(a: Agent) {
     customAttributeInstructions: str(tg.set_custom_attribute),
     labelInstructions: str(tg.assign_label),
     updateKanbanTaskInstructions: str(tg.update_kanban_task),
+    toolPreconditions: parseToolPreconditionRows(s.toolPreconditions),
     businessHoursId: a.businessHoursId ?? "",
     followUpHoursId: a.followUpHoursId ?? "",
     settings: s,
@@ -360,6 +363,10 @@ function readBehaviorState(a: Agent) {
       noticeCooldownSeconds: num(ca.noticeCooldownSeconds) || "60",
       includeMessageText: ca.includeMessageText === true,
       denyMessage: str(ca.denyMessage),
+      // NOTE: The reader is strict about the mode for the same reason it is strict about the
+      // switch, so anything else reads back as the default.
+      mode: ca.mode === "once" ? "once" : "perMessage",
+      grantTtlSeconds: num(ca.grantTtlSeconds) || "86400",
       handoffEnabled:
         typeof ca.handoffEnabled === "boolean" ? ca.handoffEnabled : true,
       handoffTeamId: num(ca.handoffTeamId),
@@ -384,11 +391,7 @@ function readBehaviorState(a: Agent) {
         : "",
       templateContent: str(sw.templateContent),
     },
-    followUp: {
-      enabled: typeof fu.enabled === "boolean" ? fu.enabled : false,
-      steps: readFollowUpSteps(fu),
-      pauseWhileAppointment: fu.pauseWhileAppointment !== false,
-    },
+    followUp: followUpToForm(s),
     handoff: {
       mode: str(ho.mode) || "route",
       target: num(ho.targetAgentId)
@@ -428,11 +431,12 @@ function readBehaviorState(a: Agent) {
     // REST or an import can carry the string "true", which the runtime honors — reading it stricter
     // here would show the switch off while values were being logged, and would then persist that lie
     // on the next save.
-    observability: readObservabilityConfig(s),
+    observability: observabilityToForm(s),
     // NOTE: Same reason as observability above — through the runtime's own reader, because this one
     // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
     // predates the feature, then persist that lie on the next save.
     memory: memoryToForm(s),
+    modelFallback: modelFallbackToForm(s),
   };
 }
 
@@ -578,6 +582,24 @@ function AgentEditorSkeleton() {
 // the thing it clears will be repopulated, and answering that per field is how a discard ends up
 // stranding a value the form still needs. A different agent is a different form. `:tab` is NOT in
 // the key, so moving between tabs of the same agent keeps everything, which is what it is for.
+// The two names this page renders a control for, out of everything an agent write can be refused
+// about. The rest of the editor's values live in bags — `settings.tts.normalizeCredentialRef`,
+// `guardrails.output.templateMessage` — behind tabs, and placing a refusal on one of those means
+// also taking the operator to the tab that holds it, which is its own change (fazer-ai/agents#349;
+// the abstention is recorded in tests/client/field-refusal-fence.test.ts).
+const CLONE_FIELDS = ["name"] as const;
+
+// The forms that write, as a union rather than loose strings: each one holds its own refusal (#415),
+// and a section name that does not match a holder would otherwise be a holder nobody ever captures
+// into, which is the orphan the fence exists to catch.
+type RefusalSection =
+  | "general"
+  | "behavior"
+  | "knowledge"
+  | "tools"
+  | "guardrails"
+  | "channelRedirect";
+
 export function AgentEditorPage() {
   const { id = "" } = useParams();
   return <AgentEditor key={id} />;
@@ -614,6 +636,24 @@ function AgentEditor() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [savingAgent, setSavingAgent] = useState(false);
+  // WHAT the last failed save was, never its sentence. The sentence has one home and it is the
+  // holder (see `message` there): a copy here is a second source of truth for one fact, and three
+  // review rounds found three ways the two drift.
+  //
+  // `section` is the form whose write produced it, so a later success elsewhere cannot take it down.
+  // `named` is the value the server refused, when it named one, so the banner can say WHY it offers
+  // no way to it: `toolGuidance` takes a note for all thirteen native tools and the console draws
+  // three, and the server's sentence names the field without knowing that.
+  //
+  // Written by every `capture` and read only while the holder has a sentence, so neither can go stale
+  // against it.
+  // Keyed by section since #415: each writing form holds its own, so a second refused save no longer
+  // erases what the first one had to say about a different form.
+  const [refusedSave, setRefusedSave] = useState<
+    Partial<Record<RefusalSection, { named: string | null } | null>>
+  >({});
+  const refusedSaveRef = useRef(refusedSave);
+  refusedSaveRef.current = refusedSave;
   const [savingGrants, setSavingGrants] = useState(false);
   const [savingChannelRedirect, setSavingChannelRedirect] = useState(false);
   const [savingGuardrails, setSavingGuardrails] = useState(false);
@@ -621,6 +661,10 @@ function AgentEditor() {
   // Agent fields
   const [name, setName] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
+  // Gated on the TAB, for the same reason a dialog's holder is gated on `isOpen`: `GeneralTab` is
+  // only mounted while `tab === "general"`, so a save that answers after the operator has moved on —
+  // or the "Save and export" that writes General from wherever they are — would place its mark on a
+  // control nobody is rendering. Off that tab the sentence goes to the toast.
   const [enabled, setEnabled] = useState(true);
   const [agentMode, setAgentMode] = useState<"test" | "production">(
     "production",
@@ -657,6 +701,8 @@ function AgentEditor() {
     noticeCooldownSeconds: "60",
     includeMessageText: false,
     denyMessage: "",
+    mode: "perMessage",
+    grantTtlSeconds: "86400",
     handoffEnabled: true,
     handoffTeamId: "",
     handoffTeamInstanceId: "",
@@ -683,6 +729,7 @@ function AgentEditor() {
         instructions: "",
         assignLabels: [] as string[],
         resolve: false,
+        ignoreAppointmentPause: false,
       },
     ],
     pauseWhileAppointment: true,
@@ -702,14 +749,31 @@ function AgentEditor() {
     maxToolCalls: "10",
     maxHistoryTokens: "",
   });
-  // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
-  // agent.settings.observability (modules/flowlog/settings).
-  const [observability, setObservability] = useState({ logToolValues: false });
+  // Whether this agent's tool lines log the values the model sent instead of their shape, and
+  // whether the log debug mode is armed. Mirrors agent.settings.observability
+  // (modules/flowlog/settings), and seeded from the reader over an empty bag rather than a literal
+  // so a field added to that block cannot default differently here than it does at runtime.
+  // Null until the tenant settings answer, which reads as "not known yet" and never as "off".
+  const [langfuseSendContent, setLangfuseSendContent] = useState<
+    boolean | null
+  >(null);
+  const [observability, setObservability] = useState(observabilityToForm({}));
+  // What the SERVER is doing, as opposed to what the form is about to ask it to do. The "recording
+  // more than the default" warning reads this one, never the form: a switch flipped off stops
+  // recording when the save lands, not when the operator touches it, and a warning that goes quiet
+  // on the touch tells them recording stopped while it is still running. Set only where a server
+  // read set the form (load, post-save refresh, discard), never by a switch.
+  const [savedObservability, setSavedObservability] = useState(
+    observabilityToForm({}),
+  );
   // Whether an attendance that ended is folded into a summary, and which model writes it. Seeded
   // from the reader over an empty bag rather than a literal: the pre-load state is the same shape
   // the round-trip pair produces, so a field added to `compaction` cannot default differently here
   // than it does everywhere else.
   const [memory, setMemory] = useState<MemoryState>(() => memoryToForm({}));
+  const [modelFallback, setModelFallback] = useState<ModelFallbackState>(() =>
+    modelFallbackToForm({}),
+  );
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -768,6 +832,11 @@ function AgentEditor() {
   const [labelInstructions, setLabelInstructions] = useState("");
   // Operator usage guidance for update_kanban_task (Tools-tab config). Persisted in
   // agent.settings.toolGuidance.update_kanban_task; synced only by syncToolConfig.
+  // Per-tool preconditions (Tools tab, same lifecycle as the guidance above). Held as a LIST while
+  // editing and stored as a map keyed by tool name — see ToolPreconditionsEditor.
+  const [toolPreconditions, setToolPreconditions] = useState<
+    ToolPreconditionRow[]
+  >([]);
   const [updateKanbanTaskInstructions, setUpdateKanbanTaskInstructions] =
     useState("");
   // Model config (flattened). Cost tracking comes from Langfuse, so there is no
@@ -790,6 +859,7 @@ function AgentEditor() {
   const sttCredBaseUrl = vaultBaseUrl(stt.credentialRef);
   const visionCredBaseUrl = vaultBaseUrl(vision.credentialRef);
   const memoryCredBaseUrl = vaultBaseUrl(memory.credentialRef);
+  const modelFallbackCredBaseUrl = vaultBaseUrl(modelFallback.credentialRef);
   const ttsNormalizeCredBaseUrl = vaultBaseUrl(tts.normalizeCredentialRef);
 
   // Tool selection
@@ -844,6 +914,343 @@ function AgentEditor() {
   const fillCredModal = useModalController<VaultEntry>();
   const exportModal = useModalController();
   const [cloneName, setCloneName] = useState("");
+  // WHERE A REFUSAL ABOUT THIS EDITOR GOES. One holder for the page, declaring two different lists:
+  // what the OPEN TAB is drawing, and everything the editor can mark at all.
+  //
+  // The second is the whole of #349. Every value this page writes other than the name and the prompt
+  // lives in a bag edited behind one of eight tabs, so a refusal about
+  // `guardrails.output.templateMessage` names a control that exists and is not on screen. Marking it
+  // and falling silent is the failure this mechanism is against; dropping it into a toast is what the
+  // page did before, and the toast scrolls away carrying the only copy of the reason. So the mark is
+  // written for the tab the operator has yet to open, and the banner below says it is there.
+  //
+  // Declared AFTER the state it reads, and not beside the other hooks: the lists are a function of
+  // the open tab and of how many follow-up steps the Proactive section is drawing.
+  // What the editor is DRAWING, answered per control. The switches are here rather than inside the
+  // module because they are this page's state; the module owns which switch each control sits behind.
+  const refusalView: EditorControlsShown = {
+    tab,
+    awayEnabled,
+    sttEnabled: stt.enabled,
+    ttsOn: tts.mode !== "never",
+    ttsNormalize: tts.normalize,
+    visionEnabled: vision.enabled,
+    contactAuthEnabled: contactAuth.enabled,
+    memoryCompactionEnabled: memory.compactionEnabled,
+    modelFallbackChosen: !!modelFallback.provider,
+    guardrailsEnabled: guardrails.enabled,
+    followUpEnabled: followUp.enabled,
+    followUpSteps: followUp.steps.length,
+  };
+  const refusalFields = editorRefusalFields(refusalView);
+
+  // ONE HELD REFUSAL PER FORM THAT WRITES, WHICH IS WHAT THE HOLDER ALWAYS ASKED FOR (#415).
+  //
+  // `useFieldRefusal` says it in its own header: "PER FORM, not per page and not in a context". This
+  // page had six independently savable forms behind ONE holder, and `capture` is also the clear, so
+  // the second refusal erased the first. No concurrency needed: refuse a Behavior save, switch to
+  // Guardrails, refuse that one, and the operator returns to a Behavior form that looks clean and is
+  // still refused.
+  //
+  // Six fixed calls rather than a loop, because hooks cannot be called in one. Every holder is given
+  // the SAME drawn/owned lists on purpose: a refusal does not stay inside the section that produced
+  // it. `saveAgent("behavior")` sends the whole settings bag and can be refused about
+  // `guardrails.output.templateMessage`, whose control the Guardrails tab draws. Splitting the lists
+  // per section would mean a holder that cannot place the very refusal its own save provoked.
+  const generalRefusal = useFieldRefusal(
+    refusalFields.drawn,
+    refusalFields.owned,
+  );
+  const behaviorRefusal = useFieldRefusal(
+    refusalFields.drawn,
+    refusalFields.owned,
+  );
+  const knowledgeRefusal = useFieldRefusal(
+    refusalFields.drawn,
+    refusalFields.owned,
+  );
+  const toolsRefusal = useFieldRefusal(
+    refusalFields.drawn,
+    refusalFields.owned,
+  );
+  const guardrailsRefusal = useFieldRefusal(
+    refusalFields.drawn,
+    refusalFields.owned,
+  );
+  // Sixth, and it did not answer a refusal at all before this. `saveChannelRedirect` writes the whole
+  // settings bag and its catch showed a bare toast, so a refusal naming a value this editor draws
+  // came back with no mark and nothing to jump to. That is the defect #349 fixed, at the one form
+  // #349 did not reach.
+  const channelRedirectRefusal = useFieldRefusal(
+    refusalFields.drawn,
+    refusalFields.owned,
+  );
+  const refusals: Record<RefusalSection, FieldRefusal> = {
+    general: generalRefusal,
+    behavior: behaviorRefusal,
+    knowledge: knowledgeRefusal,
+    tools: toolsRefusal,
+    guardrails: guardrailsRefusal,
+    channelRedirect: channelRedirectRefusal,
+  };
+  const REFUSAL_SECTIONS = Object.keys(refusals) as RefusalSection[];
+
+  // The reading every marked control does, now that there is more than one holder to ask. First
+  // match wins: a control draws ONE value, so two holders answering for it would be two refusals
+  // about the same box, and the older one is the one the operator has already been shown.
+  //
+  // Each holder still expires its own mark by value, so a stale one is silent here rather than
+  // shadowing a live one behind it.
+  const refusal = {
+    at: (field: string, value: unknown): string | null =>
+      firstRefusalAt(
+        REFUSAL_SECTIONS.map((section) => refusals[section].at),
+        field,
+        value,
+      ),
+  };
+  // The holder as it is NOW, for the success and failure paths of a request that started earlier.
+  //
+  // Same reason the hook keeps its own refs: a save handler closes over the render that launched it,
+  // and this page's saves are long enough for another tab's save to fail while one is still in
+  // flight. Answering from the closure would let an older success clear a refusal that arrived after
+  // it — `refusal.at` is memoized on the hold, so even the comparison would be the old one.
+  const refusalRef = useRef(refusals);
+  refusalRef.current = refusals;
+  // What every placeable input holds right now, keyed by the SERVER'S name for it, readable from
+  // inside a save that started before them: this page's saves are long and the operator keeps typing
+  // during them. Keyed by the wire name rather than by the state variable because that is the name a
+  // refusal arrives carrying, and the name `placeRefusal` compares against what the request sent.
+  //
+  // EACH ENTRY NORMALIZES THE WAY ITS WRITER DOES, and that is a rule rather than a detail. The other
+  // side of the comparison is `sentFromPatch`, read off the request, so a value the patch trims and
+  // this map keeps raw reads as "the operator edited it while the request was out" — and the refusal
+  // then goes to the banner instead of to the textarea it is about, on nothing but surrounding
+  // whitespace. Where the writer is a function (`followUpToStored`), call it rather than restating
+  // what it does.
+  const currentRef = useRef<Record<string, unknown>>({});
+  currentRef.current = {
+    name: name.trim(),
+    systemPrompt,
+    "modelConfig.credentialRef": model.credentialRef,
+    "settings.stt.credentialRef": stt.credentialRef,
+    "settings.tts.credentialRef": tts.credentialRef,
+    "settings.tts.normalizeCredentialRef": tts.normalizeCredentialRef,
+    "settings.vision.credentialRef": vision.credentialRef,
+    "settings.contactAuth.credentialRef": contactAuth.credentialRef,
+    "settings.memory.compaction.credentialRef": memory.credentialRef,
+    "settings.modelFallback.credentialRef": modelFallback.credentialRef,
+    "settings.guardrails.credentialRef": guardrails.credentialRef,
+    "availability.awayMessage": awayMessage.trim(),
+    "contactAuth.denyMessage": contactAuth.denyMessage.trim(),
+    // `buildSettings` stores null for an empty prompt or one still at the default, so an untouched
+    // vision block sends null and a raw copy here would never match it.
+    "vision.extractionPrompt":
+      vision.extractionPrompt.trim() &&
+      vision.extractionPrompt.trim() !== DEFAULT_EXTRACTION_PROMPT
+        ? vision.extractionPrompt.trim()
+        : null,
+    "guardrails.customPolicy": guardrails.customPolicy,
+    "guardrails.input.templateMessage": guardrails.input.templateMessage,
+    "guardrails.output.templateMessage": guardrails.output.templateMessage,
+    "guardrails.output.generationPrompt": guardrails.output.generationPrompt,
+    // Through the serializer for the handoff note, and mirroring saveTools for the rest: it trims
+    // every one of them, and a raw copy here reads surrounding whitespace as an edit made while the
+    // request was out.
+    "handoff.instructions": serializeHandoff(handoff).instructions,
+    "kanban.instructions": kanbanInstructions.trim() || null,
+    "toolGuidance.set_custom_attribute": customAttributeInstructions.trim(),
+    "toolGuidance.assign_label": labelInstructions.trim(),
+    "toolGuidance.update_kanban_task": updateKanbanTaskInstructions.trim(),
+    // Through the writer itself: `followUpToStored` trims each note, and a second spelling of that
+    // here is the drift this whole block is against.
+    ...Object.fromEntries(
+      followUpToStored(followUp).steps.map((step, i) => [
+        followUpStepField(i),
+        step.instructions,
+      ]),
+    ),
+  };
+  // What THIS write carried, by the server's names, read from the patch it is about to send.
+  //
+  // From the patch and not from what the tab is drawing, which is what the first version did: those
+  // are different questions and they disagree by construction. `buildSettings()` serializes the whole
+  // bag including blocks whose controls are switched off, and `saveGuardrails` resends the guardrails
+  // block whether or not the switch is on -- so a visibility-derived list under-reports the write,
+  // and a field it omits gets marked without a staleness comparison and never cleared by the save
+  // that answered it. See sentFromPatch.
+  function sentFor(patch: Record<string, unknown>): Record<string, unknown> {
+    return sentFromPatch(patch, refusalFields.owned);
+  }
+
+  // Every save on this page answers a refusal the same way, so the decision is written once.
+  //
+  // `capture` places the mark and hands back whatever is left to say. What is left is NOT decided
+  // here by asking whether the refused name has a place in this editor: that reads the FIELD and not
+  // what the hook did with it, and the two come apart. A name the map knows can still fail to be
+  // placed -- the operator edited the value while the request was out, a follow-up step that no
+  // longer exists -- and a caller that trusted the map would drop the sentence with nothing holding
+  // it. Silence, which is the one outcome barred here. So whatever comes back is kept, and the
+  // render below decides which container it belongs in.
+  //
+  // `sent` is passed in rather than read here, and that is the whole of the staleness check working:
+  // `currentRef` is LIVE, so reading it in the catch compares the boxes with themselves and the
+  // comparison can never fire. Each handler snapshots before its request goes out.
+  function answerRefusal(
+    e: unknown,
+    fallback: string,
+    section: RefusalSection,
+    sent: Record<string, unknown>,
+  ): void {
+    // The holder of the form that WROTE, so a refusal about another section's save is not
+    // overwritten by this one. Indexed directly rather than through a local: `RefusalSection` is a
+    // union, so there is no missing entry to guard against, and the direct spelling is what lets the
+    // fence prove every declared holder is reachable.
+    const left = refusals[section].capture(
+      e,
+      fallback,
+      sent,
+      currentRef.current,
+    );
+    setRefusedSave((prev) => ({
+      ...prev,
+      [section]: left ? { named: readRefusal(e)?.field ?? null } : null,
+    }));
+    setRefusalSeq((n) => n + 1);
+  }
+
+  // A SECTION IS SETTLED — by a save that went through, or by a discard that put its values back.
+  //
+  // One function for both because both answer the same thing: the values that section owns are no
+  // longer in dispute, so a refusal about one of them is over. Written twice it drifted immediately —
+  // the save half required the write to have carried the refused VALUE, and that is false exactly
+  // when the operator has done what the refusal asked, so a corrected save left the stale hold in
+  // place and the mark came back the next time they typed the old value.
+  //
+  // Scoped by the tab that DRAWS the value, not by what the request happened to serialize. A Behavior
+  // save spreads the last-synced `settings`, so it carries `guardrails.customPolicy` holding what is
+  // STORED rather than the edit the Guardrails tab still has unsaved; presence in the patch would let
+  // it answer for a refusal it never re-sent. The tab says whose value it is, which is the question.
+  //
+  // A refusal the holder could place nowhere is about a SAVE rather than a value, so its own section
+  // answers it.
+  // Scoped by the tab that DRAWS the value, across EVERY holder, and that is the half of this the
+  // per-form split does not get for free. The obvious reading of "one holder per form" is that a
+  // form's own save settles its own holder, and that is wrong here for the same reason the split is
+  // right: a refusal does not stay inside the section that produced it. Refuse a Behavior save about
+  // `guardrails.output.templateMessage`, then go to Guardrails, fix the value and save it: the
+  // refusal is answered, and it is sitting in the BEHAVIOR holder. Settling only the saving form's
+  // own holder would leave that mark standing on a value the server has since accepted, which is the
+  // stale hold #349 removed.
+  //
+  // So the question stays "whose value is this", answered by the tab, and the loop is what makes it
+  // reach all six. A refusal the holder could place nowhere is about a SAVE rather than a value, so
+  // there the holder's own section answers it.
+  function settleRefusalFor(section: RefusalSection): void {
+    for (const owner of REFUSAL_SECTIONS) {
+      const now = refusalRef.current[owner];
+      const held = now.field;
+      const target = held
+        ? editorTargetFor(held, { guardrailsEnabled: guardrails.enabled })
+        : null;
+      if (
+        settlesRefusal({
+          drawnBy: held ? (target?.tab ?? null) : null,
+          owner,
+          settled: section,
+        })
+      ) {
+        now.clear();
+      }
+    }
+    setRefusedSave((prev) => {
+      if (!prev?.[section]) return prev;
+      const next = { ...prev };
+      delete next[section];
+      return next;
+    });
+  }
+
+  // WHAT THE BANNER SAYS: every standing refusal, whichever of them is standing.
+  //
+  // Unconditional on purpose, and the earlier versions of this are why. Both tried to show it only
+  // when the marked control was NOT readable, and both had to answer "is it readable" from outside
+  // the component that draws it: first by tab, which missed a section switched off after the refusal
+  // landed; then by tab plus each section's switch, which missed a guardrails field hidden by its
+  // own action and a native-tool note inside a collapsed card. What can hide a control belongs to the
+  // tab components, it is a list this file cannot close, and every version of it that got one entry
+  // short produced the same outcome: a failed save with nothing on screen saying so.
+  //
+  // So the question is not asked. A held mark is announced here whether or not its control is on
+  // screen, and `drawn` stops carrying any weight it could be wrong about -- it decides which
+  // channel `placeRefusal` uses, and this page reads neither channel for the sentence.
+  //
+  // The cost is a duplicate while the operator is looking at the marked control: the sentence at the
+  // input, and the same sentence above the tabs. That is the shape a form-level error summary has
+  // everywhere it is used, it does not interrupt and it does not scroll away, and it is the trade
+  // this takes over being silent on a case nobody enumerated yet.
+  // WITH SIX HOLDERS THE BANNER IS A LIST, because "the refusal in force" stopped being one thing.
+  // Two forms can each be refused about something different, and a banner that showed the newest
+  // would be the erasure this issue is about, moved from the holder into the render.
+  //
+  // Built in section order rather than in arrival order, so the list does not reshuffle under the
+  // operator when one entry settles and another arrives.
+  const refusalRows = REFUSAL_SECTIONS.flatMap((section) => {
+    const holder = refusals[section];
+    const held = holder.field;
+    // The mark expires by VALUE, so a placed sentence has to be asked for through `at`; one the
+    // holder could place nowhere has no value to expire against and is read straight off the holder.
+    // Either way there is one copy, and it is the holder's.
+    const placed = held ? holder.at(held, currentRef.current[held]) : null;
+    const message = held ? placed : holder.message;
+    if (!message) return [];
+    const named = refusedSave[section]?.named ?? null;
+    // A jump only when there is somewhere to send them: a mark on the open tab is already as close
+    // as the operator can get, and a sentence with no mark has no control to point at. From the mark
+    // when there is one and from the name the server used when there is not, because a refusal this
+    // editor cannot MARK can still be about a value it draws (a tool precondition is edited as a
+    // list, so there is no single box to put the sentence in).
+    const target = held
+      ? placed
+        ? editorTargetFor(held, { guardrailsEnabled: guardrails.enabled })
+        : null
+      : named
+        ? editorTargetFor(named, { guardrailsEnabled: guardrails.enabled })
+        : null;
+    return [
+      {
+        section,
+        message,
+        // Said only where it can be PROVED. It used to be read off a map having no entry, and absence
+        // proves nothing about the console: the map was missing `settings.modelFallback.model` and
+        // `observability.fullDetailUntil`, both of which have a visible control, so the banner told
+        // the operator the opposite of the truth about them. `hasNoConsoleControl` answers from the
+        // closed set it can derive, the ten native-tool notes the editor draws no field for.
+        noControl: !held && named != null && hasNoConsoleControl(named),
+        target: target && target.tab !== tab ? target : null,
+      },
+    ];
+  });
+
+  const bannerRef = useRef<HTMLDivElement | null>(null);
+  // Counted, not compared by text. Two transport failures in a row produce the SAME fallback
+  // sentence, and a second failure the operator has scrolled away from would have scrolled nothing
+  // and changed nothing for assistive technology — the save would look like it did not happen.
+  // Every answered request bumps this, so each one is announced once whatever it says.
+  const [refusalSeq, setRefusalSeq] = useState(0);
+  const announcedRef = useRef(0);
+  const hasRefusalRow = refusalRows.length > 0;
+  useEffect(() => {
+    if (!hasRefusalRow || announcedRef.current === refusalSeq) return;
+    announcedRef.current = refusalSeq;
+    bannerRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [hasRefusalRow, refusalSeq]);
+
+  // The clone dialog is its own form: one input, and the route refuses a name already taken by name.
+  // Separate from the editor's holder, because the two are on screen together.
+  const cloneRefusal = useFieldRefusal(cloneModal.isOpen ? CLONE_FIELDS : []);
+  const cloneRef = useRef("");
+  cloneRef.current = cloneName;
   // The suggested name prefilled on open; the modal only warns about discarding
   // when the user actually edited it.
   const cloneNameDefaultRef = useRef("");
@@ -900,6 +1307,7 @@ function AgentEditor() {
     setCustomAttributeInstructions(b.customAttributeInstructions);
     setLabelInstructions(b.labelInstructions);
     setUpdateKanbanTaskInstructions(b.updateKanbanTaskInstructions);
+    setToolPreconditions(b.toolPreconditions);
   }, []);
 
   // Full reset of the general + behavior form state from a synced agent. Used on load and discard-all
@@ -928,7 +1336,9 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
@@ -965,7 +1375,9 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
@@ -997,6 +1409,17 @@ function AgentEditor() {
         api.api.v1["business-hours"].get(),
         api.api.v1.agents({ id })["channel-binding"].get(),
       ]);
+      // Only for the shared debug warning (#58): the third switch that widens what is recorded is
+      // the tenant's `langfuse.sendContent`, and it lives on another page. Deliberately OUTSIDE the
+      // load above and not awaited with it — the warning is allowed to say less, never to hold the
+      // editor open or send it to the error state, and inside that `Promise.all` a slow or refused
+      // optional read would do both.
+      void api.api.v1["tenant-settings"]
+        .get()
+        .then((r) =>
+          setLangfuseSendContent(r.data?.langfuse.sendContent ?? null),
+        )
+        .catch(() => setLangfuseSendContent(null));
       if (agentRes.error || !agentRes.data || tsRes.error || !tsRes.data) {
         setError(true);
         return;
@@ -1125,7 +1548,7 @@ function AgentEditor() {
   function guardModelBeforeSave(): boolean {
     if (
       model.provider &&
-      model.provider !== "openai-compatible" &&
+      !modelOptionalFor(model.provider) &&
       !model.model.trim()
     ) {
       showToast(
@@ -1182,6 +1605,17 @@ function AgentEditor() {
         // method back and forth does not lose the choice.
         includeMessageText: contactAuth.includeMessageText,
         denyMessage: contactAuth.denyMessage.trim() || null,
+        mode: contactAuth.mode === "once" ? "once" : "perMessage",
+        // NOTE: `|| 86_400` would turn a typed (or imported) ZERO into a day, which is the wrong
+        // direction for the one field here that decides how long an authorization counts: the reader
+        // clamps 0 up to the 60-second floor, so passing it through honours "as short as possible"
+        // instead of silently granting the opposite. Same shape as noticeCooldownSeconds above, and
+        // the twelve other `Number(x) || default` fields in this block keep theirs — they share the
+        // spelling, not the risk, since a zeroed debounce window or balloon size is cosmetic.
+        grantTtlSeconds:
+          contactAuth.grantTtlSeconds.trim() === ""
+            ? 86_400
+            : Number(contactAuth.grantTtlSeconds) || 0,
         handoffEnabled: contactAuth.handoffEnabled,
         handoffTeamId: Number(contactAuth.handoffTeamId) || null,
         // The account the team was picked from, saved with it. Never on its own: without a team it
@@ -1209,26 +1643,7 @@ function AgentEditor() {
           .filter(Boolean),
         templateContent: serviceWindow.templateContent.trim() || null,
       },
-      followUp: {
-        enabled: followUp.enabled,
-        pauseWhileAppointment: followUp.pauseWhileAppointment,
-        // `resolve` is sent only for the LAST step (the server also enforces this); `assignLabels` is
-        // omitted when empty so the persisted shape stays minimal and round-trips cleanly.
-        steps: followUp.steps.map((s, i) => {
-          const labels = s.assignLabels
-            .map((l) => l.trim())
-            .filter((l) => l.length > 0);
-          return {
-            delayValue: Math.max(1, Number(s.delayValue) || 1),
-            delayUnit: s.delayUnit,
-            instructions: s.instructions.trim(),
-            ...(labels.length > 0 ? { assignLabels: labels } : {}),
-            ...(i === followUp.steps.length - 1 && s.resolve
-              ? { resolve: true }
-              : {}),
-          };
-        }),
-      },
+      followUp: followUpToStored(followUp),
       vision: {
         enabled: vision.enabled,
         provider: vision.provider,
@@ -1252,11 +1667,15 @@ function AgentEditor() {
         // is what "not configured" means everywhere else in this payload.
         maxHistoryTokens: Number(limits.maxHistoryTokens) || null,
       },
-      observability: { logToolValues: observability.logToolValues },
+      // NOTE: through the pair, for the same reason `memory` below is — this save REPLACES the
+      // block, so a field written out by hand here is deleted from the bag the moment someone
+      // forgets it. ./observabilityFormState is the round-trip guard.
+      observability: observabilityToStored(observability),
       // NOTE: through the pair, not spelled out here. The Behavior save REPLACES the block, so a
       // field the form dropped would be deleted on the next save — which is exactly how
       // `tts.baseURL` was lost once, and the round-trip test over ./memoryFormState is the guard.
       memory: memoryToStored(memory),
+      modelFallback: modelFallbackToStored(modelFallback),
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1304,6 +1723,7 @@ function AgentEditor() {
       sendImage,
       observability,
       memory,
+      modelFallback,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1322,6 +1742,7 @@ function AgentEditor() {
       customAttributeInstructions,
       labelInstructions,
       updateKanbanTaskInstructions,
+      toolPreconditions,
     }),
     knowledge: canonicalGrants(grants.filter((g) => g.source === "RAG")),
   };
@@ -1476,7 +1897,9 @@ function AgentEditor() {
   // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.ttsNormalize', 'The speech-rewrite credential is referenced but not filled in yet.')
   // t('editor.configIssue.memoryModel', 'A separate model is set for attendance summaries but its configuration cannot run, so attendances that end will not be summarized and the contact keeps no memory of them. Check its provider, model, key and endpoint.')
+  // t('editor.configIssue.modelFallback', 'A fallback provider is set but its configuration cannot run, so a turn the primary provider drops is still lost. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.memoryModel', 'The summary-model credential is referenced but not filled in yet, so attendances that end are not summarized.')
+  // t('editor.configIssuePending.modelFallback', 'The fallback-provider credential is referenced but not filled in yet, so the fallback cannot take a turn.')
   // t('editor.configIssue.vision', 'Image/document reading is on but has no API key set.')
   // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
   // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
@@ -1500,6 +1923,7 @@ function AgentEditor() {
   // t('editor.configIssueUnresolved.tts', 'The audio-reply credential no longer exists, so replies are sent as text.')
   // t('editor.configIssueUnresolved.ttsNormalize', 'The speech-rewrite credential no longer exists, so replies are spoken without the rewrite.')
   // t('editor.configIssueUnresolved.memoryModel', 'The summary-model credential no longer exists, so attendances that end are not summarized.')
+  // t('editor.configIssueUnresolved.modelFallback', 'The fallback-provider credential no longer exists, so the fallback cannot take a turn.')
   // t('editor.configIssueUnresolved.vision', 'The image-reading credential no longer exists, so images and documents are not read.')
   // t('editor.configIssueUnresolved.embedding', 'A knowledge base needs indexing, but the embedding credential no longer exists.')
   // Knowledge bases this agent uses (its RAG grant) that still have documents awaiting indexing —
@@ -1528,6 +1952,12 @@ function AgentEditor() {
     readMemoryConfig(syncedAgentRef.current?.settings).compaction
       .credentialRef ?? "",
   );
+  // Same rule, same reason: the fallback is judged on the STORED bag, so its endpoint has to come
+  // from the credential the row names rather than from the one the form is holding.
+  const savedModelFallbackCredBaseUrl = vaultBaseUrl(
+    readModelFallbackConfig(syncedAgentRef.current?.settings).credentialRef ??
+      "",
+  );
   const configIssues = computeConfigIssues({
     settings: syncedAgentRef.current?.settings,
     // Saved, like the settings above. Absent only before the first load lands, and nothing that
@@ -1543,6 +1973,7 @@ function AgentEditor() {
     savedModelBaseURL: savedModelBaseUrl,
     savedModelCredentialRef: savedModel.credentialRef,
     savedMemoryCredentialBaseURL: savedMemoryCredBaseUrl,
+    savedModelFallbackCredentialBaseURL: savedModelFallbackCredBaseUrl,
     ttsNormalize: tts.normalize,
     ttsNormalizeProvider: tts.normalizeProvider,
     ttsNormalizeModel: tts.normalizeModel,
@@ -1608,11 +2039,24 @@ function AgentEditor() {
       navigate("/resources/advanced");
       return;
     }
+    goToEditorTarget({
+      tab: issue.tab as EditorTab,
+      sectionId: issue.sectionId,
+    });
+  }
+
+  // Switch to a tab (URL-driven) carrying the focus marker the effect above reads to scroll to the
+  // section and highlight it. One function, because a config-health warning and a refusal are the
+  // same act from here: both hold a place in this editor and have to take the operator to it.
+  function goToEditorTarget(target: {
+    tab: EditorTab;
+    sectionId?: string;
+  }): void {
     navigate(
-      `/agents/${id}/${issue.tab}${
+      `/agents/${id}/${target.tab}${
         backToConversation ? `?from=${backToConversation}` : ""
       }`,
-      { state: { focusSection: issue.sectionId } },
+      { state: { focusSection: target.sectionId } },
     );
   }
 
@@ -1779,6 +2223,18 @@ function AgentEditor() {
         return t(
           "editor.importWarning.hoursReused",
           'Business hours "{{name}}" already existed and were reused; check the schedule is right.',
+          p,
+        );
+      case "hoursWindowsDropped":
+        return t(
+          "editor.importWarning.hoursWindowsDropped",
+          'Business hours "{{name}}": {{count}} weekly window(s) were not stored as written. Open the schedule and check the days are right.',
+          p,
+        );
+      case "hoursExceptionsDropped":
+        return t(
+          "editor.importWarning.hoursExceptionsDropped",
+          'Business hours "{{name}}": {{count}} date exception(s) were not stored as written. Open the schedule and check the holidays and closures are right.',
           p,
         );
       case "httpToolBodyIgnored":
@@ -2057,6 +2513,7 @@ function AgentEditor() {
   // syncSeq bump — only the reverted section returns to baseline, the other
   // tabs keep their own pending state.
   const revertGeneral = () => {
+    settleRefusalFor("general");
     const a = syncedAgentRef.current;
     if (!a) return;
     setName(a.name);
@@ -2066,6 +2523,7 @@ function AgentEditor() {
     setModel(readModelState(a));
   };
   const revertBehavior = () => {
+    settleRefusalFor("behavior");
     const a = syncedAgentRef.current;
     if (!a) return;
     const b = readBehaviorState(a);
@@ -2084,16 +2542,20 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
   const revertChannelRedirect = () => {
+    settleRefusalFor("channelRedirect");
     const a = syncedAgentRef.current;
     if (!a) return;
     setChannelRedirect(readChannelRedirectState(a));
   };
   const revertGuardrails = () => {
+    settleRefusalFor("guardrails");
     const a = syncedAgentRef.current;
     if (!a) return;
     setGuardrails(readGuardrailsFormState(a.settings));
@@ -2102,6 +2564,7 @@ function AgentEditor() {
   // non-RAG, Knowledge = RAG), so each discard restores only its slice and
   // keeps the other tab's pending edits.
   const revertTools = () => {
+    settleRefusalFor("tools");
     const synced = mapGrants(syncedGrantsRef.current);
     setGrants((cur) => [
       ...cur.filter((g) => g.source === "RAG"),
@@ -2111,6 +2574,7 @@ function AgentEditor() {
     if (syncedAgentRef.current) syncToolConfig(syncedAgentRef.current);
   };
   const revertKnowledge = () => {
+    settleRefusalFor("knowledge");
     const synced = mapGrants(syncedGrantsRef.current);
     setGrants((cur) => [
       ...synced.filter((g) => g.source === "RAG"),
@@ -2130,6 +2594,11 @@ function AgentEditor() {
       danger: true,
       confirmLabel: t("editor.discardAll", "Discard all"),
       onConfirm: () => {
+        // Every section at once, so every refusal goes with them: six holders now, and a discard
+        // that cleared only one would put values back while a mark about them stayed up.
+        for (const owner of REFUSAL_SECTIONS)
+          refusalRef.current[owner]?.clear();
+        setRefusedSave({});
         const a = syncedAgentRef.current;
         if (a) {
           applyAgent(a);
@@ -2184,6 +2653,9 @@ function AgentEditor() {
   ) {
     savingRef.current += 1;
     setSavingAgent(true);
+    // Snapshotted BEFORE the request, never after: the staleness check compares what went out
+    // with what the boxes hold when the answer lands, and `currentRef` is live.
+    const sent = sentFor(patch);
     try {
       const expected = expectedFor(force);
       const { data, error: err } = await api.api.v1.agents({ id }).patch({
@@ -2199,14 +2671,18 @@ function AgentEditor() {
       else applyBehavior(data.agent);
       markSynced(String(data.agent.updatedAt));
       bumpSync(section);
+      // Only for the section this holder DRAWS. One function writes both, and a Behavior save
+      // carries neither `name` nor `systemPrompt` — clearing there takes the standing refusal off
+      // the General tab without anything having answered it, so the operator comes back to a form
+      // that looks fine and is still refused.
+      settleRefusalFor(section);
       showToast(t("editor.saved", "Agent saved."), "success");
     } catch (e) {
-      // NOTE: surface the backend's localized message when present (the prompt-size cap, the
-      // settings text caps) instead of the generic failure toast.
-      showToast(
-        apiErrorMessage(e) ||
-          t("editor.saveError", "Could not save the agent."),
-        "error",
+      answerRefusal(
+        e,
+        t("editor.saveError", "Could not save the agent."),
+        section,
+        sent,
       );
     } finally {
       savingRef.current -= 1;
@@ -2232,12 +2708,17 @@ function AgentEditor() {
       setCatalog(data.catalog);
       markSynced(data.agentUpdatedAt ? String(data.agentUpdatedAt) : null);
       bumpSync("tools", "knowledge");
+      // This is the KNOWLEDGE tab's save (it is the only caller), and it carries the grant set and
+      // none of the Tools tab's notes. Both halves matter: the empty snapshot says it answers for no
+      // field, and the section says whose banner it may take down.
+      settleRefusalFor("knowledge");
       showToast(t("editor.grantsSaved", "Tools updated."), "success");
     } catch (e) {
-      showToast(
-        apiErrorMessage(e) ||
-          t("editor.grantsError", "Could not update tools."),
-        "error",
+      answerRefusal(
+        e,
+        t("editor.grantsError", "Could not update tools."),
+        "knowledge",
+        {},
       );
     } finally {
       savingRef.current -= 1;
@@ -2253,6 +2734,7 @@ function AgentEditor() {
   async function saveTools(force = false) {
     savingRef.current += 1;
     setSavingGrants(true);
+    let sent: Record<string, unknown> = {};
     try {
       // Everything the PATCH will send, built BEFORE the grants PUT so the whole bag can be checked
       // against the write boundary's own rule first. None of it depends on the PUT's result.
@@ -2294,13 +2776,21 @@ function AgentEditor() {
       if (updateKanbanNote)
         toolGuidanceJson.update_kanban_task = updateKanbanNote;
       else delete toolGuidanceJson.update_kanban_task;
+      const toolPreconditionsJson = serializeToolPreconditions(
+        toolPreconditions,
+        syncedSettings.toolPreconditions,
+      );
       const toolsSettings = {
         ...syncedSettings,
         handoff: handoffJson,
         kanban: kanbanJson,
         zproCrm: zproCrmJson,
         toolGuidance: toolGuidanceJson,
+        toolPreconditions: toolPreconditionsJson,
       };
+      // Before either request: the grants PUT goes out first and the PATCH after it, and both can
+      // answer a refusal about this bag.
+      sent = sentFor({ settings: toolsSettings });
       // The WHOLE bag, not just this tab's fields: the PATCH resends every block, so text typed on
       // another tab would refuse it just the same — after the grants had already been written.
       //
@@ -2359,15 +2849,21 @@ function AgentEditor() {
         kanban: kanbanJson,
         zproCrm: zproCrmJson,
         toolGuidance: toolGuidanceJson,
+        // The SAME value that was just written, not a recomputation. Left out, the shared bag keeps
+        // the pre-save map, and the next Behavior save spreads it back over the rules that were just
+        // stored — with the Tools tab still showing them as saved.
+        toolPreconditions: toolPreconditionsJson,
       }));
       markSynced(String(agentRes.data.agent.updatedAt));
       bumpSync("tools", "knowledge");
+      settleRefusalFor("tools");
       showToast(t("editor.grantsSaved", "Tools updated."), "success");
     } catch (e) {
-      showToast(
-        apiErrorMessage(e) ||
-          t("editor.grantsError", "Could not update tools."),
-        "error",
+      answerRefusal(
+        e,
+        t("editor.grantsError", "Could not update tools."),
+        "tools",
+        sent,
       );
     } finally {
       savingRef.current -= 1;
@@ -2382,6 +2878,9 @@ function AgentEditor() {
   async function saveChannelRedirect(force = false) {
     savingRef.current += 1;
     setSavingChannelRedirect(true);
+    // Declared out here so the catch can read it: the snapshot has to be taken before the request,
+    // and a `const` inside the try would not be in scope where the refusal is answered.
+    let sent: Record<string, unknown> = {};
     try {
       const expected = expectedFor(force);
       const syncedSettings = (syncedAgentRef.current?.settings ?? {}) as Record<
@@ -2389,10 +2888,14 @@ function AgentEditor() {
         unknown
       >;
       const crJson = fromChannelRedirectForm(channelRedirect);
-      const { data, error: err } = await api.api.v1.agents({ id }).patch({
+      const patch = {
         settings: { ...syncedSettings, channelRedirect: crJson },
         ...(expected ? { expectedUpdatedAt: expected } : {}),
-      });
+      };
+      // Snapshot BEFORE the request, never read in the catch: `currentRef` is live, so comparing it
+      // with itself there can never fire the staleness check.
+      sent = sentFor(patch);
+      const { data, error: err } = await api.api.v1.agents({ id }).patch(patch);
       if (handleConflict(err, () => void saveChannelRedirect(true))) return;
       if (err || !data) throw err ?? new Error("no data");
       applyChannelRedirect(data.agent);
@@ -2402,11 +2905,16 @@ function AgentEditor() {
       markSynced(String(data.agent.updatedAt));
       bumpSync("channelRedirect");
       showToast(t("editor.saved", "Agent saved."), "success");
+      settleRefusalFor("channelRedirect");
     } catch (e) {
-      showToast(
-        apiErrorMessage(e) ||
-          t("editor.saveError", "Could not save the agent."),
-        "error",
+      // It writes the WHOLE settings bag, so it can be refused about any value in it, and until #415
+      // this catch showed a bare toast: the sentence named a field, the field had a control, and
+      // nothing marked it or offered to go there.
+      answerRefusal(
+        e,
+        t("editor.saveError", "Could not save the agent."),
+        "channelRedirect",
+        sent,
       );
     } finally {
       savingRef.current -= 1;
@@ -2420,14 +2928,17 @@ function AgentEditor() {
   async function saveGuardrails(force = false) {
     savingRef.current += 1;
     setSavingGuardrails(true);
+    let sent: Record<string, unknown> = {};
     try {
       const expected = expectedFor(force);
       const syncedSettings = (syncedAgentRef.current?.settings ?? {}) as Record<
         string,
         unknown
       >;
+      const patch = { settings: { ...syncedSettings, guardrails } };
+      sent = sentFor(patch);
       const { data, error: err } = await api.api.v1.agents({ id }).patch({
-        settings: { ...syncedSettings, guardrails },
+        ...patch,
         ...(expected ? { expectedUpdatedAt: expected } : {}),
       });
       if (handleConflict(err, () => void saveGuardrails(true))) return;
@@ -2436,12 +2947,14 @@ function AgentEditor() {
       setSettings((s) => ({ ...s, guardrails }));
       markSynced(String(data.agent.updatedAt));
       bumpSync("guardrails");
+      settleRefusalFor("guardrails");
       showToast(t("editor.saved", "Agent saved."), "success");
     } catch (e) {
-      showToast(
-        apiErrorMessage(e) ||
-          t("editor.saveError", "Could not save the agent."),
-        "error",
+      answerRefusal(
+        e,
+        t("editor.saveError", "Could not save the agent."),
+        "guardrails",
+        sent,
       );
     } finally {
       savingRef.current -= 1;
@@ -2455,17 +2968,22 @@ function AgentEditor() {
         .agents({ id })
         .clone.post({ name: cloneName.trim() || undefined });
       if (err || !data) throw err ?? new Error("no data");
+      cloneRefusal.clear();
       cloneModal.close();
       showToast(t("editor.cloned", "Agent cloned (disabled)."), "success");
       navigate(`/agents/${data.agent.id}`);
     } catch (e) {
       // The clone carries the source agent's settings verbatim, so a source written before the text
       // caps is refused by name — the generic message would leave the operator with a button that
-      // fails and no field to shorten.
-      showToast(
-        apiErrorMessage(e) || t("editor.cloneError", "Could not clone."),
-        "error",
+      // fails and no field to shorten. A refusal about the NEW NAME lands on the one input this
+      // dialog draws; one about the copied settings has no control here and stays a toast.
+      const toast = cloneRefusal.capture(
+        e,
+        t("editor.cloneError", "Could not clone."),
+        { name: cloneName.trim() || undefined },
+        { name: cloneRef.current.trim() || undefined },
       );
+      if (toast) showToast(toast, "error");
     }
   }
 
@@ -2493,8 +3011,11 @@ function AgentEditor() {
       a.download = `agents-agent-${slugify(data.export.agent.name) || "agent"}.json`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      showToast(t("editor.exportError", "Could not export."), "error");
+    } catch (caught) {
+      showToast(
+        apiErrorMessage(caught) || t("editor.exportError", "Could not export."),
+        "error",
+      );
     }
   }
 
@@ -2558,10 +3079,11 @@ function AgentEditor() {
           .delete({ confirmName, password });
         if (err) {
           showToast(
-            t(
-              "editor.deleteError",
-              "Could not delete. Check your password and try again.",
-            ),
+            apiErrorMessage(err) ||
+              t(
+                "editor.deleteError",
+                "Could not delete. Check your password and try again.",
+              ),
             "error",
           );
           throw err; // keep the dialog open
@@ -2698,6 +3220,8 @@ function AgentEditor() {
                     );
                     cloneNameDefaultRef.current = suggested;
                     setCloneName(suggested);
+                    // The component outlives the dialog, so a mark from the last session is still held here.
+                    cloneRefusal.clear();
                     cloneModal.open();
                   }}
                 >
@@ -2878,8 +3402,56 @@ function AgentEditor() {
               </div>
             )}
 
+            {/* The refusal the server just sent about a control on ANOTHER tab. Not dismissible and not
+                a toast: the sentence is the only copy of the reason, and a toast takes it away after
+                five seconds while the input it is about is still refused. It goes when the operator
+                answers the refusal, or when they reach the tab that draws the mark. */}
+            {refusalRows.length > 0 && (
+              <div ref={bannerRef} className="flex scroll-mt-4 flex-col gap-2">
+                {refusalRows.map((entry) => (
+                  <div
+                    key={entry.section}
+                    role="alert"
+                    className="flex items-baseline justify-between gap-3 rounded-lg border border-error bg-error-soft px-4 py-3"
+                  >
+                    <span className="min-w-0 text-sm text-text-primary">
+                      {entry.message}
+                      {entry.noControl && (
+                        <span className="block text-text-secondary text-xs">
+                          {t(
+                            "editor.refusalNoControl",
+                            "This value has no field in the console, so it can only be changed through the API.",
+                          )}
+                        </span>
+                      )}
+                    </span>
+                    {entry.target && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          entry.target && goToEditorTarget(entry.target)
+                        }
+                        className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
+                      >
+                        {t("editor.goToIssue", "Fix")}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
             {tab === "general" && (
               <GeneralTab
+                nameError={refusal.at("name", currentRef.current["name"])}
+                promptError={refusal.at(
+                  "systemPrompt",
+                  currentRef.current["systemPrompt"],
+                )}
+                modelCredentialError={refusal.at(
+                  "modelConfig.credentialRef",
+                  currentRef.current["modelConfig.credentialRef"],
+                )}
                 availability={promptAvailability}
                 name={name}
                 setName={setName}
@@ -2949,6 +3521,8 @@ function AgentEditor() {
                 labelInstructions={labelInstructions}
                 setLabelInstructions={setLabelInstructions}
                 updateKanbanTaskInstructions={updateKanbanTaskInstructions}
+                toolPreconditions={toolPreconditions}
+                setToolPreconditions={setToolPreconditions}
                 setUpdateKanbanTaskInstructions={
                   setUpdateKanbanTaskInstructions
                 }
@@ -2960,6 +3534,28 @@ function AgentEditor() {
                 setMcpCollapsed={setMcpCollapsed}
                 integrationCollapsed={integrationCollapsed}
                 setIntegrationCollapsed={setIntegrationCollapsed}
+                refusals={{
+                  handoffInstructions: refusal.at(
+                    "handoff.instructions",
+                    currentRef.current["handoff.instructions"],
+                  ),
+                  kanbanInstructions: refusal.at(
+                    "kanban.instructions",
+                    currentRef.current["kanban.instructions"],
+                  ),
+                  attributeInstructions: refusal.at(
+                    "toolGuidance.set_custom_attribute",
+                    currentRef.current["toolGuidance.set_custom_attribute"],
+                  ),
+                  labelInstructions: refusal.at(
+                    "toolGuidance.assign_label",
+                    currentRef.current["toolGuidance.assign_label"],
+                  ),
+                  updateKanbanInstructions: refusal.at(
+                    "toolGuidance.update_kanban_task",
+                    currentRef.current["toolGuidance.update_kanban_task"],
+                  ),
+                }}
                 dirty={dirty.tools}
                 saving={savingGrants}
                 onSave={() => saveTools()}
@@ -2986,6 +3582,8 @@ function AgentEditor() {
               <BehaviorTab
                 agentId={id}
                 channelBinding={channelBinding}
+                langfuseSendContent={langfuseSendContent}
+                savedObservability={savedObservability}
                 hours={hours}
                 businessHoursId={businessHoursId}
                 setBusinessHoursId={setBusinessHoursId}
@@ -3027,10 +3625,13 @@ function AgentEditor() {
                 setVision={setVision}
                 visionCredBaseUrl={visionCredBaseUrl}
                 memoryCredBaseUrl={memoryCredBaseUrl}
+                modelFallbackCredBaseUrl={modelFallbackCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
                 memory={memory}
                 setMemory={setMemory}
+                modelFallback={modelFallback}
+                setModelFallback={setModelFallback}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}
@@ -3038,6 +3639,56 @@ function AgentEditor() {
                 attributeContext={attributeContext}
                 setAttributeContext={setAttributeContext}
                 onScheduleSaved={onScheduleSaved}
+                refusals={{
+                  sttCredential: refusal.at(
+                    "settings.stt.credentialRef",
+                    currentRef.current["settings.stt.credentialRef"],
+                  ),
+                  ttsCredential: refusal.at(
+                    "settings.tts.credentialRef",
+                    currentRef.current["settings.tts.credentialRef"],
+                  ),
+                  ttsNormalizeCredential: refusal.at(
+                    "settings.tts.normalizeCredentialRef",
+                    currentRef.current["settings.tts.normalizeCredentialRef"],
+                  ),
+                  visionCredential: refusal.at(
+                    "settings.vision.credentialRef",
+                    currentRef.current["settings.vision.credentialRef"],
+                  ),
+                  visionExtractionPrompt: refusal.at(
+                    "vision.extractionPrompt",
+                    currentRef.current["vision.extractionPrompt"],
+                  ),
+                  contactAuthCredential: refusal.at(
+                    "settings.contactAuth.credentialRef",
+                    currentRef.current["settings.contactAuth.credentialRef"],
+                  ),
+                  contactAuthDenyMessage: refusal.at(
+                    "contactAuth.denyMessage",
+                    currentRef.current["contactAuth.denyMessage"],
+                  ),
+                  memoryCredential: refusal.at(
+                    "settings.memory.compaction.credentialRef",
+                    currentRef.current[
+                      "settings.memory.compaction.credentialRef"
+                    ],
+                  ),
+                  modelFallbackCredential: refusal.at(
+                    "settings.modelFallback.credentialRef",
+                    currentRef.current["settings.modelFallback.credentialRef"],
+                  ),
+                  awayMessage: refusal.at(
+                    "availability.awayMessage",
+                    currentRef.current["availability.awayMessage"],
+                  ),
+                  followUpSteps: followUp.steps.map((_step, i) =>
+                    refusal.at(
+                      followUpStepField(i),
+                      currentRef.current[followUpStepField(i)],
+                    ),
+                  ),
+                }}
                 dirty={dirty.behavior}
                 saving={savingAgent}
                 onSave={() =>
@@ -3059,6 +3710,28 @@ function AgentEditor() {
               <GuardrailsTab
                 guardrails={guardrails}
                 setGuardrails={setGuardrails}
+                refusals={{
+                  credential: refusal.at(
+                    "settings.guardrails.credentialRef",
+                    currentRef.current["settings.guardrails.credentialRef"],
+                  ),
+                  customPolicy: refusal.at(
+                    "guardrails.customPolicy",
+                    currentRef.current["guardrails.customPolicy"],
+                  ),
+                  inputTemplateMessage: refusal.at(
+                    "guardrails.input.templateMessage",
+                    currentRef.current["guardrails.input.templateMessage"],
+                  ),
+                  outputTemplateMessage: refusal.at(
+                    "guardrails.output.templateMessage",
+                    currentRef.current["guardrails.output.templateMessage"],
+                  ),
+                  outputGenerationPrompt: refusal.at(
+                    "guardrails.output.generationPrompt",
+                    currentRef.current["guardrails.output.generationPrompt"],
+                  ),
+                }}
                 dirty={dirty.guardrails}
                 saving={savingGuardrails}
                 onSave={() => saveGuardrails()}
@@ -3154,7 +3827,10 @@ function AgentEditor() {
               )}
             </div>
           )}
-          <FormField label={t("editor.cloneName", "New agent name")}>
+          <FormField
+            label={t("editor.cloneName", "New agent name")}
+            error={cloneRefusal.at("name", cloneName.trim() || undefined)}
+          >
             <Input
               value={cloneName}
               onChange={(e) => setCloneName(e.target.value)}

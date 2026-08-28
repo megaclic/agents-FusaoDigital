@@ -6,16 +6,28 @@ import type { TFunction } from "i18next";
 
 export function flowStageLabel(stage: string, t: TFunction): string {
   switch (stage) {
+    case "route":
+      return t("logs.stage.route", "Routing");
+    case "command":
+      return t("logs.stage.command", "Control command");
     case "stt":
       return t("logs.stage.stt", "Transcription");
+    case "vision":
+      return t("logs.stage.vision", "Image reading");
     case "embed":
       return t("logs.stage.embed", "Embedding");
+    case "delivery":
+      return t("logs.stage.delivery", "Interrupted delivery");
     case "debounce":
       return t("logs.stage.debounce", "Message grouping");
     case "contact_auth":
       return t("logs.stage.contact_auth", "Contact authorization");
+    case "spend_ceiling":
+      return t("logs.stage.spend_ceiling", "Token ceiling");
     case "generate":
       return t("logs.stage.generate", "Generation");
+    case "guardrail":
+      return t("logs.stage.guardrail", "Guardrail check");
     case "tool":
       return t("logs.stage.tool", "Tool call");
     case "normalize":
@@ -28,6 +40,12 @@ export function flowStageLabel(stage: string, t: TFunction): string {
       return t("logs.stage.handoff", "Handoff");
     case "presence":
       return t("logs.stage.presence", "Typing indicator");
+    case "memory":
+      return t("logs.stage.memory", "Memory");
+    case "webhook":
+      return t("logs.stage.webhook", "Outbound webhook");
+    case "dead_letter":
+      return t("logs.stage.dead_letter", "Abandoned work");
     default:
       return stage;
   }

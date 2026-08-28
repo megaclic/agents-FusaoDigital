@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -32,6 +33,7 @@ import { getToolpackToolViews } from "@/modules/integrations/toolpacks";
 // translate('errors.googleCredentialNotConnected', 'This credential is not a connected Google account.')
 // translate('errors.googleCredentialNotFound', 'The credential this integration needs was not found.')
 // translate('errors.googleDriveScopeDenied', "Google Drive denied the request. Reconnect the credential granting the 'Drive (read-only)' or 'Drive (full access)' scope; 'Drive (app files)' cannot list existing folders.")
+// translate('errors.integrationHeaderNameUnusable', 'The "{{field}}" value is not a usable header name: use only letters, digits and !#$%&\'*+-.^_`|~ (no spaces or line breaks).')
 // translate('errors.integrationHttpError', '{{provider}} returned HTTP {{status}}.')
 // translate('errors.integrationInstanceNotFound', 'Integration instance not found.')
 // translate('errors.integrationNoInboundWebhook', 'The {{integration}} integration has no inbound webhook.')
@@ -102,7 +104,7 @@ export const integrationsAdminController = new Elysia({
             "Vault reference (vault:<id>) of a connected google_oauth credential.",
         }),
       }),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .get(
@@ -127,7 +129,7 @@ export const integrationsAdminController = new Elysia({
             "Vault reference (vault:<id>) of a connected google_oauth credential.",
         }),
       }),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .get(
@@ -155,7 +157,7 @@ export const integrationsAdminController = new Elysia({
         instance: instanceIdentity,
         integration: await getIntegrationInstance(
           ctxOrThrow(tenantContext),
-          BigInt(params.id),
+          requireDbId(params.id),
         ),
       };
     },
@@ -235,7 +237,7 @@ export const integrationsAdminController = new Elysia({
           }),
         ),
       }),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .patch(
@@ -244,7 +246,7 @@ export const integrationsAdminController = new Elysia({
       instance: instanceIdentity,
       integration: await updateIntegrationInstance(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body as {
           name?: string;
           enabled?: boolean;
@@ -299,7 +301,7 @@ export const integrationsAdminController = new Elysia({
           }),
         ),
       }),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   // NOTE: Rotation is a POST because it MUTATES: the old URL stops resolving the moment it commits.
@@ -311,7 +313,7 @@ export const integrationsAdminController = new Elysia({
       instance: instanceIdentity,
       ...(await rotateIntegrationRouteToken(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       )),
     }),
     {
@@ -334,7 +336,7 @@ export const integrationsAdminController = new Elysia({
     async ({ tenantContext, params }) => {
       await deleteIntegrationInstance(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       return { instance: instanceIdentity, success: true };
     },

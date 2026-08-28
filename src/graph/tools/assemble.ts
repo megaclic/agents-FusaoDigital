@@ -1,4 +1,5 @@
 import type { StructuredToolInterface } from "@langchain/core/tools";
+import type { AgentToolSource, Prisma } from "@/../generated/prisma/client";
 import type { ScopedDb } from "@/lib/tenancy";
 import type { DocumentField } from "@/modules/documents/blocks";
 import { parseTemplateContent } from "@/modules/documents/validate";
@@ -6,11 +7,11 @@ import type { IntegrationSelection } from "@/modules/integrations/toolpacks";
 import { isManagedOAuthKind } from "@/modules/vault/secret-types";
 import {
   formatVaultRef,
+  readVaultRefId,
   tryResolveVaultEntry,
-  VAULT_REF_PREFIX,
 } from "@/modules/vault/service";
 import type { DocumentSelection } from "./documents";
-import { buildHttpTool, type HttpToolDef } from "./http";
+import { buildHttpTool, type HttpToolDef, type HttpToolDeps } from "./http";
 import type { McpSelection } from "./mcp";
 
 // Per-agent tool assembly with fail-closed allowlists. The single source of truth is the
@@ -62,6 +63,11 @@ export interface LoadedHttpToolDef {
   // forgotten in — silently, since a missing column reads as `undefined` and normalizes to "declare
   // nothing". Keeping it required makes both the select and the mapping a compile error to skip.
   expectedStatuses: number[];
+  // What this tool's response declares about an appointment, or null when it declares nothing
+  // (issue #352). Required for the same reason `expectedStatuses` above is: a column that can be
+  // forgotten in the `select` reads as `undefined` and normalizes to "declare nothing", which is a
+  // feature going silently missing rather than failing.
+  appointment: unknown;
 }
 
 export interface AgentToolSelections {
@@ -80,6 +86,93 @@ export interface AgentToolSelections {
   documentSelections: DocumentSelection[];
 }
 
+// THE PRECEDENCE WHEN TWO TOOLS CLAIM ONE NAME (#389), anchored on the SOURCE's identity.
+//
+// `namespacedToolName` gives the plain name to whoever asks first and `_2` to the next, and
+// `dropDuplicateToolNames` keeps the first of two toolpack instances that expose the same names. So
+// the order this read comes back in is not cosmetic; it decides which tool the model sees under
+// which name.
+//
+// Unordered, that answer was the physical row order — and `replaceAgentToolSelections` deletes every
+// row and recreates the set on each save, in the order the client sent, which for the editor is the
+// operator's CLICK HISTORY (`toggleMcp` appends on toggle-on). Toggling one of two colliding
+// connections off and back on therefore renamed the other one's tools, mid-conversation, for a
+// change that granted nothing new.
+//
+// Ordering by the grant's `id` looks equivalent and is not: the recreated rows are assigned ids in
+// the order the client sent, so it reproduces exactly the click history it was meant to erase.
+// Measured — grants inserted alphabetically read back as ids 6727…6734, and after a re-save that
+// sent them reversed they read back 6734…6727, with `ORDER BY id` agreeing with the unordered read
+// both times. The connection / instance / definition rows are the thing a grant POINTS AT, and a
+// grant re-save never touches them.
+//
+// AND THE ANCHOR IS THE SOURCE'S NAME, not its id (#412). The id is identity inside one tenant and
+// nothing at all across two: `exportAgent` carries each component by NAME and `importAgent` matches
+// on it, creating a row only where the destination has none — so the destination's ids are whatever
+// that import assigned, in no relation to the source's. When the destination ALREADY has one of two
+// colliding sources, it is reused with its own (lower) id while its partner is created fresh, and
+// ordering by id puts the pair the other way round. Both tools still exist under both names, and each
+// name now reaches the OTHER server. Nothing is missing, so nothing looks wrong.
+//
+// The name is the right anchor because it is what the transfer preserves and what the database
+// already keeps unique (`@@unique([tenantId, name])` on the connection,
+// `@@unique([tenantId, catalogType, name])` on the instance). It is the same anchor a re-save needs,
+// so it replaces the id rather than joining it.
+//
+// BUT NOT `ORDER BY name` — the comparison is done here, in code, by UTF-16 code unit. SQL would
+// compare under the database's collation, and a bundle exported from one deployment is imported into
+// another: measured on the same two names, `en_US.utf8` orders "…connection a" before
+// "…connection B" and `C` orders them the other way round, so the pair inverts on arrival and each
+// name reaches the other server again — the very failure this is fixing, one layer down. A code-unit
+// comparison is the same on every runtime and every database.
+//
+// The instance is ordered by name ALONE, without its catalogType, because the only pair that can
+// contest a name is two instances of ONE catalog type — every toolpack prefixes its tools with its
+// own catalog (`calendar_`, `asaas_`, `drive_`), so no two catalog types expose a common name — and
+// within one catalog type the name is already a total order. Adding the catalogType key first killed
+// no test in the mutation battery, which is what a rule with no observable effect looks like.
+//
+// HTTP and document grants stay on the id: their exposed names are the definition's name and
+// `send_<slug>`, both unique per tenant, so no two of them can contest a name and the order is
+// invisible either way (asserted in tests/graph/tool-grant-order.test.ts).
+const GRANT_ORDER: Prisma.AgentToolSelectionOrderByWithRelationInput[] = [
+  { source: "asc" },
+  { mcpServerConnectionId: "asc" },
+  { integrationInstanceId: "asc" },
+  { toolDefinitionId: "asc" },
+  { documentTemplateId: "asc" },
+];
+
+// The grant rows in assembly order: source first, then the source's NAME for the two sources that can
+// contest one, compared by code unit.
+//
+// A TOTAL order, and it has to be: a comparator that answers 0 for the rows without a name while
+// ordering the named ones among themselves is not transitive, and `Array.prototype.sort` is free to
+// return anything for one of those. The `?? ""` is what buys that — a grant whose relation row is
+// missing gets a position instead of tying with every row it meets.
+//
+// The source key on top of it buys the GROUPING, not the totality: it keeps the blocks the read
+// already delivered (`source: "asc"`) instead of interleaving MCP and integration rows by name.
+// Measured, removing it kills no test, because each source is dispatched into its own array below
+// and nothing reads `rows` as blocks. It stays as the cheaper half of a surprise for whoever does.
+function byContestedName(
+  a: {
+    source: AgentToolSource;
+    mcpServerConnection: { name: string } | null;
+    integrationInstance: { name: string } | null;
+  },
+  b: {
+    source: AgentToolSource;
+    mcpServerConnection: { name: string } | null;
+    integrationInstance: { name: string } | null;
+  },
+): number {
+  if (a.source !== b.source) return a.source < b.source ? -1 : 1;
+  const an = a.mcpServerConnection?.name ?? a.integrationInstance?.name ?? "";
+  const bn = b.mcpServerConnection?.name ?? b.integrationInstance?.name ?? "";
+  return an < bn ? -1 : an > bn ? 1 : 0;
+}
+
 // Loads every tool grant for an agent in one scoped read (DB only — no network; MCP connect/
 // discover and the toolpack build happen later, outside the tx). Resolves each MCP connection's
 // vault credential here (still a scoped DB read). A grant whose source is disabled
@@ -90,6 +183,7 @@ export async function loadToolSelections(
 ): Promise<AgentToolSelections> {
   const rows = await db.agentToolSelection.findMany({
     where: { agentId },
+    orderBy: GRANT_ORDER,
     select: {
       source: true,
       enabledTools: true,
@@ -110,6 +204,7 @@ export async function loadToolSelections(
           ackEnabled: true,
           ackMessage: true,
           expectedStatuses: true,
+          appointment: true,
         },
       },
       mcpServerConnection: {
@@ -126,6 +221,7 @@ export async function loadToolSelections(
       integrationInstance: {
         select: {
           id: true,
+          name: true,
           catalogType: true,
           config: true,
           credentialRef: true,
@@ -157,7 +253,7 @@ export async function loadToolSelections(
     documentSelections: [],
   };
 
-  for (const row of rows) {
+  for (const row of [...rows].sort(byContestedName)) {
     switch (row.source) {
       case "NATIVE":
         // Explicit row ⇒ exactly this set (empty ⇒ none, fail-closed). The absence of a row keeps
@@ -192,6 +288,7 @@ export async function loadToolSelections(
           query: td.query,
           body: td.body,
           expectedStatuses: td.expectedStatuses,
+          appointment: td.appointment,
         });
         break;
       }
@@ -290,13 +387,9 @@ export async function loadToolSelections(
     // the map by the ref string so the lookup matches what is stored on the tool.
     const ids: bigint[] = [];
     for (const r of refs) {
-      if (r.startsWith(VAULT_REF_PREFIX)) {
-        try {
-          ids.push(BigInt(r.slice(VAULT_REF_PREFIX.length)));
-        } catch {
-          // malformed id-ref → no kind (auto-injection simply off for it)
-        }
-      }
+      // malformed, or past what a bigint column holds → no kind (auto-injection off for it)
+      const id = readVaultRefId(r);
+      if (id !== null) ids.push(id);
     }
     const entries =
       ids.length > 0
@@ -337,6 +430,15 @@ export interface HttpToolBuildDeps {
   // Conversation/contact context for {{placeholder}} interpolation in fixed fields, headers, URL and
   // the raw body (e.g. {{conversation_id}}, {{contact_name}}). Never a secret.
   context?: Record<string, string>;
+  // Passed straight through to every tool built here, for the ones whose definition declares that
+  // their response describes an appointment (issue #352). Named individually rather than spread from
+  // HttpToolDeps so that adding a dep to the runtime does not silently widen what this layer
+  // forwards.
+  // The agent zone an offset-less start is read in, same reason as the rest of this block.
+  timezone?: HttpToolDeps["timezone"];
+  appointmentBooked?: HttpToolDeps["appointmentBooked"];
+  cancelAppointment?: HttpToolDeps["cancelAppointment"];
+  onSideEffectError?: HttpToolDeps["onSideEffectError"];
 }
 
 // Builds StructuredTools from loaded ToolDefinition rows. Network (the actual HTTP call) happens
@@ -362,6 +464,7 @@ export function buildHttpTools(
       query: d.query,
       body: d.body,
       expectedStatuses: d.expectedStatuses,
+      appointment: d.appointment,
     };
     return buildHttpTool(def, deps);
   });

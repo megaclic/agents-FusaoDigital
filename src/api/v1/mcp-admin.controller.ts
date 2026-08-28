@@ -1,7 +1,9 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
+import { parseQueryId } from "@/api/lib/query-filters";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
+import { requireDbId } from "@/lib/db-id";
 import { instanceIdentity } from "@/lib/instance";
 import {
   type CreateClientInput,
@@ -101,7 +103,7 @@ export const mcpAdminController = new Elysia({
           }),
         ),
       }),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 422),
     },
   )
   .patch(
@@ -125,7 +127,7 @@ export const mcpAdminController = new Elysia({
         scopes: t.Optional(t.Array(t.String())),
         firstParty: t.Optional(t.Boolean()),
       }),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .delete(
@@ -151,10 +153,7 @@ export const mcpAdminController = new Elysia({
     async ({ query }) => ({
       instance: instanceIdentity,
       tokens: await listActiveTokens({
-        tenantId:
-          query.tenantId != null && query.tenantId !== ""
-            ? BigInt(query.tenantId)
-            : null,
+        tenantId: parseQueryId(query.tenantId, "tenantId") ?? null,
       }),
     }),
     {
@@ -171,7 +170,7 @@ export const mcpAdminController = new Elysia({
           }),
         ),
       }),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .delete(
@@ -210,7 +209,7 @@ export const mcpAdminController = new Elysia({
   .delete(
     "/approvals/:id",
     async ({ params }) => {
-      await deleteClientApproval(BigInt(params.id));
+      await deleteClientApproval(requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
     {
@@ -221,10 +220,9 @@ export const mcpAdminController = new Elysia({
       ),
       params: t.Object({
         id: t.String({
-          pattern: "^[0-9]+$",
           description: "The approval id.",
         }),
       }),
-      response: errors(401, 403, 404),
+      response: errors(400, 401, 403, 404),
     },
   );

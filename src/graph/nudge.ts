@@ -2,6 +2,8 @@ import type { BaseMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { NUDGE_RETRY_BACKOFF_MS, NUDGE_RETRY_LIMIT } from "@/graph/nudge-retry";
+import { parseDbId } from "@/lib/db-id";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
@@ -36,6 +38,10 @@ import {
   proactiveSendMode,
 } from "@/modules/service-window/service";
 import {
+  announceSpendCeiling,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
+import {
   attendanceHasStarted,
   claimAttendanceBoundary,
   needsAttendanceStartProbe,
@@ -46,11 +52,7 @@ import {
   threadBelongsToTenant,
 } from "./checkpointer";
 import { lastAssistantText } from "./graph";
-import {
-  clearTurnInFlight,
-  isTurnInFlight,
-  markTurnInFlight,
-} from "./inflight";
+import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
 import { conversationDividerMessage, nudgeMessage } from "./markers";
 import {
@@ -62,6 +64,12 @@ import {
 } from "./prepare";
 import { undoRefusedTurn } from "./refused-turn";
 import type { RuntimeDeps } from "./runtime";
+import {
+  clearTurnOwning,
+  markTurnOwning,
+  type ThreadOwner,
+  type TurnHold,
+} from "./thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 import { buildNativeTools, handoffAnsweredTheTurn } from "./tools/native";
 
@@ -95,6 +103,53 @@ export interface AgentNudge {
   // For a follow-up sequence: the 1-based step that fired. Surfaced on the conversation timeline
   // ("Follow-up N enviado") and in the flow log. Undefined for non-sequenced nudges (inbound events).
   step?: number;
+  // NOTE: The caller's own name for THIS occasion, read by `nudgeOccasionKey` and by nothing else —
+  // never rendered, so it does not reach the model the way `refs` does. Set it when the descriptor's
+  // own fields cannot tell two independent occasions apart: an inbound delivery carries no `step`
+  // and no `refs`, so two separate events on one conversation describe themselves identically and
+  // would share a window. The inbound dispatcher passes the delivery row's id, which is exactly one
+  // occasion — a redelivery of that same row is the same occasion, and gets the same key on purpose.
+  occasionId?: string;
+}
+
+// WHICH SCHEDULED OCCASION A REFUSAL BELONGS TO. The `over` line is one per occasion, and the retry
+// ladder is only half of what "one occasion" has to mean: the conversation alone collapses genuinely
+// independent jobs, so an appointment reminder refused an hour after an inactivity follow-up lost its
+// row and its alert. Derived from the nudge DESCRIPTOR rather than threaded in from the caller,
+// because a parameter three callers must remember to pass is the one the fourth forgets — and each
+// caller already describes its own occasion here: `source` and `kind` tell the three apart, `step`
+// separates the rungs of a follow-up sequence, `refs` separates two reminders for two different
+// appointments on one conversation, and `occasionId` is what a caller whose descriptor says none of
+// those uses to name the occasion outright.
+//
+// What it deliberately does NOT separate is the first and the final reminder of the SAME appointment
+// inside one window: they differ only in their instructions, and the second alert would say what the
+// first already said.
+export function nudgeOccasionKey(
+  // THE ACCOUNT THE CONVERSATION ID BELONGS TO. Chatwoot conversation ids are account-local, so a
+  // tenant connected to two Chatwoot instances has two different conversations numbered the same;
+  // without this, an identical follow-up step on each would share one two-hour window and the second
+  // refusal would lose its row and its alert. Every caller already parsed it out of the thread id.
+  instanceId: bigint,
+  conversationId: number,
+  nudge: AgentNudge,
+): string {
+  // JSON, not `k=v` joined by commas, because refs are OPAQUE strings from a calendar or a payment
+  // provider and that encoding is not injective: `{a: "x,b=y"}` and `{a: "x", b: "y"}` produce the
+  // same suffix, which would hand two independent occasions one window. Sorted first, explicitly and
+  // by code unit rather than with `localeCompare`, because this key has to be the same string on
+  // every machine that builds it.
+  const refs = JSON.stringify(
+    Object.entries(nudge.refs ?? {})
+      .filter(([, v]) => v != null)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+  );
+  return `nudge:${instanceId}:${conversationId}:${JSON.stringify([
+    nudge.source,
+    nudge.kind ?? null,
+    nudge.step ?? null,
+    nudge.occasionId ?? null,
+  ])}:${refs}`;
 }
 
 export type RunAgentNudgeOutcome =
@@ -118,6 +173,11 @@ export type RunAgentNudgeOutcome =
   // that own an occasion (a follow-up step, a reminder offset, a ladder stage) must not spend it
   // here; see isRepairableNudgeRefusal.
   | "agent-unavailable"
+  // NOTE: The tenant is past its token ceiling for the month (issue #146). Nothing was posted and no
+  // model was reached, and like `agent-unavailable` this is a refusal an operator REPAIRS (raise the
+  // ceiling, or wait for the month to turn), so a caller that owns an occasion must not spend it
+  // here; see isRepairableNudgeRefusal.
+  | "over-ceiling"
   | "no-conversation"
   | "no-agent";
 
@@ -162,15 +222,17 @@ export function parseThreadId(
 ): { tenantId: bigint; instanceId: bigint; conversationId: number } | null {
   const parts = threadId.split(":");
   if (parts.length !== 3) return null;
-  try {
-    const tenantId = BigInt(parts[0] as string);
-    const instanceId = BigInt(parts[1] as string);
-    const conversationId = Number(parts[2]);
-    if (!Number.isInteger(conversationId)) return null;
-    return { tenantId, instanceId, conversationId };
-  } catch {
-    return null;
-  }
+  // NOTE: `parseDbId`, not a `try` around `BigInt`. A thread id is built from `String(bigint)`, so
+  // there is no lenient spelling to keep compatible with — and the `catch` this replaces saw only
+  // the segments that fail to convert. A segment past 2^63-1 converts, passes the tenant check its
+  // callers run when the FIRST segment is a real tenant, and then binds an instance id no column
+  // holds: a job handler answering with a database error. Issue #407.
+  const tenantId = parseDbId(parts[0]);
+  const instanceId = parseDbId(parts[1]);
+  const conversationId = Number(parts[2]);
+  if (tenantId === null || instanceId === null) return null;
+  if (!Number.isInteger(conversationId)) return null;
+  return { tenantId, instanceId, conversationId };
 }
 
 // Marks the untrusted-data boundary in a rendered nudge. Also a reliable signal that a persisted
@@ -419,6 +481,11 @@ export async function runAgentNudge(
     inboxId: cfg.inboxDbId,
     threadId: params.threadId,
     base,
+    // The proactive turn runs on the SAME loaded config as the reactive one, so the agent's debug
+    // mode reaches it the same way (#58). Leaving it out would answer one question two ways for one
+    // agent: the tool line of a follow-up would still be cut at 2,000 while the tool line of a reply
+    // was not, with nothing in the settings saying so.
+    fullDetail: cfg.fullDetail,
   };
   const markFollowUp = (outcome: RunAgentNudgeOutcome): void => {
     emitFlowEvent(flow, {
@@ -551,6 +618,39 @@ export async function runAgentNudge(
   // thread, so a retired job asked only at the send boundary would still leave memory of a message
   // nobody received.
   if (!(await stillWanted())) return "stale";
+
+  // THE TENANT'S OWN CEILING, asked here for the reason the line above states: before any model
+  // spend. A proactive nudge has nobody waiting on the other end, so there is no copy and no handoff
+  // to arrange — it simply does not go out, and the caller reschedules it rather than burning the
+  // occasion, because a month that turns over repairs this by itself.
+  const ceiling = await spendCeilingVerdict({
+    tenantId,
+    source: "inbox",
+    base,
+  });
+  // ASKED AGAIN, because the verdict above is two database reads deep and a `/reset` landing inside
+  // them retires this nudge. Everything below is a report about work that will not happen: the flow
+  // line is `error` severity for `over`, so it pages the alert channels, and the announcement CLAIMS
+  // the occasion window as it decides — a line written about a retired job would also swallow the
+  // window the next attempt's real refusal needs. Nothing was refused, so nothing is reported.
+  if (!(await stillWanted())) return "stale";
+  // ONE LINE PER OCCASION, not per attempt. A refused nudge is repairable, so the caller reschedules
+  // it every fifteen minutes for two hours (`nudge-retry.ts`) — and the ceiling it walks into is one
+  // unchanging fact, not eight refusals. Windowed to the ladder it has to outlast, and keyed by the
+  // occasion itself rather than by the conversation, which two independent jobs share.
+  announceSpendCeiling(flow, ceiling, "inbox", tenantId, {
+    key: nudgeOccasionKey(instanceId, conversationId, params.nudge),
+    windowMs: NUDGE_RETRY_BACKOFF_MS * NUDGE_RETRY_LIMIT,
+  });
+  if (ceiling.state === "over") {
+    logger.info(
+      "nudge: spend ceiling reached (conv=%s used=%s ceiling=%s) — nothing was sent",
+      String(conversationId),
+      String(ceiling.usedTokens),
+      String(ceiling.ceilingTokens),
+    );
+    return "over-ceiling";
+  }
 
   // Pre-invoke gate: may we message the customer (bot owns it), or only note (human owns it)?
   // When the live gate ran, it already proved bot ownership with FRESH data (and reconciled the
@@ -795,14 +895,64 @@ export async function runAgentNudge(
     checkpointer,
     // Same warn line the reactive turn leaves: a proactive send that only worked on the second
     // attempt must not read like a clean one, and this path can page an alert channel.
-    onModelRetry: ({ attempt }) =>
+    onModelRetry: ({ attempt, provider, model }) =>
       emitFlowEvent(flow, {
         stage: "generate",
         level: "warn",
         status: "ok",
-        provider: cfg.mc.provider,
-        model: cfg.mc.model,
+        // NOTE: the retry can happen on either model, and the row names the one that made it. The
+        // labels ride on the event rather than being defaulted here, so there is no default to get
+        // wrong — which is what two of the four emitters did while they were optional.
+        provider,
+        model,
         detail: { retriedEmptyResponse: attempt },
+      }),
+    // A fallback that ANSWERS produces a successful turn, so nothing else on it would ever say the
+    // primary was down: the reply went out, the customer was served, and the only trace would be a
+    // usage row under another model's name. Warn rather than info — this is the operator's one
+    // signal that a provider they are paying for is not taking their traffic.
+    onModelFallback: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        provider,
+        model,
+        detail: { fallbackFrom: cfg.mc.provider, fallbackReason: reason },
+      }),
+    // The turn's real ending when there was a second provider and it failed too. `error` rather
+    // than `warn`: the customer got nothing. The stage line that wraps the call is labelled with the
+    // primary by construction, so without this the last thing an operator reads is an error against
+    // the model that never made the second call.
+    // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+    // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+    // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+    // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+    // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+    // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+    // labelled with the primary by construction and would otherwise blame the model that never made
+    // the second call. `status` stays "error": the call did fail.
+    onModelFallbackFailed: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "info",
+        status: "error",
+        provider,
+        model,
+        detail: { fallbackFailed: reason },
+      }),
+    // The mirror image, and it fires BEFORE any failure: a fallback the operator configured and that
+    // cannot be built leaves the turn with nothing behind it, which is indistinguishable from having
+    // configured none. Reported once per turn build rather than on the failure, because by then it
+    // is too late to be the warning it needs to be.
+    onModelFallbackUnavailable: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        provider,
+        model,
+        detail: { fallbackUnavailable: reason },
       }),
     // The proactive turn runs on the SAME thread as the reactive one, so it is subject to the same
     // ceiling and has to leave the same trace. INFO for the reason given in runtime.ts.
@@ -895,6 +1045,8 @@ export async function runAgentNudge(
       flow,
       systemPrompt: cfg.systemPrompt,
       makeModel: params.deps?.makeModel,
+      // Same sink as this turn's own callbacks (see the buildCallbacks call above).
+      persistUsage: params.deps?.persistUsage,
     })("output", text);
 
   // What the transfer promised the customer, delivered on the way OUT of the turn — whatever the way
@@ -973,7 +1125,11 @@ export async function runAgentNudge(
     }
   };
 
+  // Held in this process for a thread with no row to hang on (the conversation-keyed fallback
+  // below), and in the ROW for the one that has one. Issue #203.
   let claimedGraphThread = false;
+  let graphOwner: ThreadOwner | null = null;
+  let graphHold: TurnHold | null = null;
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
     // BARRIER (issue #194), for the same reason the reactive turn has one: a proactive turn reads
@@ -1027,17 +1183,26 @@ export async function runAgentNudge(
           contactInboxId,
         },
       };
+      // Taken in the row too, so an append on another replica stands down instead of landing inside
+      // this invoke (../graph/thread-claim.ts).
+      const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+      graphHold = await markTurnOwning(owner, base);
+      graphOwner = owner;
+      // ASKED AGAIN, for the reason ./runtime.ts gives at the same seam: `markTurnOwning` waits out
+      // an append's lease and the row lock /reset holds, so the ask above is stale by the time the
+      // claim lands, and a reset releasing that lock hands it straight to this waiter. Last moment
+      // before the divider and the marker below write the cleared thread back.
+      if (!(await stillWanted(true))) return null;
+      // READ AFTER THE CLAIM, for the reason ./runtime.ts states at the same seam: the claim can
+      // wait out an append that writes this very marker, so a row read before the wait is stale.
+      // Whether another invoke was already reading comes from the claim itself.
       const existing = await runScopedOn(base, sysCtx(tenantId), (db) =>
         db.agentThread.findUnique({
           where: key,
           select: { lastConversationId: true },
         }),
       );
-      // Read BEFORE this nudge marks its own claim: what matters is whether some OTHER invoke is
-      // mid-flight (./attendance-boundary.ts, case 1).
-      const anotherInvokeIsReading = isTurnInFlight(graphThreadId);
-      markTurnInFlight(graphThreadId);
-      claimedGraphThread = true;
+      const anotherInvokeIsReading = graphHold.heldBefore;
       const previous = existing?.lastConversationId ?? null;
       const alreadyStarted = needsAttendanceStartProbe(
         previous,
@@ -1150,7 +1315,24 @@ export async function runAgentNudge(
         throw e;
       });
   } finally {
-    if (claimedGraphThread) clearTurnInFlight(graphThreadId);
+    // NOTE: best-effort, for the reason ../graph/runtime.ts states at its own release: a throw here
+    // would leave through a `finally` that runs after the customer post, turning a delivered nudge
+    // into a failure the caller retries. The lease is the recovery path.
+    if (graphOwner) {
+      const heldOwner: ThreadOwner = graphOwner;
+      try {
+        await clearTurnOwning(
+          heldOwner,
+          base,
+          graphHold ?? { epoch: null, heldBefore: false },
+        );
+      } catch (err) {
+        logger.warn(
+          { err, thread: heldOwner.graphThreadId },
+          "failed to release the durable turn claim; its lease will expire",
+        );
+      }
+    } else if (claimedGraphThread) clearTurnInFlight(graphThreadId);
   }
   // Every refusal from here on suppresses the send and leaves the generated pair checkpointed, which
   // is what `refuse` is for: it takes the outcome back out through the rollback instead of returning
@@ -1167,6 +1349,7 @@ export async function runAgentNudge(
       checkpointer,
       graphThreadId,
       produced: result.messages,
+      kind: "proactive",
     }).catch((err) => {
       // NOTE: best-effort, and loudly. The send was already suppressed, so a failed rollback costs
       // the next turn a message the customer never saw, which is the defect this exists to close,

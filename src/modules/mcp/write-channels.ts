@@ -1,5 +1,6 @@
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
+import { truncForAudit } from "@/modules/audit/projection";
 import {
   bindInbox,
   connectChatwootDeployment,
@@ -7,8 +8,10 @@ import {
   listChatwootAccounts,
   listDeploymentAccounts,
   listInboxes,
+  previewInboxRemoval,
   reconcileInboxBots,
   reconnectInbox,
+  removeInbox,
   rotateChatwootDeploymentToken,
   setConnectedAccounts,
   softDisconnectChatwootInstance,
@@ -22,7 +25,6 @@ import {
   ok,
   parseMcpId,
   recordMcpAudit,
-  truncForAudit,
   type WriteDeps,
   type WriteResult,
 } from "./write";
@@ -80,7 +82,7 @@ export async function deploymentConnect(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.deployment_connect",
+      action: "deployment.connect",
       target: `chatwoot_deployment:${result.deployment.id}`,
       before: null,
       after: truncForAudit({
@@ -125,7 +127,7 @@ export async function deploymentRotateToken(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.deployment_rotate_token",
+      action: "deployment.rotate_token",
       target: `chatwoot_deployment:${updated.id}`,
       before: null,
       after: truncForAudit({ id: updated.id, adminTokenRotated: true }),
@@ -183,7 +185,7 @@ export async function deploymentSetAccounts(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.deployment_set_accounts",
+      action: "deployment.set_accounts",
       target,
       before: null,
       after: truncForAudit({
@@ -225,7 +227,7 @@ export async function instanceDisconnect(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.instance_disconnect",
+      action: "instance.disconnect",
       target,
       before: truncForAudit(beforeProj),
       after: null,
@@ -283,7 +285,7 @@ export async function instanceSyncInboxes(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.instance_sync_inboxes",
+      action: "instance.sync_inboxes",
       target,
       before: null,
       after: truncForAudit(result),
@@ -331,12 +333,62 @@ export async function inboxBind(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.inbox_bind",
+      action: "inbox.bind",
       target,
       before: truncForAudit({ agentId: current.agentId }),
       after: truncForAudit({ agentId: updated.agentId }),
     });
     return ok({ dryRun: false, applied: true, target, inbox: updated });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// Remove the LOCAL mirror of an inbox that was deleted in Chatwoot. The dry run calls Chatwoot too,
+// which is the difference that matters: the write refuses a live inbox, so a preview answering from
+// its arguments alone would approve exactly what the apply then rejects.
+export async function inboxRemove(
+  principal: VerifiedToken,
+  args: { inbox_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const inboxId = parseMcpId(args.inbox_id, "inbox_id");
+  if (typeof inboxId !== "bigint") return inboxId;
+  try {
+    const cw = { makeClient: deps.makeClient };
+    const { inbox, gone } = await previewInboxRemoval(ctx, inboxId, cw, base);
+    const target = `inbox:${inboxId}`;
+    const beforeProj = {
+      id: inbox.id,
+      name: inbox.name,
+      chatwootInboxId: inbox.chatwootInboxId,
+      agentId: inbox.agentId,
+    };
+    if (args.dry_run !== false) {
+      return ok({
+        dryRun: true,
+        action: "remove",
+        target,
+        current: beforeProj,
+        goneFromChatwoot: gone,
+        note: gone
+          ? "Removes the LOCAL mirror only. Past conversations are kept and stop naming an inbox; past usage and log lines are kept."
+          : "This inbox still exists in Chatwoot, so applying would be refused. Delete it in Chatwoot first.",
+      });
+    }
+    await removeInbox(ctx, inboxId, cw, base);
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "inbox.remove",
+      target,
+      before: truncForAudit(beforeProj),
+      after: null,
+    });
+    return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
   }
@@ -366,7 +418,7 @@ export async function inboxReconnect(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.inbox_reconnect",
+      action: "inbox.reconnect",
       target,
       before: null,
       after: truncForAudit({ id: updated.id, agentId: updated.agentId }),
@@ -399,7 +451,7 @@ export async function inboxReconcile(
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
-      action: "mcp.inbox_reconcile",
+      action: "inbox.reconcile",
       target,
       before: null,
       after: truncForAudit(status),

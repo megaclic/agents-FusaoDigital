@@ -6,6 +6,7 @@ import { doc, errors, htmlResponse } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, NotFoundError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import {
@@ -44,11 +45,13 @@ import { vaultRefWhere } from "@/modules/vault/service";
 // translate('errors.googleOAuthTokenExchangeFailed', 'Failed to exchange the Google authorization code')
 // translate('errors.googleOAuthNoRefreshToken', 'Google did not return a refresh token; re-consent is required')
 // translate('errors.googleOAuthNotConnected', 'This Google credential is not connected')
+// translate('errors.googleOAuthCredentialNotFound', 'This Google credential no longer exists')
+// translate('errors.googleOAuthTokenEndpointError', 'Google refused the token request: {{reason}}')
+// translate('errors.googleOAuthRefreshFailed', 'Could not refresh the Google credential: the answer carried no access token. Reconnect it.')
 // translate('errors.googleOAuthWrongKind', 'This credential is not a Google OAuth credential')
 
 const idParams = t.Object({
   id: t.String({
-    pattern: "^\\d+$",
     description: "Vault entry id (BigInt serialized as a decimal string).",
   }),
 });
@@ -97,7 +100,7 @@ export const oauthGoogleVaultController = new Elysia({
     "/:id/oauth/google/authorize",
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const cred = await loadGoogleCredential(ctx, id);
       const scopes = validateScopes((body as { scopes: string[] }).scopes);
       const codeVerifier = generateCodeVerifier();
@@ -134,7 +137,7 @@ export const oauthGoogleVaultController = new Elysia({
           { description: "Google OAuth scopes to request during consent." },
         ),
       }),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   // Connection status (never returns tokens or the client secret).
@@ -142,7 +145,7 @@ export const oauthGoogleVaultController = new Elysia({
     "/:id/oauth/google/status",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const cred = await loadGoogleCredential(ctx, BigInt(params.id));
+      const cred = await loadGoogleCredential(ctx, requireDbId(params.id));
       return { instance: instanceIdentity, ...projectStatus(cred) };
     },
     {
@@ -160,7 +163,7 @@ export const oauthGoogleVaultController = new Elysia({
     "/:id/oauth/google/disconnect",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const cred = await loadGoogleCredential(ctx, id);
       if (cred.refreshToken) await revokeGoogleToken(cred.refreshToken);
       const stripped: GoogleOAuthCredential = {

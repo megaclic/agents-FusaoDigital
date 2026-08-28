@@ -42,6 +42,9 @@ export async function scheduleZproStatusCheck(
     kind: "ZPRO_STATUS_CHECK",
     dedupeKey: `zpro-status-check:${params.zproInstanceId}:${params.ticketId}`,
     runAt: new Date(now.getTime() + CHECK_DELAY_MS),
+    // A re-arm here means a NEW handoff/resolve happened on this ticket — the world changed again —
+    // not a clock repeating the same check, so a prior failed pass's budget must not carry over.
+    rearm: "new-work",
     payload: {
       zproInstanceId: params.zproInstanceId.toString(),
       ticketId: params.ticketId,

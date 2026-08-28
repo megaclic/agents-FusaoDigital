@@ -27,6 +27,7 @@ import {
   useTenantEvents,
 } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { cn } from "@/client/lib/utils";
 
 // Types derived from the Eden treaty — never hand-declared (see docs/eden-treaty.md).
@@ -482,7 +483,8 @@ export function ZproConversationDetailPage() {
         ["toggle-agent"].post({ agentActive: nextActive });
       if (err || !data) {
         showToast(
-          t("zpro.conversations.toggleError", "Could not update the agent."),
+          apiErrorMessage(err) ||
+            t("zpro.conversations.toggleError", "Could not update the agent."),
           "error",
         );
         return;

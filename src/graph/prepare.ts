@@ -7,18 +7,25 @@ import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import config from "@/config";
 import type { ModelOverride } from "@/graph/model-override";
+import {
+  applyToolPreconditions,
+  preconditionFlowEvent,
+  preconditionStateLoader,
+  unmatchedPreconditionEvent,
+} from "@/graph/tools/precondition";
 import { parseDbId } from "@/lib/db-id";
 import type { ScopedDb, TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
+  readToolPreconditions,
+  type ToolPrecondition,
+} from "@/modules/agents/tool-preconditions";
+import {
   buildAppointmentContextSection,
   loadAppointmentContext,
 } from "@/modules/appointments/context";
-import {
-  cancelAppointmentReminders,
-  enqueueAppointmentReminders,
-} from "@/modules/appointments/reminders";
+import { appointmentSideEffects } from "@/modules/appointments/side-effect";
 import { parseSchedule, type Schedule } from "@/modules/business-hours/hours";
 import { readSchedule } from "@/modules/business-hours/service";
 import {
@@ -84,7 +91,15 @@ import { readTtsConfig, type TtsConfig } from "@/modules/tts/settings";
 import { resolveInjectableCredential } from "@/modules/vault/injectable";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
 import { chatwootThreadId, getCheckpointer } from "./checkpointer";
-import { buildAgentGraph } from "./graph";
+import {
+  type FallbackConfig,
+  hasModelFallback,
+  readModelFallbackConfig,
+  resolveFallbackModel,
+} from "./fallback-settings";
+import { buildAgentGraph, type FallbackModel } from "./graph";
+import { PRIMARY_MAX_RETRIES, PRIMARY_TIMEOUT_MS } from "./model-fallback";
+import type { ModelLabels, ModelRetryInfo } from "./model-limit";
 import {
   createChatModel,
   type ModelConfig,
@@ -119,7 +134,10 @@ import {
   type McpSelection,
 } from "./tools/mcp";
 import { buildRagTools } from "./tools/rag";
-import { dropDuplicateToolNames } from "./tools/unique-names";
+import {
+  dropDuplicateToolNames,
+  droppedToolNamesEvent,
+} from "./tools/unique-names";
 import { UsageCapture, type UsagePersist, type UsageSource } from "./usage";
 
 // Shared agent-invocation plumbing used by BOTH entry points: runAgentTurn (incoming customer
@@ -191,6 +209,16 @@ export interface AgentConfig {
   // the guardrails agent's, so the audio path never opens a DB read of its own.
   ttsNormalizeApiKey: string;
   ttsNormalizeCredentialBaseUrl: string | null;
+  // The second provider behind the agent's own, and its OWN resolved key / baseURL. Resolved here
+  // next to the other three, so the turn never opens a DB read while a customer is waiting.
+  //
+  // Its shape is the two siblings' and its DEFAULT is the opposite: everything absent means no
+  // fallback at all, never "the agent's own model" (see graph/fallback-settings). An unresolvable
+  // ref leaves the key empty, and `buildModelAndGraph` then builds NO fallback — the turn fails the
+  // way it does today rather than sending the agent's key to a vendor that never issued it.
+  modelFallback: FallbackConfig;
+  modelFallbackApiKey: string;
+  modelFallbackCredentialBaseUrl: string | null;
   contactVoiceReply: boolean | null;
   // Humanized text delivery (split into balloons + typing delay).
   splitConfig: SplitConfig;
@@ -208,6 +236,9 @@ export interface AgentConfig {
   // Operator-authored guidance for tools whose only config is the note (set_custom_attribute,
   // assign_label, …), keyed by native tool name; merged into the tool descriptions at buildToolset.
   toolGuidance: Partial<Record<NativeToolName, string>>;
+  // Operator-declared preconditions, keyed by TOOL NAME (issue #101). Native or custom: the seam
+  // that applies them is the one place every source's tools meet, so one map covers all six.
+  toolPreconditions: Record<string, ToolPrecondition>;
   // Conversation/contact context exposed to custom HTTP tools as {{placeholders}} (contact_name,
   // contact_email, …). conversation_id is merged in at buildToolset time (it lives on ctx). Never
   // holds a secret.
@@ -233,6 +264,12 @@ export interface AgentConfig {
   // Whether this agent's tool lines log the VALUES the model sent instead of their shape
   // (agent.settings.observability.logToolValues; off by default — see src/modules/flowlog/shape.ts).
   logToolValues: boolean;
+  // Whether this agent's debug mode is on for this turn: flow lines keep their `detail` strings
+  // whole instead of cutting them at 2000, which is what lets an operator read the audited system
+  // prompt past that point (agent.settings.observability.fullDetailUntil; off by default, and it
+  // expires on its own — see src/modules/flowlog/settings.ts). Read HERE, with the rest of the
+  // agent's settings, so the emit path never pays a settings read per log line.
+  fullDetail: boolean;
 }
 
 export interface LoadAgentArgs {
@@ -391,6 +428,29 @@ export async function loadAgentConfig(
       );
     }
   }
+  // The fallback provider's own credential. Same fail-open shape as the three around it, and the
+  // failure mode it protects is the loudest of them: without a key the fallback is simply not built,
+  // so the turn behaves exactly as an install that configured none. Sending the agent's key instead
+  // would hand one vendor's secret to another on every 503.
+  const fallbackCfg = readModelFallbackConfig(effSettings);
+  let modelFallbackApiKey = "";
+  let modelFallbackCredentialBaseUrl: string | null = null;
+  if (hasModelFallback(fallbackCfg) && fallbackCfg.credentialRef) {
+    const fEntry = await tryResolveVaultEntry<string>(
+      db,
+      fallbackCfg.credentialRef,
+    );
+    if (fEntry) {
+      modelFallbackApiKey = fEntry.secret;
+      modelFallbackCredentialBaseUrl = fEntry.baseUrl;
+    } else {
+      logger.warn(
+        "agent %s: model fallback credentialRef %s did not resolve, so there is nothing behind the provider",
+        String(args.agentId),
+        fallbackCfg.credentialRef,
+      );
+    }
+  }
   // The summariser's own credential, when it runs on a separate model. Same fail-open shape as the
   // two above: an unresolvable ref leaves the key empty, and runCompaction then FAILS the job rather
   // than quietly falling back to the agent's key on a provider that may not accept it. Failing is
@@ -416,6 +476,18 @@ export async function loadAgentConfig(
     }
   }
   const attributeContext = readAttributeContextConfig(effSettings);
+  // One read for both observability knobs, and one instant for the debug mode's expiry: reading it
+  // twice would let the window close between the two answers.
+  // From the SAVED bag, not the draft, and it is the one block here that is read that way.
+  //
+  // The overrides exist so the playground can run an unsaved agent, and every other block in them
+  // changes how the agent BEHAVES — the prompt, the model, the tools, the guardrails. This one does
+  // not: it changes what the platform STORES about the run. A draft that widened it would record
+  // the customer's tool values, or full-size rows, from a switch the operator has not committed and
+  // could close the tab on, while the console's own warning says "Save to apply" and the agent's
+  // stored settings say the mode is off. Recording policy follows the saved settings, so the two
+  // can never disagree (#58).
+  const obs = readObservabilityConfig(agent.settings);
   const wantsAttributeContext = !isAttributeContextEmpty(attributeContext);
   const conv = await db.conversation.findUnique({
     where: {
@@ -689,6 +761,9 @@ export async function loadAgentConfig(
     ttsConfig: ttsCfg,
     ttsNormalizeApiKey,
     ttsNormalizeCredentialBaseUrl,
+    modelFallback: fallbackCfg,
+    modelFallbackApiKey,
+    modelFallbackCredentialBaseUrl,
     contactVoiceReply: conv?.contact?.voiceReply ?? null,
     splitConfig: readSplitConfig(effSettings),
     serviceWindowConfig: readServiceWindowConfig(effSettings),
@@ -697,6 +772,7 @@ export async function loadAgentConfig(
     sendImageConfig: readSendImageConfig(effSettings),
     kanbanConfig: readKanbanConfig(effSettings),
     toolGuidance: readToolGuidance(effSettings),
+    toolPreconditions: readToolPreconditions(effSettings),
     httpToolContext: {
       ...(conv?.contact?.chatwootContactId != null
         ? { contact_id: String(conv.contact.chatwootContactId) }
@@ -724,7 +800,8 @@ export async function loadAgentConfig(
     },
     memoryCompactionApiKey,
     memoryCompactionCredentialBaseUrl,
-    logToolValues: readObservabilityConfig(effSettings).logToolValues,
+    logToolValues: obs.logToolValues,
+    fullDetail: obs.fullDetail,
   };
 }
 
@@ -868,77 +945,25 @@ export async function buildToolset(
           errorMessage: e.err instanceof Error ? e.err.message : String(e.err),
         })
     : undefined;
-  // Deterministic appointment reminders: when the Calendar toolpack books an appointment, arm one
-  // scheduler job per configured offset; cancel them on cancel/reschedule. Bound to the tenant + THIS
-  // conversation's thread (the per-conversation `tenant:instance:convId`, which runAgentNudge parses —
-  // NOT the per-contact-inbox memory thread). The POLICY (offsets/confirmation) lives in the Calendar
-  // integration's config and is passed in by the toolpack; here we only wire the MECHANISM. Both are
-  // wired on any real conversation so reminders can be armed and stale ones cleaned up regardless of
-  // the per-integration toggle.
+  // The two closures a tool calls to say a booking now stands, or no longer does — the Calendar
+  // toolpack and any HTTP tool whose definition declares an appointment (issue #352). The POLICY
+  // (offsets/confirmation, or none at all) comes from the caller; this only binds the MECHANISM to
+  // the tenant and THIS conversation's thread. Wired on any real conversation, regardless of the
+  // per-integration reminder toggle: the RECORD is not about sending a reminder.
   const apptThreadId =
     ctx.conversationId > 0
       ? chatwootThreadId(ctx.tenantId, ctx.instanceId, ctx.conversationId)
       : null;
-  const scheduleAppointmentReminders = apptThreadId
-    ? async (a: {
-        eventId: string;
-        calendarId: string;
-        startISO: string;
-        credentialRef: string | null;
-        offsetsHours: number[];
-        askConfirmationOnLast: boolean;
-        summary: string | null;
-        calendarLabel: string | null;
-      }) => {
-        try {
-          await enqueueAppointmentReminders({
-            tenantId: ctx.tenantId,
-            threadId: apptThreadId,
-            eventId: a.eventId,
-            calendarId: a.calendarId,
-            credentialRef: a.credentialRef,
-            startISO: a.startISO,
-            offsetsHours: a.offsetsHours,
-            askConfirmationOnLast: a.askConfirmationOnLast,
-            summary: a.summary,
-            calendarLabel: a.calendarLabel,
-            base: ctx.base,
-          });
-        } catch (e) {
-          logger.warn(
-            "appointment reminders enqueue failed: %s",
-            e instanceof Error ? e.message : String(e),
-          );
-          // NOTE: The appointment exists in Google but its reminders were never armed — the customer
-          // silently misses them. `google_calendar` is the toolpack family name (the closure does not
-          // know which calendar tool called it).
-          onSideEffectError?.({
-            tool: "google_calendar",
-            phase: "reminders_enqueue",
-            detail: { eventId: a.eventId },
-            err: e,
-          });
-        }
-      }
+  const apptSideEffects = apptThreadId
+    ? appointmentSideEffects({
+        tenantId: ctx.tenantId,
+        threadId: apptThreadId,
+        base: ctx.base,
+        report: onSideEffectError,
+      })
     : undefined;
-  const cancelAppointmentRemindersFn = apptThreadId
-    ? async (eventId: string) => {
-        try {
-          await cancelAppointmentReminders(ctx.tenantId, eventId, ctx.base);
-        } catch (e) {
-          logger.warn(
-            "appointment reminders cancel failed: %s",
-            e instanceof Error ? e.message : String(e),
-          );
-          onSideEffectError?.({
-            tool: "google_calendar",
-            phase: "reminders_cancel",
-            detail: { eventId },
-            err: e,
-          });
-        }
-      }
-    : undefined;
+  const appointmentBookedFn = apptSideEffects?.booked;
+  const cancelAppointmentFn = apptSideEffects?.cancel;
   // Slow-tool ack emitter: posts the per-tool "I'll look into that…" message (with a typing
   // indicator) before the tool runs. Wired ONLY on a real conversation (conversationId > 0) — the
   // playground builds its toolset with conversationId 0 and a dummy client, so acks never fire
@@ -991,8 +1016,8 @@ export async function buildToolset(
     contactDbId: cfg.contactDbId,
     resolveCredential,
     resolveBusinessHours,
-    scheduleAppointmentReminders,
-    cancelAppointmentReminders: cancelAppointmentRemindersFn,
+    appointmentBooked: appointmentBookedFn,
+    cancelAppointment: cancelAppointmentFn,
     onSideEffectError,
     // Only a real conversation gets the live handle (mirrors the emitAck gate); the playground
     // builds with conversationId 0 + a stub client, so customer-delivery tools degrade.
@@ -1153,6 +1178,16 @@ export async function buildToolset(
           : {}),
         ...cfg.httpToolContext,
       },
+      // The zone an offset-less start from a declared response is read in. Same value the documents
+      // tool gets, and for the same reason: two readers of the operator's own wall clock must not
+      // disagree by three hours.
+      timezone: cfg.timezone,
+      // The same two closures the toolpacks get, for a tool whose DEFINITION declares that its
+      // response describes an appointment (issue #352). Wired identically: undefined on the
+      // playground, where nothing is recorded, and the declaration then simply does nothing.
+      appointmentBooked: appointmentBookedFn,
+      cancelAppointment: cancelAppointmentFn,
+      onSideEffectError,
     }),
     ...mcpTools,
     ...toolpackTools,
@@ -1168,18 +1203,53 @@ export async function buildToolset(
       cfg.ragConfig?.tools,
     ),
   ]);
+  // NOTE: The precondition seam, and the reason the whole feature is six lines: every source's tools have
+  // already been merged into ONE name-unique list above, so a map keyed by name reaches native,
+  // document, HTTP, MCP, toolpack and RAG at once. An agent with no preconditions gets the same
+  // array back, untouched.
+  const guarded = applyToolPreconditions(
+    tools,
+    cfg.toolPreconditions,
+    preconditionStateLoader({
+      base: ctx.base,
+      tenantId: ctx.tenantId,
+      conversationDbId: cfg.conversationDbId ?? null,
+      contactDbId: cfg.contactDbId ?? null,
+    }),
+    flow
+      ? (info) => emitFlowEvent(flow, preconditionFlowEvent(info))
+      : undefined,
+    (unmatched) => {
+      // A rule that matches no assembled tool guards nothing and reads on screen exactly like one
+      // that does. Reported at assembly because this is the first and only point where the whole
+      // toolset is known.
+      if (flow) emitFlowEvent(flow, unmatchedPreconditionEvent(unmatched));
+      logger.warn(
+        "agent %s: precondition(s) on tool(s) not in this turn's toolset (%s) — the tool is NOT guarded",
+        String(cfg.agentId),
+        unmatched.join(", "),
+      );
+    },
+  );
   if (dropped.length > 0) {
     // The operator is the only one who can fix this, and the symptom they would otherwise see is a
     // tool that quietly does nothing — or, on a provider that rejects a duplicated function name,
-    // an agent that stops replying at all.
+    // an agent that stops replying at all. So it goes where they look at the turn (#389), not only
+    // to the process log, which on a managed deploy they may have no way to read at all.
+    if (flow) emitFlowEvent(flow, droppedToolNamesEvent(dropped));
+    // NOTE: what to rename is NOT said here any more. It was "rename the later one", which is an
+    // action that exists for an MCP connection (the slug comes from its display name) and does not
+    // exist for the commonest case: two instances of one toolpack expose identical names, because
+    // the names come from the pack. Naming the tool that lost is the part that is true for every
+    // source.
     logger.warn(
-      "agent %s: %d tool(s) dropped for a duplicate name (%s) — rename the later one",
+      "agent %s: %d tool(s) dropped for a duplicate name (%s)",
       String(cfg.agentId),
       dropped.length,
       [...new Set(dropped)].join(", "),
     );
   }
-  return tools;
+  return guarded;
 }
 
 export interface CallbacksArgs {
@@ -1382,13 +1452,126 @@ export interface GraphBuildDeps {
   checkpointer?: BaseCheckpointSaver;
   // Fired when the hard tool-call limit forces a no-tools answer (runtime emits a flow warn).
   onToolLimit?: (info: { maxToolCalls: number; toolCalls: number }) => void;
-  onModelRetry?: (info: { attempt: number; error: unknown }) => void;
+  onModelRetry?: (info: ModelRetryInfo) => void;
+  // Fired when the configured second provider took the turn, so the runtime can put it on the trail.
+  // A fallback that answers is a SUCCESSFUL turn, so nothing else on the turn would say it happened
+  // — and a cost break-down that cannot see it reads the fallback's spend as the primary's.
+  onModelFallback?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  // Fired when a fallback was configured and could not be built, which is the state that looks
+  // exactly like having none. Separate from `onModelFallback` on purpose: one says the safety net
+  // caught the turn, the other says there is no net, and folding them would let the second read as
+  // the first.
+  // Fired when the fallback ALSO failed, which is the turn's real ending. Its own line, because the
+  // `generate` stage is labelled with the primary by construction.
+  onModelFallbackFailed?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  // WHICH FALLBACK could not be built, carried and NOT optional, for the reason the other three
+  // fallback events carry it: the line is written by handlers whose only other labels are the
+  // PRIMARY's, so a `reason` on its own gets published under the name of the model that is working.
+  // Measured on all three consumers before this: the webhook and the nudge stamped the primary's
+  // provider and model onto a warning about the fallback, and the playground stamped neither, so a
+  // filter by model showed it under the wrong one or not at all. Only reached after
+  // `hasModelFallback` said yes, so the configured labels always exist.
+  onModelFallbackUnavailable?: (info: ModelLabels & { reason: string }) => void;
   // Fired when a turn dropped history to fit maxHistoryTokens (runtime records it in the trail).
   onHistoryTrim?: (info: {
     kept: number;
     dropped: number;
     tokens: number;
   }) => void;
+}
+
+// The second provider, built or deliberately absent. Every way this returns undefined is a way an
+// install behaves exactly as it does today, which is the property that makes the whole feature safe
+// to ship on: the fallback can only ever ADD an attempt that would not have happened.
+//
+// The three refusals are the three ways a configuration can be wrong, and none of them is silent:
+//   * nothing named        — the ordinary state, and the only one with no line (there is nothing to
+//                            report about a feature the operator did not ask for);
+//   * named but unrunnable — `resolveModelOverride` refused the destination (unknown provider, a key
+//                            that belongs to another vendor, an endpoint that would be dropped);
+//   * named with a credential that did not resolve — the ref is stale or was deleted.
+function buildFallbackModel(
+  cfg: AgentConfig,
+  makeModel: (mc: ResolvedModelConfig) => BaseChatModel,
+  deps: GraphBuildDeps,
+): FallbackModel | undefined {
+  if (!hasModelFallback(cfg.modelFallback)) return undefined;
+  const unavailable = (reason: string): undefined => {
+    logger.warn(
+      "agent %s: a model fallback is configured but cannot run (%s), so the provider has nothing behind it",
+      String(cfg.agentId),
+      reason,
+    );
+    deps.onModelFallbackUnavailable?.({
+      provider: cfg.modelFallback.provider ?? "",
+      model: cfg.modelFallback.model ?? "",
+      reason,
+    });
+    return undefined;
+  };
+  const resolved = resolveFallbackModel(
+    cfg.modelFallback,
+    {
+      provider: cfg.mc.provider,
+      model: cfg.mc.model,
+      baseURL: cfg.credentialBaseUrl ?? cfg.mc.baseURL,
+    },
+    { ownCredentialBaseURL: cfg.modelFallbackCredentialBaseUrl },
+  );
+  if (!resolved.runnable) return unavailable(resolved.reason ?? "not_runnable");
+  const own = resolved.credential === "own";
+  if (own && !cfg.modelFallbackApiKey)
+    return unavailable("credential_not_found");
+  // Built from the resolution alone, never spread from the agent's config: a spread would carry the
+  // agent's credentialRef (and every field the schema grows later) across a provider switch, which
+  // is the one thing the resolution exists to refuse. The two sibling overrides are built the same
+  // way.
+  const mc: ResolvedModelConfig = {
+    provider: resolved.provider as ModelConfig["provider"],
+    model: resolved.model,
+    apiKey:
+      resolved.credential === "own"
+        ? cfg.modelFallbackApiKey
+        : resolved.credential === "agent"
+          ? cfg.apiKey
+          : "",
+    baseURL: resolved.baseURL ?? undefined,
+    // The agent's temperature and reasoningEffort DO carry, unlike the two sibling overrides: those
+    // rewrite or summarise something that already exists, while this answers the customer in the
+    // agent's place. A fallback that answers in a different register than the primary is a worse
+    // fallback, and the operator tuned those values for the answer, not for the vendor.
+    temperature: cfg.mc.temperature,
+    ...(resolved.provider === cfg.mc.provider && cfg.mc.reasoningEffort
+      ? { reasoningEffort: cfg.mc.reasoningEffort }
+      : {}),
+    maxRetries: PRIMARY_MAX_RETRIES,
+    timeoutMs: PRIMARY_TIMEOUT_MS,
+  };
+  // `createChatModel` REFUSES some configurations synchronously (openai-compatible with no effective
+  // base URL throws a 400). Uncaught here that would cost the turn the fallback exists to save, and
+  // it would cost it on EVERY turn, not just the ones the primary failed.
+  try {
+    return { model: makeModel(mc), provider: mc.provider, modelId: mc.model };
+  } catch (err) {
+    logger.warn(
+      { err, agentId: String(cfg.agentId) },
+      "model fallback config is not runnable",
+    );
+    deps.onModelFallbackUnavailable?.({
+      provider: mc.provider,
+      model: mc.model,
+      reason: "model_not_runnable",
+    });
+    return undefined;
+  }
 }
 
 export async function buildModelAndGraph(
@@ -1398,10 +1581,17 @@ export async function buildModelAndGraph(
 ) {
   const makeModel = deps.makeModel ?? createChatModel;
   const effectiveBaseUrl = cfg.credentialBaseUrl ?? cfg.mc.baseURL;
+  const fallback = buildFallbackModel(cfg, makeModel, deps);
+  // Bounded ONLY when something was actually built behind it. An install with no fallback keeps
+  // LangChain's six retries and its unbounded wait, byte for byte — see ./model-fallback for what
+  // those cost when there IS a second provider waiting for the turn.
   const model = makeModel({
     ...cfg.mc,
     apiKey: cfg.apiKey,
     baseURL: effectiveBaseUrl,
+    ...(fallback
+      ? { maxRetries: PRIMARY_MAX_RETRIES, timeoutMs: PRIMARY_TIMEOUT_MS }
+      : {}),
   });
   const checkpointer = deps.checkpointer ?? (await getCheckpointer());
   // Append the MCP server-context block (each connected server's scope + native `instructions` + its
@@ -1417,8 +1607,12 @@ export async function buildModelAndGraph(
     checkpointer,
     tools,
     maxToolCalls: cfg.maxToolCalls,
+    primary: { provider: cfg.mc.provider, model: cfg.mc.model },
+    fallback,
     onToolLimit: deps.onToolLimit,
     onModelRetry: deps.onModelRetry,
+    onModelFallback: deps.onModelFallback,
+    onModelFallbackFailed: deps.onModelFallbackFailed,
     maxHistoryTokens: cfg.maxHistoryTokens,
     onHistoryTrim: deps.onHistoryTrim,
   });

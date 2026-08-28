@@ -7,6 +7,7 @@ import type { RuntimeDeps } from "@/graph/runtime";
 import { AppError, UnauthorizedError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { makeStorableDeep, unstorableProblem } from "@/lib/text";
+import { emitDeadLetter } from "@/modules/flowlog/dead-letter";
 import { getMapper } from "@/modules/integrations/mappers";
 import {
   type ResolvedInboundRoute,
@@ -282,8 +283,16 @@ async function persistFailed(
         select: { id: true },
       }),
     );
+  // NOTE: announced only on a REAL insert (issue #356). A provider that retries an unprocessable
+  // body lands on the dedupe key below and gets back the row it already has; announcing there would
+  // report one dropped event as many, at whatever rate the provider retries.
+  //
+  // The emit is OUTSIDE the try, not merely after the create: `emitFlowEvent` is fire-and-forget
+  // and cannot reject, but a throw from inside that try is read as "not a unique violation" and
+  // rethrown, which would turn a delivery that WAS persisted into a 500 for the provider.
+  let inserted: bigint | null = null;
   try {
-    return (await create()).id;
+    inserted = (await create()).id;
   } catch (err) {
     if (!isUniqueViolation(err)) throw err;
     const existing = await runScopedOn(base, sysCtx(route.tenantId), (db) =>
@@ -295,6 +304,25 @@ async function persistFailed(
     if (!existing) throw err;
     return existing.id;
   }
+  emitDeadLetter({
+    tenantId: route.tenantId,
+    unit: "inbound_delivery",
+    // NOTE: the event happened at the provider and the platform accepted it with a 2xx. It is gone.
+    level: "error",
+    error: `inbound payload not processable: ${String(payload.reason)}`,
+    detail: {
+      deliveryId: String(inserted),
+      integrationInstanceId: String(route.id),
+      catalogType: route.catalogType,
+      // NOTE: `no-mapper`, `invalid`, `unstorable-identity` — a closed vocabulary this module
+      // writes, and the three have different fixes. `issues` is the mapper's own diagnostic and
+      // never the body (the raw body is only ever hashed into the dedupe key).
+      reason: payload.reason,
+      ...(payload.issues ? { issues: payload.issues } : {}),
+    },
+    base,
+  });
+  return inserted;
 }
 
 // create-then-catch across two transactions (a unique violation aborts its own transaction,
@@ -358,10 +386,17 @@ export interface ProcessParams {
 function buildNudge(
   payload: Record<string, unknown>,
   source: string,
+  // WHICH OCCASION THIS IS, and the delivery row is the answer: one row is one event, a redelivery
+  // of that row is the same event, and two events on one conversation are two rows. Nothing else in
+  // this descriptor separates them — an inbound nudge carries no `step` and no `refs`, so two
+  // distinct deliveries would otherwise describe themselves identically and the second, refused by
+  // the spend ceiling inside the first's window, would lose its flow line and its alert.
+  deliveryId: bigint,
 ): AgentNudge {
   return {
     source,
     kind: "agent_nudge",
+    occasionId: `delivery:${deliveryId}`,
     status: asString(payload.status) ?? null,
     value: typeof payload.value === "number" ? payload.value : null,
     currency: asString(payload.currency) ?? null,
@@ -382,6 +417,9 @@ export async function processInboundDelivery(
   params: ProcessParams,
 ): Promise<"processed" | "skipped"> {
   const base = params.base ?? basePrisma;
+  // NOTE: set inside the claim below, emitted AFTER it commits: a line written from inside the
+  // scope would survive a rollback of the very write it reports.
+  let exhausted: bigint | null | undefined;
   const plan: ProcessPlan = await runScopedOn(
     base,
     sysCtx(params.tenantId),
@@ -392,28 +430,71 @@ export async function processInboundDelivery(
       // the row is marked FAILED instead of looping. (A periodic sweeper is added with the
       // scheduler; until then a redelivery reclaims a stranded row.)
       const staleCutoff = new Date(Date.now() - PROCESSING_STALE_MS);
+      // NOTE: staleness is measured from the CURRENT claim, not from the delivery's receipt. That
+      // distinction is the whole of it: `receivedAt` is stamped once and a claim never refreshes
+      // it, so five minutes after a webhook arrives the row is permanently "stale" by that measure
+      // and a duplicate delivery could take a row whose attempt was still running (issue #356).
+      //
+      // AN UNSTAMPED ROW FALLS BACK TO THE OLD RULE rather than reading as stale, and that is a
+      // compatibility mechanism with a definite end, not a hedge. `docs/deploy.md` supports a
+      // rolling pre-deploy over a scaled web tier, which is where inbound webhooks are served, so
+      // the previous version keeps CLAIMING rows after the migration has run — a snapshot backfill
+      // fences the rows that were PROCESSING at that instant and cannot fence the ones claimed a
+      // second later. Reading those as stale would take a live claim.
+      //
+      // The fallback is exactly what shipped before this column, so a row the old code claimed is
+      // judged no worse than it is today, and a row the new code claimed is judged correctly. It
+      // stops being reachable once every replica stamps, and it is what makes this one release
+      // instead of the two an expand/contract would need.
+      const stale = [
+        { claimedAt: { lt: staleCutoff } },
+        { claimedAt: null, receivedAt: { lt: staleCutoff } },
+      ] as const;
       const claimed = await db.inboundDelivery.updateMany({
         where: {
           id: params.deliveryId,
           attempts: { lt: MAX_PROCESS_ATTEMPTS },
-          OR: [
-            { status: "PENDING" },
-            { status: "PROCESSING", receivedAt: { lt: staleCutoff } },
-          ],
+          OR: [{ status: "PENDING" }, { status: "PROCESSING", OR: [...stale] }],
         },
-        data: { status: "PROCESSING", attempts: { increment: 1 } },
+        data: {
+          status: "PROCESSING",
+          attempts: { increment: 1 },
+          claimedAt: new Date(),
+        },
       });
       if (claimed.count === 0) {
         // Either not reclaimable (done / freshly PROCESSING) or the attempt cap is exhausted —
         // in the latter case move it to a terminal FAILED so it stops being retried.
-        await db.inboundDelivery.updateMany({
+        //
+        // NOTE: the PROCESSING half carries the SAME staleness rule the claim above does, and it
+        // has to: the claim says a PROCESSING row is only takeable once its claim went stale, so
+        // any other measure here would let this disagree with it about the same row. The last
+        // attempt running RIGHT NOW is `attempts = MAX` and `PROCESSING`, and a duplicate webhook
+        // arriving mid-flight would otherwise mark the delivery terminally FAILED under the
+        // invocation still working on it — which then marks it PROCESSED over the top. Silent
+        // before issue #356; announcing it is what made the disagreement visible, and a dead-letter
+        // line about work still in flight is the one thing this announcement must never say.
+        const killed = await db.inboundDelivery.updateMany({
           where: {
             id: params.deliveryId,
             attempts: { gte: MAX_PROCESS_ATTEMPTS },
-            status: { in: ["PENDING", "PROCESSING"] },
+            OR: [
+              { status: "PENDING" },
+              { status: "PROCESSING", OR: [...stale] },
+            ],
           },
           data: { status: "FAILED" },
         });
+        // NOTE: the count separates the two cases the branch above collapses, and only one of them
+        // is a death: a row that was simply not reclaimable (already processed, freshly claimed by
+        // another replica, or still being worked on) matched nothing here and is not a loss.
+        if (killed.count > 0) {
+          const row = await db.inboundDelivery.findUnique({
+            where: { id: params.deliveryId },
+            select: { integrationInstanceId: true },
+          });
+          exhausted = row?.integrationInstanceId ?? null;
+        }
         return { kind: "skip" };
       }
 
@@ -457,7 +538,7 @@ export async function processInboundDelivery(
           return {
             kind: "nudge",
             threadId: corr.threadId,
-            nudge: buildNudge(payload, source),
+            nudge: buildNudge(payload, source, params.deliveryId),
           };
         }
         await markProcessed();
@@ -489,7 +570,7 @@ export async function processInboundDelivery(
         return {
           kind: "nudge",
           threadId: ref.threadId,
-          nudge: buildNudge(payload, source),
+          nudge: buildNudge(payload, source, params.deliveryId),
         };
       }
 
@@ -510,10 +591,43 @@ export async function processInboundDelivery(
     },
   );
 
+  // NOTE: the row exhausted its processing budget and is terminally FAILED — the provider's event
+  // was accepted with a 2xx and will never be acted on (issue #356).
+  if (exhausted !== undefined) {
+    emitDeadLetter({
+      tenantId: params.tenantId,
+      unit: "inbound_delivery",
+      level: "error",
+      error: `inbound delivery exhausted ${MAX_PROCESS_ATTEMPTS} processing attempts`,
+      detail: {
+        deliveryId: String(params.deliveryId),
+        ...(exhausted !== null
+          ? { integrationInstanceId: String(exhausted) }
+          : {}),
+        reason: "attempts-exhausted",
+      },
+      base,
+    });
+  }
+
   if (plan.kind === "skip") return "skipped";
   if (plan.kind === "done") return "processed";
 
   // Phase B: agent_nudge network turn outside the tx (best-effort), then mark PROCESSED.
+  //
+  // BEST-EFFORT MEANS THE OUTCOME IS NOT CONSULTED, and that is the contract rather than an
+  // oversight: the durable barrier is the ConversionEvent recorded in Phase A, and everything past
+  // it is one attempt at telling the customer. A Chatwoot outage, a model failure and a spend
+  // ceiling all end the same way — the notification does not go out, the row is PROCESSED, and the
+  // catch above says so in the log. The ceiling additionally writes an `error` flow line, which
+  // pages the alert channels, so a refusal here is the most visible of the three.
+  //
+  // Making a refused nudge RECOVERABLE is a real gap and a separate change: this module has no
+  // driver that re-runs a delivery (`processInboundDelivery` is called only by the inbound route,
+  // detached, and we ack 200 before Phase B, so no provider redelivers), and the conversion barrier
+  // means a redelivery that did arrive would take the `done` path instead of re-running the nudge.
+  // It needs a scheduler kind of its own — which would fix the throw case too, and that is the
+  // larger half of the same hole.
   const runNudge = params.deps?.runNudge ?? runAgentNudge;
   try {
     await runNudge({

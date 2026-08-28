@@ -14,10 +14,11 @@
 // Secret VALUES are never imported, only empty placeholders.
 
 import { z } from "zod";
-import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { normalizeExpectedStatuses } from "@/graph/tools/http-status";
+import { parseDbId } from "@/lib/db-id";
 import { AppError, NotFoundError } from "@/lib/errors";
 import {
   hasSafeStdioCommandChars,
@@ -25,6 +26,7 @@ import {
   stdioCommandLauncher,
 } from "@/lib/mcp-launchers";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { auditSafe } from "@/modules/agents/audit-projection";
 import {
   type CredentialFieldTab,
   credRefSlot,
@@ -32,6 +34,15 @@ import {
   SETTINGS_CREDENTIAL_PATHS,
 } from "@/modules/agents/credential-paths";
 import { clampOversizedTextInPlace } from "@/modules/agents/text-caps";
+import { auditMutation } from "@/modules/audit/service";
+import {
+  MAX_SCHEDULE_EXCEPTIONS,
+  MAX_SCHEDULE_WINDOWS,
+  parseExceptions,
+  parseWindows,
+  type ScheduleException,
+  type WindowSpec,
+} from "@/modules/business-hours/hours";
 import { parseDocumentStyle } from "@/modules/documents/blocks";
 import {
   slugProblem,
@@ -39,9 +50,11 @@ import {
   templateNameSchema,
 } from "@/modules/documents/templates";
 import { parseAuthoredTemplate } from "@/modules/documents/validate";
+import { disarmFullDetail } from "@/modules/flowlog/settings";
 import { normalizeSettingsForStorage } from "@/modules/images/settings";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import { assertNoSecrets } from "@/modules/n8n-export/n8n";
+import { readAppointmentDeclaration } from "@/modules/tool-definitions/appointment";
 import {
   canonicalBodyShape,
   unsupportedBodyShape,
@@ -51,6 +64,7 @@ import {
   createPendingVaultEntry,
   formatVaultRef,
   isVaultIdRef,
+  readVaultRefId,
   resolveVaultRefByName,
   VAULT_REF_PREFIX,
 } from "@/modules/vault/service";
@@ -165,6 +179,9 @@ const exportedHttpToolSchema = z.object({
   // Optional so bundles exported before issue #59 still import (defaults to [], which is today's
   // "every non-2xx is a failure").
   expectedStatuses: z.array(z.number()).optional(),
+  // Optional for the same reason, one issue later (#352): a bundle exported before the column
+  // existed carries nothing here, which is what every tool declared then.
+  appointment: z.record(z.string(), z.unknown()).nullable().optional(),
 });
 const exportedMcpServerSchema = z.object({
   name: z.string(),
@@ -661,14 +678,10 @@ export async function exportAgent(
       // AND the ones referenced INSIDE integration configs (e.g. Google Calendar's `businessHoursId`) —
       // those are otherwise a dead id at the destination, since the config is not remapped on import.
       const configBhIds = integrationRows.flatMap((r) => {
-        const raw = (r.config as Record<string, unknown> | null)
-          ?.businessHoursId;
-        if (typeof raw !== "string" || raw === "") return [];
-        try {
-          return [BigInt(raw)];
-        } catch {
-          return [];
-        }
+        const id = configBusinessHoursId(
+          r.config as Record<string, unknown> | null,
+        );
+        return id === null ? [] : [id];
       });
       const bhIds = [
         ...new Set(
@@ -711,6 +724,13 @@ export async function exportAgent(
           ackMessage: r.ackMessage,
           credentialRef: r.credentialRef,
           expectedStatuses: r.expectedStatuses,
+          // Carried, because a bundle that drops it re-imports the tool WITHOUT its declaration and
+          // the agent then books appointments the platform never hears about — the exact silence
+          // issue #352 removed, reintroduced by a round trip nobody would think to check.
+          appointment: (r.appointment ?? null) as Record<
+            string,
+            unknown
+          > | null,
         })),
         mcpServers: mcpRows.map((r) => ({
           name: r.name,
@@ -776,11 +796,9 @@ export async function exportAgent(
     if (exportIdRefs.length > 0) {
       const ids: bigint[] = [];
       for (const r of exportIdRefs) {
-        try {
-          ids.push(BigInt(r.slice(VAULT_REF_PREFIX.length)));
-        } catch {
-          // malformed id-ref → skipped (translates to unset)
-        }
+        // malformed, or past what a bigint column holds → skipped (translates to unset)
+        const id = readVaultRefId(r);
+        if (id !== null) ids.push(id);
       }
       const vrows = await db.vaultEntry.findMany({
         where: { id: { in: ids } },
@@ -1060,8 +1078,9 @@ export async function importAgent(
         name: exp.name,
         systemPrompt: exp.systemPrompt,
         modelConfig: modelConfig as Prisma.InputJsonValue,
-        settings: (normalizeSettingsForStorage(settings) ??
-          settings) as Prisma.InputJsonValue,
+        settings: disarmFullDetail(
+          normalizeSettingsForStorage(settings) ?? settings,
+        ) as Prisma.InputJsonValue,
         transferWithSummary: exp.transferWithSummary,
         businessHoursId,
         followUpHoursId,
@@ -1112,9 +1131,20 @@ export async function importAgent(
       await db.agentToolSelection.createMany({ data: grantRows });
     }
 
+    const agent = toDto(created);
+    await auditMutation(db, ctx, {
+      action: "agent.import",
+      target: `agent:${agent.id}`,
+      after: auditSafe({
+        id: agent.id,
+        name: agent.name,
+        enabled: agent.enabled,
+        mode: agent.mode,
+      }),
+    });
     // De-dupe: the same credential/component referenced in several places should warn once, and the
     // toast count ("{{n}} warnings") must match the rendered list.
-    return { agent: toDto(created), warnings: dedupeWarnings(warnings) };
+    return { agent, warnings: dedupeWarnings(warnings) };
   });
 }
 
@@ -1122,13 +1152,28 @@ export async function importAgent(
 // `businessHoursId`). On EXPORT we rewrite that id to the schedule's NAME so it survives the tenant hop
 // (the referenced schedule is also bundled in components.businessHours); on IMPORT the name is resolved
 // back to the local id. A config with no such ref, or an unresolved one, is left untouched.
+// The schedule an integration config references, read the way the RUNTIME reads it.
+//
+// `resolveBusinessHoursId` in the Calendar toolpack trims before using the value, so a config
+// holding `" 7 "` is a working configuration pointing at schedule 7. Both halves of the export have
+// to agree with that reader or they disagree with each other: the bundling below would omit a
+// schedule the tool actually uses, and the id→name rewrite would leave a destination-invalid id in
+// the config. Bounded as well as trimmed, because a run of digits past 2^63-1 converts under
+// `BigInt` and would reach the `in` clause as a bind error. Issue #407.
+export function configBusinessHoursId(
+  config: Record<string, unknown> | null,
+): bigint | null {
+  const raw = config?.businessHoursId;
+  return typeof raw === "string" ? parseDbId(raw.trim()) : null;
+}
+
 export function remapConfigBusinessHoursIdToName(
   config: Record<string, unknown>,
   bhNameById: Map<string, string>,
 ): Record<string, unknown> {
-  const id = config.businessHoursId;
-  if (typeof id !== "string" || id === "") return config;
-  const name = bhNameById.get(id);
+  const id = configBusinessHoursId(config);
+  if (id === null) return config;
+  const name = bhNameById.get(id.toString());
   return name ? { ...config, businessHoursId: name } : config;
 }
 
@@ -1172,6 +1217,108 @@ async function resolveByName(
 // Recreates the bundled business-hours schedules missing on the target tenant. A same-name schedule is
 // reused (warned, never overwritten) — its windows may differ from the source, so the operator should
 // review it. Runs before the agent's hours/follow-up names are resolved.
+type EntryFate = "dropped" | "altered" | "intact";
+
+// How many bundled entries do not reach the column as written. Three things it has to get right, and
+// each one was a wrong answer first:
+//
+//   - a subtraction of ARRAY LENGTHS misses the entry that survives and still loses something.
+//     `parseExceptions` prunes the RANGES inside an exception it keeps, so a half-day written
+//     backwards (14:00–09:00) loses its only range and lands as `ranges: []`, which means CLOSED ALL
+//     DAY: a different schedule than the bundle asked for, arriving with nothing said;
+//   - the verdict per entry is taken by running the REAL parser over that entry alone, never by a
+//     second copy of its rules, so this cannot drift from what actually gets stored;
+//   - the cap counts SURVIVORS, not positions. A malformed entry does not consume a slot, so testing
+//     the first `cap` raw items over-reports by one for every one of them (measured: one bad window
+//     followed by 200 good ones stores all 200 and would have been reported as two lost). The walk
+//     below therefore tracks how many have been stored so far, which is exactly what decides whether
+//     the next survivor lands or is truncated away.
+function countNotStoredAsWritten(
+  raw: unknown[],
+  cap: number,
+  fateOf: (item: unknown) => EntryFate,
+): number {
+  let stored = 0;
+  let lost = 0;
+  for (const item of raw) {
+    const fate = fateOf(item);
+    if (fate === "dropped" || stored >= cap) {
+      lost++;
+      continue;
+    }
+    stored++;
+    if (fate === "altered") lost++;
+  }
+  return lost;
+}
+
+// The ranges a bundled exception CLAIMS, before any of them is judged. Read off the raw entry, since
+// the parsed one only ever reports the survivors.
+function rangeCount(item: unknown): number {
+  const ranges = (item as { ranges?: unknown })?.ranges;
+  return Array.isArray(ranges) ? ranges.length : 0;
+}
+
+// The half of a bundled schedule this instance can actually read, with everything it dropped named
+// in a warning. Both JSON columns arrive as `z.array(z.unknown())` and this path writes to the table
+// directly rather than through `createBusinessHours`, so the import is the one writer that never
+// answers to `businessHoursCreateSchema`: nothing between a hand-authored file and the column asks
+// whether an entry is readable at all.
+//
+// Storing what the READER surfaces settles that, and the reader is the right authority precisely
+// because it is entry-by-entry and bounded. One unreadable window then costs that window instead of
+// the whole grid, which matters here more than the tidiness suggests: an empty grid is not "closed",
+// it is ALWAYS OPEN, so the as-a-unit reading turned a typo in a bundle into an agent that answers
+// around the clock on the destination tenant (issue #346).
+//
+// The two rejected alternatives fail in that same direction. Refusing the whole BUNDLE over one
+// field is the wrong trade for a bulk restore. SKIPPING just this schedule is worse than it looks:
+// the agent then resolves no business hours at all, which is the very always-open state being fixed.
+// So the schedule always lands, carrying what could be read, and the warning is what keeps the drop
+// from being one more silence.
+function readableSchedule(
+  h: ExportedBusinessHours,
+  warnings: ImportWarning[],
+): { windows: WindowSpec[]; exceptions: ScheduleException[] } {
+  const windows = parseWindows(h.windows ?? []);
+  // `parseExceptions` deliberately does NOT cap (dropping a closure widens availability, so the
+  // reader must never do it to a row already written). The bound is this writer's job, and here it
+  // is safe for the reason it is not there: it applies to a row being created, and it is warned.
+  const exceptions = parseExceptions(h.exceptions ?? []).slice(
+    0,
+    MAX_SCHEDULE_EXCEPTIONS,
+  );
+  const dropped: [string, number][] = [
+    [
+      "hoursWindowsDropped",
+      countNotStoredAsWritten(h.windows ?? [], MAX_SCHEDULE_WINDOWS, (item) =>
+        parseWindows([item]).length === 1 ? "intact" : "dropped",
+      ),
+    ],
+    [
+      "hoursExceptionsDropped",
+      countNotStoredAsWritten(
+        h.exceptions ?? [],
+        MAX_SCHEDULE_EXCEPTIONS,
+        (item) => {
+          const [one] = parseExceptions([item]);
+          if (one === undefined) return "dropped";
+          return one.ranges.length === rangeCount(item) ? "intact" : "altered";
+        },
+      ),
+    ],
+  ];
+  for (const [code, count] of dropped) {
+    if (count <= 0) continue;
+    warnings.push({
+      code,
+      params: { name: h.name, count },
+      target: { kind: "businessHours", name: h.name },
+    });
+  }
+  return { windows, exceptions };
+}
+
 async function createMissingBusinessHours(
   db: ScopedDb,
   tenantId: bigint,
@@ -1191,22 +1338,24 @@ async function createMissingBusinessHours(
       });
       continue;
     }
+    const { windows, exceptions } = readableSchedule(h, warnings);
     await db.businessHours.create({
       data: {
         tenantId,
         name: h.name,
         ...(h.timezone ? { timezone: h.timezone } : {}),
         ...(h.windows != null
-          ? { windows: h.windows as Prisma.InputJsonValue }
+          ? { windows: windows as Prisma.InputJsonValue }
           : {}),
         ...(h.exceptions != null
-          ? { exceptions: h.exceptions as Prisma.InputJsonValue }
+          ? { exceptions: exceptions as Prisma.InputJsonValue }
           : {}),
         ...(h.source ? { source: h.source } : {}),
       },
     });
-    // Creating a fresh schedule is silent: a brand-new bundled schedule is correct by construction.
-    // Only a same-name REUSE warns (above), so the operator verifies it matches the source.
+    // Creating a fresh schedule is silent when it arrived intact: a brand-new bundled schedule is
+    // correct by construction. Only a same-name REUSE warns (above), and a DROP (readableSchedule),
+    // which the operator has no other way to notice.
   }
 }
 
@@ -1278,6 +1427,10 @@ async function createMissingComponents(
           // Normalized like the shapes above, and for the same reason: the import writes straight to
           // the DB, so a hand-edited bundle would otherwise store a list the service would refuse.
           expectedStatuses: normalizeExpectedStatuses(tdef.expectedStatuses),
+          // Read through the runtime's own reader, like the shapes above: a hand-edited bundle
+          // otherwise stores a declaration the runtime would silently ignore.
+          appointment: (readAppointmentDeclaration(tdef.appointment) ??
+            Prisma.DbNull) as unknown as Prisma.InputJsonValue,
           ackEnabled: tdef.ackEnabled,
           ackMessage: tdef.ackMessage ?? null,
           credentialRef: resolveCredName(tdef.credentialRef),
@@ -1491,6 +1644,7 @@ async function createMissingComponents(
     //
     // Asked AFTER the validity gate, and the order is the message: a bundle carrying a template that
     // is both unreadable and named like an existing one is more usefully told about the first.
+    // not-caller-input: a name read off the template being imported, not a value from this request
     const approvedName = templateNameSchema.parse(tpl.name);
     const nameHolder = await db.documentTemplate.findFirst({
       where: { name: approvedName },

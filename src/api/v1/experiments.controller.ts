@@ -1,6 +1,8 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import config from "@/config";
+import { optionalDbId, requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -59,8 +61,8 @@ const variantSchemaT = t.Object({
   ),
   systemPrompt: t.Optional(
     t.String({
-      description:
-        "System prompt override applied when this variant is assigned.",
+      maxLength: config.agent.promptMaxChars,
+      description: `System prompt override applied when this variant is assigned (up to ${config.agent.promptMaxChars} characters, the same ceiling the agent's own prompt is held to).`,
     }),
   ),
 });
@@ -90,7 +92,7 @@ export const experimentsController = new Elysia({
     async ({ tenantContext, params }) => ({
       instance: instanceIdentity,
       experiment: ser(
-        await getExperiment(ctxOrThrow(tenantContext), BigInt(params.id)),
+        await getExperiment(ctxOrThrow(tenantContext), requireDbId(params.id)),
       ),
     }),
     {
@@ -108,7 +110,7 @@ export const experimentsController = new Elysia({
       instance: instanceIdentity,
       results: await experimentResults(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -135,7 +137,7 @@ export const experimentsController = new Elysia({
       const created = await createExperiment({
         ctx: ctxOrThrow(tenantContext),
         name: b.name,
-        agentId: b.agentId ? BigInt(b.agentId) : undefined,
+        agentId: optionalDbId(b.agentId, "agentId") ?? undefined,
         variants: b.variants,
         enabled: b.enabled,
       });
@@ -147,7 +149,7 @@ export const experimentsController = new Elysia({
         "Create experiment",
         "Create a prompt A/B experiment with one or more variants.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       body: t.Object({
         name: t.String({
           minLength: 1,
@@ -184,14 +186,9 @@ export const experimentsController = new Elysia({
       };
       const updated = await updateExperiment({
         ctx: ctxOrThrow(tenantContext),
-        id: BigInt(params.id),
+        id: requireDbId(params.id),
         name: b.name,
-        agentId:
-          b.agentId === undefined
-            ? undefined
-            : b.agentId
-              ? BigInt(b.agentId)
-              : null,
+        agentId: optionalDbId(b.agentId, "agentId"),
         variants: b.variants,
         enabled: b.enabled,
       });
@@ -203,7 +200,7 @@ export const experimentsController = new Elysia({
         "Update experiment",
         "Update an experiment name, target agent, variants, or enabled flag.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({ description: "Experiment id (BigInt as a string)." }),
       }),
@@ -238,7 +235,7 @@ export const experimentsController = new Elysia({
   .delete(
     "/:id",
     async ({ tenantContext, params }) => {
-      await deleteExperiment(ctxOrThrow(tenantContext), BigInt(params.id));
+      await deleteExperiment(ctxOrThrow(tenantContext), requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
     {

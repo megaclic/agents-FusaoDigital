@@ -6,6 +6,7 @@ import { doc, errors, htmlResponse } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
+import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, NotFoundError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import {
@@ -44,17 +45,23 @@ import { vaultRefWhere } from "@/modules/vault/service";
 
 // NOTE: these AppError translationKeys are localized centrally in `onError`; declared here for the
 // i18n extractor (keepRemoved: false). Keep in sync with src/api/locales/*.json.
-// translate('errors.mcpOAuthDiscoveryFailed', 'Could not discover the MCP server OAuth configuration')
+// translate('errors.mcpOAuthDiscoveryFailed', 'Could not read the MCP server OAuth configuration: {{url}} answered {{status}}')
+// translate('errors.mcpOAuthNoAuthorizationServer', 'The MCP server metadata names no authorization server, so there is nothing to connect to')
+// translate('errors.mcpOAuthMetadataIncomplete', 'The MCP authorization server metadata is missing the authorization or token endpoint')
+// translate('errors.mcpOAuthPkceUnsupported', 'The MCP authorization server does not support PKCE (S256), which is required to connect')
 // translate('errors.mcpOAuthDcrDisabled', 'The MCP server does not support dynamic client registration')
 // translate('errors.mcpOAuthDcrFailed', 'Dynamic client registration with the MCP server failed: {{reason}}')
 // translate('errors.mcpOAuthTokenExchangeFailed', 'Failed to exchange the MCP authorization code')
 // translate('errors.mcpOAuthNotConnected', 'This MCP credential is not connected')
+// translate('errors.mcpOAuthNoServerUrl', 'This MCP credential has no server URL, so there is nothing to authorize')
+// translate('errors.mcpOAuthCredentialNotFound', 'This MCP credential no longer exists')
+// translate('errors.mcpOAuthTokenEndpointError', 'The MCP server refused the token request: {{reason}}')
+// translate('errors.mcpOAuthRefreshFailed', 'Could not refresh the MCP credential: the answer carried no access token. Reconnect it.')
 // translate('errors.mcpOAuthInvalidState', 'Invalid MCP OAuth state')
 // translate('errors.mcpOAuthWrongKind', 'This credential is not an MCP OAuth credential')
 
 const idParams = t.Object({
   id: t.String({
-    pattern: "^\\d+$",
     description: "Vault entry id (BigInt serialized as a decimal string).",
   }),
 });
@@ -119,12 +126,12 @@ export const oauthMcpVaultController = new Elysia({
     "/:id/oauth/mcp/authorize",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const { cred, baseUrl } = await loadMcpCredential(ctx, id);
       if (!baseUrl) {
         throw new NotFoundError(
           "mcp_oauth credential has no MCP server URL (baseUrl)",
-          "errors.mcpOAuthNotConnected",
+          "errors.mcpOAuthNoServerUrl",
         );
       }
 
@@ -216,7 +223,7 @@ export const oauthMcpVaultController = new Elysia({
     "/:id/oauth/mcp/status",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const { cred } = await loadMcpCredential(ctx, BigInt(params.id));
+      const { cred } = await loadMcpCredential(ctx, requireDbId(params.id));
       return { instance: instanceIdentity, ...projectMcpStatus(cred) };
     },
     {
@@ -235,7 +242,7 @@ export const oauthMcpVaultController = new Elysia({
     "/:id/oauth/mcp/disconnect",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const { cred } = await loadMcpCredential(ctx, id);
       const stripped: McpOAuthCredential = {
         resource: cred.resource,

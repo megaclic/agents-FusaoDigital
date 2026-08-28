@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { requireVaultRef } from "@/modules/vault/service";
@@ -113,12 +114,12 @@ export async function createWebhookSubscription(
 ): Promise<WebhookSubscriptionDto> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
-  const parsed = webhookSubscriptionCreateSchema.parse(input);
+  const parsed = parseInput(webhookSubscriptionCreateSchema, input);
   const events = assertKnownEvents(parsed.events);
   await assertUrlSafe(parsed.url);
   const row = await runScopedOn(base, ctx, async (db) => {
     const secretRef = parsed.secretRef
-      ? await requireVaultRef(db, parsed.secretRef)
+      ? await requireVaultRef(db, parsed.secretRef, "secretRef")
       : null;
     return db.webhookSubscription.create({
       data: {
@@ -155,7 +156,7 @@ export async function updateWebhookSubscription(
   patch: WebhookSubscriptionUpdate,
   base: PrismaClient = basePrisma,
 ): Promise<WebhookSubscriptionDto> {
-  const parsed = webhookSubscriptionUpdateSchema.parse(patch);
+  const parsed = parseInput(webhookSubscriptionUpdateSchema, patch);
   const data: Record<string, unknown> = {};
   if (parsed.url !== undefined) {
     await assertUrlSafe(parsed.url);
@@ -177,7 +178,7 @@ export async function updateWebhookSubscription(
   const row = await runScopedOn(base, ctx, async (db) => {
     // Canonicalized inside the tx, so the entry cannot be deleted between the check and the write.
     if (typeof data.secretRef === "string") {
-      data.secretRef = await requireVaultRef(db, data.secretRef);
+      data.secretRef = await requireVaultRef(db, data.secretRef, "secretRef");
     }
     const res = await db.webhookSubscription.updateMany({
       where: { id },
@@ -205,10 +206,11 @@ export async function deleteWebhookSubscription(
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<void> {
-  // The delivery FK is onDelete: Restrict (never Cascade — a Cascade would silently drop in-flight
-  // rows the worker is mid-delivery). Clear this subscription's deliveries first inside the same
-  // scoped tx (RLS-fenced), then remove the subscription. Operator-initiated, so dropping its
-  // delivery ledger is acceptable.
+  // The delivery FK is ON DELETE CASCADE at the database (20260727000000_init), so what keeps this
+  // from silently dropping rows the worker is mid-delivery is THIS function, not the constraint:
+  // clear the subscription's deliveries first inside the same scoped tx (RLS-fenced), then remove
+  // the subscription. Operator-initiated, so dropping its delivery ledger is acceptable — and it is
+  // now a ledger somebody may be reading (issue #305), which is why the order is written down.
   const count = await runScopedOn(base, ctx, async (db) => {
     await db.outboundWebhookDelivery.deleteMany({
       where: { subscriptionId: id },

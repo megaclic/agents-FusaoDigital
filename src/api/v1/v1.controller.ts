@@ -2,8 +2,15 @@ import { Elysia, t } from "elysia";
 import { getUserById, verifyPassword } from "@/api/features/auth/auth.service";
 import { createInvite } from "@/api/features/invitations/invitation.service";
 import { doc, errors } from "@/api/lib/openapi";
+import {
+  parseQueryCount,
+  parseQueryId,
+  parseQueryInstant,
+  parseQueryText,
+} from "@/api/lib/query-filters";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
+import { requireDbId } from "@/lib/db-id";
 import { AppError, ForbiddenError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
@@ -92,7 +99,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params }) => {
       const tenant = await getTenant(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       return { instance: instanceIdentity, tenant };
     },
@@ -115,7 +122,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, body }) => {
       const tenant = await updateTenant(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body as TenantUpdate,
       );
       return { instance: instanceIdentity, tenant };
@@ -140,7 +147,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ...doc("Update tenant", "Updates a tenant's mutable fields by id."),
         tags: ["Tenants"],
       },
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   // Permanently delete a tenant and ALL its data (cascade). HARD-gated: SUPER_ADMIN, re-typed tenant
@@ -150,7 +157,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
       const b = body as { confirmName: string; password: string };
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const tenant = await getTenant(ctx, id);
       if (b.confirmName.trim() !== tenant.name) {
         throw new AppError(
@@ -164,11 +171,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         !user?.passwordHash ||
         !(await verifyPassword(b.password, user.passwordHash))
       ) {
-        throw new AppError(
-          "password verification failed",
-          403,
-          "errors.invalidPassword",
-        );
+        throw new AppError("Incorrect password", 403, "errors.invalidPassword");
       }
       await deleteTenant(ctx, id);
       return { instance: instanceIdentity, success: true };
@@ -196,7 +199,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Tenants"],
       },
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   // SUPER_ADMIN provisions a tenant; with adminEmail it also issues the first TENANT_ADMIN invite
@@ -258,7 +261,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Tenants"],
       },
-      response: errors(400, 401, 403, 409),
+      response: errors(400, 401, 403, 409, 422),
     },
   )
   .get(
@@ -266,9 +269,9 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, query }) => {
       const page = await listConversations(ctxOrThrow(tenantContext), {
         status: query.status,
-        limit: query.limit ? Number(query.limit) : undefined,
-        cursor: query.cursor,
-        q: query.q,
+        limit: parseQueryCount(query.limit, "limit"),
+        cursor: parseQueryId(query.cursor, "cursor"),
+        q: parseQueryText(query.q, "q"),
       });
       return {
         instance: instanceIdentity,
@@ -320,7 +323,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
       instance: instanceIdentity,
       conversation: await getConversationDetail(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -345,18 +348,15 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
   .get(
     "/conversations/:id/messages",
     async ({ tenantContext, params, query }) => {
-      const before =
-        query.before != null && query.before !== ""
-          ? Number.parseInt(query.before, 10)
-          : undefined;
+      const before = parseQueryCount(query.before, "before");
       return {
         instance: instanceIdentity,
         ...(await getConversationMessages(
           ctxOrThrow(tenantContext),
-          BigInt(params.id),
+          requireDbId(params.id),
           {},
           undefined,
-          Number.isFinite(before) ? before : undefined,
+          before,
         )),
       };
     },
@@ -394,7 +394,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, query, set }) => {
       const blob = await getConversationMedia(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         query.url,
       );
       if (!blob) {
@@ -429,7 +429,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Conversations"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   // Same CSP constraint as the media proxy above, but for the contact's avatar thumbnail — no
@@ -475,7 +475,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, body }) => {
       await replyToConversation(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body.content,
         body.private ?? false,
       );
@@ -509,7 +509,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Conversations"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   .post(
@@ -517,7 +517,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, body }) => {
       await handoffConversation(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body.assigneeId ?? null,
       );
       return { instance: instanceIdentity, success: true };
@@ -545,7 +545,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Conversations"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   .post(
@@ -553,7 +553,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params }) => {
       const outcome = await returnConversationToAgent(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       // The call succeeded either way — the conversation is pending and the mirror is correct. The
       // outcome says whether the unassign happened, because "taken-over" means a human claimed it
@@ -583,7 +583,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params }) => {
       const { outcome } = await reengageConversation(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       return { instance: instanceIdentity, outcome };
     },
@@ -610,7 +610,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, body }) => {
       await setConversationStatus(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         body.status,
       );
       return { instance: instanceIdentity, success: true };
@@ -639,15 +639,15 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Conversations"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   .get(
     "/metrics",
     async ({ tenantContext, query }) => {
-      const since = query.since ? new Date(query.since) : undefined;
+      const since = parseQueryInstant(query.since, "since");
       const metrics = await getInstanceMetrics(ctxOrThrow(tenantContext), {
-        since: since && !Number.isNaN(since.getTime()) ? since : undefined,
+        since,
         source: query.source,
       });
       return { instance: instanceIdentity, metrics };
@@ -657,7 +657,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         since: t.Optional(
           t.String({
             description:
-              "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
           }),
         ),
         // Usage segment: "inbox" (real) | "playground". Omitted → all sources.
@@ -676,15 +676,15 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   .get(
     "/metrics/kpis",
     async ({ tenantContext, query }) => {
-      const since = query.since ? new Date(query.since) : undefined;
+      const since = parseQueryInstant(query.since, "since");
       const kpis = await getKpis(ctxOrThrow(tenantContext), {
-        since: since && !Number.isNaN(since.getTime()) ? since : undefined,
+        since,
       });
       return { instance: instanceIdentity, kpis };
     },
@@ -693,7 +693,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         since: t.Optional(
           t.String({
             description:
-              "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
           }),
         ),
       }),
@@ -705,15 +705,15 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(401, 404),
+      response: errors(400, 401, 404),
     },
   )
   .get(
     "/metrics/timeseries",
     async ({ tenantContext, query }) => {
-      const since = query.since ? new Date(query.since) : undefined;
+      const since = parseQueryInstant(query.since, "since");
       const points = await getTimeseries(ctxOrThrow(tenantContext), {
-        since: since && !Number.isNaN(since.getTime()) ? since : undefined,
+        since,
         source: query.source,
         tz: query.tz,
       });
@@ -724,7 +724,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         since: t.Optional(
           t.String({
             description:
-              "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
           }),
         ),
         source: t.Optional(
@@ -748,15 +748,15 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   .get(
     "/metrics/costs",
     async ({ tenantContext, query }) => {
-      const since = query.since ? new Date(query.since) : undefined;
+      const since = parseQueryInstant(query.since, "since");
       const costs = await getLangfuseCosts(ctxOrThrow(tenantContext), {
-        since: since && !Number.isNaN(since.getTime()) ? since : undefined,
+        since,
       });
       return { instance: instanceIdentity, costs };
     },
@@ -765,7 +765,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         since: t.Optional(
           t.String({
             description:
-              "Optional ISO start timestamp; invalid values are ignored rather than rejected.",
+              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
           }),
         ),
       }),
@@ -777,6 +777,6 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(401, 404),
+      response: errors(400, 401, 404),
     },
   );

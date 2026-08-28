@@ -42,6 +42,12 @@ export interface ResolveRedirectLinkParams {
   // Stored in the token, injected into the widget on land (the cloned WhatsApp message). Omitted by the
   // proactive WhatsApp follow-up (nothing new to clone — the lead already saw their first message).
   clonedMessage?: string;
+  // The WhatsApp entry conversation the link is being sent on (its chatwootConversationId). Rides in
+  // the token so the fork can stamp it on the widget conversation, which is what turns the episode's
+  // pairing from an inference into a fact (issue #222). Optional: the Z-PRO entry path has no
+  // Chatwoot conversation to name here (its entry conversation is a Z-PRO ticket, not a Chatwoot
+  // one) — mintRedirectToken already treats an absent value as "no pairing to stamp".
+  originDisplayId?: number;
   openWidget: boolean;
   ttlSeconds: number;
   base: PrismaClient;
@@ -154,8 +160,12 @@ export async function resolveRedirectLink(
     const { token, websiteUrl } = await admin.mintRedirectToken({
       inboxId: p.widgetInboxId,
       identifier,
+      // The contact, alongside the value it carries: the identifier says WHAT to identify as and this
+      // says WHO, which is the half a moved identifier loses (issue #286).
+      contactId: p.chatwootContactId,
       message: p.clonedMessage,
       ttlSeconds: p.ttlSeconds,
+      originDisplayId: p.originDisplayId,
     });
     if (!websiteUrl) {
       logger.warn(
@@ -209,7 +219,9 @@ export function interpolateLink(template: string, url: string): string {
 export interface RunRedirectGateParams {
   tenantId: bigint;
   instanceId: bigint;
-  conversationId: number; // Chatwoot display id, for logging
+  // Chatwoot display id of the conversation the gate is running on — the WhatsApp ENTRY half of the
+  // episode. Load-bearing since #222: it is what the token carries as the redirect's origin.
+  conversationId: number;
   conv: {
     id: bigint;
     contactId: bigint | null;
@@ -262,6 +274,7 @@ export async function runRedirectGate(
     instanceId,
     chatwootContactId: contact.chatwootContactId,
     widgetInboxId,
+    originDisplayId: p.conversationId,
     clonedMessage:
       cfg.cloneWaMessage && p.clonedMessage
         ? clipText(p.clonedMessage, MAX_CLONE_CHARS)

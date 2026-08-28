@@ -1351,6 +1351,47 @@ describe.skipIf(!dbUp)(
       });
     });
 
+    // The pairing is NOT one of them, and the difference is what each column is. The four above are
+    // one-shot / cooldown watermarks: /reset clears them so the funnel can be run again. The pairing
+    // is an observed FACT — which WhatsApp conversation this chat was opened from — and /reset does
+    // not undo that; it does not un-click the link the lead clicked.
+    //
+    // Clearing it would be strictly worse, not neutral. `episodeOriginQuery` falls back to the
+    // contact's most recently active entry conversation when there is no stored answer, which is the
+    // inference #222 exists to remove: the reset would trade a right answer for a guess, on a
+    // consumer that MESSAGES and RESOLVES the conversation it picks. And nothing goes stale by
+    // keeping it: the value only ever changes when a new redirect is actually consumed, and then the
+    // fork writes the new origin over it.
+    test("the pairing survives, because a reset does not un-click the link", async () => {
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: CONV_ID },
+        data: {
+          redirectOriginDisplayId: 4242,
+          redirectLinkedAt: new Date(),
+          redirectClosedAt: new Date(),
+        },
+      });
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: CONV_ID },
+        select: {
+          redirectOriginDisplayId: true,
+          redirectLinkedAt: true,
+          redirectClosedAt: true,
+        },
+      });
+      expect(conv).toEqual({
+        // The episode can be run again...
+        redirectLinkedAt: null,
+        redirectClosedAt: null,
+        // ...against the origin it actually came from.
+        redirectOriginDisplayId: 4242,
+      });
+    });
+
     // Jobs the episode armed. /reset already cancels FOLLOWUP and MEMORY_COMPACT; these two carry
     // exactly the same argument and were left running.
     test("the jobs the episode armed are cancelled with it", async () => {
@@ -1753,6 +1794,7 @@ describe.skipIf(!dbUp)(
     test("a reschedule during the cleanup keeps its reminders", async () => {
       const threadId = `${tenantId}:${instanceId}:${CONV_ID}`;
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "APPOINTMENT_REMINDER",
         dedupeKey: "reminder:evt-1:60",
@@ -1767,6 +1809,7 @@ describe.skipIf(!dbUp)(
         if (!rearmed && String(input).includes("/kanban/tasks/")) {
           rearmed = true;
           await enqueueJob({
+            rearm: "same-work",
             tenantId,
             kind: "APPOINTMENT_REMINDER",
             dedupeKey: "reminder:evt-1:60",
@@ -1802,6 +1845,7 @@ describe.skipIf(!dbUp)(
     test("a redirect ladder re-armed during the cleanup survives", async () => {
       const threadId = `${tenantId}:${instanceId}:${CONV_ID}`;
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "REDIRECT_FOLLOWUP",
         dedupeKey: `redirect-followup:${threadId}`,
@@ -1816,6 +1860,7 @@ describe.skipIf(!dbUp)(
         if (!rearmed && String(input).includes("/kanban/tasks/")) {
           rearmed = true;
           await enqueueJob({
+            rearm: "same-work",
             tenantId,
             kind: "REDIRECT_FOLLOWUP",
             dedupeKey: `redirect-followup:${threadId}`,
@@ -2552,6 +2597,53 @@ describe.skipIf(!dbUp)(
       // own ownership read is the second place this could have thrown after the cleanup.
       expect(ackCalls(cw.calls).length).toBeGreaterThan(0);
       // ...and did not take the conversation from the human on an answer it does not have.
+      expect(
+        cw.calls.filter((c) =>
+          c.path.endsWith(`/conversations/${CONV_ID}/assignments`),
+        ),
+      ).toEqual([]);
+    });
+
+    // THE THIRD LATE READ, and the newest (issue #203). The turn half of that same fence used to be
+    // a Map lookup that could not fail; it is a row read now, so it can, and it sits in exactly the
+    // position the two tests above exist for: after the cleanup, outside every step. A rejection
+    // reaching the command means the operator gets no acknowledgement for work that DID happen and
+    // the delivery is left to retry.
+    //
+    // Driven by rejecting the claim query alone, matched on the column only it selects, so the
+    // cleanup's own reads of the same table are untouched and this measures the late read.
+    test("a claim read that fails does not strand the command", async () => {
+      let refused = 0;
+      const blind = appDb.$extends({
+        query: {
+          async $allOperations({ operation, args, query }) {
+            if (operation === "$queryRaw") {
+              const sql = ((args as { strings?: string[] }).strings ?? []).join(
+                " ",
+              );
+              if (sql.includes("AS held")) {
+                refused += 1;
+                throw new Error("connection reset");
+              }
+            }
+            return query(args);
+          },
+        },
+      }) as unknown as PrismaClient;
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset("/reset", CONV_ID, {
+        status: "open",
+        assigneeType: "User",
+        base: blind,
+      });
+
+      // The read the test is about actually ran; without this the assertions below would pass on a
+      // command that never reached it.
+      expect(refused).toBeGreaterThan(0);
+      expect(ackCalls(cw.calls).length).toBeGreaterThan(0);
+      // And an unreadable claim reads as a turn still running, so the conversation stays with the
+      // human rather than being taken from them on an answer nobody has.
       expect(
         cw.calls.filter((c) =>
           c.path.endsWith(`/conversations/${CONV_ID}/assignments`),

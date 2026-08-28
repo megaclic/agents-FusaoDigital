@@ -43,7 +43,7 @@ const app = new Elysia({
   // fetch handler ever runs (causa-raiz documentada em
   // elysiajs/elysia#1515 e issues do Bun #17595, #17363, #23999). The
   // bare /api carve-out covers requests without a trailing slash. Re-run
-  // the smoke test in CLAUDE.md when upgrading Elysia.
+  // the smoke test in docs/routing.md when upgrading Elysia.
   serve: {
     routes: {
       "/api": false,
@@ -136,12 +136,6 @@ const app = new Elysia({
   // now (issue #255) and so DOES depend on this placement: the plugin has already charged it by the
   // time this handler returns.
   .onError(({ path, error, request, set }) => {
-    // NOTE: Handle BigInt parsing errors as 400 Bad Request
-    if (error instanceof SyntaxError && error.message.includes("BigInt")) {
-      set.status = 400;
-      return new Response("Invalid ID format", { status: 400 });
-    }
-
     // NOTE: a schema refusal, answered in the app's own vocabulary instead of TypeBox's. Registered
     // HERE, after the limiters, and not next to the AppError branch above: the rate-limit plugin
     // charges request-side VALIDATION from its own `onError` (see the note in middlewares/rateLimit
@@ -194,7 +188,7 @@ const app = new Elysia({
     // NOTE: `set.status` too, not just the Response's. The access log in onAfterResponse reads
     // `set.status`, and Elysia seeds it from the thrown value's own `status` property — so an
     // error carrying `status: 401` is answered 500 here and LOGGED as 401 unless this line runs.
-    // Same reason the AppError arm above carries the same note; the BigInt arm needed it too.
+    // Same reason the AppError arm above carries the same note.
     set.status = 500;
     const message =
       config.env === "development"

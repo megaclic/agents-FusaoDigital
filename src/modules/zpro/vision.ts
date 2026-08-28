@@ -13,17 +13,16 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn } from "@/lib/tenancy";
-import {
-  emitFlowEvent,
-  type FlowContext,
-  withFlowStage,
-} from "@/modules/flowlog/service";
+import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { visionAcceptsDocuments } from "@/modules/vision/document-support";
 import {
   getVisionProvider,
   type VisionKind,
+  type VisionResult,
   visionKindForMime,
 } from "@/modules/vision/providers";
+import { extractWithRetry } from "@/modules/vision/service";
 import { readVisionConfig, type VisionConfig } from "@/modules/vision/settings";
 import { sysCtx } from "./ctx";
 import { decryptWhatsappMedia, type WhatsappMediaType } from "./media-crypto";
@@ -58,7 +57,11 @@ export interface ExtractZproFileParams {
   mediaMimetype: string | null;
   cfg: VisionConfig;
   base?: PrismaClient;
-  deps?: { fetchImpl?: typeof fetch };
+  deps?: {
+    fetchImpl?: typeof fetch;
+    // Injectable so the retry battery does not actually wait out the backoff in tests.
+    sleep?: (ms: number) => Promise<void>;
+  };
   // Optional execution-flow context: when present, the extraction is logged as a `vision` stage
   // (visible in /logs), same contract as the Chatwoot path.
   flow?: FlowContext;
@@ -179,32 +182,30 @@ export async function extractZproFile(
 
   const kind = visionKindForMime(contentType ?? params.mediaMimetype);
   if (!kind) return skip("unsupported_mime");
-  if (kind === "document" && !provider.supportsDocuments)
+  const baseURL = entry.baseUrl ?? cfg.baseURL;
+  if (kind === "document" && !visionAcceptsDocuments(cfg.provider, baseURL))
     return skip("document_not_supported");
 
-  let text: string;
+  let extracted: VisionResult;
   try {
-    text = await withFlowStage(
-      params.flow,
-      "vision",
-      {
-        provider: cfg.provider,
+    extracted = await extractWithRetry({
+      provider,
+      providerName: cfg.provider,
+      model: cfg.model || provider.defaultModel,
+      flow: params.flow,
+      sleep: params.deps?.sleep,
+      req: {
+        bytes,
+        mimeType:
+          contentType ?? params.mediaMimetype ?? "application/octet-stream",
+        kind,
+        prompt: cfg.extractionPrompt,
         model: cfg.model || provider.defaultModel,
-        detail: { kind },
+        apiKey: entry.secret,
+        baseURL,
+        fetchImpl,
       },
-      () =>
-        provider.extract({
-          bytes,
-          mimeType:
-            contentType ?? params.mediaMimetype ?? "application/octet-stream",
-          kind,
-          prompt: cfg.extractionPrompt,
-          model: cfg.model || provider.defaultModel,
-          apiKey: entry.secret,
-          baseURL: entry.baseUrl ?? cfg.baseURL,
-          fetchImpl,
-        }),
-    );
+    });
   } catch (err) {
     logger.warn(
       "zpro:vision: extraction failed: %s",
@@ -212,6 +213,7 @@ export async function extractZproFile(
     );
     return null;
   }
+  const text = extracted.text;
   const trimmed = text.trim();
   return trimmed ? { kind, text: trimmed } : null;
 }

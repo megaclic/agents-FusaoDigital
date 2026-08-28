@@ -6,6 +6,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { lastAssistantText } from "@/graph/graph";
+import type { ModelRetryInfo } from "@/graph/model-limit";
 import type { ResolvedModelConfig } from "@/graph/models";
 import {
   type AgentNudge,
@@ -55,7 +56,6 @@ import {
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
-import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import {
   readFollowUpConfig,
   stepDelayMinutes,
@@ -66,6 +66,7 @@ import {
   guardrailTripped,
   screenedText,
 } from "@/modules/guardrails/gate";
+import { assertPlaygroundSpendCeiling } from "@/modules/spend-ceiling/service";
 import { transcribePlaygroundAudio } from "@/modules/stt/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
@@ -287,6 +288,11 @@ async function buildPlaygroundToolset(
     threadId: string;
     base: PrismaClient;
     deps?: PlaygroundDeps;
+    // The turn's telemetry context, so a tool-stage line the toolset produces lands in the Logs page
+    // under source=playground. Without it a precondition refusal is invisible exactly where an
+    // operator goes to find out what their agent does — a refused call never reaches the inner tool,
+    // so ToolFlowLogger sees no run either and there is nothing else to read.
+    flow: FlowContext | undefined;
   },
 ): Promise<StructuredToolInterface[]> {
   const tenantId = params.ctx.tenantId as bigint;
@@ -351,6 +357,7 @@ async function buildPlaygroundToolset(
       // no zpro-specific counterpart the way buildNativeTools above does.
       simulateDocuments: true,
       mcp: params.deps?.mcp,
+      flow: params.flow,
     },
   );
 }
@@ -363,13 +370,38 @@ async function buildPlaygroundGraph(params: {
   agentId: bigint;
   threadId: string;
   base: PrismaClient;
+  // Passed down to the toolset so a tool-stage line has somewhere to land. The graph's own callbacks
+  // below already write to this same context; the toolset was the one seam that did not receive it.
+  flow?: FlowContext;
   deps?: PlaygroundDeps;
   overrides?: AgentConfigOverrides;
   // Reused as the Langfuse trace id (item 10) so a playground trace correlates with the turn.
   turnId?: string;
+  // The config, when the caller already resolved it. The two turn entrypoints do, because the
+  // spend ceiling may only refuse a target that EXISTS — see the comment at their gates. Passing it
+  // through keeps that ordering from costing a second read of the same agent row.
+  loaded?: AgentConfig;
   // Same warn line the reactive turn leaves when a model call had to be retried. The caller passes
   // it because the FlowContext is the caller's.
-  onModelRetry?: (info: { attempt: number; error: unknown }) => void;
+  onModelRetry?: (info: ModelRetryInfo) => void;
+  // The same two lines the two production entrypoints leave. The playground is where an operator
+  // finds out what their agent does, so a fallback that silently answers here is a fallback they
+  // conclude the wrong things from.
+  onModelFallback?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackFailed?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackUnavailable?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
   onHistoryTrim?: (info: {
     kept: number;
     dropped: number;
@@ -378,19 +410,22 @@ async function buildPlaygroundGraph(params: {
 }) {
   const { ctx, agentId, threadId, base } = params;
   const tenantId = ctx.tenantId as bigint;
-  const loaded = await loadPlaygroundConfig({
-    ctx,
-    agentId,
-    threadId,
-    base,
-    overrides: params.overrides,
-  });
+  const loaded =
+    params.loaded ??
+    (await loadPlaygroundConfig({
+      ctx,
+      agentId,
+      threadId,
+      base,
+      overrides: params.overrides,
+    }));
   const rawTools = await buildPlaygroundToolset(loaded, {
     ctx,
     agentId,
     threadId,
     base,
     deps: params.deps,
+    flow: params.flow,
   });
   const toolMocks = params.overrides?.toolMocks;
   const tools = applyToolMocks(rawTools, toolMocks);
@@ -411,6 +446,9 @@ async function buildPlaygroundGraph(params: {
     makeModel: params.deps?.makeModel,
     checkpointer: params.deps?.checkpointer,
     onModelRetry: params.onModelRetry,
+    onModelFallback: params.onModelFallback,
+    onModelFallbackFailed: params.onModelFallbackFailed,
+    onModelFallbackUnavailable: params.onModelFallbackUnavailable,
     onHistoryTrim: params.onHistoryTrim,
   });
   // Tag usage as playground so it never pollutes the real dashboard figures (the dashboard
@@ -472,6 +510,10 @@ export async function listPlaygroundTools(params: {
     threadId,
     base,
     deps: params.deps,
+    // NOTE: A LISTING, not a turn: nothing here executes a tool, so there is no tool-stage line to
+    // write and no FlowContext to write it to. Spelled out rather than omitted because the field is
+    // required — the next caller has to answer the same question instead of inheriting a default.
+    flow: undefined,
   });
 
   const conversation = new Set<string>(CONVERSATION_NATIVE_TOOL_NAMES);
@@ -548,6 +590,24 @@ export async function runPlaygroundTurn(
     threadId,
     base,
   };
+  // WHO IS BEING RUN, resolved before the ceiling is asked. A refusal says that spend was what stood
+  // in the way, and for an agent that does not exist — or has no runnable model — there was never a
+  // provider call to refuse: the same request in a month with budget to spare answers 404 or 400, so
+  // answering 429 in a spent one reports a refusal that did not happen and sends the operator to
+  // look at their budget over a selector that was simply wrong. The read is handed to the graph
+  // below, so asking in this order costs nothing.
+  const loadedConfig = await loadPlaygroundConfig({
+    ctx,
+    agentId,
+    threadId,
+    base,
+    overrides: params.overrides,
+  });
+  // The playground's token ceiling, before the graph is built and before a single provider call.
+  // Its own number, never the inbox one: an operator burning the month testing must not be able to
+  // silence the agent for customers, and the two ledgers are already told apart by `source`.
+  await assertPlaygroundSpendCeiling({ tenantId, base, flow });
+
   const { graph, callbacks, loaded, tools, traceLabels } =
     await buildPlaygroundGraph({
       ctx,
@@ -557,12 +617,51 @@ export async function runPlaygroundTurn(
       deps: params.deps,
       overrides: params.overrides,
       turnId,
-      onModelRetry: ({ attempt }) =>
+      flow,
+      loaded: loadedConfig,
+      onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
           level: "warn",
           status: "ok",
+          provider,
+          model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackReason: reason },
+        }),
+      // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+      // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+      // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+      // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+      // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+      // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+      // labelled with the primary by construction and would otherwise blame the model that never made
+      // the second call. `status` stays "error": the call did fail.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
+        }),
+      onModelFallbackUnavailable: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackUnavailable: reason },
         }),
       onHistoryTrim: ({ kept, dropped, tokens }) =>
         emitFlowEvent(flow, {
@@ -576,6 +675,12 @@ export async function runPlaygroundTurn(
           },
         }),
     });
+  // Assigned rather than passed at construction: the debug mode is an agent SETTING, and the agent's
+  // settings are what `buildPlaygroundGraph` just read. Every callback above only fires during
+  // `graph.invoke` below, so none of them can emit before this line runs. Playground rows are on the
+  // Logs page like any other, so an operator who turned the mode on for this agent gets the same
+  // answer here as on real traffic (#58).
+  flow.fullDetail = loaded.fullDetail;
 
   // The SAME gate the inbox path runs (issue #136). Without it the operator read the agent's raw
   // reply while the customer would have received the template, or nothing at all — the one setting
@@ -871,6 +976,24 @@ export async function runPlaygroundFollowup(
     threadId,
     base,
   };
+  // WHO IS BEING RUN, resolved before the ceiling is asked. A refusal says that spend was what stood
+  // in the way, and for an agent that does not exist — or has no runnable model — there was never a
+  // provider call to refuse: the same request in a month with budget to spare answers 404 or 400, so
+  // answering 429 in a spent one reports a refusal that did not happen and sends the operator to
+  // look at their budget over a selector that was simply wrong. The read is handed to the graph
+  // below, so asking in this order costs nothing.
+  const loadedConfig = await loadPlaygroundConfig({
+    ctx,
+    agentId,
+    threadId,
+    base,
+    overrides: params.overrides,
+  });
+  // The playground's token ceiling, before the graph is built and before a single provider call.
+  // Its own number, never the inbox one: an operator burning the month testing must not be able to
+  // silence the agent for customers, and the two ledgers are already told apart by `source`.
+  await assertPlaygroundSpendCeiling({ tenantId, base, flow });
+
   const { graph, callbacks, loaded, tools, traceLabels } =
     await buildPlaygroundGraph({
       ctx,
@@ -880,12 +1003,51 @@ export async function runPlaygroundFollowup(
       deps: params.deps,
       overrides: params.overrides,
       turnId,
-      onModelRetry: ({ attempt }) =>
+      flow,
+      loaded: loadedConfig,
+      onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
           level: "warn",
           status: "ok",
+          provider,
+          model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackReason: reason },
+        }),
+      // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+      // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+      // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+      // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+      // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+      // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+      // labelled with the primary by construction and would otherwise blame the model that never made
+      // the second call. `status` stays "error": the call did fail.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
+        }),
+      onModelFallbackUnavailable: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackUnavailable: reason },
         }),
       onHistoryTrim: ({ kept, dropped, tokens }) =>
         emitFlowEvent(flow, {
@@ -899,6 +1061,8 @@ export async function runPlaygroundFollowup(
           },
         }),
     });
+  // Same reason as the turn path above: set after the settings read, before any callback can emit.
+  flow.fullDetail = loaded.fullDetail;
 
   // Draft settings (if present) drive the follow-up instructions/delay so the simulation matches
   // what the operator is editing live; otherwise the saved settings.
@@ -933,7 +1097,11 @@ export async function runPlaygroundFollowup(
         callbacks: [
           ...callbacks,
           new ToolFlowLogger(flow, {
-            logValues: readObservabilityConfig(settings).logToolValues,
+            // From the loaded config, which reads this block off the SAVED bag — never from
+            // `settings` here, which is the draft. Recording policy does not follow a draft (see
+            // `prepare.ts`), and this line reading it separately is how the follow-up path came to
+            // answer differently from the turn path for the same agent.
+            logValues: loaded.logToolValues,
             tools,
           }),
         ],

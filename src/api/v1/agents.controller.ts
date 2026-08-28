@@ -1,8 +1,10 @@
 import { Elysia, t } from "elysia";
 import { getUserById, verifyPassword } from "@/api/features/auth/auth.service";
 import { doc, errors } from "@/api/lib/openapi";
+import { parseQueryText } from "@/api/lib/query-filters";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
+import { requireDbId } from "@/lib/db-id";
 import {
   AppError,
   ForbiddenError,
@@ -55,15 +57,21 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.audioTooLarge', 'Audio file is too large')
 // translate('errors.baseUrlRequired', 'A base URL is required for this provider.')
 // translate('errors.credentialRequired', 'A credential is required to list provider models.')
+// translate('errors.credentialNotUsable', 'This credential did not provide an API key: it may be missing, empty, or of a type this provider cannot use.')
 // translate('errors.emptyMessage', 'The message is empty.')
 // translate('errors.fileTooLarge', 'File is too large')
 // translate('errors.invalidAgentExport', 'This file is not a valid agent export.')
 // translate('errors.invalidModelConfig', 'The model configuration must be an object.')
 // translate('errors.invalidModelConfigDetail', 'The model configuration is not valid: {{reason}}')
 // translate('errors.promptTooLong', 'System prompt is too long: {{len}} characters (limit {{max}}).')
-// translate('errors.providerModelsFailed', 'Failed to retrieve model list from provider.')
+// translate('errors.providerModelsFailed', '{{provider}} refused the list request (status {{status}}).')
+// translate('errors.providerListUnexpectedResponse', '{{provider}} answered the list request in an unexpected format.')
+// translate('errors.providerListUnreachable', 'Could not reach {{provider}} to list the options')
 // translate('errors.sessionNotFound', 'Playground session not found.')
 // translate('errors.settingsTextTooLong', 'The text in {{field}} is too long: {{len}} characters (limit {{max}}).')
+// translate('errors.debugWindowTooLong', 'The log debug mode can be armed for at most {{hours}}h at a time.')
+// translate('errors.invalidToolPrecondition', '`{{tool}}` has an invalid precondition: it must name an attribute scope and key.')
+// translate('errors.halfConfiguredFallback', 'The fallback provider is only half configured: {{missing}} is missing.')
 // translate('errors.sttCredentialMissing', 'The transcription credential was not found.')
 // translate('errors.sttFailed', 'Transcription failed: {{detail}}')
 // translate('errors.sttNotConfigured', 'Speech-to-text is not configured for this workspace.')
@@ -73,11 +81,12 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.toolGrantToolNotInIntegration', 'The tool {{tool}} is not available for the {{integration}} integration.')
 // translate('errors.toolGrantUnknownSource', 'Unknown tool source: {{source}}.')
 // translate('errors.toolGrantUnknownTool', 'Unknown {{source}} tool: {{tool}}.')
-// translate('errors.unknownProvider', 'Unknown model provider.')
+// translate('errors.unknownProvider', 'Unknown {{capability}} provider: {{provider}}.')
 // translate('errors.unsupportedAudioType', 'Unsupported audio type')
 // translate('errors.visionCredentialMissing', 'Vision credential not found')
 // translate('errors.visionFailed', 'Image/document extraction failed')
 // translate('errors.visionNotConfigured', 'Image/document reading is not configured')
+// translate('errors.spendCeilingReached', 'The playground token ceiling for this month has been reached. Raise it in Settings or wait for the next month.')
 
 // Agent config REST surface (one of the three transports; MCP prompt_get/set + UI project over
 // the same service). Config management is TENANT_ADMIN; the scoped service is the hard boundary.
@@ -254,7 +263,7 @@ export const agentsController = new Elysia({
       const { agents, total } = await listAgentsPaged(
         ctxOrThrow(tenantContext),
         {
-          q: query.q,
+          q: parseQueryText(query.q, "q"),
           orderBy: query.orderBy,
           order: query.order,
           enabled: query.enabled,
@@ -269,7 +278,7 @@ export const agentsController = new Elysia({
         "List agents",
         "Returns a paginated list of agents for the tenant.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       query: t.Object({
         q: t.Optional(
@@ -317,7 +326,7 @@ export const agentsController = new Elysia({
     "/:id",
     async ({ tenantContext, params }) => ({
       instance: instanceIdentity,
-      agent: await getAgent(ctxOrThrow(tenantContext), BigInt(params.id)),
+      agent: await getAgent(ctxOrThrow(tenantContext), requireDbId(params.id)),
     }),
     {
       detail: doc("Get agent", "Returns a single agent by id."),
@@ -358,7 +367,7 @@ export const agentsController = new Elysia({
       windowHours: GUARDRAIL_HEALTH_WINDOW_HOURS,
       ...(await readGuardrailHealth(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         guardrailHealthWindowStart(),
       )),
     }),
@@ -385,7 +394,7 @@ export const agentsController = new Elysia({
       instance: instanceIdentity,
       inboxes: await listOutOfOfficeInboxes(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       ),
     }),
     {
@@ -410,7 +419,7 @@ export const agentsController = new Elysia({
     }),
     {
       detail: doc("Create agent", "Creates a new agent for the tenant."),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         name: t.String({
@@ -480,7 +489,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         agent: await updateAgent(
           ctxOrThrow(tenantContext),
-          BigInt(params.id),
+          requireDbId(params.id),
           patch,
           undefined,
           { expectedUpdatedAt },
@@ -489,7 +498,7 @@ export const agentsController = new Elysia({
     },
     {
       detail: doc("Update agent", "Partially updates an existing agent."),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -570,7 +579,7 @@ export const agentsController = new Elysia({
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
       const b = body as { confirmName: string; password: string };
-      const agent = await getAgent(ctx, BigInt(params.id));
+      const agent = await getAgent(ctx, requireDbId(params.id));
       if (b.confirmName.trim() !== agent.name) {
         throw new AppError(
           "name confirmation does not match",
@@ -583,13 +592,9 @@ export const agentsController = new Elysia({
         !user?.passwordHash ||
         !(await verifyPassword(b.password, user.passwordHash))
       ) {
-        throw new AppError(
-          "password verification failed",
-          403,
-          "errors.invalidPassword",
-        );
+        throw new AppError("Incorrect password", 403, "errors.invalidPassword");
       }
-      await deleteAgent(ctx, BigInt(params.id));
+      await deleteAgent(ctx, requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
     {
@@ -597,7 +602,7 @@ export const agentsController = new Elysia({
         "Delete agent",
         "Deletes an agent by id. Requires re-typing the agent name and the current password (step-up).",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -621,13 +626,13 @@ export const agentsController = new Elysia({
       instance: instanceIdentity,
       agent: await cloneAgent(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         (body as { name?: string }).name,
       ),
     }),
     {
       detail: doc("Clone agent", "Creates a copy of an existing agent."),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -652,7 +657,7 @@ export const agentsController = new Elysia({
       instance: instanceIdentity,
       export: await exportAgent(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
         undefined,
         {
           // `?components=true` bundles the full HTTP-tool / MCP / integration defs + KB metadata so
@@ -708,7 +713,7 @@ export const agentsController = new Elysia({
         "Import agent config",
         "Recreates an agent (disabled) from an exported config, resolving references by name.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         export: t.Unknown({
@@ -723,7 +728,7 @@ export const agentsController = new Elysia({
       instance: instanceIdentity,
       ...(await getAgentToolSelections(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       )),
     }),
     {
@@ -757,7 +762,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await runPlaygroundTurn({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
           message: b.message,
           threadId: b.threadId,
           overrides: b.draft,
@@ -771,7 +776,7 @@ export const agentsController = new Elysia({
         "Run playground turn",
         "Runs one chat turn against the agent in the playground, with no Chatwoot side effects.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422, 429),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -791,7 +796,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         tools: await listPlaygroundTools({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
         }),
       };
     },
@@ -825,7 +830,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await runPlaygroundFollowup({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
           threadId: b.threadId,
           context: b.context,
           overrides: b.draft,
@@ -838,7 +843,7 @@ export const agentsController = new Elysia({
         "Run playground follow-up",
         "Simulates the proactive follow-up nudge on the current playground thread, with no Chatwoot post.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422, 429),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -860,7 +865,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await runPlaygroundTranscribe({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
           file: b.file,
           overrides: parseDraft(b.draft),
         })),
@@ -871,7 +876,7 @@ export const agentsController = new Elysia({
         "Transcribe playground audio",
         "Transcribes an uploaded voice note only (step 1 of 2), returning the transcription.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -911,7 +916,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await runPlaygroundAudioTurn({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
           file: b.file,
           threadId: b.threadId,
           overrides,
@@ -926,7 +931,7 @@ export const agentsController = new Elysia({
         "Run playground audio turn",
         "Runs a turn on an uploaded voice note (step 2 of 2), returning the transcription and the reply.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422, 429),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -981,7 +986,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await runPlaygroundExtract({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
           file: b.file,
           overrides: parseDraft(b.draft),
         })),
@@ -992,7 +997,7 @@ export const agentsController = new Elysia({
         "Extract playground file",
         "Extracts content from an uploaded image or document only (step 1 of 2), returning the kind and content.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422, 429),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -1033,7 +1038,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await runPlaygroundFileTurn({
           ctx,
-          agentId: BigInt(params.id),
+          agentId: requireDbId(params.id),
           file: b.file,
           threadId: b.threadId,
           overrides,
@@ -1049,7 +1054,7 @@ export const agentsController = new Elysia({
         "Run playground file turn",
         "Runs a turn on an uploaded image or document (step 2 of 2), returning the extraction and the reply.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422, 429),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -1102,14 +1107,13 @@ export const agentsController = new Elysia({
     "/:id/playground/media/:mediaId",
     async ({ tenantContext, params, set }) => {
       const ctx = ctxOrThrow(tenantContext);
-      let mediaId: bigint;
-      try {
-        mediaId = BigInt(params.mediaId);
-      } catch {
-        set.status = 404;
-        return { error: "Not Found" };
-      }
-      const blob = await getPlaygroundMedia(ctx, mediaId);
+      // NOTE: refused, not answered 404. A media id that is not an id is a malformed request, and
+      // this route used to answer it as "no such blob": the one spelling of the rule in this app
+      // that told the caller their id was fine and the row was gone. Issue #371.
+      const blob = await getPlaygroundMedia(
+        ctx,
+        requireDbId(params.mediaId, "mediaId"),
+      );
       if (!blob) {
         set.status = 404;
         return { error: "Not Found" };
@@ -1145,7 +1149,7 @@ export const agentsController = new Elysia({
       const ctx = ctxOrThrow(tenantContext);
       return {
         instance: instanceIdentity,
-        sessions: await listPlaygroundSessions(ctx, BigInt(params.id)),
+        sessions: await listPlaygroundSessions(ctx, requireDbId(params.id)),
       };
     },
     {
@@ -1170,7 +1174,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         turns: await getPlaygroundSessionTurns(
           ctx,
-          BigInt(params.id),
+          requireDbId(params.id),
           params.threadId,
         ),
       };
@@ -1197,7 +1201,11 @@ export const agentsController = new Elysia({
     "/:id/playground/sessions/:threadId",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      await deletePlaygroundSession(ctx, BigInt(params.id), params.threadId);
+      await deletePlaygroundSession(
+        ctx,
+        requireDbId(params.id),
+        params.threadId,
+      );
       return { instance: instanceIdentity, ok: true };
     },
     {
@@ -1244,7 +1252,7 @@ export const agentsController = new Elysia({
         "List provider models",
         "Lists the available models for a model provider, using a vault credential reference.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         provider: t.String({
@@ -1305,7 +1313,7 @@ export const agentsController = new Elysia({
         "List TTS voices/models",
         "Lists the voices or models for a text-to-speech provider. OpenAI returns a curated set; ElevenLabs is fetched live with the vault credential.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         provider: t.String({
@@ -1338,7 +1346,7 @@ export const agentsController = new Elysia({
         instance: instanceIdentity,
         ...(await replaceAgentToolSelections(
           ctxOrThrow(tenantContext),
-          BigInt(params.id),
+          requireDbId(params.id),
           b.grants,
           undefined,
           { expectedUpdatedAt: parseExpectedUpdatedAt(b.expectedUpdatedAt) },
@@ -1350,7 +1358,7 @@ export const agentsController = new Elysia({
         "Replace tool selections",
         "Replaces the agent's entire set of tool grants (replace-the-set semantics).",
       ),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({

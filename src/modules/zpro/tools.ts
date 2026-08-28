@@ -28,10 +28,7 @@ import { loadMcpToolsForAgent } from "@/graph/tools/mcp";
 import { buildNativeTools, utilityNativeAllow } from "@/graph/tools/native";
 import { buildRagTools } from "@/graph/tools/rag";
 import { runScopedOn } from "@/lib/tenancy";
-import {
-  cancelAppointmentReminders,
-  enqueueAppointmentReminders,
-} from "@/modules/appointments/reminders";
+import { appointmentSideEffects } from "@/modules/appointments/side-effect";
 import { readSchedule } from "@/modules/business-hours/service";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
@@ -165,66 +162,18 @@ export async function loadZproAgentTools(
         })
     : undefined;
 
-  // Deterministic appointment reminders (mirrors src/graph/prepare.ts's Chatwoot wiring): when the
-  // Calendar toolpack books an appointment, arm one scheduler job per configured offset; cancel them
-  // on cancel/reschedule. enqueueAppointmentReminders/cancelAppointmentReminders are channel-agnostic
-  // (threadId-keyed, never touch Conversation/Inbox) — the mechanism was already reusable, it just
-  // wasn't wired into this ToolpackCtx, so a Z-PRO agent's booked appointment silently got no
-  // reminders armed. `threadId` here is always the zpro:-shaped one (runtime.ts's zproThreadId), which
+  // Deterministic appointment reminders (mirrors src/graph/prepare.ts's Chatwoot wiring): the same
+  // channel-agnostic appointmentSideEffects (threadId-keyed, never touches Conversation/Inbox) binds
+  // the booked/cancel mechanism to this tenant + thread, so the Calendar toolpack — and any HTTP tool
+  // whose definition declares an appointment — gets a working record + reminder arm/cancel here too.
+  // `threadId` here is always the zpro:-shaped one (runtime.ts's zproThreadId), which
   // appointmentReminderHandler now knows how to route back (see runZproAgentNudge in nudge.ts).
-  const scheduleAppointmentReminders = async (a: {
-    eventId: string;
-    calendarId: string;
-    startISO: string;
-    credentialRef: string | null;
-    offsetsHours: number[];
-    askConfirmationOnLast: boolean;
-    summary: string | null;
-    calendarLabel: string | null;
-  }) => {
-    try {
-      await enqueueAppointmentReminders({
-        tenantId,
-        threadId,
-        eventId: a.eventId,
-        calendarId: a.calendarId,
-        credentialRef: a.credentialRef,
-        startISO: a.startISO,
-        offsetsHours: a.offsetsHours,
-        askConfirmationOnLast: a.askConfirmationOnLast,
-        summary: a.summary,
-        calendarLabel: a.calendarLabel,
-        base,
-      });
-    } catch (e) {
-      logger.warn(
-        "zpro appointment reminders enqueue failed: %s",
-        e instanceof Error ? e.message : String(e),
-      );
-      onSideEffectError?.({
-        tool: "google_calendar",
-        phase: "reminders_enqueue",
-        detail: { eventId: a.eventId },
-        err: e,
-      });
-    }
-  };
-  const cancelAppointmentRemindersFn = async (eventId: string) => {
-    try {
-      await cancelAppointmentReminders(tenantId, eventId, base);
-    } catch (e) {
-      logger.warn(
-        "zpro appointment reminders cancel failed: %s",
-        e instanceof Error ? e.message : String(e),
-      );
-      onSideEffectError?.({
-        tool: "google_calendar",
-        phase: "reminders_cancel",
-        detail: { eventId },
-        err: e,
-      });
-    }
-  };
+  const apptSideEffects = appointmentSideEffects({
+    tenantId,
+    threadId,
+    base,
+    report: onSideEffectError,
+  });
 
   const toolpackTools =
     selections.integrationSelections.length > 0
@@ -235,8 +184,8 @@ export async function loadZproAgentTools(
           contactDbId: conversationId,
           resolveCredential,
           resolveBusinessHours,
-          scheduleAppointmentReminders,
-          cancelAppointmentReminders: cancelAppointmentRemindersFn,
+          appointmentBooked: apptSideEffects.booked,
+          cancelAppointment: apptSideEffects.cancel,
           onSideEffectError,
         })
       : [];

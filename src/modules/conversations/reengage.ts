@@ -8,8 +8,10 @@ import {
   TenantTargetRequiredError,
 } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
   type ChatwootMessageRow,
+  parseChatwootMessages,
   pendingIncoming,
 } from "@/modules/chatwoot/messages";
 import { shouldBotHandle } from "@/modules/chatwoot/normalize";
@@ -21,6 +23,10 @@ import {
 import { coalesceAndRunTurn } from "@/modules/debounce/handler";
 import { readHandledWatermark } from "@/modules/debounce/watermark";
 import { emitFlowEvent } from "@/modules/flowlog/service";
+import {
+  announceSpendCeiling,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
 import { clearConversationError } from "./error";
 
 // Manual re-engage (item 6): re-fire the agent turn on a conversation WITHOUT waiting for a new
@@ -70,7 +76,11 @@ export type ReengageOutcome =
   | RunAgentTurnOutcome
   | "empty"
   | "gate-closed"
-  | "not-authorized";
+  | "not-authorized"
+  // The tenant is past its month's tokens. Its own outcome rather than a silent no-reply, because
+  // this path is an operator pressing a button: they are owed the reason, and it is one they can
+  // act on from the settings page.
+  | "over-ceiling";
 
 export interface ReengageResult {
   outcome: ReengageOutcome;
@@ -158,6 +168,91 @@ export async function reengageConversation(
   );
   if (!gateOpen) return { outcome: "gate-closed" };
 
+  // WHAT THIS CLICK WOULD ANSWER, computed once and used twice: here, to decide whether there is a
+  // turn at all, and inside `coalesceAndRunTurn`, to build it. One expression rather than two,
+  // because the pre-check and the turn disagreeing is how a gate ends up refusing work that was
+  // never going to happen (or letting through work it should have stopped).
+  const authCfg = resolved.loaded.contactAuthConfig;
+  const selectPending = authCfg.enabled
+    ? async (messages: ChatwootMessageRow[]) => {
+        // With the gate on, the tail is filtered by the handled watermark as well, re-read at the
+        // point the burst is chosen. The authorization call below is a round-trip to somebody
+        // else's endpoint, and a message that arrived and was REFUSED during it has already had the
+        // watermark advanced past it by its own delivery — but the tail is chosen from the last
+        // OUTGOING message, which a refusal never writes, so that refused message would be handed
+        // straight to the model. "No turn for a contact the endpoint will not vouch for" is a
+        // statement about turns, and this is one. The same guard the debounce flush carries.
+        //
+        // Only with the gate on: this floor is not free. A watermark ahead of the last outgoing
+        // message is exactly what a deliberate skip leaves behind (out of hours, a human took
+        // over), and re-engage exists to answer a tail nobody answered — so applying it
+        // unconditionally would turn the button into a no-op on the conversations it was written
+        // for.
+        const tail = incomingAfterLastOutgoing(messages);
+        const handled = await readHandledWatermark({
+          tenantId,
+          conversationDbId: resolved.convDbId,
+          base,
+        });
+        return handled === null ? tail : tail.filter((m) => m.id > handled);
+      }
+    : incomingAfterLastOutgoing;
+
+  // NOTHING TO ANSWER ⇒ NOTHING TO REFUSE, and the gates below are all about a TURN. A conversation
+  // whose last message is ours has no tail, so this click was always going to be a no-op: reporting
+  // a spent budget for it tells the operator to raise a ceiling that would change nothing, and
+  // spends an authorization call on somebody else's endpoint for a turn that will not run.
+  //
+  // It costs one Chatwoot read, on a path that was going to make one anyway. Deliberately NOT a
+  // spend: the gates sit in front of the billed call, and a message fetch is not one.
+  const preview = await loadChatwootClient(tenantId, resolved.instanceId, {
+    base,
+    makeClient: deps.makeClient,
+  });
+  const previewTail = await selectPending(
+    parseChatwootMessages(await preview.getMessages(resolved.conversationId)),
+  );
+  if (previewTail.length === 0) return { outcome: "empty" };
+
+  // The spend ceiling, asked here for the reason every other turn seam asks it: this is a billed
+  // call, and nothing above it is. An operator re-engaging a conversation by hand is spending the
+  // same budget a customer's message spends, so the same wall applies — and unlike the customer
+  // paths, this one REPORTS rather than going quiet, because somebody is looking at the button.
+  const ceiling = await spendCeilingVerdict({
+    tenantId,
+    source: "inbox",
+    base,
+  });
+  // ...AND THE TAIL IS RE-READ BEFORE THE REFUSAL, because the verdict above is two database reads
+  // deep and this conversation is live the whole time. A delivery that answered the tail inside that
+  // window leaves nothing for this click to run, so the refusal would tell the operator to raise a
+  // ceiling for work that no longer exists — the same "nothing to answer ⇒ nothing to refuse" the
+  // pre-fetch above applies, asked again at the moment the answer is used. Only on the refusing
+  // path: `allowed` and `warning` both go on to coalesce for real, which re-reads anyway, and a
+  // warning is a statement about the MONTH rather than about this turn.
+  if (ceiling.state === "over") {
+    const freshTail = await selectPending(
+      parseChatwootMessages(await preview.getMessages(resolved.conversationId)),
+    );
+    if (freshTail.length === 0) return { outcome: "empty" };
+  }
+  announceSpendCeiling(
+    {
+      tenantId,
+      turnId: crypto.randomUUID(),
+      source: "inbox",
+      conversationId: resolved.convDbId,
+      agentId: resolved.loaded.agentId,
+      inboxId: resolved.loaded.inboxDbId,
+      threadId: resolved.threadId,
+      base,
+    },
+    ceiling,
+    "inbox",
+    tenantId,
+  );
+  if (ceiling.state === "over") return { outcome: "over-ceiling" };
+
   // The contact-authorization gate (docs/contact-auth.md) applies here for the same reason it
   // applies to a follow-up: this runs the model and sends its answer to the customer, so it is a
   // turn, and the invariant is that no turn happens for a contact the endpoint will not vouch for.
@@ -169,7 +264,6 @@ export async function reengageConversation(
   // customer copy and the handoff exist to answer a message the customer just sent, and here there
   // is none. It is logged, though — a refused re-engage that left no trace would read in the
   // flowlog as if the click never happened.
-  const authCfg = resolved.loaded.contactAuthConfig;
   let authContext: AuthContext | null = null;
   if (authCfg.enabled) {
     const auth = await authorizeContact({
@@ -244,29 +338,9 @@ export async function reengageConversation(
       loaded: resolved.loaded,
       settings: resolved.settings,
       authContext,
-      // With the gate on, the tail is filtered by the handled watermark as well, re-read at the
-      // point the burst is chosen. The authorization call above is a round-trip to somebody else's
-      // endpoint, and a message that arrived and was REFUSED during it has already had the
-      // watermark advanced past it by its own delivery — but the tail is chosen from the last
-      // OUTGOING message, which a refusal never writes, so that refused message would be handed
-      // straight to the model. "No turn for a contact the endpoint will not vouch for" is a
-      // statement about turns, and this is one. The same guard the debounce flush carries.
-      //
-      // Only with the gate on: this floor is not free. A watermark ahead of the last outgoing
-      // message is exactly what a deliberate skip leaves behind (out of hours, a human took over),
-      // and re-engage exists to answer a tail nobody answered — so applying it unconditionally
-      // would turn the button into a no-op on the conversations it was written for.
-      selectPending: authCfg.enabled
-        ? async (messages) => {
-            const tail = incomingAfterLastOutgoing(messages);
-            const handled = await readHandledWatermark({
-              tenantId,
-              conversationDbId: resolved.convDbId,
-              base,
-            });
-            return handled === null ? tail : tail.filter((m) => m.id > handled);
-          }
-        : incomingAfterLastOutgoing,
+      // The same expression the pre-check above used, re-evaluated against a FRESH fetch: the
+      // authorization call between them is a round trip long enough for the tail to change.
+      selectPending,
       label: "reengage",
     },
     base,

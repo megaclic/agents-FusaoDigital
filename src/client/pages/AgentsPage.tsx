@@ -27,7 +27,9 @@ import {
   useModalController,
   useToast,
 } from "@/client/components";
+import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { providerLabel } from "@/client/lib/providerLabels";
 import { formatDateTime, formatRelativeTime } from "@/client/lib/utils";
 
@@ -39,6 +41,10 @@ type SortField = "updatedAt" | "createdAt" | "name";
 type StatusFilter = "all" | "active" | "inactive";
 
 const PAGE_SIZE = 20;
+
+// The one key the create body carries. The import next to it sends a whole bundle under `export`,
+// and its refusals are about elements inside that file rather than about an input on this page.
+const CREATE_AGENT_FIELDS = ["name"] as const;
 
 export function AgentsPage() {
   const { t, i18n } = useTranslation();
@@ -55,6 +61,11 @@ export function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [name, setName] = useState("");
+  const refusal = useFieldRefusal(
+    createModal.isOpen ? CREATE_AGENT_FIELDS : [],
+  );
+  const nameRef = useRef(name);
+  nameRef.current = name;
   const [creating, setCreating] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const [importing, setImporting] = useState(false);
@@ -119,6 +130,8 @@ export function AgentsPage() {
 
   function openCreate() {
     setName("");
+    // The component outlives the dialog, so a mark from the last session is still held here.
+    refusal.clear();
     createModal.open();
   }
 
@@ -154,9 +167,10 @@ export function AgentsPage() {
           ? { importWarnings: data.warnings }
           : undefined,
       });
-    } catch {
+    } catch (e) {
       showToast(
-        t("agents.importError", "Could not import (invalid file?)."),
+        apiErrorMessage(e) ||
+          t("agents.importError", "Could not import (invalid file?)."),
         "error",
       );
     } finally {
@@ -167,18 +181,21 @@ export function AgentsPage() {
   async function create() {
     if (!name.trim()) return;
     setCreating(true);
+    const sent = { name: name.trim() };
     try {
-      const { data, error: err } = await api.api.v1.agents.post({
-        name: name.trim(),
-      });
+      const { data, error: err } = await api.api.v1.agents.post(sent);
       if (err || !data) throw err ?? new Error("no data");
+      refusal.clear();
       createModal.close();
       navigate(`/agents/${data.agent.id}`);
-    } catch {
-      showToast(
+    } catch (e) {
+      const toast = refusal.capture(
+        e,
         t("agents.createError", "Could not create the agent."),
-        "error",
+        sent,
+        { name: nameRef.current.trim() },
       );
+      if (toast) showToast(toast, "error");
     } finally {
       setCreating(false);
     }
@@ -433,6 +450,7 @@ export function AgentsPage() {
             "agents.createHint",
             "You'll configure the prompt, model and tools next.",
           )}
+          error={refusal.at("name", name.trim())}
         >
           <Input
             value={name}

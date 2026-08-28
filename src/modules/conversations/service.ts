@@ -8,6 +8,7 @@ import {
   NotFoundError,
   TenantTargetRequiredError,
 } from "@/lib/errors";
+import { assertUsableCount, badQueryParam } from "@/lib/query-param";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { loadAppointmentContext } from "@/modules/appointments/context";
@@ -32,6 +33,7 @@ import {
 } from "@/modules/chatwoot/normalize";
 import { reconcileMirrorFromLive } from "@/modules/chatwoot/reconcile";
 import { recordResolutionOrigin } from "@/modules/conversations/record-resolution";
+import { appointmentPauseApplies } from "@/modules/followups/appointment-pause";
 import { isFollowUpLive } from "@/modules/followups/eligibility";
 import type { FollowUpDelayUnit } from "@/modules/followups/settings";
 import {
@@ -64,7 +66,7 @@ export interface ListConversationsFilter {
   limit?: number;
   // Keyset cursor: the id of the last item from the previous page. The next page continues from just
   // past it in the (lastEventAt desc, id desc) ordering.
-  cursor?: string;
+  cursor?: bigint;
   // Free-text search: matches the contact display name or the Chatwoot conversation id (see
   // buildConversationsWhere). No message-body search — the mirror holds metadata only.
   q?: string;
@@ -99,23 +101,20 @@ export interface ConversationsPage {
 }
 
 function clampLimit(limit: number | undefined): number {
-  if (!limit || Number.isNaN(limit)) return DEFAULT_LIMIT;
-  return Math.min(Math.max(Math.trunc(limit), 1), MAX_LIMIT);
+  assertUsableCount(limit, "limit");
+  return limit === undefined ? DEFAULT_LIMIT : Math.min(limit, MAX_LIMIT);
 }
 
+// A status outside the closed set is REFUSED, never dropped: dropping it answers a request for one
+// status with every status, which is the widening this whole surface exists to stop. `""` counts as
+// a value the caller sent, exactly as it does for the ids. The check lives here rather than in the
+// controller because MCP and internal callers reach this function without a query string, the same
+// split `assertUsableCount` follows.
 function normalizeStatus(status: string | undefined): string | undefined {
-  return status && (CONVERSATION_STATUSES as readonly string[]).includes(status)
-    ? status
-    : undefined;
-}
-
-function parseCursor(cursor: string | undefined): bigint | null {
-  if (!cursor) return null;
-  try {
-    return BigInt(cursor);
-  } catch {
-    return null;
-  }
+  if (status === undefined) return undefined;
+  if (!(CONVERSATION_STATUSES as readonly string[]).includes(status))
+    badQueryParam("status");
+  return status;
 }
 
 // Combine the status filter with an optional free-text search. Search matches the contact display
@@ -149,7 +148,7 @@ export async function listConversations(
 ): Promise<ConversationsPage> {
   const take = clampLimit(filter.limit);
   const status = normalizeStatus(filter.status);
-  const cursorId = parseCursor(filter.cursor);
+  const cursorId = filter.cursor ?? null;
   const where = buildConversationsWhere(status, filter.q);
   const rows = await runScopedOn(base, ctx, (db) =>
     db.conversation.findMany({
@@ -977,7 +976,19 @@ export async function getConversationDetail(
       (agent?.followUpArmedAt == null ||
         conv.lastInboundAt == null ||
         conv.lastInboundAt < agent.followUpArmedAt);
-    if (job && !fencedStep0Job && followUpLive) {
+    // NOTE: a job whose step no longer exists is a sequence that is OVER, and the handler says so
+    // by returning `done` on its very first look (issue #103 moved that check to the top). An
+    // operator who shortens a sequence with a later-step job still pending leaves exactly that
+    // state, so the console has to reach the same terminal answer — otherwise it counts down to a
+    // step that will never fire, prints "step 5 of 1", and (once the step decides the pause)
+    // reports the conversation as appointment-paused over a job that is about to end instead.
+    //
+    // Its own arm, ahead of both others, because falling through is not the same answer: the
+    // estimate arm below would offer step 1, which is a countdown for a sequence about to end.
+    const jobStepGone = job != null && cfg.steps[jobStepIndex] === undefined;
+    if (jobStepGone) {
+      nextStep = null;
+    } else if (job && !fencedStep0Job && followUpLive) {
       const stepIndex = jobStepIndex;
       nextStep = stepIndex + 1;
       // job.runAt is NOT the firing time yet — the sweep enqueues step 0 with runAt=now (and re-arms
@@ -1052,10 +1063,17 @@ export async function getConversationDetail(
     // its own, and announcing "paused by appointment" there would state a reason that is not the
     // reason — and, because the completion marker yields to this flag, would hide a finished sequence
     // behind it. It also skips the query on every conversation with nothing to suppress.
+    //
+    // NOTE: which step is about to fire decides it, not the agent (issue #103). `nextStep` is
+    // 1-based for display, so the step the worker will actually run is `steps[nextStep - 1]` — the
+    // same index the handler resolves from the job's payload. The three sites agreeing is not the
+    // same condition written out three times: it is one function, asked here about this step.
+    const upcomingStep =
+      nextStep === null ? undefined : cfg.steps[nextStep - 1];
     const pausedByAppointment =
       nextStep !== null &&
       cfg.enabled &&
-      cfg.pauseWhileAppointment &&
+      appointmentPauseApplies(cfg, upcomingStep) &&
       !managedByRedirect &&
       (await runScopedOn(
         base,

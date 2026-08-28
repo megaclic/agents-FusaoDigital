@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import { clearFlowLog, flowLogRow } from "@/tests/utils/flowlog";
 
 // THE EFFECT THE ISSUE NAMES: the stage line is not there.
 //
@@ -48,7 +49,7 @@ let tenantId = 0n;
 // amount: a fixed sleep either flakes on a slow machine or wastes the difference on a fast one.
 async function rowFor(turnId: string): Promise<unknown | null> {
   for (let i = 0; i < 100; i++) {
-    const row = await suDb.executionLog.findFirst({
+    const row = await flowLogRow(suDb, {
       where: { tenantId, turnId },
     });
     if (row) return row.detail;
@@ -76,7 +77,7 @@ describe.skipIf(!dbUp)("execution_logs.detail survives bad characters", () => {
   });
   afterAll(async () => {
     if (!dbUp) return;
-    await suDb.executionLog.deleteMany({ where: { tenantId } });
+    await clearFlowLog(suDb, { tenantId });
     await suDb.tenant.delete({ where: { id: tenantId } });
     await suDb.$disconnect();
     await appDb.$disconnect();

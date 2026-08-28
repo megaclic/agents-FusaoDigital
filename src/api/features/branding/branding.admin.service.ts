@@ -1,8 +1,12 @@
 import { unlink } from "node:fs/promises";
-import prisma from "@/api/lib/prisma";
+import type { PrismaClient } from "@/../generated/prisma/client";
+import basePrisma from "@/api/lib/prisma";
 import { isValidColorToken, sanitizeBranding } from "@/lib/branding";
 import { AppError } from "@/lib/errors";
+import { asSuperAdminOn, type TenantContext } from "@/lib/tenancy";
+import { auditMutationOn } from "@/modules/audit/service";
 import {
+  ALLOWED_ASSET_FORMATS,
   ALLOWED_ASSET_TYPES,
   ASSET_MAX_BYTES,
   type AssetKind,
@@ -23,11 +27,17 @@ import {
 // Branding mutation implementation for this fork (FusaoDigital agents): white-label editing is NOT
 // gated behind a Pro edition here — SUPER_ADMIN can write colors/name/footer-links/logo/favicon
 // directly. Reads (getGlobalBranding/readBrandingAsset) stay public and live in branding.service.
-// Writes go through the base (non-scoped) prisma client since AppBranding is a GLOBAL singleton row
-// (id = SINGLETON_ID), not tenant data.
+// Writes go through `asSuperAdminOn` rather than `runScopedOn`: AppBranding is a GLOBAL singleton row
+// (id = SINGLETON_ID), not tenant data, so there is no tenant to scope the transaction to — but the
+// audit row still needs the fleet role's RLS bypass to insert a `tenant_id IS NULL` row. `ctx` is
+// used only to attribute that row to the SUPER_ADMIN who made the change (`auditMutationOn`, pinning
+// tenantId null so the change is never filed under whichever tenant the actor happened to have
+// selected in the console).
 
 export async function updateBrandingColors(
+  ctx: TenantContext,
   input: ColorUpdate,
+  base: PrismaClient = basePrisma,
 ): Promise<GlobalBrandingDto> {
   if (Object.keys(input).length === 0) {
     throw new AppError(
@@ -116,16 +126,24 @@ export async function updateBrandingColors(
 
   data.updatedAt = new Date();
 
-  await prisma.appBranding.upsert({
-    where: { id: SINGLETON_ID },
-    create: { id: SINGLETON_ID, ...data },
-    update: data,
+  await asSuperAdminOn(base, async (db) => {
+    await db.appBranding.upsert({
+      where: { id: SINGLETON_ID },
+      create: { id: SINGLETON_ID, ...data },
+      update: data,
+    });
+    await auditMutationOn(db, ctx, null, {
+      action: "branding.colors_set",
+      target: "branding:colors",
+      after: data,
+    });
   });
 
   return getGlobalBranding();
 }
 
 export async function setBrandingAsset(
+  ctx: TenantContext,
   kind: AssetKind,
   variant: AssetVariant,
   file: {
@@ -133,12 +151,14 @@ export async function setBrandingAsset(
     size: number;
     arrayBuffer: () => Promise<ArrayBuffer>;
   },
+  base: PrismaClient = basePrisma,
 ): Promise<GlobalBrandingDto> {
   if (!ALLOWED_ASSET_TYPES.includes(file.type)) {
     throw new AppError(
-      "Unsupported image type — must be a PNG or JPEG",
+      `Unsupported image type. Allowed: ${ALLOWED_ASSET_FORMATS}`,
       400,
       "errors.unsupportedImageType",
+      { allowed: ALLOWED_ASSET_FORMATS },
     );
   }
   if (file.size > ASSET_MAX_BYTES[kind]) {
@@ -146,19 +166,29 @@ export async function setBrandingAsset(
   }
 
   const column = keyColumn(kind, variant);
-  const existing = await prisma.appBranding.findUnique({
-    where: { id: SINGLETON_ID },
-  });
-  const oldFilename = existing ? (existing[column] as string | null) : null;
-
   const ext = EXT_BY_TYPE[file.type];
   const filename = `${kind}-${variant}-${Date.now()}.${ext}`;
-  await Bun.write(assetPath(filename), await file.arrayBuffer());
+  const bytes = await file.arrayBuffer();
 
-  await prisma.appBranding.upsert({
-    where: { id: SINGLETON_ID },
-    create: { id: SINGLETON_ID, [column]: filename },
-    update: { [column]: filename, updatedAt: new Date() },
+  let oldFilename: string | null = null;
+  await asSuperAdminOn(base, async (db) => {
+    const existing = await db.appBranding.findUnique({
+      where: { id: SINGLETON_ID },
+    });
+    oldFilename = existing ? (existing[column] as string | null) : null;
+
+    await Bun.write(assetPath(filename), bytes);
+
+    await db.appBranding.upsert({
+      where: { id: SINGLETON_ID },
+      create: { id: SINGLETON_ID, [column]: filename },
+      update: { [column]: filename, updatedAt: new Date() },
+    });
+    await auditMutationOn(db, ctx, null, {
+      action: "branding.asset_set",
+      target: `branding:asset:${kind}:${variant}`,
+      after: { filename },
+    });
   });
 
   // Best-effort cleanup, AFTER the new file is durably written: an orphaned old file on disk is
@@ -175,14 +205,31 @@ export async function setBrandingAsset(
 }
 
 export async function clearBrandingAsset(
+  ctx: TenantContext,
   kind: AssetKind,
   variant: AssetVariant,
+  base: PrismaClient = basePrisma,
 ): Promise<GlobalBrandingDto> {
   const column = keyColumn(kind, variant);
-  const existing = await prisma.appBranding.findUnique({
-    where: { id: SINGLETON_ID },
+  let filename: string | null = null;
+
+  await asSuperAdminOn(base, async (db) => {
+    const existing = await db.appBranding.findUnique({
+      where: { id: SINGLETON_ID },
+    });
+    filename = existing ? (existing[column] as string | null) : null;
+
+    if (existing) {
+      await db.appBranding.update({
+        where: { id: SINGLETON_ID },
+        data: { [column]: null, updatedAt: new Date() },
+      });
+    }
+    await auditMutationOn(db, ctx, null, {
+      action: "branding.asset_clear",
+      target: `branding:asset:${kind}:${variant}`,
+    });
   });
-  const filename = existing ? (existing[column] as string | null) : null;
 
   if (filename) {
     try {
@@ -190,13 +237,6 @@ export async function clearBrandingAsset(
     } catch {
       // ignore
     }
-  }
-
-  if (existing) {
-    await prisma.appBranding.update({
-      where: { id: SINGLETON_ID },
-      data: { [column]: null, updatedAt: new Date() },
-    });
   }
 
   return getGlobalBranding();

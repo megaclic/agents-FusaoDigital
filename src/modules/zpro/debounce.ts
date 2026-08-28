@@ -276,6 +276,7 @@ export async function flushZproDebounceJob(
     agentId: loaded.agentId,
     threadId: zproThreadId(tenantId, zproInstanceId, event.threadId),
     base,
+    fullDetail: loaded.fullDetail,
   };
   emitFlowEvent(flow, {
     stage: "debounce",

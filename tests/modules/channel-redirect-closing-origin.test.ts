@@ -388,6 +388,176 @@ describe.skipIf(!dbUp)(
       });
     };
 
+    // Review round 9 of #355, and it is round 7's fix read back. The mark is a VERSION: it advances
+    // on every payload that states the pairing, the ones that state the SAME pairing included. Used
+    // as an equality token it turns any ordinary webhook arriving mid-run into "the episode moved",
+    // and on this path that is permanent — the ladder is already cancelled, so the resolve trigger is
+    // the only closing this episode will ever get.
+    test("an ordinary same-origin update does not cost the closing its claim", async () => {
+      await rearm();
+      await suDb.conversation.updateMany({
+        where: { tenantId: tid, chatwootConversationId: WIDGET },
+        data: {
+          redirectOriginDisplayId: SIBLING,
+          chatwootRedirectOriginAt: 1_786_000_000.5,
+        },
+      });
+      const bumping = appDb.$extends({
+        query: {
+          conversation: {
+            async findUnique({ args, query }) {
+              const res = await query(args);
+              const sel = args.select as Record<string, unknown> | undefined;
+              if (sel?.chatwootStatusAt && sel?.lastInboundAt && sel?.inbox) {
+                // Same origin, newer version: the shape of every retried or ordinary delivery.
+                await suDb.conversation.updateMany({
+                  where: { tenantId: tid, chatwootConversationId: WIDGET },
+                  data: { chatwootRedirectOriginAt: 1_786_000_090.5 },
+                });
+              }
+              return res;
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
+      try {
+        await resolveWidget(bumping);
+        // The episode never changed, so the goodbye goes out and the anchor is spent.
+        const widget = await suDb.conversation.findFirstOrThrow({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          select: { redirectClosedAt: true },
+        });
+        expect(widget.redirectClosedAt).not.toBeNull();
+        expect(
+          wire.filter((u) => u.includes(`/conversations/${SIBLING}/messages`)),
+        ).not.toEqual([]);
+      } finally {
+        await suDb.conversation.updateMany({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          data: {
+            redirectOriginDisplayId: null,
+            chatwootRedirectOriginAt: null,
+          },
+        });
+      }
+    });
+
+    // Review round 7 of #355, and the same question one state deeper. A closing that starts from
+    // `(origin=null, mark=null)` resolved its sibling through the recency fallback; a stated clear
+    // landing under it makes that answer wrong, and the claim compares only the origin, so both
+    // nulls match and the goodbye goes out on a thread the source just disowned.
+    test("a stated clear landing under the closing stops the claim", async () => {
+      await rearm();
+      const flipping = appDb.$extends({
+        query: {
+          conversation: {
+            async findUnique({ args, query }) {
+              const res = await query(args);
+              const sel = args.select as Record<string, unknown> | undefined;
+              if (sel?.chatwootStatusAt && sel?.lastInboundAt && sel?.inbox) {
+                await suDb.conversation.updateMany({
+                  where: { tenantId: tid, chatwootConversationId: WIDGET },
+                  data: { chatwootRedirectOriginAt: 1_786_000_000.5 },
+                });
+              }
+              return res;
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
+      try {
+        await resolveWidget(flipping);
+        expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
+        const widget = await suDb.conversation.findFirstOrThrow({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          select: { redirectClosedAt: true },
+        });
+        expect(widget.redirectClosedAt).toBeNull();
+      } finally {
+        await suDb.conversation.updateMany({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          data: { chatwootRedirectOriginAt: null },
+        });
+      }
+    });
+
+    // Review round 6 of #355, and the effect rather than the decision table. A STATED clear reaches
+    // this consumer as a stored null, which is also what "the fork never spoke about this
+    // conversation" looks like — and the old predicate answers the second one. Read as a gap it
+    // hands the closing the contact's most recent WhatsApp thread and that thread gets a goodbye and
+    // a resolve, on an episode the source said has no WhatsApp half at all.
+    test("a stated clear leaves the closing with no sibling to post on", async () => {
+      await rearm();
+      await suDb.conversation.updateMany({
+        where: { tenantId: tid, chatwootConversationId: WIDGET },
+        data: {
+          redirectOriginDisplayId: null,
+          // The mark is the whole difference: we have been told, and the answer was "none".
+          chatwootRedirectOriginAt: 1_786_000_000.5,
+        },
+      });
+      try {
+        await resolveWidget();
+        // The sibling exists and recency would have found it. Nothing is posted on it.
+        expect(
+          wire.filter((u) => u.includes(`/conversations/${SIBLING}/`)),
+        ).toEqual([]);
+      } finally {
+        await suDb.conversation.updateMany({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          data: { chatwootRedirectOriginAt: null },
+        });
+      }
+    });
+
+    // Review round 5 of #355. The closing RESOLVES the WhatsApp conversation it names, and on this
+    // path there is no job to ask about — the resolve webhook enters it directly — so the claim CAS is
+    // the only thing standing between a run that read one episode and a conversation that is now in
+    // another. The pairing is read at the top and the claim is written after the agent read, the bot
+    // load and the client build; a re-entry accepted in that window re-points the episode, and a
+    // goodbye sent afterwards resolves a thread this conversation is no longer paired with.
+    test("the pairing moving under the closing stops the claim", async () => {
+      await rearm();
+      await suDb.conversation.updateMany({
+        where: { tenantId: tid, chatwootConversationId: WIDGET },
+        data: { redirectOriginDisplayId: SIBLING },
+      });
+      // The rendezvous is the closing's OWN read of the widget conversation — identified by the
+      // select only it makes — so the flip lands strictly between that read and the claim.
+      const flipping = appDb.$extends({
+        query: {
+          conversation: {
+            async findUnique({ args, query }) {
+              const res = await query(args);
+              const sel = args.select as Record<string, unknown> | undefined;
+              if (sel?.chatwootStatusAt && sel?.lastInboundAt && sel?.inbox) {
+                await suDb.conversation.updateMany({
+                  where: { tenantId: tid, chatwootConversationId: WIDGET },
+                  data: { redirectOriginDisplayId: SIBLING + 100 },
+                });
+              }
+              return res;
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
+      try {
+        await resolveWidget(flipping);
+        expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
+        const widget = await suDb.conversation.findFirstOrThrow({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          select: { redirectClosedAt: true },
+        });
+        // Not burned either: the episode that is current now still gets its own goodbye.
+        expect(widget.redirectClosedAt).toBeNull();
+      } finally {
+        await suDb.conversation.updateMany({
+          where: { tenantId: tid, chatwootConversationId: WIDGET },
+          data: { redirectOriginDisplayId: null },
+        });
+      }
+    });
+
     test("a switched-off agent posts no goodbye on the sibling", async () => {
       await suDb.agent.update({
         where: { id: agent },
