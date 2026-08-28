@@ -59,6 +59,10 @@ export interface ZproAgentTools {
   // Whether search_knowledge was granted — the caller composes the grounding directive onto the
   // system prompt when true (see src/graph/prompt.ts's composeSystemPrompt, same as Chatwoot).
   grounded: boolean;
+  // ZproConversation.contactExtraInfo, the mirrored bag the attribute-context prompt block and the
+  // tool-precondition state read both read from — untyped like the Prisma Json column it is
+  // (attributeBagsFrom's plainBag does the narrowing); null on a playground/no-conversation call.
+  contactExtraInfoBag: unknown;
 }
 
 export interface LoadZproAgentToolsParams {
@@ -128,6 +132,7 @@ export async function loadZproAgentTools(
           opportunityTitle: true,
           queueId: true,
           contactTags: true,
+          contactExtraInfo: true,
         },
       });
       const selections = await loadToolSelections(db, agentId);
@@ -413,5 +418,10 @@ export async function loadZproAgentTools(
     ],
     conversationId,
     grounded: !!selections.ragConfig?.tools.includes("search_knowledge"),
+    // The MIRRORED bag (ZproConversation.contactExtraInfo), not params.contactExtraInfo (the live
+    // webhook payload's own copy) — the attribute-context prompt block reads from our DB so the
+    // direct turn and the debounce flush (which has no live payload) see the same value, same
+    // reasoning as Chatwoot's own attribute-context read (chatwoot/attributes.ts's header note).
+    contactExtraInfoBag: conversation?.contactExtraInfo ?? null,
   };
 }

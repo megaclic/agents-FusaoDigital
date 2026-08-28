@@ -304,6 +304,29 @@ export function parseContactTags(raw: unknown): ZproContactTagRef[] {
   return out;
 }
 
+// ticket.contact.extraInfo, mirrored on ZproConversation.contactExtraInfo every message (same
+// cadence as contactTags above) — this is what backs the attribute-context prompt block and the
+// tool-precondition state read for Z-PRO (both read a LOCAL bag, never a live API call). Flattened
+// to a plain Record here rather than kept as the wire's array-of-pairs, since every reader on the
+// other side (attributeBagsFrom, evaluatePrecondition) wants a bag keyed by name — array shape has no
+// use once mirrored. A duplicate name keeps its LAST value (the vendor's own array can carry one).
+export function parseContactExtraInfo(raw: unknown): Record<string, string> {
+  if (!Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    if (
+      typeof o.name === "string" &&
+      o.name.trim() &&
+      typeof o.value === "string"
+    ) {
+      out[o.name.trim()] = o.value;
+    }
+  }
+  return out;
+}
+
 export function resolveZproInstanceCandidate<T extends { apiId: string }>(
   candidates: T[],
   apikey: string | undefined,

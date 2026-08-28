@@ -12,7 +12,8 @@ import {
 import { encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
-import { runScopedOn } from "@/lib/tenancy";
+import { runScopedOn, type ScopedDb } from "@/lib/tenancy";
+import { emitOutbound } from "@/modules/webhooks/outbound/service";
 import { wasAgentSending } from "./agent-echo";
 import { ZPRO_METHOD_CONTACT, ZPRO_METHOD_MESSAGE } from "./constants";
 import { sysCtx } from "./ctx";
@@ -20,6 +21,7 @@ import {
   extractMedia,
   extractMessageBody,
   extractQuotedText,
+  parseContactExtraInfo,
   parseContactTags,
 } from "./parse";
 import type { ZproWebhookPayload } from "./types";
@@ -35,6 +37,61 @@ function isUniqueViolation(err: unknown): boolean {
   return (
     err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002"
   );
+}
+
+// Fleet events — Z-PRO analog of chatwoot/mirror.ts's emitMirrorEvent trio (conversation.created/
+// status_changed/handoff). Best-effort like the Chatwoot original: a fan-out failure never breaks
+// the mirror write, it only enqueues rows the worker drains later, so a failure here is swallowed
+// and logged, never thrown.
+//
+// `handoff` has no Chatwoot-shaped assignee-type edge to detect on Z-PRO (no User/AgentBot
+// distinction here) — the closest real signal is `agentActive` (ticket.n8nStatus) going true→false,
+// which is exactly what deactivateAgent (handoff.ts) flips when handoff_to_human/resolve_conversation
+// hand the ticket off. A conversation created already-inactive does not fire it: there is no PRIOR
+// active state for it to have left.
+async function emitZproMirrorEvent(
+  base: PrismaClient,
+  tenantId: bigint,
+  before: { status: string; agentActive: boolean } | null,
+  after: { conversationId: bigint; status: string; agentActive: boolean },
+): Promise<void> {
+  const emit = async (
+    event:
+      | "conversation.created"
+      | "conversation.status_changed"
+      | "conversation.handoff",
+    data: Record<string, unknown>,
+  ) => {
+    try {
+      await runScopedOn(base, sysCtx(tenantId), (db: ScopedDb) =>
+        emitOutbound(db, tenantId, event, data),
+      );
+    } catch (err) {
+      logger.warn(
+        "zpro: outbound emit failed (event=%s): %s",
+        event,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  };
+  const conversationId = String(after.conversationId);
+  if (before === null) {
+    await emit("conversation.created", {
+      conversation_id: conversationId,
+      status: after.status,
+    });
+    return;
+  }
+  if (after.status !== before.status) {
+    await emit("conversation.status_changed", {
+      conversation_id: conversationId,
+      status: after.status,
+      previous_status: before.status,
+    });
+  }
+  if (before.agentActive && !after.agentActive) {
+    await emit("conversation.handoff", { conversation_id: conversationId });
+  }
 }
 
 async function resolveSenderType(
@@ -101,8 +158,33 @@ export async function mirrorZproMessage(
   const contactTags = parseContactTags(
     ticket.contact.tags,
   ) as unknown as Prisma.InputJsonValue;
+  // Same cadence as contactTags above (arrives on every message webhook) — backs the
+  // attribute-context prompt block and tool-precondition state, see parseContactExtraInfo.
+  const contactExtraInfo = parseContactExtraInfo(
+    ticket.contact.extraInfo,
+  ) as unknown as Prisma.InputJsonValue;
 
   let conversation: { id: bigint };
+  let wonUpsert = true;
+  // Read BEFORE the upsert: Prisma's upsert result does not say which branch fired, and the fleet
+  // events below (conversation.created/status_changed/handoff) need to know. A SEPARATE scoped
+  // transaction from the upsert's own (runScopedOn opens one per call), not one shared statement —
+  // two webhook deliveries for the SAME existing ticket racing between this read and the other's
+  // write can read a stale `before`, so an occasional status_changed event reports a `previous_status`
+  // one hop behind the true prior value. Accepted: this is best-effort telemetry (same as the
+  // Chatwoot original), never the row itself, and a `conversation.created` double-fire is still
+  // impossible — that path is guarded by `wonUpsert` below, which only a real P2002 sets false.
+  // Costs one extra read per message, same trade Chatwoot's own decideConversationWrites machinery
+  // avoids by tracking state its own way — Z-PRO's mirror has no such engine, so this is the simple
+  // version of the same question.
+  const before = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.findUnique({
+      where: {
+        zproInstanceId_ticketId: { zproInstanceId, ticketId: ticket.id },
+      },
+      select: { id: true, status: true, agentActive: true },
+    }),
+  );
   try {
     conversation = await runScopedOn(base, sysCtx(tenantId), (db) =>
       db.zproConversation.upsert({
@@ -122,6 +204,7 @@ export async function mirrorZproMessage(
           humanUserId: ticket.userId,
           queueId: ticket.queueId,
           contactTags,
+          contactExtraInfo,
           lastMessageAt,
           lastMessageBody: body,
           ...(lastInboundAt ? { lastInboundAt } : {}),
@@ -147,6 +230,7 @@ export async function mirrorZproMessage(
           humanUserId: ticket.userId,
           queueId: ticket.queueId,
           contactTags,
+          contactExtraInfo,
           lastMessageAt,
           lastMessageBody: body,
           ...(lastInboundAt ? { lastInboundAt } : {}),
@@ -161,6 +245,7 @@ export async function mirrorZproMessage(
     if (!isUniqueViolation(err)) throw err;
     // Lost the concurrent-redelivery race on (zproInstanceId, ticketId): the other request already
     // wrote the same ticket data. Adopt its row instead of erroring — there's no "our" data to lose.
+    wonUpsert = false;
     logger.debug(
       { ticketId: ticket.id, messageId: msg.id },
       "zpro:mirror: lost conversation upsert race (duplicate Z-PRO redelivery), adopting winner",
@@ -173,6 +258,18 @@ export async function mirrorZproMessage(
         select: { id: true },
       }),
     );
+  }
+
+  // Fleet events — Z-PRO analog of chatwoot/mirror.ts's emitMirrorEvent trio, same three events,
+  // same allowlisted (ids/status only, no PII) projection. Only on the WINNING upsert: the race-adopt
+  // branch above did not write, so its own comparison against `before` would be meaningless — the
+  // winner's own call already emitted whatever changed.
+  if (wonUpsert) {
+    await emitZproMirrorEvent(base, tenantId, before, {
+      conversationId: conversation.id,
+      status: ticket.status,
+      agentActive: ticket.n8nStatus,
+    });
   }
 
   // Idempotente por messageId: uma redelivery sequencial hit a unique index e é um no-op via
@@ -262,6 +359,9 @@ export async function mirrorZproContact(
   const contactTags = parseContactTags(
     contact.tags,
   ) as unknown as Prisma.InputJsonValue;
+  const contactExtraInfo = parseContactExtraInfo(
+    contact.extraInfo,
+  ) as unknown as Prisma.InputJsonValue;
   await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.zproConversation.updateMany({
       where: { zproInstanceId, contactId: contact.id },
@@ -269,6 +369,7 @@ export async function mirrorZproContact(
         contactName: name,
         contactNumber: contact.number,
         contactTags,
+        contactExtraInfo,
         ...(contact.profilePicUrl ? { avatarUrl: contact.profilePicUrl } : {}),
       },
     }),

@@ -23,6 +23,7 @@ const TENANT_SCOPED_MODELS = new Set<string>([
   "Inbox",
   "Contact",
   "ContactAuthGrant",
+  "ZproContactAuthGrant",
   "Conversation",
   "Agent",
   "BusinessHours",

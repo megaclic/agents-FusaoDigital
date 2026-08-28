@@ -105,6 +105,7 @@ import {
   clampDelayMinutes,
   scheduleMessage,
 } from "@/modules/scheduled-messages/service";
+import { emitOutbound } from "@/modules/webhooks/outbound/service";
 import { markAgentSending } from "./agent-echo";
 import type { ZproClient } from "./client";
 import {
@@ -710,7 +711,7 @@ async function upsertOpportunity(
     status?: "open" | "win" | "lose";
     closingForecast?: string;
   },
-): Promise<{ stageId: number; stageName: string }> {
+): Promise<{ stageId: number; stageName: string; opportunityId: number }> {
   const stageId = patch.stageId ?? k.currentStageId ?? k.stages[0]?.id;
   if (stageId == null) {
     throw new Error("no stage available in this pipeline");
@@ -761,7 +762,7 @@ async function upsertOpportunity(
       },
     }),
   );
-  return { stageId, stageName };
+  return { stageId, stageName, opportunityId: id };
 }
 
 function kanbanMoveTool(ctx: ZproToolCtx) {
@@ -785,8 +786,11 @@ function kanbanMoveTool(ctx: ZproToolCtx) {
       if (k.opportunityId != null && stage.id === k.currentStageId) {
         return `The deal is already in "${stage.name}".`;
       }
+      let moved: { opportunityId: number };
       try {
-        await upsertOpportunity(ctx, k, k.pipelineId, { stageId: stage.id });
+        moved = await upsertOpportunity(ctx, k, k.pipelineId, {
+          stageId: stage.id,
+        });
       } catch (e) {
         logger.warn(
           "zpro kanban_move_card failed (ticket=%s): %s",
@@ -799,6 +803,27 @@ function kanbanMoveTool(ctx: ZproToolCtx) {
           err: e,
         });
         return toolFailure("Could not move the deal.");
+      }
+      // Best-effort fleet event (ids only — no PII), mirrors graph/tools/native.ts's own emission.
+      try {
+        await runScopedOn(ctx.base, sysCtx(ctx.tenantId), (db) =>
+          emitOutbound(db, ctx.tenantId, "kanban.card_moved", {
+            card_id: String(moved.opportunityId),
+            to_step: String(stage.id),
+            conversation_id: String(ctx.conversationDbId),
+          }),
+        );
+      } catch (err) {
+        logger.warn(
+          "zpro: outbound emit failed (event=kanban.card_moved): %s",
+          err instanceof Error ? err.message : String(err),
+        );
+        ctx.onSideEffectError?.({
+          tool: "kanban_move_card",
+          phase: "outbound_emit",
+          detail: { event: "kanban.card_moved" },
+          err,
+        });
       }
       return `Moved the deal to "${stage.name}".`;
     },

@@ -39,3 +39,52 @@ export async function resolveZproAvailability(
   if (businessHoursId === null) return null;
   return readSchedule(sysCtx(tenantId), String(businessHoursId), base);
 }
+
+// The CUSTOMER-facing half (Conversation.awayMessageSentAt's CAS pair, chatwoot/webhook.ts), ported
+// as-is: same compare-and-swap shape, same "only one caller wins the send" contract, just against
+// ZproConversation instead. See src/modules/availability/away.ts for the pure render/due functions
+// this pairs with (channel-agnostic already, nothing to port there).
+export async function claimZproAwayMessage(params: {
+  tenantId: bigint;
+  conversationId: bigint;
+  previous: Date | null;
+  now: Date;
+  base: PrismaClient;
+}): Promise<boolean> {
+  const claimed = await runScopedOn(
+    params.base,
+    sysCtx(params.tenantId),
+    (db) =>
+      db.zproConversation.updateMany({
+        where: {
+          id: params.conversationId,
+          awayMessageSentAt: params.previous,
+        },
+        data: { awayMessageSentAt: params.now },
+      }),
+  );
+  return claimed.count === 1;
+}
+
+export async function releaseZproAwayMessage(params: {
+  tenantId: bigint;
+  conversationId: bigint;
+  previous: Date | null;
+  claimed: Date;
+  base: PrismaClient;
+}): Promise<void> {
+  try {
+    await runScopedOn(params.base, sysCtx(params.tenantId), (db) =>
+      db.zproConversation.updateMany({
+        where: {
+          id: params.conversationId,
+          awayMessageSentAt: params.claimed,
+        },
+        data: { awayMessageSentAt: params.previous },
+      }),
+    );
+  } catch {
+    // Best-effort release, like the Chatwoot pair: a failure here just means the claim stands
+    // (the customer got no message this round, so a stale claim costs one skipped day at worst).
+  }
+}

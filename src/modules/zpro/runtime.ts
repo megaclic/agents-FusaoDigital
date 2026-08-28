@@ -49,7 +49,10 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "@/graph/inflight";
-import { PRIMARY_MAX_RETRIES, PRIMARY_TIMEOUT_MS } from "@/graph/model-fallback";
+import {
+  PRIMARY_MAX_RETRIES,
+  PRIMARY_TIMEOUT_MS,
+} from "@/graph/model-fallback";
 import {
   createChatModel,
   type ModelConfig,
@@ -73,13 +76,32 @@ import {
   composeSystemPrompt,
   interpolatePromptVars,
 } from "@/graph/prompt";
+import { type AuditedSection, buildPromptAudit } from "@/graph/prompt-audit";
 import { DEFAULT_TIMEZONE } from "@/graph/time";
 import { ToolFlowLogger } from "@/graph/tool-flowlog";
 import type { NativeToolName } from "@/graph/tools/catalog";
+import {
+  applyToolPreconditions,
+  preconditionFlowEvent,
+  unmatchedPreconditionEvent,
+} from "@/graph/tools/precondition";
 import { UsageCapture } from "@/graph/usage";
 import { runScopedOn } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
+import {
+  type PreconditionState,
+  readToolPreconditions,
+  type ToolPrecondition,
+} from "@/modules/agents/tool-preconditions";
+import {
+  type AttributeContextConfig,
+  attributeBagsFrom,
+  buildAttributeContextSection,
+  isAttributeContextEmpty,
+  readAttributeContextConfig,
+} from "@/modules/chatwoot/attributes";
+import { resolveVariantOverride } from "@/modules/experiments/service";
 import {
   emitFlowEvent,
   type FlowContext,
@@ -221,6 +243,22 @@ export interface LoadedZproAgent {
   // from the same readObservabilityConfig call, and threaded onto every FlowContext this module
   // builds (both the direct turn and the debounce flush).
   fullDetail: boolean;
+  // Operator-selected custom-attribute keys to append as a prompt block (agent.settings.
+  // attributeContext — same reader/shape Chatwoot's turn uses, src/modules/chatwoot/attributes.ts,
+  // despite the module name: the builder itself is channel-agnostic, it just takes bags in). Z-PRO
+  // only ever fills the "contact" scope (ZproConversation.contactExtraInfo) — "conversation"/"task"
+  // stay empty, there being no Z-PRO analog of Chatwoot's own conversation/kanban-task attributes.
+  attributeContext: AttributeContextConfig;
+  // Operator-declared per-tool guard rules (agent.settings.toolPreconditions, issue #378 — same
+  // reader/shape Chatwoot's turn uses, src/modules/agents/tool-preconditions.ts). The wrap/evaluate
+  // machinery (applyToolPreconditions/guardedTool, src/graph/tools/precondition.ts) is fully
+  // channel-agnostic; only the STATE loader is per-channel — Z-PRO's reads ZproConversation.
+  // contactExtraInfo (the local mirror) for `contact` scope and always answers empty for
+  // `conversation` (no Chatwoot custom_attributes analog). A rule set via set_custom_attribute
+  // earlier in the SAME turn is not visible to a guarded call later in that turn: the tool writes
+  // live to Z-PRO's API, the mirror only catches up on the next webhook — a disclosed, bounded gap,
+  // not a silent one (see docs/zpro.md).
+  toolPreconditions: Record<string, ToolPrecondition>;
   // Per-TENANT Langfuse config (Tenant.settings.langfuse + a vault key pair — src/graph/
   // observability.ts's resolveLangfuseConfig, fully channel-agnostic). null when tracing is off/
   // unconfigured for this tenant. See docs/zpro.md's "Langfuse tracing" section.
@@ -360,6 +398,8 @@ export async function loadZproAgent(
       sendImageConfig: readSendImageConfig(agent.settings),
       logToolValues: obs.logToolValues,
       fullDetail: obs.fullDetail,
+      attributeContext: readAttributeContextConfig(agent.settings),
+      toolPreconditions: readToolPreconditions(agent.settings),
       langfuseCfg,
       guardrails,
       guardrailsApiKey,
@@ -427,6 +467,38 @@ export type RunLoadedZproTurnOutcome =
 // ourselves never loops back through a webhook, so without this the ticket stays "pending"/
 // agentActive:true in our own UI forever — confirmed live 2026-08-18: the real Z-PRO ticket was
 // genuinely closed, but our list kept showing it open with the IA badge on.
+// Z-PRO's own PreconditionState reader (see LoadedZproAgent.toolPreconditions above). Reads the
+// LOCAL mirror, never a live Z-PRO call — same rule preconditionStateLoader follows for Chatwoot's
+// tables — so `conversation` scope always answers empty (no Chatwoot custom_attributes analog) and
+// `contact` scope answers whatever the last webhook mirrored, which may lag a set_custom_attribute
+// call made earlier in THIS same turn (see the field comment).
+function zproPreconditionStateLoader(args: {
+  base: PrismaClient;
+  tenantId: bigint;
+  conversationId: bigint | null;
+}): () => Promise<PreconditionState> {
+  const { base, tenantId, conversationId } = args;
+  return async () => {
+    if (conversationId === null) {
+      return { conversationAttributes: {}, contactAttributes: {} };
+    }
+    const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.zproConversation.findUnique({
+        where: { id: conversationId },
+        select: { contactExtraInfo: true },
+      }),
+    );
+    const bag = conv?.contactExtraInfo;
+    return {
+      conversationAttributes: {},
+      contactAttributes:
+        bag && typeof bag === "object" && !Array.isArray(bag)
+          ? (bag as Record<string, unknown>)
+          : {},
+    };
+  };
+}
+
 async function applyDeferredZproResolve(
   client: ZproClient,
   ticketId: number,
@@ -702,7 +774,8 @@ export async function runLoadedZproTurn(
               : "",
         baseURL: resolved.baseURL ?? undefined,
         temperature: loaded.mc.temperature,
-        ...(resolved.provider === loaded.mc.provider && loaded.mc.reasoningEffort
+        ...(resolved.provider === loaded.mc.provider &&
+        loaded.mc.reasoningEffort
           ? { reasoningEffort: loaded.mc.reasoningEffort }
           : {}),
         maxRetries: PRIMARY_MAX_RETRIES,
@@ -771,6 +844,7 @@ export async function runLoadedZproTurn(
       tools: agentTools,
       conversationId,
       grounded,
+      contactExtraInfoBag,
     } = await loadZproAgentTools({
       base,
       tenantId,
@@ -799,17 +873,66 @@ export async function runLoadedZproTurn(
     const handoffGranted = agentTools.some(
       (t) => t.name === "handoff_to_human",
     );
-    const systemPrompt = interpolatePromptVars(
-      composeSystemPrompt(loaded.systemPrompt, { grounded, handoffGranted }),
-      buildPromptVars({
-        contactName: ev.contactName,
-        contactPhone: ev.contactNumber,
-        inboxName: ev.channelType,
-        companyName: loaded.companyName,
-        agentName: loaded.agentName,
+    // A/B: an active experiment for this agent may override the system prompt for this thread —
+    // same primitive src/graph/prepare.ts's Chatwoot turn asks (resolveVariantOverride is already
+    // fully channel-agnostic: tenantId/agentId/threadId only, no Chatwoot coupling anywhere in it).
+    const promptOverride = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      resolveVariantOverride(db, {
+        tenantId,
+        agentId: loaded.agentId,
+        threadId,
       }),
-      { timezone: DEFAULT_TIMEZONE },
     );
+    const promptTemplate = composeSystemPrompt(
+      promptOverride ?? loaded.systemPrompt,
+      { grounded, handoffGranted },
+    );
+    const promptVars = buildPromptVars({
+      contactName: ev.contactName,
+      contactPhone: ev.contactNumber,
+      inboxName: ev.channelType,
+      companyName: loaded.companyName,
+      agentName: loaded.agentName,
+    });
+    const promptOpts = { timezone: DEFAULT_TIMEZONE, now: new Date() };
+    const renderedPrompt = interpolatePromptVars(
+      promptTemplate,
+      promptVars,
+      promptOpts,
+    );
+    // Same block Chatwoot's turn prep appends (src/modules/chatwoot/attributes.ts), CONTACT scope
+    // only — Z-PRO's mirrored bag (ticket.contact.extraInfo) has no conversation- or task-scope
+    // analogue (no Chatwoot custom_attributes, no Kanban Pro card). Absent selection ⇒ no block.
+    const attributeSection = !isAttributeContextEmpty(loaded.attributeContext)
+      ? buildAttributeContextSection(
+          attributeBagsFrom({ contactAttributes: contactExtraInfoBag }),
+          loaded.attributeContext,
+          undefined,
+          agentTools.some((t) => t.name === "set_custom_attribute"),
+        )
+      : null;
+    const systemPrompt = attributeSection
+      ? `${renderedPrompt}\n\n${attributeSection}`
+      : renderedPrompt;
+    // Redacted twin of the prompt above, for the flow-log's `generate` line (see
+    // src/graph/prompt-audit.ts). Z-PRO had zero wiring for this: the RAW resolved prompt — real
+    // contact name/phone, and now every exposed attribute value — was what the Logs page showed for
+    // every Z-PRO turn.
+    const auditedSections: AuditedSection[] = attributeSection
+      ? [
+          {
+            label: "atributos",
+            keys: loaded.attributeContext.contact.map((k) => `contact:${k}`),
+            text: attributeSection,
+          },
+        ]
+      : [];
+    const systemPromptAudit = buildPromptAudit({
+      template: promptTemplate,
+      vars: promptVars,
+      opts: promptOpts,
+      sections: auditedSections,
+    });
     // set_voice_preference (TTS "preference" mode only — no point exposing it when the agent always
     // replies in text/mirror): unlike the other native tools (built inside loadZproAgentTools, gated
     // by the SAME grant UI Chatwoot uses), this one needs currentVoiceReply (resolved below, after
@@ -834,11 +957,28 @@ export async function runLoadedZproTurn(
         }),
       );
     }
+    // Precondition seam (issue #378) — one map keyed by tool NAME reaches every source already
+    // merged into `tools` above, same six-line shape src/graph/prepare.ts uses. An agent with no
+    // rules configured gets the same array back, untouched.
+    const guardedTools = applyToolPreconditions(
+      tools,
+      loaded.toolPreconditions,
+      zproPreconditionStateLoader({ base, tenantId, conversationId }),
+      (info) => emitFlowEvent(flow, preconditionFlowEvent(info)),
+      (unmatched) => {
+        emitFlowEvent(flow, unmatchedPreconditionEvent(unmatched));
+        logger.warn(
+          "zpro agent %s: precondition(s) on tool(s) not in this turn's toolset (%s) — the tool is NOT guarded",
+          String(loaded.agentId),
+          unmatched.join(", "),
+        );
+      },
+    );
     const graph = buildAgentGraph({
       model,
       systemPrompt,
       checkpointer,
-      tools,
+      tools: guardedTools,
       primary: { provider: loaded.mc.provider, model: loaded.mc.model },
       fallback,
       // Mirrors src/graph/runtime.ts's onModelRetry wiring (upstream #68): a turn recovered from a
@@ -916,14 +1056,17 @@ export async function runLoadedZproTurn(
     // ToolFlowLogger itself), so this was only ever a missing CALL, not a missing capability.
     const toolLogger = new ToolFlowLogger(flow, {
       logValues: loaded.logToolValues,
-      tools,
+      tools: guardedTools,
     });
     // Per-tenant Langfuse trace (mirrors src/graph/prepare.ts's buildCallbacks — buildLangfuseHandler
     // itself has no Chatwoot coupling, so this was only ever a missing CALL, same as ToolFlowLogger
     // above). null when the tenant hasn't configured Langfuse; conversationId here is Z-PRO's own
     // ZproConversation.id — a display-only trace metadata field, not a foreign key, so reusing the
     // same field name across channels carries none of LlmUsage's cross-system collision risk.
-    const toolTrace = buildToolTraceMetadata(tools, loaded.langfuseCfg?.debug);
+    const toolTrace = buildToolTraceMetadata(
+      guardedTools,
+      loaded.langfuseCfg?.debug,
+    );
     const langfuse = buildLangfuseHandler(loaded.langfuseCfg, {
       tenantId,
       threadId,
@@ -950,7 +1093,13 @@ export async function runLoadedZproTurn(
       const result = await withFlowStage(
         flow,
         "generate",
-        { provider: loaded.mc.provider, model: loaded.mc.model },
+        {
+          provider: loaded.mc.provider,
+          model: loaded.mc.model,
+          // The prompt the agent was given THIS turn, audited — mirrors src/graph/runtime.ts's own
+          // wiring (item 15 / docs/logs.md). See prompt-audit.ts for the redaction rule.
+          detail: { systemPrompt: systemPromptAudit },
+        },
         () =>
           graph.invoke(
             { messages: [new HumanMessage(text)] },

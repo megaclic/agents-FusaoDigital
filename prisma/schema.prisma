@@ -120,6 +120,7 @@ model Tenant {
   inboxes                       Inbox[]
   contacts                      Contact[]
   contactAuthGrants             ContactAuthGrant[]
+  zproContactAuthGrants         ZproContactAuthGrant[]
   conversations                 Conversation[]
   agentThreads                  AgentThread[]
   attendanceSummaries           AttendanceSummary[]
@@ -758,11 +759,42 @@ model ZproInstance {
   webhookDeliveries ZproWebhookDelivery[]
   agentBindings     ZproAgentBinding[]
   conversations     ZproConversation[]
+  contactAuthGrants ZproContactAuthGrant[]
 
   // Um whatsappId é único por tenant (não pode ter dois canais iguais no mesmo tenant).
   @@unique([tenantId, whatsappId])
   @@index([tenantId])
   @@map("zpro_instances")
+}
+
+// Z-PRO analog of ContactAuthGrant (issue #189's "once" mode cache). Cannot reuse that table: its
+// contact FK targets Chatwoot's own Contact row, which Z-PRO has none of. Keyed on the phone NUMBER
+// rather than a row id — the durable identity across however many tickets that number opens, which
+// is arguably closer to the CORRECT key than Chatwoot's contactId (a Chatwoot contact merge/split
+// changes which row a phone maps to; the number itself does not move). Same shape otherwise: two
+// hashes so a grant expires on its own terms (the mirrored identity moving under it, or the operator
+// changing endpoint/credential/unlock/TTL), `context` the endpoint's own bounded facts bag.
+model ZproContactAuthGrant {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  agentId        BigInt   @map("agent_id")
+  zproInstanceId BigInt   @map("zpro_instance_id")
+  contactNumber  String   @map("contact_number")
+  identityHash   String   @map("identity_hash")
+  policyHash     String   @map("policy_hash")
+  context        Json?
+  expiresAt      DateTime @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent        Agent        @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  zproInstance ZproInstance @relation(fields: [zproInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, agentId, contactNumber])
+  @@index([agentId])
+  @@index([zproInstanceId])
+  @@map("zpro_contact_auth_grants")
 }
 
 // Idempotência de entrega do webhook global do Z-PRO. Equivalente ao ChatwootWebhookDelivery.
@@ -831,6 +863,12 @@ model ZproConversation {
   // parseContactTags, cada item guardado como {id, name} com o que estiver disponível (um dos dois
   // pode faltar; resolvido contra o catálogo de tags em leitura quando só o id sobrevive).
   contactTags      Json      @default("[]") @map("contact_tags")
+  // ticket.contact.extraInfo, flattened to a bag (parse.ts's parseContactExtraInfo) — the promise
+  // the comment above already made ("memória... espelhadas a cada mensagem") but never implemented.
+  // Backs the attribute-context prompt block (Z-PRO analog of Contact.customAttributes) and the
+  // tool-precondition state read; a live ZproClient.updateContactExtraInfo call remains the WRITE
+  // side (set_custom_attribute, native-tools.ts) — this is the read-back local mirror it lacked.
+  contactExtraInfo Json      @default("{}") @map("contact_extra_info")
   // Preferência de resposta em áudio (TTS modo "preference"), mesma semântica de Contact.voiceReply:
   // true = quer áudio, false = quer texto, null = desconhecido (mirror do que o cliente mandou).
   // Setado pela tool set_voice_preference (src/modules/zpro/tts.ts) — não existe Contact no Z-PRO,
@@ -881,6 +919,11 @@ model ZproConversation {
   // permanent for this ticket — a new ticket (new row) gets a fresh notice. Accepted, matches the
   // Chatwoot watermark's own semantics rather than inventing a new reset mechanism.
   outOfHoursNoticeSentAt     DateTime? @map("out_of_hours_notice_sent_at")
+  // The CUSTOMER-facing half of the same gate (Conversation.awayMessageSentAt's Z-PRO analog,
+  // src/modules/availability/away.ts's CAS claim/release) — previously only the operator's fixed
+  // note above existed for Z-PRO; the operator's OWN away-message text was never sent to the
+  // customer. Same once-per-local-day cadence as Chatwoot's (awayMessageDue).
+  awayMessageSentAt          DateTime? @map("away_message_sent_at")
   // Generic follow-up (reengagement sweep) watermarks — Z-PRO analog of Conversation.lastInboundAt/
   // lastFollowUpAt. lastInboundAt is CLIENT-only (advanced in mirror.ts's mirrorZproMessage), distinct
   // from lastMessageAt (any sender) — needed for the "fresh episode" gate (isNewFollowUpEpisode) the
@@ -1029,11 +1072,12 @@ model Agent {
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 
-  tenant            Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  toolSelections    AgentToolSelection[]
-  chatwootBots      ChatwootAgentBot[]
-  zproBindings      ZproAgentBinding[]
-  contactAuthGrants ContactAuthGrant[]
+  tenant                Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  toolSelections        AgentToolSelection[]
+  chatwootBots          ChatwootAgentBot[]
+  zproBindings          ZproAgentBinding[]
+  contactAuthGrants     ContactAuthGrant[]
+  zproContactAuthGrants ZproContactAuthGrant[]
 
   @@index([tenantId])
   @@map("agents")

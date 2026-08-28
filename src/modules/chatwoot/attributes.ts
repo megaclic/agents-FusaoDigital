@@ -189,7 +189,7 @@ export function buildAttributeContextSection(
     ? " Para gravar ou corrigir qualquer um deles use a ferramenta set_custom_attribute (nunca invente valores)."
     : " Você NÃO tem ferramenta para alterá-los: use-os apenas como contexto (nunca invente valores).";
   return [
-    "## Dados deste atendimento (Chatwoot)",
+    "## Dados deste atendimento",
     `${intro}${write}`,
     `<attribute_values>\n${blocks.join("\n")}\n</attribute_values>`,
   ].join("\n");

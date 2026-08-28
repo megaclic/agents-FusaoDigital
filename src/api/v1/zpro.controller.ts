@@ -17,6 +17,11 @@ import logger from "@/api/lib/logger";
 import { doc } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { asSuperAdminOn, runScopedOn } from "@/lib/tenancy";
+import {
+  awayMessageDue,
+  readAvailabilityConfig,
+  renderAwayMessage,
+} from "@/modules/availability/away";
 import { outOfHoursGate } from "@/modules/business-hours/service";
 import { runZproRedirectGate } from "@/modules/channel-redirect/gate";
 import {
@@ -25,7 +30,11 @@ import {
 } from "@/modules/channel-redirect/service";
 import { armDebounce } from "@/modules/debounce/service";
 import type { FlowContext } from "@/modules/flowlog/service";
-import { resolveZproAvailability } from "@/modules/zpro/availability";
+import {
+  claimZproAwayMessage,
+  releaseZproAwayMessage,
+  resolveZproAvailability,
+} from "@/modules/zpro/availability";
 import { ZproClient } from "@/modules/zpro/client";
 import { sysCtx } from "@/modules/zpro/ctx";
 import { resolveZproDebounceConfig } from "@/modules/zpro/debounce";
@@ -457,7 +466,10 @@ export const zproController = new Elysia({
             (db) =>
               db.zproConversation.findUnique({
                 where: { id: mirrored.conversationId },
-                select: { outOfHoursNoticeSentAt: true },
+                select: {
+                  outOfHoursNoticeSentAt: true,
+                  awayMessageSentAt: true,
+                },
               }),
           );
           const hours = await resolveZproAvailability(
@@ -471,6 +483,88 @@ export const zproController = new Elysia({
             availConv?.outOfHoursNoticeSentAt != null,
           );
           if (availability.silence) {
+            // ── The CUSTOMER-facing half (mirrors chatwoot/webhook.ts's #153 wiring): a DISABLED
+            //    agent still gets the operator note below, but acquires no voice toward the
+            //    customer — same reasoning as the Chatwoot gate. Own settings read (the redirect
+            //    gate above already pays one; this step has no bundle to share it with yet). ──
+            const now = new Date();
+            if (hours) {
+              const agentBinding = await runScopedOn(
+                basePrisma,
+                sysCtx(instance.tenantId),
+                (db) =>
+                  db.zproAgentBinding.findFirst({
+                    where: {
+                      tenantId: instance.tenantId,
+                      zproInstanceId: instance.id,
+                    },
+                    select: {
+                      agent: { select: { enabled: true, settings: true } },
+                    },
+                  }),
+              );
+              const awayCfg = readAvailabilityConfig(
+                agentBinding?.agent.settings,
+              );
+              const away =
+                agentBinding?.agent.enabled &&
+                awayMessageDue(hours, now, availConv?.awayMessageSentAt ?? null)
+                  ? renderAwayMessage({
+                      enabled: awayCfg.enabled,
+                      copy: awayCfg.awayMessage,
+                      schedule: hours,
+                      now,
+                    })
+                  : ({ send: false, reason: "disabled" } as const);
+              if (!away.send && away.reason === "no_next_open") {
+                logger.warn(
+                  "zpro:dispatch away message not sent (conv=%s) — it interpolates the next opening and the schedule never opens",
+                  String(mirrored.conversationId),
+                );
+              }
+              if (away.send) {
+                const previous = availConv?.awayMessageSentAt ?? null;
+                const claimed = await claimZproAwayMessage({
+                  tenantId: instance.tenantId,
+                  conversationId: mirrored.conversationId,
+                  previous,
+                  now,
+                  base: basePrisma,
+                }).catch((err) => {
+                  logger.warn(
+                    { err },
+                    "zpro:dispatch away-message claim failed (conv=%s)",
+                    String(mirrored.conversationId),
+                  );
+                  return false;
+                });
+                if (claimed) {
+                  try {
+                    const zproClient = new ZproClient(
+                      instance.baseUrl,
+                      instance.apiId,
+                      decryptJson<string>(instance.bearerToken),
+                    );
+                    await zproClient.sendText(event.contactNumber, away.text, {
+                      validateNumber: false,
+                    });
+                  } catch (err) {
+                    logger.warn(
+                      { err },
+                      "zpro:dispatch away-message send failed (conv=%s)",
+                      String(mirrored.conversationId),
+                    );
+                    await releaseZproAwayMessage({
+                      tenantId: instance.tenantId,
+                      conversationId: mirrored.conversationId,
+                      previous,
+                      claimed: now,
+                      base: basePrisma,
+                    });
+                  }
+                }
+              }
+            }
             if (availability.postNote) {
               try {
                 const zproClient = new ZproClient(
