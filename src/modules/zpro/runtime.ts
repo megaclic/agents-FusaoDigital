@@ -101,6 +101,10 @@ import {
   isAttributeContextEmpty,
   readAttributeContextConfig,
 } from "@/modules/chatwoot/attributes";
+import {
+  type ContactAuthConfig,
+  readContactAuthConfig,
+} from "@/modules/contact-auth/settings";
 import { resolveVariantOverride } from "@/modules/experiments/service";
 import {
   emitFlowEvent,
@@ -259,6 +263,12 @@ export interface LoadedZproAgent {
   // live to Z-PRO's API, the mirror only catches up on the next webhook — a disclosed, bounded gap,
   // not a silent one (see docs/zpro.md).
   toolPreconditions: Record<string, ToolPrecondition>;
+  // Contact-authorization gate config (agent.settings.contactAuth, docs/contact-auth.md — same
+  // reader Chatwoot's turn uses, src/modules/contact-auth/settings.ts, fully channel-agnostic).
+  // Resolved once here so the debounce flush and the proactive nudge (both already load this whole
+  // object) can re-check it without a second settings read; the direct webhook path resolves its own
+  // (it runs before any agent config is loaded at all — see zpro.controller.ts).
+  contactAuthConfig: ContactAuthConfig;
   // Per-TENANT Langfuse config (Tenant.settings.langfuse + a vault key pair — src/graph/
   // observability.ts's resolveLangfuseConfig, fully channel-agnostic). null when tracing is off/
   // unconfigured for this tenant. See docs/zpro.md's "Langfuse tracing" section.
@@ -400,6 +410,7 @@ export async function loadZproAgent(
       fullDetail: obs.fullDetail,
       attributeContext: readAttributeContextConfig(agent.settings),
       toolPreconditions: readToolPreconditions(agent.settings),
+      contactAuthConfig: readContactAuthConfig(agent.settings),
       langfuseCfg,
       guardrails,
       guardrailsApiKey,

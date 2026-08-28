@@ -28,14 +28,26 @@ import {
   isRedirectEntryZproInstance,
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
+import {
+  contactAuthFlowEvent,
+  contactAuthNoteText,
+} from "@/modules/contact-auth/service";
+import { readContactAuthConfig } from "@/modules/contact-auth/settings";
+import {
+  type ContactAuthNotice,
+  claimContactAuthNotice,
+  contactAuthNoticeKey,
+  releaseContactAuthNotice,
+} from "@/modules/contact-auth/state";
 import { armDebounce } from "@/modules/debounce/service";
-import type { FlowContext } from "@/modules/flowlog/service";
+import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import {
   claimZproAwayMessage,
   releaseZproAwayMessage,
   resolveZproAvailability,
 } from "@/modules/zpro/availability";
 import { ZproClient } from "@/modules/zpro/client";
+import { authorizeZproContact } from "@/modules/zpro/contact-auth";
 import { sysCtx } from "@/modules/zpro/ctx";
 import { resolveZproDebounceConfig } from "@/modules/zpro/debounce";
 import {
@@ -49,6 +61,7 @@ import { mirrorZproContact, mirrorZproMessage } from "@/modules/zpro/mirror";
 import {
   extractMedia,
   extractWhatsappId,
+  parseContactExtraInfo,
   resolveZproInstanceCandidate,
 } from "@/modules/zpro/parse";
 import { runZproAgentTurn, zproThreadId } from "@/modules/zpro/runtime";
@@ -607,6 +620,180 @@ export const zproController = new Elysia({
               String(delivery.id),
             );
             return;
+          }
+        }
+
+        // 1g. Contact authorization gate: some agents only serve contacts an operator-configured
+        // endpoint recognizes (docs/contact-auth.md) — same feature Chatwoot has, now wired for
+        // Z-PRO. Runs on every new incoming message, after availability and before debounce/the
+        // direct turn — the same gate order Chatwoot's webhook uses (redirect → availability →
+        // contact-auth; Z-PRO has no test-mode/cross-link gates to interleave with). Own settings
+        // read: the redirect/availability gates above each pay their own for the same reason (no
+        // shared bundle exists yet at this point in the dispatch).
+        if (mirrored) {
+          const authBinding = await runScopedOn(
+            basePrisma,
+            sysCtx(instance.tenantId),
+            (db) =>
+              db.zproAgentBinding.findFirst({
+                where: {
+                  tenantId: instance.tenantId,
+                  zproInstanceId: instance.id,
+                },
+                select: {
+                  agentId: true,
+                  agent: { select: { settings: true } },
+                },
+              }),
+          );
+          const authCfg = readContactAuthConfig(authBinding?.agent.settings);
+          if (authBinding && authCfg.enabled) {
+            const agentId = authBinding.agentId;
+            // The operator's own id for this contact — Z-PRO's analog of Chatwoot's native
+            // `identifier` field (no such native field exists here): an operator-set custom
+            // attribute, same bag the attribute-context block reads.
+            const identifier =
+              parseContactExtraInfo(event.extraInfo).identifier?.trim() || null;
+            const verdict = await authorizeZproContact({
+              tenantId: instance.tenantId,
+              agentId,
+              contactNumber: event.contactNumber,
+              contactName: event.contactName,
+              identifier,
+              ticketId: Number(event.threadId),
+              channelType: event.channelType,
+              messageText: event.body || null,
+              requestKey: authCfg.includeMessageText
+                ? `msg:${msg?.id ?? "none"}`
+                : "inbox",
+              cfg: authCfg,
+              base: basePrisma,
+            });
+            emitFlowEvent(
+              {
+                tenantId: instance.tenantId,
+                turnId: crypto.randomUUID(),
+                source: "inbox",
+                agentId,
+                threadId: zproThreadId(
+                  instance.tenantId,
+                  instance.id,
+                  event.threadId,
+                ),
+                base: basePrisma,
+              },
+              contactAuthFlowEvent(verdict),
+            );
+            if (verdict.outcome !== "allowed") {
+              const zproClient = new ZproClient(
+                instance.baseUrl,
+                instance.apiId,
+                decryptJson<string>(instance.bearerToken),
+              );
+              const cooldownMs = authCfg.noticeCooldownSeconds * 1000;
+              const claim = (notice: ContactAuthNotice) =>
+                claimContactAuthNotice(
+                  contactAuthNoticeKey(
+                    instance.tenantId,
+                    agentId,
+                    mirrored.conversationId,
+                    notice,
+                  ),
+                  cooldownMs,
+                );
+              // Customer copy first (denied only — an error/no_identity says nothing to a customer
+              // who may not even be a real contact yet), then the handoff-open, then the note — so
+              // the note can say what actually happened. Mirrors chatwoot/webhook.ts's ordering.
+              const denyMessage =
+                verdict.outcome === "denied" ? authCfg.denyMessage : null;
+              const copyClaim = denyMessage ? claim("copy") : false;
+              if (denyMessage && copyClaim) {
+                try {
+                  await zproClient.sendText(event.contactNumber, denyMessage, {
+                    validateNumber: false,
+                  });
+                } catch (err) {
+                  releaseContactAuthNotice(copyClaim);
+                  logger.warn(
+                    { err },
+                    "zpro:dispatch contact-auth deny message failed (conv=%s)",
+                    String(mirrored.conversationId),
+                  );
+                }
+              }
+              let handedOff = false;
+              if (verdict.outcome !== "error" && authCfg.handoffEnabled) {
+                // Best-effort, outside the cooldown: the open is what ends the bot's attribution to
+                // this ticket, and a first attempt that failed must be retried on the next refused
+                // message. No queue target — unlike Chatwoot's handoffTeamId/handoffTeamInstanceId
+                // (a Chatwoot-account-scoped concept with no Z-PRO analog), the ticket is simply
+                // left in whatever queue it is already in.
+                try {
+                  await deactivateAgent(zproClient, Number(event.threadId));
+                  handedOff = true;
+                } catch (err) {
+                  logger.warn(
+                    { err },
+                    "zpro:dispatch contact-auth handoff failed (conv=%s)",
+                    String(mirrored.conversationId),
+                  );
+                }
+              }
+              const noteClaim = claim("note");
+              if (noteClaim) {
+                try {
+                  await zproClient.createNote(
+                    Number(event.threadId),
+                    contactAuthNoteText(verdict, handedOff),
+                  );
+                } catch (err) {
+                  releaseContactAuthNotice(noteClaim);
+                  logger.warn(
+                    { err },
+                    "zpro:dispatch contact-auth note failed (conv=%s)",
+                    String(mirrored.conversationId),
+                  );
+                }
+              }
+              await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                db.zproWebhookDelivery.update({
+                  where: { id: delivery.id },
+                  data: { status: "PROCESSED", processedAt: new Date() },
+                }),
+              );
+              logger.info(
+                "zpro:dispatch contact-auth silent (conv=%s outcome=%s shared=%s)",
+                String(mirrored.conversationId),
+                verdict.outcome,
+                String(verdict.shared),
+              );
+              return;
+            }
+            // Allowed, and up to `timeoutMs` may have gone by inside somebody else's endpoint —
+            // re-check ownership before proceeding (mirrors Chatwoot's ownershipNow re-fence): a
+            // human could have taken the ticket during the wait.
+            const stillOurs = await runScopedOn(
+              basePrisma,
+              sysCtx(instance.tenantId),
+              (db) =>
+                db.zproConversation.findUnique({
+                  where: { id: mirrored.conversationId },
+                  select: { agentActive: true },
+                }),
+            );
+            if (!stillOurs?.agentActive) {
+              await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                db.zproWebhookDelivery.update({
+                  where: { id: delivery.id },
+                  data: { status: "PROCESSED", processedAt: new Date() },
+                }),
+              );
+              logger.info(
+                "zpro:dispatch contact-auth allowed but the ticket is no longer the bot's (conv=%s)",
+                String(mirrored.conversationId),
+              );
+              return;
+            }
           }
         }
 

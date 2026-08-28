@@ -18,6 +18,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { runScopedOn } from "@/lib/tenancy";
+import { contactAuthFlowEvent } from "@/modules/contact-auth/service";
 import { readLastMessageId } from "@/modules/debounce/service";
 import {
   DEBOUNCE_DEFAULTS,
@@ -27,13 +28,18 @@ import {
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import type { JobResult } from "@/modules/scheduler/worker";
+import { authorizeZproContact } from "./contact-auth";
 import { sysCtx } from "./ctx";
 import {
   announceZproFailedTurn,
   clearZproConversationError,
   recordZproConversationError,
 } from "./failure";
-import { withMediaFallback, withQuotedPrefix } from "./parse";
+import {
+  parseContactExtraInfo,
+  withMediaFallback,
+  withQuotedPrefix,
+} from "./parse";
 import { loadZproAgent, runLoadedZproTurn, zproThreadId } from "./runtime";
 import type { NormalizedZproEvent } from "./types";
 
@@ -81,6 +87,32 @@ export function parseZproThreadId(
   }
 }
 
+// Shared by both early exits that drop a whole burst without posting (a human already owns the
+// ticket, or the contact-authorization gate refused it): advance the watermark off the burst's
+// high-water mark kept in the payload at arm time (issue #8 fix) — no query needed — so the next
+// flush doesn't re-coalesce what this one already counted as handled.
+async function advanceZproWatermarkFromArm(
+  base: PrismaClient,
+  tenantId: bigint,
+  convDbId: bigint,
+  job: ClaimedJob,
+): Promise<void> {
+  const last = readLastMessageId(job.payload);
+  if (last === null) return;
+  await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.zproConversation.updateMany({
+      where: {
+        id: convDbId,
+        OR: [
+          { lastHandledMessageId: null },
+          { lastHandledMessageId: { lt: BigInt(last) } },
+        ],
+      },
+      data: { lastHandledMessageId: BigInt(last) },
+    }),
+  );
+}
+
 export interface FlushZproDebounceParams {
   job: ClaimedJob;
   base: PrismaClient;
@@ -110,6 +142,7 @@ export async function flushZproDebounceJob(
         contactId: true,
         contactName: true,
         contactNumber: true,
+        contactExtraInfo: true,
       },
     });
     if (!conv) return null;
@@ -123,6 +156,7 @@ export async function flushZproDebounceJob(
       contactId: conv.contactId,
       contactName: conv.contactName,
       contactNumber: conv.contactNumber,
+      contactExtraInfo: conv.contactExtraInfo,
     };
   });
   if (ctx === null) return { outcome: "done" };
@@ -132,26 +166,68 @@ export async function flushZproDebounceJob(
   // at arm time (issue #8 fix, reused as-is from armDebounce — no network/query needed) so the
   // first flush after the human returns it doesn't re-coalesce the whole human-era backlog.
   if (ctx.gateClosed) {
-    const last = readLastMessageId(job.payload);
-    if (last !== null) {
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.zproConversation.updateMany({
-          where: {
-            id: ctx.convDbId,
-            OR: [
-              { lastHandledMessageId: null },
-              { lastHandledMessageId: { lt: BigInt(last) } },
-            ],
-          },
-          data: { lastHandledMessageId: BigInt(last) },
-        }),
-      );
-    }
+    await advanceZproWatermarkFromArm(base, tenantId, ctx.convDbId, job);
     return { outcome: "done" };
   }
 
   const loaded = await loadZproAgent(base, tenantId, zproInstanceId);
   if (!loaded) return { outcome: "done" };
+
+  // The contact-authorization gate, again, at the point the turn happens (docs/contact-auth.md,
+  // mirrors src/modules/debounce/handler.ts's flushDebounceJob exactly): the webhook checks every
+  // incoming message, but a turn is not a message — one allowed message can arm a flush that a
+  // later, refused message rides into (the refused delivery arms nothing, but the pending flush
+  // re-fetches everything past the watermark), and a revocation landing inside the coalescing
+  // window is the same hole from the other side. A refusal ends the flush like a human takeover:
+  // the burst counts as handled off the ARM-TIME payload's own last id (no re-fetch), nothing is
+  // posted, no customer copy and no handoff — those answer a message the customer just sent, and
+  // the webhook path already gave them to the delivery it refused. The flow line is what tells the
+  // operator the burst was dropped.
+  if (loaded.contactAuthConfig.enabled) {
+    const identifier =
+      parseContactExtraInfo(ctx.contactExtraInfo).identifier?.trim() || null;
+    const auth = await authorizeZproContact({
+      tenantId,
+      agentId: loaded.agentId,
+      contactNumber: ctx.contactNumber,
+      contactName: ctx.contactName,
+      identifier,
+      ticketId,
+      // Unavailable outside a live webhook payload (ZproConversation doesn't store it) — same
+      // degradation the synthetic event below already accepts for {{canal}}.
+      channelType: null,
+      // The burst is many messages, not one: there is no single text to forward, and an unlock
+      // code is something the customer sends on a message of their own, which the webhook path
+      // already checked.
+      messageText: null,
+      // Its own asking, like the nudge's: it carries no message text and must never join (or be
+      // joined by) the flight of an incoming message that does.
+      requestKey: "debounce",
+      cfg: loaded.contactAuthConfig,
+      base,
+    });
+    emitFlowEvent(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        agentId: loaded.agentId,
+        threadId: zproThreadId(tenantId, zproInstanceId, String(ticketId)),
+        base,
+        fullDetail: loaded.fullDetail,
+      },
+      contactAuthFlowEvent(auth),
+    );
+    if (auth.outcome !== "allowed") {
+      logger.info(
+        "zpro debounce flush: contact not authorized (conv=%s outcome=%s), dropping the burst",
+        String(ctx.convDbId),
+        auth.outcome,
+      );
+      await advanceZproWatermarkFromArm(base, tenantId, ctx.convDbId, job);
+      return { outcome: "done" };
+    }
+  }
 
   // 2. Coalesce the burst PAST THE WATERMARK, straight from our own mirror (no re-fetch — see the
   // module header). Cap at maxMessagesPerBurst, keeping the most recent.

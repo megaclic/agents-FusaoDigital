@@ -11,6 +11,7 @@ import { isNonInjectableSecret } from "@/modules/vault/secret-types";
 import {
   type AuthContext,
   type CheckDeps,
+  type ContactAuthOutcome,
   type ContactAuthVerdict,
   channelSlug,
   checkContactAuthorization,
@@ -334,4 +335,59 @@ export function contactAuthFlowEvent(result: ContactAuthResult): FlowEvent {
         }
       : {}),
   };
+}
+
+// OUR failure codes (check.ts's `reason` on an "error" outcome) as pt-BR operator copy — moved here
+// from chatwoot/webhook.ts so Z-PRO's own gate (src/modules/zpro/contact-auth.ts) reads the same
+// wording instead of maintaining a second translation of the same fixed list.
+const CONTACT_AUTH_ERROR_LABELS: Record<string, string> = {
+  timeout: "tempo esgotado",
+  network: "falha de rede",
+  unsafe_url: "URL bloqueada",
+  invalid_url: "URL inválida",
+  not_configured: "URL não configurada",
+  credential_unavailable: "credencial indisponível",
+  credential_not_injectable:
+    "a credencial escolhida nunca é enviada numa requisição",
+  invalid_response: "resposta inválida",
+  body_too_large: "resposta grande demais",
+  unexpected_status: "status inesperado",
+};
+
+// Operator-facing note for a conversation the contact-authorization gate refused (pt-BR, the same
+// register as the one-shot test-mode / out-of-hours notices). Reasons are short codes by the time
+// they get here (the slug guard upstream drops prose), so the note can carry one without carrying
+// anything the customer wrote. This is also the ONE place the endpoint's own reason surfaces: the
+// note sits in the operator's own console, on the conversation it is about, unlike the execution log
+// that alert channels read. Pure — no Chatwoot or Z-PRO coupling, both channels' webhooks call it.
+export function contactAuthNoteText(
+  verdict: {
+    outcome: ContactAuthOutcome;
+    status?: number;
+    reason?: string;
+    endpointReason?: string;
+  },
+  handedOff: boolean,
+): string {
+  const handoffLine = handedOff
+    ? " A conversa foi aberta para atendimento humano."
+    : "";
+  if (verdict.outcome === "no_identity") {
+    return (
+      "🔒 Autorização do contato: não foi possível verificar porque o contato não tem telefone, e-mail nem identificador cadastrados. O agente não respondeu automaticamente." +
+      handoffLine
+    );
+  }
+  if (verdict.outcome === "denied") {
+    const motivo = verdict.endpointReason ?? verdict.reason;
+    const reason = motivo ? ` Motivo: ${motivo}.` : "";
+    return `🔒 Contato não autorizado pela verificação externa.${reason} O agente não respondeu automaticamente.${handoffLine}`;
+  }
+  const cause =
+    verdict.status !== undefined
+      ? `HTTP ${verdict.status}`
+      : (CONTACT_AUTH_ERROR_LABELS[verdict.reason ?? ""] ??
+        verdict.reason ??
+        "falha desconhecida");
+  return `⚠️ A verificação de autorização do contato falhou (${cause}). O agente não respondeu automaticamente; a próxima mensagem tenta novamente.`;
 }

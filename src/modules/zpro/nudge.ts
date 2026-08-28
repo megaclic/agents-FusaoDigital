@@ -25,8 +25,12 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { type AgentNudge, renderNudge } from "@/graph/nudge";
 import { runScopedOn } from "@/lib/tenancy";
+import { contactAuthFlowEvent } from "@/modules/contact-auth/service";
+import { emitFlowEvent } from "@/modules/flowlog/service";
+import { authorizeZproContact } from "./contact-auth";
 import { sysCtx } from "./ctx";
 import { parseZproThreadId } from "./debounce";
+import { parseContactExtraInfo } from "./parse";
 import { loadZproAgent, runLoadedZproTurn } from "./runtime";
 import type { NormalizedZproEvent } from "./types";
 
@@ -68,6 +72,7 @@ export async function runZproAgentNudge(
         contactId: true,
         contactName: true,
         contactNumber: true,
+        contactExtraInfo: true,
         lastInboundAt: true,
       },
     }),
@@ -81,6 +86,70 @@ export async function runZproAgentNudge(
 
   const loaded = await loadZproAgent(base, tenantId, zproInstanceId);
   if (!loaded) return "no-agent";
+
+  // The contact-authorization gate applies to proactive sends too (docs/contact-auth.md): a
+  // follow-up is a turn the agent starts, and a contact the reactive gate would refuse must not be
+  // reached out to either. Denied/error/no-identity all end as "silent" — no note downgrade the way
+  // the webhook path has one, since the nudge's own text was written FOR the customer, not for an
+  // operator. Unlike Chatwoot's nudge, Z-PRO's has no deterministic "post actions" (labels/resolve)
+  // to still apply on a refusal — there is nothing else this caller owes.
+  if (loaded.contactAuthConfig.enabled) {
+    const identifier =
+      parseContactExtraInfo(conv.contactExtraInfo).identifier?.trim() || null;
+    const auth = await authorizeZproContact({
+      tenantId,
+      agentId: loaded.agentId,
+      contactNumber: conv.contactNumber,
+      contactName: conv.contactName,
+      identifier,
+      ticketId,
+      // A nudge has no live webhook payload to read a channel from — same degradation the
+      // synthetic event below already accepts for {{canal}}.
+      channelType: null,
+      // A nudge is a turn the agent starts: there is no customer message to forward.
+      messageText: null,
+      // Its own asking: it carries no message text, so it must never join (or be joined by) the
+      // flight of an incoming message that does.
+      requestKey: "nudge",
+      cfg: loaded.contactAuthConfig,
+      base,
+    });
+    emitFlowEvent(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        agentId: loaded.agentId,
+        threadId: params.threadId,
+        base,
+        fullDetail: loaded.fullDetail,
+      },
+      contactAuthFlowEvent(auth),
+    );
+    if (auth.outcome !== "allowed") {
+      logger.info(
+        "zpro nudge: contact not authorized (conv=%s outcome=%s), skipping",
+        String(conv.id),
+        auth.outcome,
+      );
+      return "silent";
+    }
+    // Allowed, and up to `timeoutMs` may have gone by inside somebody else's endpoint — re-check
+    // ownership before proceeding: a human could have taken the ticket during the wait.
+    const stillOurs = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.zproConversation.findUnique({
+        where: { id: conv.id },
+        select: { agentActive: true },
+      }),
+    );
+    if (!stillOurs?.agentActive) {
+      logger.info(
+        "zpro nudge: a human took the ticket during the authorization call (conv=%s)",
+        String(conv.id),
+      );
+      return "human-owned";
+    }
+  }
 
   const text = renderNudge(params.nudge, true);
   const event: NormalizedZproEvent = {
