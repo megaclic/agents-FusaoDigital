@@ -206,6 +206,7 @@ const FLOWLOG_READERS: Record<string, number> = {
   "tests/modules/chatwoot-command-dropped.test.ts": 2,
   "tests/modules/chatwoot-gate-trail.test.ts": 1,
   "tests/modules/chatwoot-inbox-remove.test.ts": 1,
+  "tests/modules/chatwoot-recover-delivery.test.ts": 2,
   "tests/modules/chatwoot-unbound-inbox.test.ts": 1,
   "tests/modules/contact-auth-gate-e2e.test.ts": 3,
   "tests/modules/debounce.test.ts": 8,
@@ -233,6 +234,7 @@ const FLOWLOG_READERS: Record<string, number> = {
   "tests/modules/vision-retry.test.ts": 1,
   "tests/modules/webhooks-outbound-dead-alert.test.ts": 1,
   "tests/modules/webhooks-outbound-deliveries.test.ts": 1,
+  "tests/modules/zpro/runtime-turn-failure.test.ts": 2,
 };
 
 // Lives beside the rest of the flowlog family rather than in tests/tooling/, which the manifest
@@ -315,7 +317,7 @@ async function scanTests(): Promise<Map<string, Reader[]>> {
   const { Glob } = await import("bun");
   const found = new Map<string, Reader[]>();
   for await (const rel of new Glob("**/*.{ts,tsx}").scan("tests")) {
-    const path = `tests/${rel}`;
+    const path = `tests/${rel.replaceAll("\\", "/")}`;
     if (path === SELF || path === HELPER) continue;
     const readers = flowlogReaders(await Bun.file(path).text());
     if (readers.length > 0) found.set(path, readers);
@@ -499,7 +501,7 @@ describe("nothing empties the flow log by hand", () => {
     const { Glob } = await import("bun");
     const offenders: string[] = [];
     for await (const rel of new Glob("**/*.{ts,tsx}").scan("tests")) {
-      const path = `tests/${rel}`;
+      const path = `tests/${rel.replaceAll("\\", "/")}`;
       if (CLEAR_EXEMPT.has(path)) continue;
       for (const line of rawClearLines(await Bun.file(path).text())) {
         offenders.push(`${path}:${line}`);
@@ -557,7 +559,7 @@ describe("nothing reads the flow log without waiting for the write", () => {
     const { Glob } = await import("bun");
     const offenders: string[] = [];
     for await (const rel of new Glob("**/*.{ts,tsx}").scan("tests")) {
-      const path = `tests/${rel}`;
+      const path = `tests/${rel.replaceAll("\\", "/")}`;
       if (READ_EXEMPT.has(path)) continue;
       for (const line of rawReadLines(await Bun.file(path).text())) {
         offenders.push(`${path}:${line}`);

@@ -69,7 +69,8 @@ export type SchedulerJobKind =
   | "ZPRO_STATUS_CHECK"
   | "MEMORY_COMPACT"
   | "INGEST_MESSAGE"
-  | "DELIVERY_SWEEP";
+  | "DELIVERY_SWEEP"
+  | "DELIVERY_RECOVERY";
 
 export interface ClaimedJob {
   id: bigint;

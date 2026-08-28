@@ -863,6 +863,8 @@ export const zproController = new Elysia({
           deliveryRowId: delivery.id,
           event,
           turnId,
+          conversationDbId: mirrored?.conversationId ?? null,
+          triggerMessageDbId: mirrored?.messageDbId ?? null,
         })
           .then((outcome) => {
             logger.info(

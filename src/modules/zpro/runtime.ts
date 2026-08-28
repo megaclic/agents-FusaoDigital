@@ -86,6 +86,7 @@ import {
   unmatchedPreconditionEvent,
 } from "@/graph/tools/precondition";
 import { UsageCapture } from "@/graph/usage";
+import { sanitizeErrorMessage } from "@/lib/redact";
 import { runScopedOn } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
@@ -143,6 +144,11 @@ import { markAgentSending } from "./agent-echo";
 import { ZproClient } from "./client";
 import { readZproCrmConfig, type ZproCrmConfig } from "./crm";
 import { sysCtx } from "./ctx";
+import {
+  announceZproFailedTurn,
+  readZproDirectFence,
+  recordZproConversationError,
+} from "./failure";
 import { makeZproGuardrailRunner } from "./guardrails";
 import { deactivateAgent } from "./handoff";
 import {
@@ -180,6 +186,13 @@ export interface RunZproTurnParams {
   // already emitted (eager extraction runs before dispatch — see zpro.controller.ts). Falls back
   // to a fresh id when absent, same as before this param existed.
   turnId?: string;
+  // The mirrored ZproConversation/ZproMessage row ids for THIS delivery — mirrorZproMessage's own
+  // return value, already resolved at the call site (zpro.controller.ts). Used ONLY for the two
+  // failure-visibility writes on a no-agent/turn-exception outcome (the flowlog line, the lastError
+  // badge, the operator note); the turn itself resolves its own conversation id independently via
+  // loadZproAgentTools. null degrades to silence on those two writes, never a throw.
+  conversationDbId?: bigint | null;
+  triggerMessageDbId?: bigint | null;
 }
 
 export type RunZproTurnOutcome =
@@ -1386,6 +1399,14 @@ export async function runZproAgentTurn(
 ): Promise<RunZproTurnOutcome> {
   const { tenantId, zproInstanceId, deliveryRowId, event: ev } = params;
   const base = params.base ?? basePrisma;
+  const turnId = params.turnId ?? crypto.randomUUID();
+  // For the two failure-visibility writes below only — null when the caller had no mirrored
+  // conversation/message to give (mirrorZproMessage failed, or this call has no webhook payload
+  // behind it at all). Both writes below degrade to silence rather than a throw when null: a
+  // delivery this can't be tied to a conversation still gets marked FAILED, it just can't also
+  // carry an operator-visible line about WHICH conversation.
+  const conversationDbId = params.conversationDbId ?? null;
+  const triggerMessageDbId = params.triggerMessageDbId ?? null;
 
   // CAS claim: PENDING → PROCESSING. A re-entry that finds a non-PENDING row (already claimed by
   // a concurrent dispatch, or already terminal) skips — mirrors processChatwootDelivery's tx1.
@@ -1444,6 +1465,30 @@ export async function runZproAgentTurn(
       String(zproInstanceId),
     );
     await markDelivery("FAILED");
+    // A customer message with nobody to answer it — Z-PRO's own version of the flowlog "route"
+    // line issue #318 added for Chatwoot's identical case (emitUnroutedMessage,
+    // src/modules/flowlog/unrouted.ts). Not that helper directly: it requires a mirrored `Inbox`
+    // row, which Z-PRO has none of. `warn`, not `error`, for the same reason as there — an
+    // unbound instance is a misconfiguration to repair, not a crash.
+    if (conversationDbId !== null) {
+      emitFlowEvent(
+        {
+          tenantId,
+          turnId,
+          source: "inbox",
+          conversationId: conversationDbId,
+          agentId: null,
+          threadId,
+          base,
+        },
+        {
+          stage: "route",
+          level: "warn",
+          status: "skipped",
+          detail: { outcome: "no_agent" },
+        },
+      );
+    }
     return "no-agent";
   }
 
@@ -1464,7 +1509,7 @@ export async function runZproAgentTurn(
       zproInstanceId,
       event: ev,
       text,
-      turnId: params.turnId ?? crypto.randomUUID(),
+      turnId,
       userSentAudio: ev.messageType === "audioMessage",
       base,
     });
@@ -1492,6 +1537,54 @@ export async function runZproAgentTurn(
       "zpro:runtime:turn-error",
     );
     await markDelivery("FAILED");
+    // Surface the failure to the operator, mirroring chatwoot/webhook.ts's own catch block
+    // exactly: a Logs-page line (this stage's own withFlowStage inside runLoadedZproTurn already
+    // covers a `generate`-stage throw specifically, but not one from tool loading, guardrails or
+    // anything else earlier in the turn — this is the catch-all), the lastError badge, and — only
+    // when nothing else is coming, i.e. no newer client message arrived while this one failed — a
+    // private note posted INSIDE the ticket (issue #71/#86 upstream parity).
+    if (conversationDbId !== null) {
+      emitFlowEvent(
+        {
+          tenantId,
+          turnId,
+          source: "inbox",
+          conversationId: conversationDbId,
+          agentId: loaded.agentId,
+          threadId,
+          base,
+        },
+        {
+          stage: "generate",
+          level: "error",
+          status: "error",
+          errorMessage: sanitizeErrorMessage(err),
+        },
+      );
+      void recordZproConversationError({
+        tenantId,
+        conversationDbId,
+        error: err,
+        base,
+      });
+      void announceZproFailedTurn({
+        tenantId,
+        zproInstanceId,
+        conversationDbId,
+        ticketId: Number(ev.threadId),
+        assess: async () => ({
+          path: "direct",
+          fence: await readZproDirectFence({
+            tenantId,
+            conversationDbId,
+            triggerMessageDbId,
+            base,
+          }),
+        }),
+        error: err,
+        base,
+      });
+    }
     return "error";
   } finally {
     clearTurnInFlight(threadId);

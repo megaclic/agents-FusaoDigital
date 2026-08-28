@@ -18,6 +18,48 @@ function num(v: unknown): number | null {
   return null;
 }
 
+// What kind of message this is, in the ONE vocabulary the rest of the code compares against.
+//
+// It takes both spellings because Chatwoot has two serializers and they disagree. MEASURED on the
+// fork, one message, both of them: `Message#webhook_data[:message_type]` is the string `"incoming"`
+// and `Message#push_event_data[:message_type]` is the integer `0`. The webhook carries the first and
+// every REST read carries the second, so a body's provenance decides its spelling.
+//
+// This used to be `str()` here and a private copy in ./messages.ts, which is the shape of defect
+// that keeps costing this repo: one question, two places, two tolerances. The copy in messages.ts
+// took both and this one took only the string, so an event rebuilt from a REST read normalized to
+// `messageType: null` and `isNewIncomingMessage` answered false — a customer's message classified as
+// not-incoming, with no throw and no line. Nothing rebuilt events from REST until issue #295, which
+// is why the divergence had never fired.
+//
+// Unknown input collapses to "other" rather than passing through, and that is not a widening: the
+// only two readers of this field ask `=== "incoming"` and `=== "outgoing"`, so a value neither of
+// them matches already meant "neither".
+export function messageTypeOf(
+  v: unknown,
+): "incoming" | "outgoing" | "activity" | "template" | "other" {
+  // A string is coerced only when it IS the integer spelling, digits and nothing else. `Number("")`
+  // and `Number("  ")` are both 0, so a bare coercion classifies an empty or blank `message_type` as
+  // `incoming` — and an incoming message is the one class that drives an agent turn. The old
+  // string-only reader rejected those by not matching "incoming"; widening the domain is what would
+  // have woken that branch (a defect this repo has paid for before), so the widening is closed here.
+  const n =
+    typeof v === "number"
+      ? v
+      : typeof v === "string" && /^[0-9]+$/.test(v)
+        ? Number(v)
+        : NaN;
+  if (n === 0) return "incoming";
+  if (n === 1) return "outgoing";
+  if (n === 2) return "activity";
+  if (n === 3) return "template";
+  if (v === "incoming") return "incoming";
+  if (v === "outgoing") return "outgoing";
+  if (v === "activity") return "activity";
+  if (v === "template") return "template";
+  return "other";
+}
+
 function str(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
@@ -155,7 +197,7 @@ export function normalizeChatwootEvent(
     normalized.message = {
       id: num(payload.id),
       content: str(payload.content),
-      messageType: str(payload.message_type),
+      messageType: messageTypeOf(payload.message_type),
       private: payload.private === true,
       sender: msgSender
         ? {
@@ -331,6 +373,53 @@ export function heldByAnotherParty(
     e.assigneeId != null &&
     e.assigneeId !== opts.ourAgentBotId
   );
+}
+
+// WHICH OF TWO ASSIGNEE READINGS THE GATE MUST BELIEVE, when a delivery arrives holding both.
+//
+// A delivery gates on a PAYLOAD, and every payload is a snapshot of an earlier instant: Chatwoot
+// serializes the conversation when the message fires and only then enqueues (state-order.ts, point
+// 1), and a delivery recovery rebuilds one from reads it made a moment before (#295). Beside it
+// sits the MIRROR row as it stands after this event was written — a different instant again.
+//
+// Neither reading is uniformly the newer one, so this does not pick by recency. It picks by which
+// way a wrong answer fails. A reading that says SOMEBODY ELSE HOLDS IT can only cost silence: the
+// event that releases the conversation is a conversation-level one, it applies when it lands, and
+// the next delivery passes. A reading that says NOBODY DOES costs an answer posted over a human who
+// had just taken over — and posted is the smaller half of it, because the runtime's ownership
+// re-check runs after the model call (../../graph/runtime.ts), so the turn has already run every
+// tool it chose by the time anything withholds the text.
+//
+// So: whichever witness says the conversation is held is the one believed, and the payload's
+// statement is preferred over the mirror only where neither says so.
+//
+// The asymmetry is not this function's invention — it is the mirror's rule read from the gate's
+// side. A message snapshot may never write the assignee at all (state-order.ts: `assigneeOrdered`
+// requires `fromConversationEvent`), so a mirror that reads human-owned under a payload that reads
+// bot-owned is the mirror doing its job, not lagging. MEASURED on the recovery, where the window is
+// widest: a human taking the conversation between the last mirror read and the gate got a full turn
+// run against them, tools included.
+//
+// `stated` is the degraded-payload question of issue #27 and stays separate from `assigneeType`:
+// a payload that said NOTHING is not a payload that said "unassigned", and `null` cannot tell the
+// two apart.
+export function effectiveAssignee(
+  payload: {
+    stated: boolean;
+    assigneeType: string | null;
+    assigneeId: number | null;
+  },
+  mirror: { assigneeType: string | null; assigneeId: number | null },
+  opts: { ourAgentBotId?: number | null } = {},
+): { assigneeType: string | null; assigneeId: number | null } {
+  const held = {
+    assigneeType: mirror.assigneeType,
+    assigneeId: mirror.assigneeId,
+  };
+  if (heldByAnotherParty(held, opts)) return held;
+  return payload.stated
+    ? { assigneeType: payload.assigneeType, assigneeId: payload.assigneeId }
+    : held;
 }
 
 export function shouldBotHandle(

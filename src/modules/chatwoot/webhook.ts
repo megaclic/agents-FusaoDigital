@@ -127,6 +127,7 @@ import { mirrorChatwootEvent } from "./mirror";
 import {
   type ControlCommand,
   controlCommand,
+  effectiveAssignee,
   firstAudioAttachment,
   firstLocationAttachment,
   firstVisualAttachment,
@@ -665,6 +666,30 @@ export interface ProcessChatwootParams {
   deliveryRowId: bigint;
   agentBotId: number | null;
   normalized: NormalizedChatwootEvent;
+  // Which state the opening CAS claims from. Omitted = "PENDING", a delivery arriving. "DEAD" is a
+  // recovery taking back a row the sweep gave up on (issue #295); see the CAS for why it is one
+  // statement and not two.
+  claimFrom?: "PENDING" | "DEAD";
+  // What the DIRECT turn did, told to nobody who does not ask. The return union is a contract with
+  // every caller (`"processed" | "skipped"`), and widening it would silently change what the live
+  // delivery reads; this is opt-in, so only the caller for whom the distinction exists pays for it.
+  //
+  // The distinction is the recovery's (#295). For a live delivery `"processed"` is the honest word:
+  // it is about the ROW, a failed turn is surfaced on the conversation and announced inside
+  // Chatwoot, and a withheld reply means the NEWER message's own delivery is carrying it. A recovery
+  // exists to ANSWER, and closing the loss on a turn that answered nobody is the lie the whole
+  // subsystem is built against — twice measured, once with the model throwing and once with a newer
+  // message landing between the recovery's own freshness read and `shouldPost`.
+  //
+  // Not called at all when debounce armed instead, which is the case the recovery must NOT read as
+  // "nobody answered": the reply is the flush's, minutes from now.
+  //
+  // TAGGED, not distinguished by which key is present: TypeScript gives the absent sibling an
+  // implicit `?: undefined` on a union of object literals, so `r.error !== undefined` narrows
+  // nothing and the outcome side stops type-checking. The tag is the discriminant.
+  onDirectTurn?: (
+    r: { kind: "outcome"; outcome: string } | { kind: "error"; error: unknown },
+  ) => void;
   base?: PrismaClient;
   // Injectable runtime deps (tests): fake model/client/checkpointer + the contact-auth fetch.
   deps?: RuntimeDeps;
@@ -2840,7 +2865,7 @@ export async function processChatwootDelivery(
 ): Promise<"processed" | "skipped"> {
   const base = params.base ?? basePrisma;
 
-  // tx1: CAS PENDING→PROCESSING. A re-entry (duplicate POST that found a stranded PENDING) sees
+  // tx1: CAS <claimFrom>→PROCESSING. A re-entry (duplicate POST that found a stranded PENDING) sees
   // 0 rows and skips.
   //
   // The claim is STAMPED, because the winner of this CAS is not always the first attempt: a
@@ -2849,10 +2874,35 @@ export async function processChatwootDelivery(
   // measures a PROCESSING row by; without it the sweep dates this live attempt to the original
   // receipt, calls it abandoned the instant it starts, and reports a lost message while the process
   // answering it is still running (issue #228).
+  //
+  // WHICH state it claims FROM is the caller's, and there are exactly two answers because there are
+  // exactly two ways a delivery reaches this function.
+  //
+  //   "PENDING"  a delivery arriving, or a redelivery of one that never started. The row was just
+  //              inserted, or was left where an insert put it.
+  //   "DEAD"     a recovery of a delivery a process death stranded and the sweep gave up on (issue
+  //              #295). `DEAD` is the sweep's verdict, reached by INFERENCE — nothing has moved this
+  //              row — and a recovery that runs the turn is direct evidence that outranks it, the
+  //              same way a turn already corrects a `DEAD` row it ran over (retireCoveredDeliveries).
+  //
+  // ONE CAS with two predicates, rather than a reclaim step followed by the ordinary claim. The
+  // difference is a window: reclaiming first would leave the row PROCESSING with nothing holding it
+  // if the process died between the two statements, which is the exact state this whole subsystem
+  // exists to make impossible to reach silently. Here the winner of the single statement owns the
+  // row, and a second recovery for the same row matches nothing and skips.
+  //
+  // `attempts` is incremented, and this is its first reader: it was carried unused since the ledger
+  // was introduced, and the caller bounds a retry on it. A live delivery does not touch it — its
+  // claim is not an attempt at recovery, it is the first attempt at all.
+  const claimFrom = params.claimFrom ?? "PENDING";
   const claimed = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
     db.chatwootWebhookDelivery.updateMany({
-      where: { id: params.deliveryRowId, status: "PENDING" },
-      data: { status: "PROCESSING", claimedAt: new Date() },
+      where: { id: params.deliveryRowId, status: claimFrom },
+      data: {
+        status: "PROCESSING",
+        claimedAt: new Date(),
+        ...(claimFrom === "DEAD" ? { attempts: { increment: 1 } } : {}),
+      },
     }),
   );
   if (claimed.count === 0) return "skipped";
@@ -3047,17 +3097,50 @@ export async function processChatwootDelivery(
   // which of the two events closed it. Re-deriving it at the second question is how the two answers
   // drift apart, and the second is the one an operator reads afterwards.
   //
-  // NOTE: only the assignee is lifted, and the literal below stays a literal on purpose: the
+  // NOTE: only the assignee is lifted, and the literals below stay literals on purpose: the
   // per-call-site sweep for issue #210 reads the argument as written, so a call handed a named
   // object no longer shows it the `assigneeId` that makes the gate strict.
-  const effectiveAssigneeType = assigneeKnown
-    ? (n.assigneeType ?? null)
-    : mirror.assigneeType;
+  //
+  // WHICHEVER WITNESS SAYS THE CONVERSATION IS HELD, and the rule for that is `effectiveAssignee`
+  // in ../chatwoot/normalize.ts, where the reasoning and its decision table live. The gate used to
+  // prefer the payload wherever it spoke, and the payload always speaks: a rebuilt one states the
+  // trio it read a moment earlier (#295), and Chatwoot's own is frozen at enqueue. A message may
+  // never write the assignee (../chatwoot/state-order.ts), so a human taking the conversation left
+  // the mirror correctly human-owned and the gate answering anyway. MEASURED on the recovery.
+  const effective = effectiveAssignee(
+    {
+      stated: assigneeKnown,
+      assigneeType: n.assigneeType ?? null,
+      assigneeId: n.assigneeId ?? null,
+    },
+    { assigneeType: mirror.assigneeType, assigneeId: mirror.assigneeId },
+    { ourAgentBotId: params.agentBotId },
+  );
+  const effectiveAssigneeType = effective.assigneeType;
+  const effectiveAssigneeId = effective.assigneeId;
+  // THE STATUS THE MIRROR SETTLED ON, not the one the payload proposed. `mirror` is the row AFTER
+  // this event was written, so it already holds whichever of the two won: a new incoming message
+  // that reopened a resolved conversation reads `pending` here exactly as Chatwoot does, and a
+  // status the ordering refused reads the one that outranked it.
+  //
+  // The payload is only a proposal, and every payload here is a snapshot of an earlier instant:
+  // Chatwoot freezes its own at enqueue, and a delivery recovery rebuilds one from reads made a
+  // moment before (#295). MEASURED there — an operator resolving the conversation between the
+  // rebuild and this line, the mirror correctly refusing the reopen, and the gate answering anyway
+  // because it read the proposal instead of the outcome.
+  //
+  // NOT `mirror.applied`: that says the event won the ordering OVERALL, and the status is decided on
+  // an axis of its own — a payload can be applied and still have its status refused, which is the
+  // case measured above.
+  //
+  // The same shape as the assignee beside it, which already prefers what the mirror holds whenever
+  // the payload is not the better witness.
+  const effectiveStatus = mirror.status ?? n.status;
   const act = shouldBotHandle(
     {
       assigneeType: effectiveAssigneeType,
-      status: n.status,
-      assigneeId: assigneeKnown ? (n.assigneeId ?? null) : mirror.assigneeId,
+      status: effectiveStatus,
+      assigneeId: effectiveAssigneeId,
     },
     { ourAgentBotId: params.agentBotId },
   );
@@ -3076,7 +3159,7 @@ export async function processChatwootDelivery(
     heldByAnotherParty(
       {
         assigneeType: effectiveAssigneeType,
-        assigneeId: assigneeKnown ? (n.assigneeId ?? null) : mirror.assigneeId,
+        assigneeId: effectiveAssigneeId,
       },
       { ourAgentBotId: params.agentBotId },
     );
@@ -3532,6 +3615,18 @@ export async function processChatwootDelivery(
       // inboxes with no Agent configured.
       if (!armed) {
         try {
+          // REPORTED FROM THE TURN'S OWN SETTLEMENT, never from the enclosing catch, and the two
+          // are not interchangeable. This `try` also wraps the bookkeeping that follows — settling
+          // the ledger, the unrouted line, clearing a surfaced error — and a caller reading
+          // `{ kind: "error" }` cannot tell "the turn failed" from "the turn ANSWERED and a write
+          // after it failed". The recovery (#295) acts on that difference: an error there puts the
+          // row back to DEAD and the scheduler runs the whole turn again, so the customer is
+          // answered twice and every side-effecting tool the turn called runs a second time.
+          //
+          // Today none of those three can throw — each swallows its own failure, and the flow-log
+          // write is fire-and-forget. That is the point: the contract must not rest on a property of
+          // three unrelated call sites that any of them could drop. Bound to the turn here, it
+          // cannot.
           const outcome = await runAgentTurn({
             tenantId: params.tenantId,
             instanceId: params.instanceId,
@@ -3540,7 +3635,16 @@ export async function processChatwootDelivery(
             base,
             deps: params.deps,
             authContext: gate.authContext,
-          });
+          }).then(
+            (o) => {
+              params.onDirectTurn?.({ kind: "outcome", outcome: o });
+              return o;
+            },
+            (err: unknown) => {
+              params.onDirectTurn?.({ kind: "error", error: err });
+              throw err;
+            },
+          );
           logger.info(
             "chatwoot agent turn: conv=%s event=%s outcome=%s mirror=%s",
             convLabel,
@@ -3707,9 +3811,16 @@ export async function processChatwootDelivery(
       n.event,
     );
   } else {
+    // THE SAME TWO READINGS THE GATE DECIDED ON, and that is the whole rule of this file: a line
+    // that explains a decision has to name the values the decision was made from. `describeClosedGate`
+    // says as much where it lives — the status rides along instead of being re-read, because a second
+    // query would answer about a different moment — and a payload's own proposal is a different
+    // moment just as surely. Reported from `n.status`, a conversation the mirror had already resolved
+    // was recorded as `ownership_lost` at `pending`, sending an investigation after a missing
+    // assignee when the answer was the status all along.
     const closed = describeClosedGate({
       assigneeType: effectiveAssigneeType,
-      status: n.status,
+      status: effectiveStatus,
     });
     logger.info(
       "chatwoot: bot silent by gate (conv=%s event=%s newIncoming=%s reason=%s status=%s)",
@@ -3717,7 +3828,7 @@ export async function processChatwootDelivery(
       n.event,
       isNewIncoming,
       closed.outcome,
-      n.status ?? "unknown",
+      effectiveStatus ?? "unknown",
     );
     // NOTE: The operator's own trail, and it is deliberately narrower than this branch: ONE line
     // per customer message the bot did not answer, never one per webhook event. This gate is the
@@ -3813,9 +3924,10 @@ export async function processChatwootDelivery(
 
   // tx2: mark processed. NOTE: a crash between tx1 and tx2 still strands the row in PROCESSING —
   // nothing here can close that window, because the process is gone. What closes it is the
-  // stranded-delivery sweep (./delivery-sweep.ts): it does not replay the event, it REPORTS the row,
-  // so the payload never had to be stored. Answering the customer is issue #295, and the reason it
-  // is not done from a sweep is written down there and at the head of that file.
+  // stranded-delivery sweep (./delivery-sweep.ts): it does not replay the event, it REPORTS the row
+  // and arms a recovery, so the payload never had to be stored. The recovery rebuilds a body from
+  // the mirror plus one REST read and comes back through THIS function with `claimFrom: "DEAD"`
+  // (issue #295, ./recover-delivery.ts).
   //
   // NOTE: By ID and with no CAS, which matters for one race and is the right side of it. A turn that
   // outlives the sweep's staleness threshold (nothing bounds a model call or a tool here) has its

@@ -69,6 +69,7 @@ enum SchedulerJobKind {
   MEMORY_COMPACT
   INGEST_MESSAGE
   DELIVERY_SWEEP
+  DELIVERY_RECOVERY
 }
 
 enum SchedulerJobStatus {
