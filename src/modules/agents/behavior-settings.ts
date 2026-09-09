@@ -13,10 +13,14 @@ import {
 } from "@/modules/flowlog/settings";
 import { readFollowUpConfig } from "@/modules/followups/settings";
 import { readGuardrailsConfig } from "@/modules/guardrails/settings";
-import { readHandoffConfig } from "@/modules/handoff/settings";
+import {
+  readHandoffConfig,
+  readTakeoverConfig,
+} from "@/modules/handoff/settings";
 import { readSendImageConfig } from "@/modules/images/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { readMonitoringConfig } from "@/modules/observe/settings";
 import { readServiceWindowConfig } from "@/modules/service-window/service";
 import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";
@@ -54,6 +58,9 @@ export interface BehaviorSettings {
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
   handoff: ReturnType<typeof readHandoffConfig>;
+  // NOTE: The second block whose default is ON (see modules/handoff/settings for why), and it is kept
+  // apart from `handoff` above because the Tools tab REPLACES that one wholesale.
+  takeover: ReturnType<typeof readTakeoverConfig>;
   sendImage: ReturnType<typeof readSendImageConfig>;
   limits: ReturnType<typeof readLimitsConfig>;
   availability: ReturnType<typeof readAvailabilityConfig>;
@@ -82,6 +89,7 @@ export interface BehaviorSettings {
   kanban: ReturnType<typeof readKanbanConfig>;
   toolGuidance: ReturnType<typeof readToolGuidance>;
   toolPreconditions: ReturnType<typeof readToolPreconditions>;
+  monitoring: ReturnType<typeof readMonitoringConfig>;
 }
 
 // The keys this surface owns inside the settings bag. Any other key (future/unknown) is preserved
@@ -96,6 +104,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "grounding",
   "followUp",
   "handoff",
+  "takeover",
   "sendImage",
   "limits",
   "availability",
@@ -110,6 +119,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "kanban",
   "toolGuidance",
   "toolPreconditions",
+  "monitoring",
 ] as const;
 export type BehaviorSettingsKey = (typeof BEHAVIOR_SETTINGS_KEYS)[number];
 
@@ -134,6 +144,7 @@ export function readBehaviorSettings(
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
     handoff: readHandoffConfig(settings),
+    takeover: readTakeoverConfig(settings),
     sendImage: readSendImageConfig(settings),
     limits: readLimitsConfig(settings),
     availability: readAvailabilityConfig(settings),
@@ -148,6 +159,7 @@ export function readBehaviorSettings(
     kanban: readKanbanConfig(settings),
     toolGuidance: readToolGuidance(settings),
     toolPreconditions: readToolPreconditions(settings),
+    monitoring: readMonitoringConfig(settings),
   };
 }
 
@@ -163,6 +175,7 @@ export interface BehaviorSettingsPatch {
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
+  takeover?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
   limits?: Record<string, unknown>;
   availability?: Record<string, unknown>;
@@ -177,6 +190,7 @@ export interface BehaviorSettingsPatch {
   kanban?: Record<string, unknown>;
   toolGuidance?: Record<string, unknown>;
   toolPreconditions?: Record<string, unknown>;
+  monitoring?: Record<string, unknown>;
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

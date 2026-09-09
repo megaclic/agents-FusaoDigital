@@ -1,5 +1,4 @@
 import { Elysia, t } from "elysia";
-import { getUserById, verifyPassword } from "@/api/features/auth/auth.service";
 import { createInvite } from "@/api/features/invitations/invitation.service";
 import { doc, errors } from "@/api/lib/openapi";
 import {
@@ -8,6 +7,7 @@ import {
   parseQueryInstant,
   parseQueryText,
 } from "@/api/lib/query-filters";
+import { confirmStepUp, STEP_UP_PASSWORD_DESCRIPTION } from "@/api/lib/step-up";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
 import { requireDbId } from "@/lib/db-id";
@@ -45,6 +45,15 @@ import { getTenant, listTenants, type TenantUpdate } from "./tenants.service";
 // throw site rather than an English sentence on a pt-BR caller's screen.
 // translate('errors.conversationNotFound', 'Conversation not found.')
 // translate('errors.reengageNoAgent', 'No agent is bound to the inbox of this conversation.')
+// translate('errors.returnNoResponder', 'No responder is bound to the inbox of this conversation.')
+// translate('errors.returnAgentOff', 'The responder of this inbox is switched off.')
+// translate('errors.returnAgentObserves', 'The responder of this inbox observes; it does not answer.')
+// translate('errors.returnAgentNoBot', 'The responder of this inbox has no bot on this Chatwoot; reconnect the instance.')
+// translate('errors.returnAgentNotAttached', 'The responder of this inbox is not attached in Chatwoot; reconnect the inbox.')
+// translate('errors.returnAgentNotRunnable', 'The responder of this inbox cannot run; check its model credential.')
+// translate('errors.returnAgentTestSilent', 'The responder of this inbox is in test mode and has not been activated on this conversation.')
+// translate('errors.returnConversationMoved', 'This conversation moved to another inbox while it was being returned; try again.')
+// translate('errors.returnResponderChanged', 'The responder of this inbox changed while the conversation was being returned; try again.')
 // translate('errors.tenantConfirmMismatch', 'The name confirmation does not match.')
 
 // NOTE: requireAuth guarantees a user, and tenancyPlugin derives tenantContext from it, so
@@ -151,12 +160,13 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     },
   )
   // Permanently delete a tenant and ALL its data (cascade). HARD-gated: SUPER_ADMIN, re-typed tenant
-  // name AND the acting user's password. Irreversible.
+  // name AND the step-up (`confirmStepUp`: a session's password; a Bearer key answers by itself).
+  // Irreversible.
   .delete(
     "/tenants/:id",
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const b = body as { confirmName: string; password: string };
+      const b = body as { confirmName: string; password?: string };
       const id = requireDbId(params.id);
       const tenant = await getTenant(ctx, id);
       if (b.confirmName.trim() !== tenant.name) {
@@ -166,13 +176,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
           "errors.tenantConfirmMismatch",
         );
       }
-      const user = ctx.userId ? await getUserById(ctx.userId) : null;
-      if (
-        !user?.passwordHash ||
-        !(await verifyPassword(b.password, user.passwordHash))
-      ) {
-        throw new AppError("Incorrect password", 403, "errors.invalidPassword");
-      }
+      await confirmStepUp(ctx, b.password);
       await deleteTenant(ctx, id);
       return { instance: instanceIdentity, success: true };
     },
@@ -187,15 +191,14 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         confirmName: t.String({
           description: "The tenant name, re-typed to confirm.",
         }),
-        password: t.String({
-          minLength: 1,
-          description: "The acting user's password (step-up confirmation).",
-        }),
+        password: t.Optional(
+          t.String({ minLength: 1, description: STEP_UP_PASSWORD_DESCRIPTION }),
+        ),
       }),
       detail: {
         ...doc(
           "Delete tenant",
-          "Permanently delete a tenant and all its data (cascade). SUPER_ADMIN only; requires re-typing the tenant name and the current password.",
+          "Permanently delete a tenant and all its data (cascade). SUPER_ADMIN only; requires re-typing the tenant name and, for a session, the current password (a Bearer API key needs no password).",
         ),
         tags: ["Tenants"],
       },
@@ -216,11 +219,10 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         | { email: string; role: string; acceptUrl: string; expiresAt: Date }
         | undefined;
       if (body.adminEmail) {
-        const created = await createInvite({
+        const created = await createInvite(ctx, {
           tenantId: BigInt(tenant.id),
           email: body.adminEmail,
           role: "TENANT_ADMIN",
-          invitedById: ctx.userId,
         });
         invite = {
           email: created.email,
@@ -439,7 +441,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
     async ({ tenantContext, params, set }) => {
       const blob = await getConversationAvatar(
         ctxOrThrow(tenantContext),
-        BigInt(params.id),
+        requireDbId(params.id),
       );
       if (!blob) {
         set.status = 404;
@@ -575,7 +577,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Conversations"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 409),
     },
   )
   .post(
@@ -757,11 +759,20 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
       const since = parseQueryInstant(query.since, "since");
       const costs = await getLangfuseCosts(ctxOrThrow(tenantContext), {
         since,
+        source: query.source,
       });
       return { instance: instanceIdentity, costs };
     },
     {
       query: t.Object({
+        // Usage segment: "inbox" (real) | "playground". Omitted → both of our environments, and
+        // never the project's other traffic (issue #427).
+        source: t.Optional(
+          t.Union([t.Literal("inbox"), t.Literal("playground")], {
+            description:
+              "Usage segment to scope the cost: inbox (real traffic) or playground; omit for both.",
+          }),
+        ),
         since: t.Optional(
           t.String({
             description:
@@ -777,6 +788,6 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ),
         tags: ["Dashboard"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   );

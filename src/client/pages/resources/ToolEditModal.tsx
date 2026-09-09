@@ -1,11 +1,22 @@
+import { json } from "@codemirror/lang-json";
+import type { EditorView } from "@codemirror/view";
 import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
+import * as PopoverPrimitive from "@radix-ui/react-popover";
 import { AlertTriangle, Braces, Plus, Trash2 } from "lucide-react";
-import { type ReactNode, useId, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
   CredentialPicker,
   FormField,
+  HelpPopover,
   HighlightedTemplateField,
   Input,
   Modal,
@@ -15,25 +26,68 @@ import {
   Skeleton,
   Switch,
   Textarea,
+  useModalController,
   useOnModalOpen,
   useToast,
 } from "@/client/components";
+import { CodeMirrorField } from "@/client/components/CodeMirrorField";
 import { Tooltip } from "@/client/components/Tooltip";
 import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
+import { firstJsonProblem, reindentJson } from "@/client/lib/sampleJson";
+import { dialableBaseUrl } from "@/client/lib/secretTypes";
+import { templateExtensions } from "@/client/lib/templateEditor";
+import {
+  recallToolSample,
+  rememberToolSample,
+  sampleIsNothing,
+  sampleTicket,
+  type ToolSample,
+  vaultGeneration,
+} from "@/client/lib/toolSample";
 import { cn } from "@/client/lib/utils";
 import { isValidUrlTemplate } from "@/client/lib/validation";
 import { normalizeToolName } from "@/graph/tools/toolName";
 import { readProviderSlug } from "@/modules/appointments/provider";
+import { sampleLeaves } from "@/modules/tool-definitions/appointment";
 import {
   isUsablePath,
   type SampleLeaf,
-  sampleLeaves,
-} from "@/modules/tool-definitions/appointment";
+  type SampleList,
+} from "@/modules/tool-definitions/json-path";
 import {
   CONTEXT_VAR_NAMES,
   normalizeToolShapes,
 } from "@/modules/tool-definitions/normalize";
+import {
+  clipToModelLimit,
+  enclosingBlock,
+  MAX_TEMPLATE_CHARS,
+  type ProjectedResponse,
+  projectToolResponse,
+  readResponseTemplateResult,
+  readsBodyVerbatim,
+  templateItemLeaves,
+  templateLeaves,
+  templateListAt,
+  templateLists,
+  templateNeedsBody,
+  unmatchedTemplateDelimiter,
+  unusableTemplateTokens,
+} from "@/modules/tool-definitions/response-template";
+import {
+  type AiFieldRow,
+  AiFieldsPanel,
+  aiFieldsFromSchema,
+  rid,
+  schemaFromAiFields,
+  testFieldsFrom,
+} from "./AiFieldsPanel";
+import { ToolTestModal, type ToolTestTarget } from "./ToolTestModal";
+
+// Kept on this module's surface: the test dialog's boxes are built through it, and
+// tests/client/pages/ToolEditModal.test.tsx reads it from here.
+export { testFieldsFrom };
 
 type ToolsData = Awaited<ReturnType<typeof api.api.v1.tools.get>>["data"];
 export type Tool = NonNullable<ToolsData>["tools"][number];
@@ -45,46 +99,13 @@ type VaultEntry = NonNullable<
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 
-// The types the AI can fill. Scalars serialize cleanly anywhere (query/header/path); enum/array/object
-// are body-only (array/object flatten to a string outside JSON). Mirrors the runtime in graph/tools/http.ts.
-const SCALAR_FIELD_TYPES = ["string", "integer", "number", "boolean"] as const;
-const AI_FIELD_TYPES = [
-  "string",
-  "integer",
-  "number",
-  "boolean",
-  "enum",
-  "array",
-  "object",
-] as const;
-type ScalarFieldType = (typeof SCALAR_FIELD_TYPES)[number];
-type AiFieldType = (typeof AI_FIELD_TYPES)[number];
-
 function parseJsonOr(value: string, fallback: Record<string, unknown>) {
   const trimmed = value.trim();
   if (!trimmed) return fallback;
   return JSON.parse(trimmed) as Record<string, unknown>;
 }
 
-// One declared input the AI fills in (the LLM-facing contract). The placement (URL/query/headers/body)
-// references it as {{name}}; the metadata lives here and is edited in the "AI fields" panel.
-type AiFieldRow = {
-  _id: string;
-  name: string;
-  type: AiFieldType;
-  required: boolean;
-  description: string;
-  enumValues: string[];
-  itemType: ScalarFieldType;
-};
 type KvRow = { _id: string; key: string; value: string };
-
-// Stable row keys for the editable lists (React key + no remount glitch on remove). Not serialized.
-let rowSeq = 0;
-function rid(): string {
-  rowSeq += 1;
-  return `r${rowSeq}`;
-}
 
 // A value that is EXACTLY one {{token}} (no surrounding text). When the token names a declared AI field,
 // the runtime keeps the AI value's original type; the editor uses it to badge the row as AI-filled.
@@ -103,6 +124,160 @@ const TOOL_TOKEN_SOURCE = "\\{\\{\\s*([a-zA-Z0-9_]+)\\s*\\}\\}";
 // valid var, not a typo) when it names a declared AI field, one of these, or {{secret}} (only when
 // a credential is selected).
 const NATIVE_VAR_NAMES = new Set<string>(CONTEXT_VAR_NAMES);
+
+// The conversation placeholders a definition actually writes, read off the NORMALIZED shapes rather
+// than off what the operator typed, because those are two different texts. An OpenAPI-style
+// `{contact_id}` is a supported way to write a placeholder — the whole point of
+// `normalizeToolShapes` — and the runtime rewrites it to `{{contact_id}}` before interpolating, at
+// write time AND at build time. A scan that knew only the double-brace form found nothing to ask
+// for, and the test run then refused for a context value the dialog never offered a box to fill.
+// Running the runtime's own normalizer here is what makes the two unable to answer differently, and
+// it also reaches the placeholders inside fixed field values, which the hand-listed set of form
+// strings it replaced had no entry for.
+//
+// Exported and pure so that agreement is a test rather than a claim.
+// What the model would be handed for the sample on screen. The point of the whole response section:
+// a template is a promise about the model's input, and this is the only place an operator can read
+// that input before a customer does — which is exactly why it has to follow the runtime's rule and
+// not a friendlier one.
+//
+// `projectResponse` runs on 2xx ALONE, and deliberately: a non-2xx body is the error message the
+// model needs to read literally, and a template aimed at success fields would render a block of
+// absent markers over it. So a sample captured from a 404 the tool declares a result is previewed
+// RAW, clipped the way the runtime clips. Rendering the template there would have contradicted the
+// `modelText` the very same test run reported, one dialog away.
+//
+// `status: null` means the sample was pasted by hand, and reads as 2xx: nobody pastes an error body
+// to design a success template against.
+//
+// Exported and pure so the agreement is a test rather than a claim.
+// Whether the server would refuse this template, in the server's own words, or null when it would
+// not. Exported and pure so that "the console's gate and the service's refinement are one reader"
+// is a test rather than a claim: they are the same function, and the test says so by putting each
+// shape through both.
+export function templateSaveProblem(template: string): string | null {
+  const t = template.trim();
+  if (!t) return null;
+  const r = readResponseTemplateResult({ mode: "template", template: t });
+  return r.declared && !r.ok ? r.problem : null;
+}
+
+export function templatePreviewFor(args: {
+  template: string;
+  sample: string;
+  status: number | null;
+}): {
+  // The runtime's OWN reason, carried rather than collapsed. A boolean here made one sentence cover
+  // two causes: a 2xx body that is not JSON was explained as "outside 2xx", with a hand-pasted
+  // sample's absent status interpolated as `null`.
+  skipped: ProjectedResponse["skipped"];
+  text: string;
+  missing: string[];
+} | null {
+  const template = args.template.trim();
+  // VERBATIM, not trimmed: on the raw path the runtime clips the body exactly as it arrived, so
+  // dropping leading whitespace here slides the 4000-character window and shows tail content the
+  // model would never have reached. Trimmed only where the question is "is there a sample at all".
+  const sample = args.sample;
+  if (!template) return null;
+  // A declaration the reader refuses has its own message under the box; previewing it as "the raw
+  // body" would answer a question about a template that cannot be saved.
+  const decl = readResponseTemplateResult({ mode: "template", template });
+  if (!decl.declared || !decl.ok) return null;
+  // An empty sample is only "nothing to preview" for a template that reads the body: with neither
+  // a token nor a block, the template IS the answer whatever came back, and the case that proves it
+  // is a tool answering 204 with no body, where the runtime hands the model the operator's own text
+  // and this box was blank.
+  if (!sample.trim() && templateNeedsBody(template)) return null;
+  // The runtime's decision, made by the runtime's own function. Everything this preview used to
+  // decide for itself drifted from it within a round: the 2xx gate, the token-less render, the
+  // clip. `status: null` is a hand-pasted sample and reads as 200 — nobody pastes an error body to
+  // design a success template against.
+  const p = projectToolResponse(
+    { mode: "template", template },
+    args.status ?? 200,
+    sample,
+  );
+  return p.text === null
+    ? {
+        skipped: p.skipped,
+        text: clipToModelLimit(sample).text,
+        missing: [],
+      }
+    : {
+        skipped: null,
+        text: clipToModelLimit(p.text).text,
+        missing: p.missing,
+      };
+}
+
+export function contextNamesReferencedBy(
+  payload: {
+    urlTemplate?: unknown;
+    query?: unknown;
+    headers?: unknown;
+    body?: unknown;
+    inputSchema?: unknown;
+  } | null,
+): string[] {
+  const { shapes } = normalizeToolShapes(
+    payload
+      ? {
+          urlTemplate: payload.urlTemplate as string | undefined,
+          query: payload.query,
+          headers: payload.headers,
+          body: payload.body,
+          inputSchema: payload.inputSchema,
+        }
+      : {},
+  );
+  const found = new Set<string>();
+  const scan = (node: unknown): void => {
+    if (typeof node !== "string") return;
+    for (const m of node.matchAll(new RegExp(TOOL_TOKEN_SOURCE, "g"))) {
+      const name = m[1] as string;
+      if (NATIVE_VAR_NAMES.has(name)) found.add(name);
+    }
+  };
+  // THE STRINGS THE RUNTIME INTERPOLATES, and only those. This was a generic deep walk, which is
+  // one line shorter and asks a different question: it found `{{contact_name}}` inside a field's
+  // DESCRIPTION (prose written for the model) and inside a NESTED header or query value, neither of
+  // which `buildHttpTool` ever interpolates — `headers[k] = interpolate(String(v), …)` turns a
+  // nested object into `[object Object]` on the way out, placeholder and all. The cost of the extra
+  // names lands on the operator: a box for a value that will not be used whatever they type in it.
+  // The list below pairs site for site with `graph/tools/http.ts`, and the test proves the pairing
+  // against the runtime rather than against this comment.
+  scan(shapes.urlTemplate);
+  for (const bag of [shapes.headers, shapes.query]) {
+    if (!bag || typeof bag !== "object" || Array.isArray(bag)) continue;
+    // Top level only, and `String(v)` because that is what the runtime does with a non-string.
+    for (const v of Object.values(bag)) scan(typeof v === "string" ? v : null);
+  }
+  const body = shapes.body;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const bag = body as Record<string, unknown>;
+    if (bag.mode === "raw") scan(bag.raw);
+    if (bag.mode === "kv" && Array.isArray(bag.rows)) {
+      for (const row of bag.rows) {
+        if (row && typeof row === "object") {
+          scan((row as Record<string, unknown>).value);
+        }
+      }
+    }
+  }
+  // A legacy FIXED field's value is a template the runtime resolves (`fixedValues`); every other
+  // key of a field declaration — type, description, enum — is metadata it never reads as one.
+  const schema = shapes.inputSchema;
+  if (schema && typeof schema === "object" && !Array.isArray(schema)) {
+    for (const field of Object.values(schema as Record<string, unknown>)) {
+      if (field && typeof field === "object" && !Array.isArray(field)) {
+        const f = field as Record<string, unknown>;
+        if (f.source === "fixed") scan(f.value);
+      }
+    }
+  }
+  return [...found];
+}
 function isKnownToolToken(
   name: string,
   params: string[],
@@ -113,17 +288,6 @@ function isKnownToolToken(
     NATIVE_VAR_NAMES.has(name) ||
     (includeSecret && name === "secret")
   );
-}
-
-function coerceFieldType(t: unknown): AiFieldType {
-  return (AI_FIELD_TYPES as readonly string[]).includes(t as string)
-    ? (t as AiFieldType)
-    : "string";
-}
-function coerceScalarType(t: unknown): ScalarFieldType {
-  return (SCALAR_FIELD_TYPES as readonly string[]).includes(t as string)
-    ? (t as ScalarFieldType)
-    : "string";
 }
 
 function objToKv(obj: Record<string, unknown>): KvRow[] {
@@ -138,48 +302,6 @@ function kvToObj(rows: KvRow[]): Record<string, unknown> {
   for (const r of rows) {
     const key = r.key.trim();
     if (key) out[key] = r.value;
-  }
-  return out;
-}
-
-// inputSchema entries that are AI-filled (source !== "fixed") become AiFieldRows; legacy fixed entries
-// (source: "fixed" + value) become literal placement rows instead.
-function aiFieldsFromSchema(schema: Record<string, unknown>): AiFieldRow[] {
-  const out: AiFieldRow[] = [];
-  for (const [name, raw] of Object.entries(schema ?? {})) {
-    const s = (raw ?? {}) as Record<string, unknown>;
-    if (s.source === "fixed") continue;
-    out.push({
-      _id: rid(),
-      name,
-      type: coerceFieldType(s.type),
-      required: s.required === true,
-      description: typeof s.description === "string" ? s.description : "",
-      enumValues: Array.isArray(s.enumValues)
-        ? s.enumValues.filter((v): v is string => typeof v === "string")
-        : [],
-      itemType: coerceScalarType(s.itemType),
-    });
-  }
-  return out;
-}
-
-// The model-facing contract (inputSchema), derived from the AI fields panel only. Fixed values never
-// live here — they are literal rows in query/headers/body.
-function schemaFromAiFields(rows: AiFieldRow[]): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const r of rows) {
-    const name = r.name.trim();
-    if (!name) continue;
-    const spec: Record<string, unknown> = { type: r.type };
-    if (r.required) spec.required = true;
-    if (r.description.trim()) spec.description = r.description.trim();
-    if (r.type === "enum") {
-      const values = r.enumValues.map((v) => v.trim()).filter(Boolean);
-      if (values.length > 0) spec.enumValues = values;
-    }
-    if (r.type === "array") spec.itemType = r.itemType;
-    out[name] = spec;
   }
   return out;
 }
@@ -203,6 +325,16 @@ function emptyForm() {
     expectedStatuses: "",
     ackEnabled: false,
     ackMessage: "",
+    // The response template (issue #456), edited as the plain markdown the operator writes; the
+    // {mode, template} envelope is assembled on save. Empty means "hand the model the raw response",
+    // which is what every tool did before the feature.
+    outputTemplate: "",
+    // Whatever else `outputSchema` was carrying, kept verbatim so editing a tool cannot silently
+    // delete it. This column has been writable through MCP since it existed, unvalidated and read
+    // nowhere, so a row may hold a JSON Schema someone still reads back — and a form that renders
+    // nothing for it would send `{}` on the next save.
+    outputSchemaOther: null as Record<string, unknown> | null,
+    outputSchemaProblem: null as string | null,
     apptAction: "" as "" | "book" | "cancel",
     apptProvider: "",
     apptIdPath: "",
@@ -210,6 +342,13 @@ function emptyForm() {
     apptSummaryPath: "",
     apptOffsets: "",
     apptAskConfirm: false,
+    // THE SAMPLE IS PART OF THE FORM SINCE #566, where it used to be local state deliberately kept
+    // out of it. Nothing about it is submitted, and nothing about it is stored: it is remembered in
+    // this tab (`client/lib/toolSample`) but it is remembered BY THE SAVE, so pasting one is an
+    // unsaved change like any other and the discard dialog on close is correct. The alternative is
+    // telling the operator the sample survives a reopen and then dropping it when they close.
+    sample: "",
+    sampleStatus: null as number | null,
   };
 }
 
@@ -236,6 +375,170 @@ type ToolForm = ReturnType<typeof emptyForm>;
 //
 // `null` when the headers are not parseable JSON, which is a client-side check with no server
 // sentence behind it.
+// WHAT THE SAMPLE DESCRIBES, as the part of the definition that decides WHICH RESPONSE comes back.
+// A sample captured by "Send a test request" and then followed by an edit to the URL, the method,
+// the headers, the body, the query or the credential is a response to a call the tool no longer
+// makes: saved, it would pass the revision check (the save is what set that revision) and go on
+// offering paths that describe an endpoint nobody calls (round 12 of review).
+//
+// An EXCLUSION list, not an inclusion one, and the direction is the point: a field added later
+// counts as response-affecting until someone says otherwise, so the failure is a sample dropped too
+// eagerly rather than a stale one kept. What is excluded is what cannot change the bytes the API
+// sends back: the tool's names, how the reply is projected for the model, and what the runtime does
+// with it afterwards.
+const NOT_RESPONSE_AFFECTING = new Set([
+  "name",
+  "label",
+  "description",
+  "outputSchema",
+  "expectedStatuses",
+  "ackEnabled",
+  "ackMessage",
+  "appointment",
+]);
+
+export function requestShapeOf(payload: unknown): string {
+  if (payload === null || typeof payload !== "object") return "";
+  const kept: Record<string, unknown> = {};
+  for (const key of Object.keys(payload as Record<string, unknown>).sort())
+    if (!NOT_RESPONSE_AFFECTING.has(key))
+      kept[key] = (payload as Record<string, unknown>)[key];
+  return JSON.stringify(kept);
+}
+
+// AND THE CREDENTIAL IS PART OF THE REQUEST WITHOUT BEING PART OF THE PAYLOAD. `credentialRef` is a
+// name; what it resolves to is a row in the vault, and editing that row's base URL or its secret
+// changes the host a relative `urlTemplate` reaches and the authorization it carries while the
+// payload is byte for byte the same. So the marker carries which vault this tab had when the sample
+// was captured, and a save made after an edit to that vault finds a marker that no longer matches
+// (round 14 of review). NUL as the separator because no JSON `JSON.stringify` produces holds one.
+export function captureShapeOf(payload: unknown): string {
+  const shape = requestShapeOf(payload);
+  // ONLY FOR A TOOL THAT NAMES ONE. A definition with no credential cannot be changed by a vault
+  // edit, and prefixing it anyway made any credential saved anywhere in the console refuse a sample
+  // that nothing could have invalidated — round 6's over-rejection arriving through the marker
+  // (round 15 of review).
+  const ref = (payload as { credentialRef?: unknown } | null)?.credentialRef;
+  return typeof ref === "string" && ref !== ""
+    ? `${vaultGeneration()}\u0000${shape}`
+    : shape;
+}
+
+// WHICH DEFINITION THE SAMPLE ON SCREEN WAS CAPTURED AGAINST, decided in one place and returned,
+// because it is maintained at four sites and review round 13 found two of them wrong: a sample
+// restored from this tab's memory recorded NO definition (so a later edit to the URL was invisible
+// to the save's refusal, which is the very defect round 12 fixed, surviving a reopen), and Format
+// re-recorded the definition on screen NOW (so pretty-printing a sample after editing the URL erased
+// the mismatch).
+//
+// The rule is one sentence: the shape changes only when a NEW sample arrives. `against` is the form
+// the sample is going into, or null for an arrival that carries no capture with it.
+export function shapeOfArrival(args: {
+  text: string;
+  status: number | null;
+  against: ToolForm | null;
+  previous: string | null;
+}): string | null {
+  // The module's own rule, asked here rather than spelled out again: an empty body with a status is
+  // a sample, and it is one that describes a definition like any other.
+  if (sampleIsNothing(args.text, args.status)) return null;
+  if (args.against === null) return args.previous;
+  return captureShapeOf(payloadOf(args.against));
+}
+
+// THE ARRIVAL AN OPEN IS: the form as the server just answered it, carrying whatever this tab kept
+// for that tool. A function rather than the call spelled out at the two open sites, so what an open
+// records is a value a test can ask about instead of a shape a fence has to read off the source.
+export function shapeOfOpening(form: ToolForm): string | null {
+  return shapeOfArrival({
+    text: form.sample,
+    status: form.sampleStatus,
+    against: form,
+    previous: null,
+  });
+}
+
+// WHETHER THE SAMPLE ON SCREEN STILL DESCRIBES THE REQUEST BEING SAVED, which is the question the
+// revision cannot answer: the save is what sets the revision, so a response captured against one URL
+// and saved after the URL changed passes that check by construction (round 12 of review).
+export function sampleDescribes(
+  shape: string | null,
+  payload: unknown,
+): boolean {
+  // NO SAMPLE WAS CAPTURED, so there is nothing that could have stopped describing anything, and
+  // whether this save keeps one is the module's emptiness rule rather than this question. Null used
+  // to mean "no objection" as well, and carried three of them: a restored sample, an empty body with
+  // a status, and a reformat all recorded null and then survived any edit at all (round 13).
+  if (shape === null) return true;
+  return shape === captureShapeOf(payload);
+}
+
+// WHAT A SAVE HANDS THE MODULE, as a value rather than as an object literal assembled at the call
+// site. The module cannot see a call site, so every field spelled there is a field a mutation can
+// change with nothing to notice: `credentialRef` taken from the form instead of the payload, or
+// dropped for null, survived the battery when this was written inline.
+export function sampleToRemember(args: {
+  revision: string | null;
+  text: string;
+  status: number | null;
+  payload: { credentialRef: string | null };
+}): ToolSample | null {
+  // `revisionForSave` saying there is nothing to keep: the sample describes another definition, or
+  // neither revision is known.
+  if (args.revision === null) return null;
+  return {
+    revision: args.revision,
+    text: args.text,
+    status: args.status,
+    // From the payload and not from the form, so it is the reference the request that was just
+    // saved carries. A change of SELECTION is caught by the shape; this is for the credential
+    // being edited under the same name (round 13 of review).
+    credentialRef: args.payload.credentialRef,
+  };
+}
+
+// WHETHER THIS SAVE HAS ANYTHING FOR THE SERVER. The sample is part of the form since #566, so
+// pasting one is an unsaved change and Save is the way to keep it, but `payloadOf` sends nothing
+// about it: with the persisted half untouched, a PATCH would rewrite the whole definition from a
+// form loaded before someone else's edit, and would advance `updatedAt` for a change the row does
+// not contain (round 11 of review).
+//
+// Only ever true for an edit with a baseline and a known revision: a create has nothing to compare
+// against and must always be sent.
+export function sendsNothing(args: {
+  editing: boolean;
+  opened: string | null;
+  openedRevision: string | null;
+  payload: unknown;
+}): boolean {
+  if (!args.editing) return false;
+  if (args.opened === null || args.openedRevision === null) return false;
+  return (
+    JSON.stringify(payloadOf(JSON.parse(args.opened) as ToolForm)) ===
+    JSON.stringify(args.payload)
+  );
+}
+
+// WHICH DEFINITION THE SAMPLE DESCRIBES, decided in one place and returned rather than spelled out
+// at the call site. When the save sent something, it is the row that came back, because the save is
+// what moved the revision and the row the form opened with already names a definition that stopped
+// existing. When it sent nothing (a sample-only change), the row did not move, so the revision this
+// dialog opened with is still the right answer. Null means neither is known, and nothing is kept.
+//
+// A value rather than a source fence, because two rounds of review found this call site holding a
+// judgement the module could not see, and a fence over a spelling is what a refactor walks past.
+export function revisionForSave(
+  row: { updatedAt: unknown } | null,
+  opened: string | null,
+  // Whether the sample on screen still describes the definition being saved. False is not a
+  // revision at all rather than a different one: there is nothing to keep, and folding it in here
+  // is what makes the caller's guard load-bearing instead of a second judgement beside it.
+  describesThis: boolean,
+): string | null {
+  if (!describesThis) return null;
+  return row ? String(row.updatedAt) : opened;
+}
+
 export function payloadOf(form: ToolForm) {
   let headers: Record<string, unknown>;
   try {
@@ -277,6 +580,11 @@ export function payloadOf(form: ToolForm) {
     expectedStatuses: parseExpectedStatuses(form.expectedStatuses),
     ackEnabled: form.ackEnabled,
     ackMessage: form.ackEnabled ? form.ackMessage.trim() || null : null,
+    // A written template wins; an empty field falls back to whatever else the column held, which is
+    // how a legacy JSON Schema survives an edit that never showed it.
+    outputSchema: form.outputTemplate.trim()
+      ? { mode: "template", template: form.outputTemplate.trim() }
+      : (form.outputSchemaOther ?? {}),
     // What the tool's response says about an appointment, or null when it says nothing (issue #352).
     // Here rather than at the call site: this function is the one place the body is built, and the
     // refusal reader below keys off exactly these fields.
@@ -296,6 +604,7 @@ const TOOL_FIELDS = [
   "headers",
   "inputSchema",
   "query",
+  "outputSchema",
   "credentialRef",
   "expectedStatuses",
 ] as const;
@@ -399,7 +708,51 @@ export function formFromTool(tool: Tool) {
     expectedStatuses: (tool.expectedStatuses ?? []).join(", "),
     ackEnabled: tool.ackEnabled,
     ackMessage: tool.ackMessage ?? "",
+    ...outputSchemaForm(tool.outputSchema),
     ...appointmentForm(tool.appointment),
+    ...sampleForm(tool),
+  };
+}
+
+// The sample comes back from this tab alone (issue #566): nothing about it is stored anywhere, so a
+// reload, a second tab or a second machine gets no offer, the same as before the feature, and "Send
+// a test request" is still the way back.
+function sampleForm(tool: Tool) {
+  // `String(...)` because the treaty TYPES this as `Date` while the wire carries a string: the
+  // client runs with `parseDate: false`, so nothing ever constructs one (`docs/eden-treaty.md`).
+  // Comparing whatever arrives against whatever was stored is what this needs, and stringifying
+  // both ends answers the same either way.
+  const kept = recallToolSample(tool.id, String(tool.updatedAt));
+  return { sample: kept?.text ?? "", sampleStatus: kept?.status ?? null };
+}
+
+// The stored `outputSchema`, split into the part this form edits and the part it must not lose. The
+// same reader the runtime uses decides which is which, so a declaration the runtime would ignore
+// shows here as no template rather than as text in a box that does nothing.
+//
+// THREE OUTCOMES, not two, and the third is a lockout. `mode:"template"` with a template the reader
+// refuses (`{mode:"template", template:42}`, which MCP could store before this feature validated
+// the column) used to fall through to "keep it verbatim": the editor showed an empty box, resent
+// the broken object on every save, and the service refinement — new in this same change — rejected
+// it. The operator could then not edit the tool's URL, its headers, anything, and nothing on screen
+// said why. `outputSchemaOther` is for a legacy schema that is NOT a template declaration (a real
+// JSON Schema, which must survive an edit that never showed it); a declaration that IS one and is
+// broken is dropped, and `outputSchemaProblem` carries the reader's own sentence so the operator
+// reads what was discarded rather than discovering it.
+export function outputSchemaForm(raw: unknown) {
+  const read = readResponseTemplateResult(raw);
+  const isBag = !!raw && typeof raw === "object" && !Array.isArray(raw);
+  if (read.declared) {
+    return {
+      outputTemplate: read.ok ? read.template : "",
+      outputSchemaOther: null as Record<string, unknown> | null,
+      outputSchemaProblem: read.ok ? null : read.problem,
+    };
+  }
+  return {
+    outputTemplate: "",
+    outputSchemaOther: isBag ? (raw as Record<string, unknown>) : null,
+    outputSchemaProblem: null as string | null,
   };
 }
 
@@ -438,50 +791,215 @@ function appointmentForm(raw: unknown) {
 // Rendered as a sibling of its FormField, never inside it: FormField wraps its children in a
 // <label>, which forwards a click on the field title to the first focusable descendant, so a button
 // in there would fire when the operator clicked the title.
-function PathPicker({
+//
+// The template's picker also offers the LISTS in the sample (#459), each inserted as a block to
+// repeat over, and it is caret-aware: with the caret inside a block it offers the fields of that
+// list's items instead, relative, under a heading that says so. Both are the same `leaves` shape
+// to this component; what differs is what `onPick` inserts, and the caller decides that.
+//
+// The toggle is what lets the operator move the caret and ask again, so it must not disappear on an
+// offer that is empty for THIS caret: with `emptyLabel` set, an empty offer renders the toggle and
+// that line instead of nothing (round 3 of review: inside a block over an empty list the whole
+// control unmounted while open, and nothing could re-read the caret).
+// The sample field's grammar, built once. `CodeMirrorField` reconfigures on this value's identity,
+// so a fresh array per render would reconfigure per render.
+const SAMPLE_LANGUAGE = [json()];
+
+export function PathPicker({
   leaves,
+  lists = [],
+  heading,
+  emptyLabel,
   open,
   onToggle,
   onPick,
+  onPickList,
   openLabel,
   closeLabel,
+  listsLabel,
+  listLength,
+  restoresFocus = false,
 }: {
   leaves: SampleLeaf[];
+  lists?: SampleList[];
+  // Shown above the offers when they are relative to something (the items of a block).
+  heading?: string | null;
+  // Shown instead of nothing when the offer is empty; without it an empty offer hides the control.
+  emptyLabel?: string;
   open: boolean;
   onToggle: () => void;
   onPick: (path: string) => void;
+  onPickList?: (path: string) => void;
   openLabel: string;
   closeLabel: string;
+  listsLabel?: string;
+  listLength?: (n: number) => string;
+  // Declares that this caller's `onPick` puts focus somewhere ITSELF, so Radix's return to the
+  // trigger has to be suppressed or it would land after and take the focus back. Only the template
+  // does that (it refocuses the textarea at the caret it wrote); the single-path fields just write
+  // a value, and for them the trigger IS the right place to come back to. The picker cannot observe
+  // the difference: the caller's focus move happens in a later frame, which is the whole reason the
+  // suppression exists (round 2 of review).
+  restoresFocus?: boolean;
 }) {
-  if (leaves.length === 0) return null;
+  const { t } = useTranslation();
+  const [query, setQuery] = useState("");
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  // Set by a pick when this caller restores focus itself, read once by `onCloseAutoFocus`. Every
+  // other way out of the offer keeps Radix's return to the trigger (round 1 of review).
+  const pickedRef = useRef(false);
+  // The filter is per visit, and clearing it in `onOpenChange` would miss the ordinary way out.
+  // Every caller closes by setting the controlled `open` prop from its own `onPick`, which Radix
+  // never sees: `onOpenChange` fires for the interactions IT handles, not for a prop the parent
+  // changed. So the transition itself is what clears, whoever caused it (round 1 of review).
+  useEffect(() => {
+    if (!open) setQuery("");
+  }, [open]);
+  const q = query.trim().toLowerCase();
+  // Filtered by PATH, never by the sample value beside it: the value is a preview of one response
+  // and typing part of it would offer paths that hold something else on the next call.
+  const shownLeaves = q
+    ? leaves.filter((l) => l.path.toLowerCase().includes(q))
+    : leaves;
+  const shownLists = q
+    ? lists.filter((l) => l.path.toLowerCase().includes(q))
+    : lists;
+  const empty = leaves.length === 0 && lists.length === 0;
+  if (empty && !emptyLabel) return null;
   return (
-    <div className="-mt-2 flex flex-col gap-1">
-      <button
-        type="button"
-        onClick={onToggle}
-        className="self-start text-text-secondary text-xs underline underline-offset-2 hover:text-text-primary"
+    <PopoverPrimitive.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (next !== open) onToggle();
+      }}
+    >
+      <div className="-mt-2 flex flex-col gap-1" ref={anchorRef}>
+        <PopoverPrimitive.Trigger asChild>
+          <button
+            type="button"
+            className="self-start text-text-secondary text-xs underline underline-offset-2 hover:text-text-primary"
+          >
+            {open ? closeLabel : openLabel}
+          </button>
+        </PopoverPrimitive.Trigger>
+      </div>
+      {/* INTO THE DIALOG, not into `document.body`. The modal's scroll lock (`react-remove-scroll`,
+          which Radix's Dialog installs) cancels wheel events whose target sits outside its subtree,
+          so a popover portalled to the body has a list that clicks fine and does not scroll — the
+          `overflow-y: auto` is honoured, `scrollTop` moves programmatically, and the wheel arrives
+          already `preventDefault`ed. Portalling into the dialog keeps the offer out of the FIELD's
+          flow container, which is what the portal was for, without leaving the area the lock allows.
+          Falls back to the default body portal outside a dialog, which is where the unit tests
+          render it. */}
+      <PopoverPrimitive.Portal
+        container={anchorRef.current?.closest<HTMLElement>('[role="dialog"]')}
       >
-        {open ? closeLabel : openLabel}
-      </button>
-      {open && (
-        <ul className="max-h-48 overflow-y-auto rounded-md border border-border">
-          {leaves.map((leaf) => (
-            <li key={leaf.path}>
-              <button
-                type="button"
-                onClick={() => onPick(leaf.path)}
-                className="flex w-full items-baseline gap-2 px-2 py-1 text-left text-xs hover:bg-bg-hover"
-              >
-                <code className="shrink-0 text-text-primary">{leaf.path}</code>
-                <span className="truncate text-text-secondary">
-                  {leaf.value}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+        <PopoverPrimitive.Content
+          side="bottom"
+          align="start"
+          sideOffset={6}
+          // THE OFFER LEAVES THE FLOW (issue #462). Rendered inline it sat in the same container as
+          // the field below, so opening it pushed that field down mid-edit; a portal makes the shift
+          // impossible rather than small.
+          // `--z-popover` (85), not a Tailwind `z-*` class: the scale in `public/index.css` is a set
+          // of tokens, and `z-50` there is `--z-drawer`, which sits BELOW `--z-modal` (80). This
+          // picker only ever opens inside a modal, so a bare `z-50` renders the offer behind the
+          // dialog — positioned correctly, sized correctly, and invisible. Found by opening it in a
+          // browser; happy-dom has no stacking context to fail in.
+          className="z-(--z-popover) w-[min(28rem,calc(100vw-2rem))] rounded-md border border-border bg-bg-secondary shadow-lg"
+          // Radix renders this as `role="dialog"`, and this screen opens three of them from three
+          // fields that differ only in what they fill. The filter's own label names the input, never
+          // the dialog around it, so an unnamed one is announced as a bare dialog.
+          aria-label={openLabel}
+          // The caret restore wins over Radix's focus return, FOR A PICK. `insertToken` refocuses
+          // the textarea in a `requestAnimationFrame` and puts the caret after the token it wrote;
+          // Radix's default close behaviour focuses the TRIGGER, which lands after that frame and
+          // takes the caret away from the box the operator is writing in.
+          //
+          // Only for a pick BY A CALLER THAT RESTORES FOCUS: everywhere else nothing refocuses
+          // anything, so preventing it unmounts the content under the focused element and drops
+          // focus to the document body, restarting the keyboard operator's next Tab from the top of
+          // the page. That covers Escape and an outside click, and also a pick on the three
+          // single-path fields, whose `onPick` only writes a value (round 2 of review).
+          onCloseAutoFocus={(e) => {
+            if (!pickedRef.current) return;
+            pickedRef.current = false;
+            e.preventDefault();
+          }}
+        >
+          <div className="border-border border-b p-2">
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("tools.pathPickerFilter", "Filter paths…")}
+              aria-label={t("tools.pathPickerFilter", "Filter paths…")}
+              className="w-full rounded-md border border-border bg-bg-tertiary px-2 py-1 text-sm text-text-primary focus:border-border-focus focus:outline-none"
+            />
+          </div>
+          <ul className="max-h-48 overflow-y-auto">
+            {heading && (
+              <li className="px-2 py-1 text-text-secondary text-xs">
+                {heading}
+              </li>
+            )}
+            {empty && (
+              <li className="px-2 py-1 text-text-secondary text-xs">
+                {emptyLabel}
+              </li>
+            )}
+            {!empty && shownLeaves.length === 0 && shownLists.length === 0 && (
+              <li className="px-2 py-1 text-text-secondary text-xs">
+                {t("tools.pathPickerNoMatch", "No path matches that.")}
+              </li>
+            )}
+            {shownLeaves.map((leaf) => (
+              <li key={leaf.path}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    pickedRef.current = restoresFocus;
+                    onPick(leaf.path);
+                  }}
+                  className="flex w-full items-baseline gap-2 px-2 py-1 text-left text-xs hover:bg-bg-hover"
+                >
+                  <code className="shrink-0 text-text-primary">
+                    {leaf.path}
+                  </code>
+                  <span className="truncate text-text-secondary">
+                    {leaf.value}
+                  </span>
+                </button>
+              </li>
+            ))}
+            {shownLists.length > 0 && listsLabel && (
+              <li className="border-border border-t px-2 py-1 text-text-secondary text-xs">
+                {listsLabel}
+              </li>
+            )}
+            {shownLists.map((list) => (
+              <li key={`each:${list.path}`}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    pickedRef.current = restoresFocus;
+                    onPickList?.(list.path);
+                  }}
+                  className="flex w-full items-baseline gap-2 px-2 py-1 text-left text-xs hover:bg-bg-hover"
+                >
+                  <code className="shrink-0 text-text-primary">
+                    {list.path}
+                  </code>
+                  <span className="truncate text-text-secondary">
+                    {listLength ? listLength(list.length) : list.length}
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
   );
 }
 
@@ -633,12 +1151,93 @@ function insertToken(
   }
   const start = el.selectionStart ?? current.length;
   const end = el.selectionEnd ?? current.length;
-  setValue(current.slice(0, start) + token + current.slice(end));
+  setValue(spliceSelection(current, start, end, () => token));
   requestAnimationFrame(() => {
     el.focus();
     const pos = start + token.length;
     el.setSelectionRange(pos, pos);
   });
+}
+
+// The one cut both inserts make: a selection is a boundary the browser chose, never the inside of
+// a surrogate pair, which is why `tests/lib/astral-cap-sweep.test.ts` lists this file under
+// "index". `insert` sees what is on either side, so an insert that wants a line of its own can
+// decide whether it needs a line break first.
+function spliceSelection(
+  current: string,
+  start: number,
+  end: number,
+  insert: (before: string, after: string) => string,
+): string {
+  const before = current.slice(0, start);
+  const after = current.slice(end);
+  return before + insert(before, after) + after;
+}
+
+// Inserts a `{{#each path}}` block at the caret, markers on lines of their own (so each takes its
+// line with it when rendered), and leaves the caret on the empty line BETWEEN them: reopening the
+// picker from there offers the items' fields. A caret mid-line gets a line break first, so the
+// opening marker lands standalone; the same for the text after it.
+// THE EDIT ITSELF, apart from who applies it, because two widgets now do: the textarea the
+// appointment fields still are, and the CodeMirror the template became (issue #563). Written once
+// so the line-break rule cannot differ between them — a block whose opening marker is not
+// standalone renders a blank line per item, which is the defect the standalone rule exists to
+// avoid, and it would have appeared in one widget and not the other.
+export function eachBlockEdit(
+  current: string,
+  start: number,
+  end: number,
+  path: string,
+): { insert: string; caret: number } {
+  const before = current.slice(0, start);
+  const after = current.slice(end);
+  const lead = before === "" || before.endsWith("\n") ? "" : "\n";
+  const tail = after === "" || after.startsWith("\n") ? "" : "\n";
+  const open = `${lead}{{#each ${path}}}\n`;
+  // The caret lands on the empty line BETWEEN the markers: that is the line the operator writes,
+  // and asking for the offer from there answers with the items' fields.
+  return { insert: `${open}\n{{/each}}${tail}`, caret: start + open.length };
+}
+
+export function insertEachBlock(
+  el: HTMLTextAreaElement | null,
+  current: string,
+  path: string,
+  setValue: (v: string) => void,
+): void {
+  const start = el?.selectionStart ?? current.length;
+  const end = el?.selectionEnd ?? current.length;
+  const { insert, caret } = eachBlockEdit(current, start, end, path);
+  setValue(spliceSelection(current, start, end, () => insert));
+  if (!el) return;
+  requestAnimationFrame(() => {
+    el.focus();
+    el.setSelectionRange(caret, caret);
+  });
+}
+
+// The same two inserts, applied to a CodeMirror document. A dispatch and not a string splice: the
+// document is the view's, so writing through the controlled prop would race the editor's own state
+// and land the caret wherever the re-render put it.
+export function insertIntoView(
+  view: EditorView | null,
+  edit: (
+    current: string,
+    start: number,
+    end: number,
+  ) => {
+    insert: string;
+    caret: number;
+  },
+): void {
+  if (!view) return;
+  const { from, to } = view.state.selection.main;
+  const { insert, caret } = edit(view.state.doc.toString(), from, to);
+  view.dispatch({
+    changes: { from, to, insert },
+    selection: { anchor: caret },
+  });
+  view.focus();
 }
 
 // Section header inside the variable picker dropdown. Stronger weight/color than the item descriptions
@@ -811,12 +1410,67 @@ export function ToolEditModal({
   // rather than under a box that no longer holds it.
   const formRef = useRef(form);
   formRef.current = form;
-  // The pasted sample and which field's picker is open. Local, never submitted, never part of the
-  // dirty comparison — see sampleParse.
-  const [apptSample, setApptSample] = useState("");
+  // The pasted (or tested) sample response, and the STATUS it came back under (null when it was
+  // pasted by hand). ONE sample for the whole screen: the response template and the appointment
+  // declaration point into the same body, and asking for it twice is the kind of duplication an
+  // operator reads as two different questions.
+  //
+  // Part of `form` since #566, where it was local state. The status exists because the runtime
+  // projects on 2xx alone: a sample captured from a 404 the tool declares a result would be handed
+  // to the model RAW, and a preview that rendered the template over it would promise something the
+  // runtime never does, under a label that says "exactly what the agent would receive". Null reads
+  // as 2xx, which is the right assumption for a hand-pasted body: nobody pastes an error response
+  // to design a success template against.
+  const sample = form.sample;
+  const sampleStatus = form.sampleStatus;
+  // Always together: a body and the status it is judged under are one fact, and setting the text
+  // while leaving the previous run's status judges this body by that one's.
+  // The definition the sample on screen describes, recorded when it is put there. Null when there
+  // is no sample, or when it came back from this tab's memory (where it is already matched to a
+  // revision, which is the same question asked at the other end).
+  const sampleShapeRef = useRef<string | null>(null);
+
+  const setSample = (text: string, status: number | null) =>
+    setForm((f) => {
+      const next = { ...f, sample: text, sampleStatus: status };
+      // Recorded from the form this sample is being put INTO, inside the updater so it is the state
+      // React is about to commit and not a render behind it.
+      sampleShapeRef.current = shapeOfArrival({
+        text,
+        status,
+        against: next,
+        previous: sampleShapeRef.current,
+      });
+      return next;
+    });
+
+  // THE SAME SAMPLE, RE-INDENTED, which is why it does not re-capture: Format changes whitespace and
+  // never a value, so the definition this response came back from is the one it already had.
+  const reformatSample = (text: string) =>
+    setForm((f) => {
+      const next = { ...f, sample: text };
+      sampleShapeRef.current = shapeOfArrival({
+        text,
+        status: f.sampleStatus,
+        against: null,
+        previous: sampleShapeRef.current,
+      });
+      return next;
+    });
+
   const [apptPicker, setApptPicker] = useState<
     "id" | "start" | "summary" | null
   >(null);
+  const [templatePickerOpen, setTemplatePickerOpen] = useState(false);
+  // Where the caret was when the picker was opened. Read THEN and not on every keystroke: the
+  // offer only has to be right for the click that follows it, and clicking the picker's button
+  // moves focus off the field without moving its selection.
+  const [templateCaret, setTemplateCaret] = useState(0);
+  // The template field is a CodeMirror since #563, so the caret is a position in ITS document and
+  // the picker writes through a dispatch. Held as state and not a ref because the completion's
+  // extensions are memoized against the sample, and the view has to exist before they matter.
+  const templateViewRef = useRef<EditorView | null>(null);
+  const testModal = useModalController<ToolTestTarget>();
   const [saving, setSaving] = useState(false);
   const [loadingForm, setLoadingForm] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -824,6 +1478,11 @@ export function ToolEditModal({
   const [selectedCredential, setSelectedCredential] =
     useState<VaultEntry | null>(null);
   const baselineRef = useRef<string | null>(null);
+  // The `updatedAt` of the row this dialog opened, so a save that sends nothing can still say
+  // which definition its sample describes. Null on a create, and while the edit fetch is in flight.
+  const openedRevisionRef = useRef<string | null>(null);
+  // Identity of the current opening (see the open handler).
+  const sessionRef = useRef<object | null>(null);
   // Targets for the variable picker (cursor insertion into the free-text template fields). Union type
   // because the highlighted field forwards its ref to either an <input> or a <textarea>.
   const urlRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
@@ -835,6 +1494,14 @@ export function ToolEditModal({
   const aiFieldNames = form.aiFields.map((f) => f.name.trim()).filter(Boolean);
   const isWriteMethod =
     form.method === "POST" || form.method === "PUT" || form.method === "PATCH";
+  // A test run has no conversation, so these are the values nobody can supply but the operator —
+  // and offering the whole catalog would ask them to fill ten boxes for a tool that references one.
+  const referencedContextNames = useMemo(
+    // Null only when the headers are unparseable, and `openTest` refuses on that before this list
+    // is ever read.
+    () => contextNamesReferencedBy(payloadOf(form)),
+    [form],
+  );
 
   const refusal = useFieldRefusal(
     modal.isOpen
@@ -858,36 +1525,92 @@ export function ToolEditModal({
     setSelectedCredential(null);
     // The sample belongs to the tool being edited, so it does not survive into the next one: a
     // response pasted for tool A offering its paths while editing tool B is worse than no offer.
-    setApptSample("");
     setApptPicker(null);
+    setTemplatePickerOpen(false);
     const payloadId = modal.payload?.id;
-    if (!payloadId) {
+    // This opening, told apart from the next one: the GET below outlives the dialog it was started
+    // for, so an answer that arrives after a close-and-reopen would fill the NEW session's form
+    // with the old tool and let Save patch the new id with it. Same guard in CodeToolEditModal.
+    const session = {};
+    sessionRef.current = session;
+    const mine = () => sessionRef.current === session;
+    if (payloadId) {
+      // Edit: fetch the full tool by id (the agent editor only carries the id). Baseline is captured
+      // once the loaded tool populates the form, so isDirty stays false until the operator edits.
+      baselineRef.current = null;
+      openedRevisionRef.current = null;
+      setLoadingForm(true);
+      void (async () => {
+        try {
+          const { data, error } = await api.api.v1
+            .tools({ id: payloadId })
+            .get();
+          if (!mine()) return;
+          if (error || !data) {
+            setLoadError(true);
+            return;
+          }
+          const initial = formFromTool(data.tool);
+          setForm(initial);
+          // A sample this tab kept was captured against the definition it is being restored beside,
+          // so THAT is the shape it describes: `recallToolSample` only answers when the revision it
+          // was stored under is the one that just loaded. Left null, an edit to the URL after a
+          // reopen would save the old response against the new definition (round 13 of review).
+          sampleShapeRef.current = shapeOfOpening(initial);
+          baselineRef.current = JSON.stringify(initial);
+          openedRevisionRef.current = String(data.tool.updatedAt);
+        } catch {
+          if (mine()) setLoadError(true);
+        } finally {
+          if (mine()) setLoadingForm(false);
+        }
+      })();
+    } else {
+      // Reset here too: the session token now drops the previous opening's answer, and that answer
+      // is what used to clear this flag on its way out — leaving the create form skeletonized
+      // forever if it never arrived. Every state this handler sets belongs to THIS opening.
+      setLoadingForm(false);
       const initial = emptyForm();
       setForm(initial);
+      // Through the same rule as the other open, and it answers null: a create form has no sample.
+      // Written as the call rather than as the answer, so there is one place that decides.
+      sampleShapeRef.current = shapeOfOpening(initial);
       baselineRef.current = JSON.stringify(initial);
+      // A create has no revision yet, and no persisted half to compare against either.
+      openedRevisionRef.current = null;
+    }
+    // ONE hook per dialog, and the early return that used to sit above is gone for that reason: the
+    // per-session reset and the child dialog's teardown both belong to this opening, and a second
+    // `useOnModalOpen(modal, …)` beside it is a second reset site that has to repeat every clear the
+    // first one does (`tests/client/field-refusal-fence.test.ts` says so, and it caught this).
+    //
+    // The test dialog belongs to the tool session that opened it, so closing the editor takes it
+    // with it — otherwise it lingers describing a definition that is no longer on screen
+    // (`docs/modals.md`, "parent close invalidates nested state").
+    return () => {
+      sessionRef.current = null;
+      testModal.close();
+    };
+  });
+
+  // NAMED rather than inline, and the reason is a fence: the toast scanner
+  // (`tests/client/error-toast-reason.test.ts`) abstains on a handler it cannot name, and an
+  // anonymous one then has to be waived by hand. The fixed sentence here is legitimate — the
+  // headers are unparseable on the CLIENT, with no server call behind it to have worded anything.
+  function openTest() {
+    const payload = payloadOf(form);
+    if (!payload) {
+      setFormError(t("tools.invalidJson", "Headers must be valid JSON."));
       return;
     }
-    // Edit: fetch the full tool by id (the agent editor only carries the id). Baseline is captured
-    // once the loaded tool populates the form, so isDirty stays false until the operator edits.
-    baselineRef.current = null;
-    setLoadingForm(true);
-    void (async () => {
-      try {
-        const { data, error } = await api.api.v1.tools({ id: payloadId }).get();
-        if (error || !data) {
-          setLoadError(true);
-          return;
-        }
-        const initial = formFromTool(data.tool);
-        setForm(initial);
-        baselineRef.current = JSON.stringify(initial);
-      } catch {
-        setLoadError(true);
-      } finally {
-        setLoadingForm(false);
-      }
-    })();
-  });
+    testModal.open({
+      definition: payload as unknown as Record<string, unknown>,
+      aiFields: testFieldsFrom(
+        (payload as Record<string, unknown>).inputSchema,
+      ),
+      contextNames: referencedContextNames,
+    });
+  }
 
   function formatBodyRaw() {
     try {
@@ -900,6 +1623,23 @@ export function ToolEditModal({
   }
 
   async function save() {
+    // The opening this save belongs to. A slow save can still be dismissed (Esc, outside, X — only
+    // Cancel is disabled while saving), and the continuation below would then close the dialog the
+    // operator reopened and write this tool's state into it (docs/modals.md).
+    const session = sessionRef.current;
+    // Read BEFORE the request, handed to the write below. A save can be in flight while this tool
+    // is deleted or the session ends, and both of those clear what this tab remembers; without the
+    // ticket, the response arriving afterwards would put the sample back (round 4 of review).
+    const ticket = sampleTicket();
+    // READ HERE, WITH THE TICKET, for the same reason the ticket is read here. `sample`,
+    // `sampleStatus` and `payload` are all values this closure captured when Save was pressed; this
+    // is a REF, and reading it in the continuation asks what the form says NOW. Dismiss a slow save
+    // and reopen, and the opening that follows writes its own marker into it: the answer that comes
+    // back is then compared against another opening's capture, which can only turn a right answer
+    // into a wrong one — the sample that did describe this payload discarded, or one that did not
+    // kept. Fourth round to find this shape, something the continuation reads at the end that had
+    // already moved (round 18 of review).
+    const captured = sampleShapeRef.current;
     setFormError(null);
     const payload = payloadOf(form);
     if (payload === null) {
@@ -911,25 +1651,86 @@ export function ToolEditModal({
     const held = (e: unknown) =>
       refusal.capture(e, fallback, payload, payloadOf(formRef.current) ?? {});
     try {
-      const { data, error: err } = editId
-        ? await api.api.v1.tools({ id: editId }).patch(payload)
-        : await api.api.v1.tools.post(payload);
-      if (err || !data) {
-        setFormError(held(err));
+      // NOTHING FOR THE SERVER TO DO. The sample is part of the form since #566, so pasting one is
+      // an unsaved change and Save is the way to keep it, but `payloadOf` sends nothing about it: a
+      // PATCH here would rewrite the whole definition from a form loaded before someone else's edit,
+      // and would advance `updatedAt` for a change the row does not contain (round 11 of review).
+      const untouched = sendsNothing({
+        editing: !!editId,
+        opened: baselineRef.current,
+        openedRevision: openedRevisionRef.current,
+        payload,
+      });
+      const saved = untouched
+        ? null
+        : await (editId
+            ? api.api.v1.tools({ id: editId }).patch(payload)
+            : api.api.v1.tools.post(payload));
+      if (saved && (saved.error || !saved.data)) {
+        if (sessionRef.current === session) setFormError(held(saved.error));
+        return;
+      }
+      const row = saved?.data?.tool ?? null;
+      // A SAMPLE THAT NO LONGER DESCRIBES THIS DEFINITION IS NOT KEPT: captured against one URL and
+      // saved after the URL changed, it would pass the revision check, because this very save is
+      // what set that revision.
+      const revision = revisionForSave(
+        row,
+        openedRevisionRef.current,
+        sampleDescribes(captured, payload),
+      );
+      const id = row?.id ?? (editId as string);
+      // The response itself, remembered in THIS tab and keyed by the id the row got (issue #566).
+      // Here rather than on every keystroke, so what comes back is the sample the tool was last
+      // saved with and not a draft the operator abandoned. Nothing to await, nothing that can fail
+      // in a way the operator could act on, and nothing written down. See `toolSample.ts`.
+      // Handed over whole, with no judgement here about whether it is worth keeping: what counts as
+      // nothing is the module's rule, and it was written in both places until a mutation walked past
+      // the copy that lives here (round 8 of review).
+      // Null is `revisionForSave` saying there is nothing to keep: the sample describes another
+      // definition, or neither revision is known.
+      // UNCONDITIONALLY, null included, because null is the save saying there is nothing to keep and
+      // that is a thing the module has to hear: it is what deletes the entry that was there and
+      // marks the write. Guarded, a sample that stopped describing this definition was refused here
+      // and the previous one stayed in the map, holding a customer's response nobody can be served
+      // and occupying one of the eight slots (round 15 of review).
+      rememberToolSample(
+        id,
+        sampleToRemember({
+          revision,
+          text: sample,
+          status: sampleStatus,
+          payload,
+        }),
+        ticket,
+      );
+      // Dismissed and reopened while this was out: the row was written, and it is the CALLER's list
+      // that has to hear about it, not the dialog now on screen. Nothing was written when nothing
+      // was sent, so there is nothing for the list to hear either.
+      if (sessionRef.current !== session) {
+        if (row) onSaved?.({ id: row.id, name: row.name }, !editId);
         return;
       }
       refusal.clear();
       showToast(t("tools.saved", "Tool saved."), "success");
       modal.close();
-      onSaved?.({ id: data.tool.id, name: data.tool.name }, !editId);
+      if (row) onSaved?.({ id: row.id, name: row.name }, !editId);
     } catch (e) {
-      setFormError(held(e));
+      // Same rule as the branch above: a transport failure of a save whose dialog is gone has
+      // nowhere to land, and would mark the form the operator has open now.
+      if (sessionRef.current === session) setFormError(held(e));
     } finally {
       setSaving(false);
     }
   }
 
-  const credBaseUrl = selectedCredential?.baseUrl ?? null;
+  // NOTE: the DIALABLE base, not the stored one (#504): a relative url_template is valid only when a
+  // credential supplies a base the runtime will actually prepend, and a stray value on a kind that
+  // takes none is no longer one.
+  const credBaseUrl = dialableBaseUrl(
+    selectedCredential?.kind,
+    selectedCredential?.baseUrl,
+  );
   // A relative path (starts with /) is valid only when a credential provides its base.
   const isRelativeTemplate =
     form.urlTemplate.trim().startsWith("/") &&
@@ -949,15 +1750,136 @@ export function ToolEditModal({
   // Deliberately NOT part of `form`: the sample is a filling aid, never a stored field, so pasting
   // one must not mark the modal dirty and must not raise the discard dialog on close.
   const sampleParse = useMemo(() => {
-    const raw = apptSample.trim();
-    if (raw === "")
-      return { state: "empty" as const, leaves: [] as SampleLeaf[] };
+    const raw = sample.trim();
+    const none = {
+      leaves: [] as SampleLeaf[],
+      templates: [] as SampleLeaf[],
+      lists: [] as SampleList[],
+      body: undefined as unknown,
+    };
+    if (raw === "") return { state: "empty" as const, ...none };
     try {
-      return { state: "ok" as const, leaves: sampleLeaves(JSON.parse(raw)) };
+      const body: unknown = JSON.parse(raw);
+      // TWO offers from one sample, because the two readers accept different things: an appointment
+      // id may not be a boolean or the empty string, and a template that could not render
+      // `"active": false` would show the model a blank where the API said no. Each picker offers
+      // exactly what its own reader takes. The lists are the template's third offer: what a block
+      // may repeat over.
+      return {
+        state: "ok" as const,
+        leaves: sampleLeaves(body),
+        templates: templateLeaves(body),
+        lists: templateLists(body),
+        body,
+      };
     } catch {
-      return { state: "invalid" as const, leaves: [] as SampleLeaf[] };
+      // NOTE: `JSON.parse` decides whether this is readable, because it is what produced the values
+      // above and a second opinion could hide the offer while the line below called the text fine.
+      // The POSITION comes from the editor's own grammar, because the engine's message does not
+      // carry one portably: V8 appends `at position N` to some errors and not others, and JSC
+      // (Safari) to none. When the two disagree the sentence simply says less (issue #562).
+      return {
+        state: "invalid" as const,
+        // NOTE: the SAMPLE, not the trimmed copy above. This number is read by a person looking at
+        // their own document, and measuring the trimmed one points at line 1 for a break on line 3
+        // (round 1 of review).
+        problem: firstJsonProblem(sample),
+        ...none,
+      };
     }
-  }, [apptSample]);
+  }, [sample]);
+  // The formatted sample, or null with the NAME of why there is nothing to write. The BUTTON is
+  // gated on this and not on `sampleParse`, so "enabled" can only mean "there is a different text
+  // ready": two readers of one field WILL disagree eventually — round 1 of review found the first
+  // pair, where a byte-order mark parsed (`String.trim` eats it) and the formatter refused — and the
+  // disagreement showed up as an enabled button doing nothing. The reason is carried rather than
+  // collapsed because the row below says it: a disabled button beside a sentence about something
+  // else is the same silent refusal wearing a different hat (round 6 of review).
+  const sampleFormat = useMemo((): {
+    text: string | null;
+    why: "verbatim" | "unreadable" | "too-large" | "already" | null;
+  } => {
+    // NOTE: a body the model reads VERBATIM is kept verbatim. `templatePreviewFor` shows a non-2xx
+    // sample raw, clipped the way the runtime clips it, so reformatting it would preview a document
+    // the API never sent (round 5 of review). The status question is asked of the runtime's own
+    // function rather than answered again here, which is the rule this file already lives by.
+    if (sampleStatus !== null && readsBodyVerbatim(sampleStatus)) {
+      return { text: null, why: "verbatim" };
+    }
+    const tidy = reindentJson(sample);
+    if (!tidy.ok) return { text: null, why: tidy.why };
+    if (tidy.text === sample) return { text: null, why: "already" };
+    return { text: tidy.text, why: null };
+  }, [sample, sampleStatus]);
+  // What the template picker offers for the caret it was opened at: outside every block, the
+  // absolute fields and the lists; inside one, the fields of that list's items, relative. The
+  // block is read leniently (`enclosingBlock`), because at the moment the operator most wants the
+  // item fields, just after typing or inserting `{{#each xs}}`, the block is not closed yet.
+  const templateOffer = useMemo(() => {
+    const block = enclosingBlock(form.outputTemplate, templateCaret);
+    if (block === null) {
+      return {
+        block: null,
+        leaves: sampleParse.templates,
+        lists: sampleParse.lists,
+      };
+    }
+    const items = templateListAt(sampleParse.body, block);
+    return {
+      block,
+      leaves: items === null ? [] : templateItemLeaves(items),
+      lists: [] as SampleList[],
+    };
+  }, [form.outputTemplate, templateCaret, sampleParse]);
+  // The grammar the template field is edited with: the token highlighting and the completion over
+  // the sample's own paths (#563). Memoized because `CodeMirrorField` reconfigures on this value's
+  // IDENTITY, so a fresh array per render would reconfigure per keystroke; keyed on the sample
+  // because that is what the offer is computed from, and on the language because the list's
+  // "N items" is a translated string.
+  const templateGrammar = useMemo(
+    () =>
+      templateExtensions(
+        {
+          body: sampleParse.body,
+          leaves: sampleParse.templates,
+          lists: sampleParse.lists,
+        },
+        t,
+      ),
+    // NOTE: `t` alone covers the language. `useTranslation` hands back a new one when the language
+    // changes, so naming `i18n.language` beside it is a second spelling of the same trigger.
+    [sampleParse, t],
+  );
+  // What the model would be handed, rendered against the pasted sample. The point of the whole
+  // section: a template is a promise about the model's input, and this is the only place the
+  // operator can read that input before a customer does.
+  const templatePreview = useMemo(
+    () =>
+      templatePreviewFor({
+        template: form.outputTemplate,
+        sample,
+        status: sampleStatus,
+      }),
+    [form.outputTemplate, sample, sampleStatus],
+  );
+  const badTemplateTokens = unusableTemplateTokens(form.outputTemplate);
+  // A `{{` or `}}` that is not part of a token: `{{a}` is not an unusable token, it is not a token,
+  // so the scan above sees nothing and the runtime would put the typo in front of the model
+  // verbatim. Same gate, because it is the same defect.
+  const strayTemplateDelimiter = unmatchedTemplateDelimiter(
+    form.outputTemplate,
+  );
+  // AND THE GATE IS THE READER'S, not the sum of the two checks above. Those name the two problems
+  // this screen can phrase well; the reader refuses more than they see — a template past
+  // MAX_TEMPLATE_CHARS, a NUL or a lone surrogate the jsonb column cannot store — and it is the
+  // same function the service refines with. Gating on the pair left Save enabled on a payload the
+  // server was always going to reject, with nothing inline saying why.
+  const templateDeclProblem = useMemo(
+    () => templateSaveProblem(form.outputTemplate),
+    [form.outputTemplate],
+  );
+  const templateTooLong =
+    form.outputTemplate.trim().length > MAX_TEMPLATE_CHARS;
   const apptIdPathInvalid = apptOn && !isUsablePath(form.apptIdPath.trim());
   const apptStartPathInvalid =
     form.apptAction === "book" && !isUsablePath(form.apptStartPath.trim());
@@ -984,6 +1906,7 @@ export function ToolEditModal({
     !apptSummaryPathInvalid &&
     !apptProviderInvalid &&
     !apptOffsetsInvalid &&
+    templateDeclProblem === null &&
     !ackInvalid;
   // NOTE: baseline is captured on open (create defaults / loaded tool); null while never opened or
   // while the edit fetch is in flight.
@@ -992,924 +1915,1085 @@ export function ToolEditModal({
     JSON.stringify(form) !== baselineRef.current;
 
   return (
-    <Modal
-      modal={modal}
-      size="lg"
-      unsavedChanges={isDirty}
-      title={
-        editId
-          ? t("tools.editTitle", "Edit tool")
-          : t("tools.addTitle", "New HTTP tool")
-      }
-      footer={
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-error text-xs">{formError}</span>
-          <div className="flex gap-2">
-            <ModalCancelButton disabled={saving} />
-            <Button onClick={save} loading={saving} disabled={!valid}>
-              {t("common.save", "Save")}
-            </Button>
-          </div>
-        </div>
-      }
-    >
-      {loadingForm ? (
-        <div className="flex flex-col gap-3" role="status">
-          <span className="sr-only">{t("common.loading", "Loading…")}</span>
-          <Skeleton className="h-9 w-full" />
-          <Skeleton className="h-16 w-full" />
-          <Skeleton className="h-9 w-full" />
-        </div>
-      ) : loadError ? (
-        <p className="text-error text-sm">
-          {t("tools.loadError", "Could not load this tool.")}
-        </p>
-      ) : (
-        <div className="flex flex-col gap-4">
-          {sharedNotice && editId && (
-            <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
-              <AlertTriangle
-                className="mt-0.5 h-4 w-4 shrink-0 text-warning"
-                aria-hidden="true"
-              />
-              <span>
-                {t(
-                  "tools.sharedNotice",
-                  "This is a shared tool definition. Changes affect every agent that uses it.",
-                )}
-              </span>
+    <>
+      <Modal
+        modal={modal}
+        size="lg"
+        unsavedChanges={isDirty}
+        title={
+          editId
+            ? t("tools.editTitle", "Edit tool")
+            : t("tools.addTitle", "New HTTP tool")
+        }
+        footer={
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-error text-xs">{formError}</span>
+            <div className="flex gap-2">
+              <ModalCancelButton disabled={saving} />
+              <Button onClick={save} loading={saving} disabled={!valid}>
+                {t("common.save", "Save")}
+              </Button>
             </div>
-          )}
-          <FormField
-            label={t("tools.name", "Display name")}
-            required
-            description={t(
-              "tools.nameHint",
-              "How the tool is shown in the console. Spaces and accents are allowed; the identifier the AI calls is derived from it automatically.",
+          </div>
+        }
+      >
+        {loadingForm ? (
+          <div className="flex flex-col gap-3" role="status">
+            <span className="sr-only">{t("common.loading", "Loading…")}</span>
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-9 w-full" />
+          </div>
+        ) : loadError ? (
+          <p className="text-error text-sm">
+            {t("tools.loadError", "Could not load this tool.")}
+          </p>
+        ) : (
+          <div className="flex flex-col gap-4">
+            {sharedNotice && editId && (
+              <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+                <AlertTriangle
+                  className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                  aria-hidden="true"
+                />
+                <span>
+                  {t(
+                    "tools.sharedNotice",
+                    "This is a shared tool definition. Changes affect every agent that uses it.",
+                  )}
+                </span>
+              </div>
             )}
-            error={
-              refusal.at("label", current.label) ??
-              refusal.at("name", current.name)
-            }
-          >
-            <Input
-              value={form.label}
-              onChange={(e) =>
-                setForm((f) => ({ ...f, label: e.target.value }))
-              }
-              placeholder={t("tools.namePlaceholder", "Look up order")}
-            />
-            {form.label.trim() && (
-              <p className="mt-1 flex flex-wrap items-center gap-1 text-text-muted text-xs">
-                <span>{t("tools.identifierPreview", "Identifier:")}</span>
-                <code className="rounded bg-bg-tertiary px-1 py-0.5 font-mono">
-                  {normalizeToolName(form.label)}
-                </code>
-              </p>
-            )}
-          </FormField>
-
-          <FormField
-            label={t("tools.description", "Description")}
-            error={refusal.at("description", current.description)}
-          >
-            <Textarea
-              value={form.description}
-              onChange={(e) =>
-                setForm({ ...form, description: e.target.value })
-              }
-              rows={2}
-              placeholder={t(
-                "tools.descriptionHint",
-                "When the agent should use this and what it does, e.g. 'Look up an order's status by its number.'",
-              )}
-            />
-          </FormField>
-
-          <FormField
-            error={refusal.at("inputSchema", current.inputSchema)}
-            label={t("tools.aiFields", "AI fields")}
-            group
-            description={t(
-              "tools.aiFieldsHint",
-              "The inputs the AI fills in. Give each a clear description, then reference it as {{name}} in the URL, query, headers or body (use Insert variable). Everything else (a constant or a {{context}} value) goes straight into those fields.",
-            )}
-          >
-            <AiFieldsPanel
-              value={form.aiFields}
-              onChange={(aiFields) => setForm({ ...form, aiFields })}
-            />
-          </FormField>
-
-          <div className="grid gap-4 sm:grid-cols-[120px_1fr]">
             <FormField
-              label={t("tools.method", "Method")}
-              error={refusal.at("method", current.method)}
+              label={t("tools.name", "Display name")}
+              required
+              description={t(
+                "tools.nameHint",
+                "How the tool is shown in the console. Spaces and accents are allowed; the identifier the AI calls is derived from it automatically.",
+              )}
+              error={
+                refusal.at("label", current.label) ??
+                refusal.at("name", current.name)
+              }
             >
-              <Select
-                value={form.method}
+              <Input
+                value={form.label}
                 onChange={(e) =>
-                  setForm({
-                    ...form,
-                    method: e.target.value as (typeof METHODS)[number],
-                  })
+                  setForm((f) => ({ ...f, label: e.target.value }))
+                }
+                placeholder={t("tools.namePlaceholder", "Look up order")}
+              />
+              {form.label.trim() && (
+                <p className="mt-1 flex flex-wrap items-center gap-1 text-text-muted text-xs">
+                  <span>{t("tools.identifierPreview", "Identifier:")}</span>
+                  <code className="rounded bg-bg-tertiary px-1 py-0.5 font-mono">
+                    {normalizeToolName(form.label)}
+                  </code>
+                </p>
+              )}
+            </FormField>
+
+            <FormField
+              label={t("tools.description", "Description")}
+              error={refusal.at("description", current.description)}
+            >
+              <Textarea
+                value={form.description}
+                onChange={(e) =>
+                  setForm({ ...form, description: e.target.value })
+                }
+                rows={2}
+                placeholder={t(
+                  "tools.descriptionHint",
+                  "When the agent should use this and what it does, e.g. 'Look up an order's status by its number.'",
+                )}
+              />
+            </FormField>
+
+            <FormField
+              error={refusal.at("inputSchema", current.inputSchema)}
+              label={t("tools.aiFields", "AI fields")}
+              group
+              description={t(
+                "tools.aiFieldsHint",
+                "Describe each AI input and insert {{name}} where it goes; put constants and {{context}} directly in the field.",
+              )}
+            >
+              <AiFieldsPanel
+                value={form.aiFields}
+                onChange={(aiFields) => setForm({ ...form, aiFields })}
+              />
+            </FormField>
+
+            <div className="grid gap-4 sm:grid-cols-[120px_1fr]">
+              <FormField
+                label={t("tools.method", "Method")}
+                error={refusal.at("method", current.method)}
+              >
+                <Select
+                  value={form.method}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      method: e.target.value as (typeof METHODS)[number],
+                    })
+                  }
+                >
+                  {METHODS.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </Select>
+              </FormField>
+              <FormField
+                label={t("tools.url", "URL template")}
+                // The children are a highlighted field PLUS a variable picker, which is what `group`
+                // is for: there is no single control for the label to name. It was missing, and the
+                // wrapping label used to paper over it by forwarding a click to the first labelable
+                // descendant; now that the label points, a dangling `htmlFor` is a visible failure.
+                group
+                required
+                description={
+                  relativeWithoutBase
+                    ? t(
+                        "tools.relativeRequiresBase",
+                        "A relative URL requires a credential with a base URL.",
+                      )
+                    : credBaseUrl
+                      ? t(
+                          "tools.relativeHint",
+                          "Paths starting with / are resolved against the credential's base. Its host is automatically allowed.",
+                        )
+                      : undefined
+                }
+                error={
+                  urlTemplateInvalid && form.urlTemplate.trim()
+                    ? t(
+                        "tools.invalidUrlTemplate",
+                        "Must start with / or be a full http(s) URL.",
+                      )
+                    : refusal.at("urlTemplate", current.urlTemplate)
                 }
               >
-                {METHODS.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </Select>
-            </FormField>
-            <FormField
-              label={t("tools.url", "URL template")}
-              required
-              description={
-                relativeWithoutBase
-                  ? t(
-                      "tools.relativeRequiresBase",
-                      "A relative URL requires a credential with a base URL.",
-                    )
-                  : credBaseUrl
-                    ? t(
-                        "tools.relativeHint",
-                        "Paths starting with / are resolved against the credential's base. Its host is automatically allowed.",
+                {credBaseUrl && (
+                  <Tooltip content={credBaseUrl} side="top">
+                    <p className="mb-1 truncate font-mono text-text-muted text-xs">
+                      {credBaseUrl}
+                    </p>
+                  </Tooltip>
+                )}
+                <div className="flex items-center gap-1.5">
+                  <HighlightedTemplateField
+                    ref={urlRef}
+                    value={form.urlTemplate}
+                    onChange={(v) => setForm({ ...form, urlTemplate: v })}
+                    isKnownToken={(n) =>
+                      isKnownToolToken(n, aiFieldNames, !!form.credentialRef)
+                    }
+                    patternSource={TOOL_TOKEN_SOURCE}
+                    invalid={relativeWithoutBase}
+                    placeholder={
+                      credBaseUrl
+                        ? "/v1/resource/{{id}}"
+                        : "https://api.example.com/orders/{{orderId}}"
+                    }
+                    className="flex-1"
+                    aria-label={t("tools.url", "URL template")}
+                  />
+                  <VariablePicker
+                    compact
+                    params={aiFieldNames}
+                    includeSecret={!!form.credentialRef}
+                    onInsert={(tok) =>
+                      insertToken(urlRef.current, form.urlTemplate, tok, (v) =>
+                        setForm({ ...form, urlTemplate: v }),
                       )
-                    : undefined
-              }
-              error={
-                urlTemplateInvalid && form.urlTemplate.trim()
-                  ? t(
-                      "tools.invalidUrlTemplate",
-                      "Must start with / or be a full http(s) URL.",
-                    )
-                  : refusal.at("urlTemplate", current.urlTemplate)
-              }
-            >
-              {credBaseUrl && (
-                <Tooltip content={credBaseUrl} side="top">
-                  <p className="mb-1 truncate font-mono text-text-muted text-xs">
-                    {credBaseUrl}
-                  </p>
-                </Tooltip>
-              )}
-              <div className="flex items-center gap-1.5">
-                <HighlightedTemplateField
-                  ref={urlRef}
-                  value={form.urlTemplate}
-                  onChange={(v) => setForm({ ...form, urlTemplate: v })}
-                  isKnownToken={(n) =>
-                    isKnownToolToken(n, aiFieldNames, !!form.credentialRef)
-                  }
-                  patternSource={TOOL_TOKEN_SOURCE}
-                  invalid={relativeWithoutBase}
-                  placeholder={
-                    credBaseUrl
-                      ? "/v1/resource/{{id}}"
-                      : "https://api.example.com/orders/{{orderId}}"
-                  }
-                  className="flex-1"
-                  aria-label={t("tools.url", "URL template")}
-                />
-                <VariablePicker
-                  compact
-                  params={aiFieldNames}
-                  includeSecret={!!form.credentialRef}
-                  onInsert={(tok) =>
-                    insertToken(urlRef.current, form.urlTemplate, tok, (v) =>
-                      setForm({ ...form, urlTemplate: v }),
-                    )
-                  }
-                />
-              </div>
-            </FormField>
-          </div>
+                    }
+                  />
+                </div>
+              </FormField>
+            </div>
 
-          <FormField
-            error={refusal.at("credentialRef", current.credentialRef)}
-            label={t("tools.credential", "Credential")}
-            group
-            description={
-              selectedCredential?.kind === "header" &&
-              selectedCredential.paramName
-                ? t(
-                    "tools.credentialHintHeader",
-                    "Will be injected automatically into the {{name}} header.",
-                    { name: selectedCredential.paramName },
-                  )
-                : selectedCredential?.kind === "query" &&
-                    selectedCredential.paramName
+            <FormField
+              error={refusal.at("credentialRef", current.credentialRef)}
+              label={t("tools.credential", "Credential")}
+              group
+              description={
+                selectedCredential?.kind === "header" &&
+                selectedCredential.paramName
                   ? t(
-                      "tools.credentialHintQuery",
-                      "Will be injected automatically as the {{name}} query parameter.",
+                      "tools.credentialHintHeader",
+                      "Will be injected automatically into the {{name}} header.",
                       { name: selectedCredential.paramName },
                     )
-                  : t(
-                      "tools.credentialHint",
-                      "Injected into every request's auth, per the credential's type.",
-                    )
-            }
-          >
-            <CredentialPicker
-              value={form.credentialRef}
-              onChange={(v) => setForm({ ...form, credentialRef: v })}
-              onEntryChange={setSelectedCredential}
-              ariaLabel={t("tools.credential", "Credential")}
-            />
-          </FormField>
+                  : selectedCredential?.kind === "query" &&
+                      selectedCredential.paramName
+                    ? t(
+                        "tools.credentialHintQuery",
+                        "Will be injected automatically as the {{name}} query parameter.",
+                        { name: selectedCredential.paramName },
+                      )
+                    : t(
+                        "tools.credentialHint",
+                        "Injected into every request's auth, per the credential's type.",
+                      )
+              }
+            >
+              <CredentialPicker
+                value={form.credentialRef}
+                onChange={(v) => setForm({ ...form, credentialRef: v })}
+                onEntryChange={setSelectedCredential}
+                ariaLabel={t("tools.credential", "Credential")}
+              />
+            </FormField>
 
-          <FormField
-            error={refusal.at("query", current.query)}
-            label={t("tools.query", "Query string")}
-            group
-            description={t(
-              "tools.queryHint",
-              "Key/value params added to the URL (any method). Use Insert variable for an AI field, {{context}} or {{secret}}.",
-            )}
-          >
-            <KvEditor
-              rows={form.queryRows}
-              onChange={(queryRows) => setForm({ ...form, queryRows })}
-              params={aiFieldNames}
-              aiFields={form.aiFields}
-              includeSecret={!!form.credentialRef}
-              keyPlaceholder={t("tools.queryKey", "Param")}
-              addLabel={t("tools.addQueryParam", "Add param")}
-            />
-          </FormField>
-
-          <FormField
-            error={refusal.at("headers", current.headers)}
-            label={t("tools.headers", "Headers")}
-            group
-            description={
-              <button
-                type="button"
-                className="font-normal text-accent text-xs hover:underline"
-                onClick={() =>
-                  setForm({
-                    ...form,
-                    headersMode: form.headersMode === "raw" ? "kv" : "raw",
-                  })
-                }
-              >
-                {form.headersMode === "raw"
-                  ? t("tools.editAsFields", "Edit as fields")
-                  : t("tools.editAsJson", "Edit as JSON")}
-              </button>
-            }
-          >
-            {form.headersMode === "raw" ? (
-              <>
-                <HighlightedTemplateField
-                  ref={headersRawRef}
-                  value={form.headersRaw}
-                  onChange={(v) => setForm({ ...form, headersRaw: v })}
-                  isKnownToken={(n) =>
-                    isKnownToolToken(n, aiFieldNames, !!form.credentialRef)
-                  }
-                  patternSource={TOOL_TOKEN_SOURCE}
-                  multiline
-                  rows={4}
-                  textClassName="font-mono text-xs"
-                  placeholder={'{ "Content-Type": "application/json" }'}
-                  aria-label={t("tools.headers", "Headers")}
-                />
-                <VariablePicker
-                  params={aiFieldNames}
-                  includeSecret={!!form.credentialRef}
-                  onInsert={(tok) =>
-                    insertToken(
-                      headersRawRef.current,
-                      form.headersRaw,
-                      tok,
-                      (v) => setForm({ ...form, headersRaw: v }),
-                    )
-                  }
-                />
-              </>
-            ) : (
+            <FormField
+              error={refusal.at("query", current.query)}
+              label={t("tools.query", "Query string")}
+              group
+              description={t(
+                "tools.queryHint",
+                "Key/value params added to the URL (any method). Use Insert variable for an AI field, {{context}} or {{secret}}.",
+              )}
+            >
               <KvEditor
-                rows={form.headerRows}
-                onChange={(headerRows) => setForm({ ...form, headerRows })}
+                rows={form.queryRows}
+                onChange={(queryRows) => setForm({ ...form, queryRows })}
                 params={aiFieldNames}
                 aiFields={form.aiFields}
                 includeSecret={!!form.credentialRef}
-                keyPlaceholder={t("tools.headerKey", "Header")}
-                addLabel={t("tools.addHeader", "Add header")}
+                keyPlaceholder={t("tools.queryKey", "Param")}
+                addLabel={t("tools.addQueryParam", "Add param")}
               />
-            )}
-          </FormField>
+            </FormField>
 
-          {isWriteMethod && (
             <FormField
-              error={refusal.at("body", current.body)}
-              label={t("tools.body", "Request body")}
+              error={refusal.at("headers", current.headers)}
+              label={t("tools.headers", "Headers")}
               group
               description={
-                <div className="flex items-center gap-3">
-                  <button
-                    type="button"
-                    className="font-normal text-accent text-xs hover:underline"
-                    onClick={() =>
-                      setForm({
-                        ...form,
-                        bodyMode: form.bodyMode === "raw" ? "kv" : "raw",
-                      })
-                    }
-                  >
-                    {form.bodyMode === "raw"
-                      ? t("tools.editAsFields", "Edit as fields")
-                      : t("tools.editAsJson", "Edit as JSON")}
-                  </button>
-                  {form.bodyMode === "raw" && (
-                    <button
-                      type="button"
-                      className="font-normal text-accent text-xs hover:underline"
-                      onClick={formatBodyRaw}
-                    >
-                      {t("tools.formatJson", "Format")}
-                    </button>
-                  )}
-                </div>
+                <button
+                  type="button"
+                  className="font-normal text-accent text-xs hover:underline"
+                  onClick={() =>
+                    setForm({
+                      ...form,
+                      headersMode: form.headersMode === "raw" ? "kv" : "raw",
+                    })
+                  }
+                >
+                  {form.headersMode === "raw"
+                    ? t("tools.editAsFields", "Edit as fields")
+                    : t("tools.editAsJson", "Edit as JSON")}
+                </button>
               }
             >
-              {form.bodyMode === "raw" ? (
+              {form.headersMode === "raw" ? (
                 <>
                   <HighlightedTemplateField
-                    ref={bodyRef}
-                    value={form.bodyRaw}
-                    onChange={(v) => setForm({ ...form, bodyRaw: v })}
+                    ref={headersRawRef}
+                    value={form.headersRaw}
+                    onChange={(v) => setForm({ ...form, headersRaw: v })}
                     isKnownToken={(n) =>
                       isKnownToolToken(n, aiFieldNames, !!form.credentialRef)
                     }
                     patternSource={TOOL_TOKEN_SOURCE}
                     multiline
-                    rows={6}
+                    rows={4}
                     textClassName="font-mono text-xs"
-                    placeholder={'{ "id": "{{conversation_id}}" }'}
-                    aria-label={t("tools.body", "Request body")}
+                    placeholder={'{ "Content-Type": "application/json" }'}
+                    aria-label={t("tools.headers", "Headers")}
                   />
                   <VariablePicker
                     params={aiFieldNames}
                     includeSecret={!!form.credentialRef}
                     onInsert={(tok) =>
-                      insertToken(bodyRef.current, form.bodyRaw, tok, (v) =>
-                        setForm({ ...form, bodyRaw: v }),
+                      insertToken(
+                        headersRawRef.current,
+                        form.headersRaw,
+                        tok,
+                        (v) => setForm({ ...form, headersRaw: v }),
                       )
                     }
                   />
                 </>
               ) : (
                 <KvEditor
-                  rows={form.bodyRows}
-                  onChange={(bodyRows) => setForm({ ...form, bodyRows })}
+                  rows={form.headerRows}
+                  onChange={(headerRows) => setForm({ ...form, headerRows })}
                   params={aiFieldNames}
                   aiFields={form.aiFields}
                   includeSecret={!!form.credentialRef}
-                  keyPlaceholder={t("tools.bodyKey", "Field")}
-                  addLabel={t("tools.addBodyField", "Add field")}
+                  keyPlaceholder={t("tools.headerKey", "Header")}
+                  addLabel={t("tools.addHeader", "Add header")}
                 />
               )}
             </FormField>
-          )}
 
-          <FormField
-            label={t(
-              "tools.expectedStatuses",
-              "Statuses that mean 'no result'",
+            {isWriteMethod && (
+              <FormField
+                error={refusal.at("body", current.body)}
+                label={t("tools.body", "Request body")}
+                group
+                description={
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      className="font-normal text-accent text-xs hover:underline"
+                      onClick={() =>
+                        setForm({
+                          ...form,
+                          bodyMode: form.bodyMode === "raw" ? "kv" : "raw",
+                        })
+                      }
+                    >
+                      {form.bodyMode === "raw"
+                        ? t("tools.editAsFields", "Edit as fields")
+                        : t("tools.editAsJson", "Edit as JSON")}
+                    </button>
+                    {form.bodyMode === "raw" && (
+                      <button
+                        type="button"
+                        className="font-normal text-accent text-xs hover:underline"
+                        onClick={formatBodyRaw}
+                      >
+                        {t("tools.formatJson", "Format")}
+                      </button>
+                    )}
+                  </div>
+                }
+              >
+                {form.bodyMode === "raw" ? (
+                  <>
+                    <HighlightedTemplateField
+                      ref={bodyRef}
+                      value={form.bodyRaw}
+                      onChange={(v) => setForm({ ...form, bodyRaw: v })}
+                      isKnownToken={(n) =>
+                        isKnownToolToken(n, aiFieldNames, !!form.credentialRef)
+                      }
+                      patternSource={TOOL_TOKEN_SOURCE}
+                      multiline
+                      rows={6}
+                      textClassName="font-mono text-xs"
+                      placeholder={'{ "id": "{{conversation_id}}" }'}
+                      aria-label={t("tools.body", "Request body")}
+                    />
+                    <VariablePicker
+                      params={aiFieldNames}
+                      includeSecret={!!form.credentialRef}
+                      onInsert={(tok) =>
+                        insertToken(bodyRef.current, form.bodyRaw, tok, (v) =>
+                          setForm({ ...form, bodyRaw: v }),
+                        )
+                      }
+                    />
+                  </>
+                ) : (
+                  <KvEditor
+                    rows={form.bodyRows}
+                    onChange={(bodyRows) => setForm({ ...form, bodyRows })}
+                    params={aiFieldNames}
+                    aiFields={form.aiFields}
+                    includeSecret={!!form.credentialRef}
+                    keyPlaceholder={t("tools.bodyKey", "Field")}
+                    addLabel={t("tools.addBodyField", "Add field")}
+                  />
+                )}
+              </FormField>
             )}
-            description={t(
-              "tools.expectedStatusesHint",
-              "Comma-separated, e.g. 404. Use it when this API answers with an error status for an ordinary answer — a lookup that returns 404 for 'no record'. Those responses stop counting as integration failures, so they no longer raise alerts. The AI reads the same reply either way. Leave empty and every non-2xx is treated as a failure.",
-            )}
-            error={refusal.at("expectedStatuses", current.expectedStatuses)}
-          >
-            <Input
-              value={form.expectedStatuses}
-              onChange={(e) =>
-                setForm({ ...form, expectedStatuses: e.target.value })
-              }
-              placeholder="404"
-            />
-          </FormField>
 
-          <div className="flex flex-col gap-3 rounded-md border border-border p-3">
             <FormField
               label={t(
-                "tools.appointment",
-                "This tool books or cancels an appointment",
+                "tools.expectedStatuses",
+                "Statuses that mean 'no result'",
               )}
+              help={t(
+                "tools.expectedStatusesHelp",
+                'These codes identify ordinary responses that arrive with an error status, such as 404 for "not found."\n\nAdding them stops those responses from counting as failures or raising alerts. The AI receives the same response either way.\n\nIf the field is empty, every status outside 200 to 299 counts as a failure.',
+              )}
+              // INLINE, because a format example is what no state can reveal (docs/ui.md), and here
+              // the cost of not saying it is silence: `parseExpectedStatuses` splits on comma, space
+              // or semicolon and drops whatever is not a positive integer, so `404/410` yields an
+              // EMPTY list, no refusal, and a tool that goes on treating both as failures. The
+              // placeholder shows one code and says nothing about how to write two.
               description={t(
-                "tools.appointmentHint",
-                "Tell the platform when this tool's answer is about a commitment, so it can hold follow-ups while the booking stands and remind ahead of it. Say where the booking's id and start time are in the response: dot-separated keys, a number for an array position, e.g. data.items.0.id. The id has to be the same one your cancellation tool answers with.",
+                "tools.expectedStatusesHint",
+                "Comma-separated, e.g. 404, 410.",
               )}
+              error={refusal.at("expectedStatuses", current.expectedStatuses)}
             >
-              <Select
-                value={form.apptAction}
+              <Input
+                value={form.expectedStatuses}
                 onChange={(e) =>
-                  setForm({
-                    ...form,
-                    apptAction: e.target.value as "" | "book" | "cancel",
+                  setForm({ ...form, expectedStatuses: e.target.value })
+                }
+                placeholder="404"
+              />
+            </FormField>
+
+            <div className="flex flex-col gap-3 rounded-md border border-border p-3">
+              <p className="font-semibold text-text-primary text-xs uppercase tracking-wider">
+                {t("tools.responseSection", "The response")}
+              </p>
+              <FormField
+                label={t("tools.sample", "Sample response (optional)")}
+                description={t(
+                  "tools.sampleHint",
+                  "One response from this API, so you can pick fields instead of typing their paths. It is never saved: it stays open for as long as this tab is, and is gone after a reload.",
+                )}
+                group
+                // THE FIELD'S OWN ERROR, not a line beside the buttons (round 6 of review). Through
+                // `FormField` it reaches the accessibility tree the way every other field's does:
+                // the `role="group"` wrapper carries `aria-describedby` to this message and
+                // `aria-invalid`, so entering the editor announces the line and column instead of
+                // announcing only that something is wrong.
+                error={
+                  sampleParse.state === "invalid"
+                    ? sampleParse.problem
+                      ? t(
+                          "tools.sampleInvalidAt",
+                          "Not valid JSON at line {{line}}, column {{column}}, so there is nothing to pick from. The fields below still work if you type the paths.",
+                          {
+                            line: sampleParse.problem.line,
+                            column: sampleParse.problem.column,
+                          },
+                        )
+                      : t(
+                          "tools.sampleInvalid",
+                          "That is not valid JSON, so there is nothing to pick from. The fields below still work if you type the paths.",
+                        )
+                    : undefined
+                }
+              >
+                <CodeMirrorField
+                  value={sample}
+                  onChange={(next) => {
+                    // Typed or pasted by hand: there is no status behind it any more.
+                    setSample(next, null);
+                  }}
+                  extensions={SAMPLE_LANGUAGE}
+                  invalid={sampleParse.state === "invalid"}
+                  minHeight="6rem"
+                  // A response with a thousand records would otherwise make this field a thousand
+                  // lines tall and push the template and the appointment controls off the screen.
+                  // Past this it scrolls inside itself, which is what the `rows` of the textarea it
+                  // replaced gave for free (round 4 of review).
+                  maxHeight="24rem"
+                  placeholder='{"data": {"id": "ap_1", "start": "2026-09-02T14:00:00-03:00"}}'
+                  aria-label={t("tools.sample", "Sample response (optional)")}
+                />
+              </FormField>
+              {/* One row for both buttons and one sentence. They are the same decision — fill the
+                  sample, tidy the sample — and stacked they spent a hundred pixels of a modal that
+                  is already tall on two controls and a hint. */}
+              <div className="-mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  // Same gate Save carries, and for a sharper reason: the server refuses a
+                  // declared template it would not honour, so leaving this enabled spends a REAL
+                  // request against the provider to come back with a 400 the box above already
+                  // knows about.
+                  disabled={
+                    !form.urlTemplate.trim() ||
+                    urlTemplateInvalid ||
+                    // Deliberately separate from `urlTemplateInvalid`, which is false for a
+                    // relative template on purpose. `buildHttpTool` refuses that shape before a
+                    // request goes out, so without this the button spends a real round trip to be
+                    // told what the form already knows — and Save has always known it.
+                    relativeWithoutBase ||
+                    templateDeclProblem !== null
+                  }
+                  onClick={openTest}
+                >
+                  {t("tools.testOpen", "Send a test request")}
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  // Formatting requires reading, so on a paste that does not read there is nothing
+                  // it could do but drop what it could not understand — and the operator got that
+                  // text from somewhere and cannot get it back from us. The line beside this button
+                  // is the refusal, and it says where.
+                  disabled={sampleFormat.text === null}
+                  onClick={() => {
+                    const tidy = sampleFormat.text;
+                    if (tidy === null) return;
+                    // NOTE: neither the status nor the captured definition is touched here,
+                    // unlike on a keystroke: re-indenting changes the whitespace and never a value,
+                    // so the last run's status still describes this body and so does the definition
+                    // it came back from.
+                    reformatSample(tidy);
+                  }}
+                >
+                  {t("tools.sampleFormat", "Format")}
+                </Button>
+                {/* ONE sentence, and it belongs to whatever the operator cannot see for themselves.
+                    The two reasons Format is off on a sample that READS fine come first — a
+                    disabled button beside a sentence about something else is the silent refusal
+                    this field exists to remove. The parse error is not here: it is the field's own
+                    error, under the editor, where the group announces it. */}
+                {sampleFormat.why === "verbatim" && sampleStatus !== null ? (
+                  <span className="text-text-secondary text-xs">
+                    {t(
+                      "tools.sampleVerbatimStatus",
+                      "Kept exactly as the API sent it: with status {{status}} the agent reads this body as it arrived, so the preview below has to show the same thing.",
+                      { status: sampleStatus },
+                    )}
+                  </span>
+                ) : sampleFormat.why === "too-large" ? (
+                  <span className="text-text-secondary text-xs">
+                    {t(
+                      "tools.sampleTooNestedToFormat",
+                      "Too deeply nested to format: laying this out would produce something no one could read, so it is left as it arrived. Everything else on this screen still works.",
+                    )}
+                  </span>
+                ) : (
+                  <span className="text-text-secondary text-xs">
+                    {t(
+                      "tools.testOpenHint",
+                      "Runs this tool once against the real API and fills the sample above with the answer.",
+                    )}
+                  </span>
+                )}
+              </div>
+              <FormField
+                label={t("tools.outputTemplate", "What the agent receives")}
+                help={t(
+                  "tools.outputTemplateHelp",
+                  "By default the agent gets the whole response, cut off at 4000 characters — so a long answer loses its end, and an agent that cannot see a field tends to make one up.\n\nWrite the few lines you actually want instead. {{campo}} is replaced with that field from the response; a field the API does not return shows as (not returned) rather than a blank. Leave it empty to keep the whole response.\n\nFor a list of results, wrap one line in {{#each results}} … {{/each}}: it repeats per item, the fields inside are the item's own, and {{.}} is the item itself when the list holds plain values. At most 50 items are shown; the rest is counted.",
+                )}
+                description={t(
+                  "tools.outputTemplateHint",
+                  "Markdown, with {{path.to.field}} for each value and {{#each list}}…{{/each}} around what repeats per item. A number picks a list position: data.items.0.name",
+                )}
+                group
+                // SAME SHAPE AS THE SAMPLE ABOVE (#562): a CodeMirror has no single labelable
+                // control for a `<label for>` to point at, so the wrapper carries the group role and
+                // this message reaches the editor through `aria-describedby`.
+                error={
+                  refusal.at("outputSchema", current.outputSchema) ??
+                  (badTemplateTokens.length > 0
+                    ? t(
+                        "tools.outputTemplateBadTokens",
+                        "These are not paths into the response: {{tokens}}. A path is dot-separated keys, with a number for a list position: data.items.0.name",
+                        {
+                          tokens: badTemplateTokens
+                            .map((tok) => `{{${tok}}}`)
+                            .join(", "),
+                        },
+                      )
+                    : strayTemplateDelimiter !== null
+                      ? t(
+                          "tools.outputTemplateStrayBrace",
+                          'There is an unmatched brace near "{{stray}}". A field takes two braces on each side, and a stray one would reach the agent as literal text.',
+                          { stray: strayTemplateDelimiter },
+                        )
+                      : templateTooLong
+                        ? t(
+                            "tools.outputTemplateTooLong",
+                            "This is {{length}} characters and the limit is {{max}}. It is sent to the agent on every call of this tool.",
+                            {
+                              length: form.outputTemplate.trim().length,
+                              max: MAX_TEMPLATE_CHARS,
+                            },
+                          )
+                        : // Whatever else the reader refused — an unstorable character, say. Its
+                          // own sentence names the offending code point, which is the part that
+                          // makes it fixable.
+                          (templateDeclProblem ?? undefined))
+                }
+              >
+                <CodeMirrorField
+                  value={form.outputTemplate}
+                  onChange={(next) =>
+                    setForm((f) => ({ ...f, outputTemplate: next }))
+                  }
+                  extensions={templateGrammar}
+                  onView={(v) => {
+                    templateViewRef.current = v;
+                  }}
+                  invalid={templateDeclProblem !== null}
+                  minHeight="6rem"
+                  // Same ceiling as the sample: a template is a handful of lines, and a long one
+                  // must not push the appointment controls under it off the screen.
+                  maxHeight="24rem"
+                  placeholder={
+                    "**{{razao_social}}** — {{municipio}}\nSituação: {{descricao_situacao_cadastral}}"
+                  }
+                  aria-label={t(
+                    "tools.outputTemplate",
+                    "What the agent receives",
+                  )}
+                />
+              </FormField>
+              <PathPicker
+                leaves={templateOffer.leaves}
+                lists={templateOffer.lists}
+                heading={
+                  templateOffer.block === null
+                    ? null
+                    : t(
+                        "tools.outputTemplatePickInside",
+                        "Fields of each item in {{path}}",
+                        { path: templateOffer.block },
+                      )
+                }
+                emptyLabel={
+                  // Only while the sample offers SOMETHING: with no sample there is nothing to
+                  // move the caret towards, and the control stays hidden as before.
+                  sampleParse.templates.length + sampleParse.lists.length > 0
+                    ? t(
+                        "tools.outputTemplatePickNone",
+                        "Nothing to pick here: {{path}} is not a list in the sample, or its items have no fields. Move the cursor and open this again.",
+                        { path: templateOffer.block ?? "" },
+                      )
+                    : undefined
+                }
+                open={templatePickerOpen}
+                restoresFocus
+                onToggle={() => {
+                  if (!templatePickerOpen) {
+                    // The caret in the EDITOR's document. Read when the offer opens, because
+                    // opening it moves focus off the field without moving its selection.
+                    setTemplateCaret(
+                      templateViewRef.current?.state.selection.main.head ??
+                        form.outputTemplate.length,
+                    );
+                  }
+                  setTemplatePickerOpen(!templatePickerOpen);
+                }}
+                onPick={(path) => {
+                  // INSERTS at the cursor rather than replacing the field: this box holds a whole
+                  // block of text, unlike the single-path fields below it. Through the view rather
+                  // than through the controlled prop, so the caret lands where the edit put it
+                  // instead of wherever the re-render leaves it.
+                  insertIntoView(templateViewRef.current, (_doc, start) => ({
+                    insert: `{{${path}}}`,
+                    caret: start + `{{${path}}}`.length,
+                  }));
+                  setTemplatePickerOpen(false);
+                }}
+                onPickList={(path) => {
+                  insertIntoView(
+                    templateViewRef.current,
+                    (current, start, end) =>
+                      eachBlockEdit(current, start, end, path),
+                  );
+                  setTemplatePickerOpen(false);
+                }}
+                openLabel={t("tools.outputTemplatePick", "Insert a field")}
+                closeLabel={t("tools.appointmentPickClose", "Close")}
+                listsLabel={t(
+                  "tools.outputTemplatePickLists",
+                  "Lists: insert a block that repeats per item",
+                )}
+                listLength={(n) =>
+                  t("tools.outputTemplateListLength", "{{count}} items", {
+                    count: n,
                   })
                 }
-              >
-                <option value="">
+              />
+              {templatePreview && (
+                <FormField
+                  group
+                  label={t("tools.outputTemplatePreview", "Preview")}
+                  description={t(
+                    "tools.outputTemplatePreviewHint",
+                    "Exactly what the agent would receive for the sample above.",
+                  )}
+                >
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-bg-tertiary p-2 text-text-primary text-xs">
+                    {templatePreview.text}
+                  </pre>
+                </FormField>
+              )}
+              {form.outputSchemaProblem && (
+                <p className="-mt-2 text-warning text-xs">
                   {t(
-                    "tools.appointmentNone",
-                    "Neither — it is not about appointments",
+                    "tools.outputTemplateDropped",
+                    "This tool had a response template stored that could not be read, so it was not applied and is not shown: {{problem}}. Saving replaces it with whatever is in the box above.",
+                    { problem: form.outputSchemaProblem },
                   )}
-                </option>
-                <option value="book">
-                  {t("tools.appointmentBook", "It books one")}
-                </option>
-                <option value="cancel">
-                  {t("tools.appointmentCancel", "It cancels one")}
-                </option>
-              </Select>
-            </FormField>
-            {form.apptAction !== "" && (
-              <>
-                <FormField
-                  label={t(
-                    "tools.appointmentSample",
-                    "Sample response (optional)",
+                </p>
+              )}
+              {templatePreview?.skipped === "not-2xx" && (
+                <p className="-mt-2 text-warning text-xs">
+                  {t(
+                    "tools.outputTemplateNotApplied",
+                    "This sample came back as HTTP {{status}}, and the template only applies to a successful response. Outside 2xx the agent reads the body as it came, so it can read the error.",
+                    { status: sampleStatus },
                   )}
-                  description={t(
-                    "tools.appointmentSampleHint",
-                    "Paste one response from this API and pick the fields below instead of typing their paths. It is not saved and never leaves this screen.",
+                </p>
+              )}
+              {templatePreview?.skipped === "not-json" && (
+                <p className="-mt-2 text-warning text-xs">
+                  {t(
+                    "tools.outputTemplateNotJson",
+                    "This sample is not JSON, so there is nothing for the fields to point at and the agent reads the body as it came. The call still succeeded — only the template does not apply to it.",
                   )}
-                >
-                  <Textarea
-                    value={apptSample}
-                    onChange={(e) => setApptSample(e.target.value)}
-                    rows={3}
-                    placeholder='{"data": {"id": "ap_1", "start": "2026-09-02T14:00:00-03:00"}}'
-                  />
-                </FormField>
-                {sampleParse.state === "invalid" && (
-                  <p className="-mt-2 text-error text-xs">
-                    {t(
-                      "tools.appointmentSampleInvalid",
-                      "That is not valid JSON, so there is nothing to pick from. The paths below still work if you type them.",
-                    )}
-                  </p>
+                </p>
+              )}
+              {templatePreview && templatePreview.missing.length > 0 && (
+                <p className="-mt-2 text-warning text-xs">
+                  {t(
+                    "tools.outputTemplateMissing",
+                    "Not in the sample response: {{paths}}. The agent would see (not returned) there.",
+                    { paths: templatePreview.missing.join(", ") },
+                  )}
+                </p>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-3 rounded-md border border-border p-3">
+              <FormField
+                label={t(
+                  "tools.appointment",
+                  "This tool books or cancels an appointment",
                 )}
-                {sampleParse.state === "ok" &&
-                  sampleParse.leaves.length === 0 && (
-                    <p className="-mt-2 text-text-secondary text-xs">
-                      {t(
-                        "tools.appointmentSampleEmpty",
-                        "Nothing in this response can be pointed at: a path can only end on a piece of text or a number, and every key along the way has to be made of letters, digits, - or _.",
-                      )}
-                    </p>
-                  )}
-                <FormField
-                  label={t("tools.appointmentIdPath", "Where the id is")}
-                >
-                  <Input
-                    value={form.apptIdPath}
-                    onChange={(e) =>
-                      setForm({ ...form, apptIdPath: e.target.value })
-                    }
-                    placeholder="data.id"
-                    error={apptIdPathInvalid}
-                    errorMessage={
-                      apptIdPathInvalid
-                        ? t(
-                            "tools.appointmentPathInvalid",
-                            "Dot-separated keys, with a number for a list position: data.items.0.id",
-                          )
-                        : undefined
-                    }
-                  />
-                </FormField>
-                <PathPicker
-                  leaves={sampleParse.leaves}
-                  open={apptPicker === "id"}
-                  onToggle={() =>
-                    setApptPicker(apptPicker === "id" ? null : "id")
+                help={t(
+                  "tools.appointmentHelp",
+                  "This option identifies when the tool creates or cancels an appointment.\n\nThe platform pauses follow-up messages while the appointment is active and sends the configured reminders.\n\nPoint it at where the id and the start time sit in the tool's response.",
+                )}
+              >
+                <Select
+                  value={form.apptAction}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      apptAction: e.target.value as "" | "book" | "cancel",
+                    })
                   }
-                  onPick={(path) => {
-                    setForm({ ...form, apptIdPath: path });
-                    setApptPicker(null);
-                  }}
-                  openLabel={t("tools.appointmentPick", "Pick from the sample")}
-                  closeLabel={t("tools.appointmentPickClose", "Close")}
-                />
-                <FormField
-                  label={t("tools.appointmentProvider", "Booking system")}
-                  description={t(
-                    "tools.appointmentProviderHint",
-                    "Only needed if you have more than one booking system: an id is unique only within the system that issued it. Use the same name on the tool that books and the tool that cancels, or the cancellation will not find the appointment.",
-                  )}
                 >
-                  <Input
-                    value={form.apptProvider}
-                    onChange={(e) =>
-                      setForm({ ...form, apptProvider: e.target.value })
+                  <option value="">
+                    {t(
+                      "tools.appointmentNone",
+                      "Neither — it is not about appointments",
+                    )}
+                  </option>
+                  <option value="book">
+                    {t("tools.appointmentBook", "It books one")}
+                  </option>
+                  <option value="cancel">
+                    {t("tools.appointmentCancel", "It cancels one")}
+                  </option>
+                </Select>
+              </FormField>
+              {form.apptAction !== "" && (
+                <>
+                  {sampleParse.state === "ok" &&
+                    sampleParse.leaves.length === 0 && (
+                      <p className="text-text-secondary text-xs">
+                        {t(
+                          "tools.appointmentSampleEmpty",
+                          "Nothing in the sample response above can be pointed at from here: an id or a start time can only be a piece of text or a number, and every key along the way has to be made of letters, digits, - or _.",
+                        )}
+                      </p>
+                    )}
+                  <FormField
+                    label={t("tools.appointmentIdPath", "Where the id is")}
+                    // INLINE, not behind the `?`, and docs/ui.md names this exact case: a cross-field
+                    // dependency is the one kind of help the field can never reveal, because the fact
+                    // lives on another screen. Nothing here can detect that the cancellation tool
+                    // answers with a different id; the cancellation just never finds the appointment.
+                    description={t(
+                      "tools.appointmentIdPathHint",
+                      "Dot-separated keys, with a number for a list position: data.items.0.id. The tool that cancels has to answer with this same id.",
+                    )}
+                  >
+                    <Input
+                      value={form.apptIdPath}
+                      onChange={(e) =>
+                        setForm({ ...form, apptIdPath: e.target.value })
+                      }
+                      placeholder="data.id"
+                      error={apptIdPathInvalid}
+                      errorMessage={
+                        apptIdPathInvalid
+                          ? t(
+                              "tools.appointmentPathInvalid",
+                              "Dot-separated keys, with a number for a list position: data.items.0.id",
+                            )
+                          : undefined
+                      }
+                    />
+                  </FormField>
+                  <PathPicker
+                    leaves={sampleParse.leaves}
+                    open={apptPicker === "id"}
+                    onToggle={() =>
+                      setApptPicker(apptPicker === "id" ? null : "id")
                     }
-                    placeholder="feegow"
-                    error={apptProviderInvalid}
-                    errorMessage={
-                      apptProviderInvalid
-                        ? t(
-                            "tools.appointmentProviderInvalid",
-                            'Lowercase letters, digits, - and _ only, and not "google_calendar".',
-                          )
-                        : undefined
-                    }
+                    onPick={(path) => {
+                      setForm({ ...form, apptIdPath: path });
+                      setApptPicker(null);
+                    }}
+                    openLabel={t(
+                      "tools.appointmentPick",
+                      "Pick from the sample",
+                    )}
+                    closeLabel={t("tools.appointmentPickClose", "Close")}
                   />
-                </FormField>
-                {form.apptAction === "book" && (
-                  <>
-                    <FormField
-                      label={t(
-                        "tools.appointmentStartPath",
-                        "Where the start time is",
-                      )}
-                    >
-                      <Input
-                        value={form.apptStartPath}
-                        onChange={(e) =>
-                          setForm({ ...form, apptStartPath: e.target.value })
-                        }
-                        placeholder="data.start"
-                        error={apptStartPathInvalid}
-                        errorMessage={
-                          apptStartPathInvalid
-                            ? t(
-                                "tools.appointmentPathInvalid",
-                                "Dot-separated keys, with a number for a list position: data.items.0.id",
-                              )
-                            : undefined
-                        }
-                      />
-                    </FormField>
-                    <PathPicker
-                      leaves={sampleParse.leaves}
-                      open={apptPicker === "start"}
-                      onToggle={() =>
-                        setApptPicker(apptPicker === "start" ? null : "start")
+                  <FormField
+                    label={t("tools.appointmentProvider", "Booking system")}
+                    description={t(
+                      "tools.appointmentProviderHint",
+                      "Only for multiple booking systems: use the same name on the tools that book and cancel.",
+                    )}
+                  >
+                    <Input
+                      value={form.apptProvider}
+                      onChange={(e) =>
+                        setForm({ ...form, apptProvider: e.target.value })
                       }
-                      onPick={(path) => {
-                        setForm({ ...form, apptStartPath: path });
-                        setApptPicker(null);
-                      }}
-                      openLabel={t(
-                        "tools.appointmentPick",
-                        "Pick from the sample",
-                      )}
-                      closeLabel={t("tools.appointmentPickClose", "Close")}
-                    />
-                    <FormField
-                      label={t(
-                        "tools.appointmentSummaryPath",
-                        "Where the title is (optional)",
-                      )}
-                      description={t(
-                        "tools.appointmentSummaryPathHint",
-                        "Only used to describe the appointment to the AI. Leave empty if the response has no title.",
-                      )}
-                    >
-                      <Input
-                        value={form.apptSummaryPath}
-                        onChange={(e) =>
-                          setForm({ ...form, apptSummaryPath: e.target.value })
-                        }
-                        placeholder="data.title"
-                        error={apptSummaryPathInvalid}
-                        errorMessage={
-                          apptSummaryPathInvalid
-                            ? t(
-                                "tools.appointmentPathInvalid",
-                                "Dot-separated keys, with a number for a list position: data.items.0.id",
-                              )
-                            : undefined
-                        }
-                      />
-                    </FormField>
-                    <PathPicker
-                      leaves={sampleParse.leaves}
-                      open={apptPicker === "summary"}
-                      onToggle={() =>
-                        setApptPicker(
-                          apptPicker === "summary" ? null : "summary",
-                        )
+                      placeholder="feegow"
+                      error={apptProviderInvalid}
+                      errorMessage={
+                        apptProviderInvalid
+                          ? t(
+                              "tools.appointmentProviderInvalid",
+                              'Lowercase letters, digits, - and _ only, and not "google_calendar".',
+                            )
+                          : undefined
                       }
-                      onPick={(path) => {
-                        setForm({ ...form, apptSummaryPath: path });
-                        setApptPicker(null);
-                      }}
-                      openLabel={t(
-                        "tools.appointmentPick",
-                        "Pick from the sample",
-                      )}
-                      closeLabel={t("tools.appointmentPickClose", "Close")}
                     />
-                    <FormField
-                      label={t(
-                        "tools.appointmentOffsets",
-                        "Remind the customer this many hours before",
-                      )}
-                      description={t(
-                        "tools.appointmentOffsetsHint",
-                        "Comma-separated, e.g. 24, 1 (up to five, between 1 and 8760 hours). Leave empty and no reminder is sent — the booking still holds follow-ups and still reaches the AI. Use it only when your own system does not already remind them.",
-                      )}
-                    >
-                      <Input
-                        value={form.apptOffsets}
-                        onChange={(e) =>
-                          setForm({ ...form, apptOffsets: e.target.value })
-                        }
-                        placeholder="24, 1"
-                        error={apptOffsetsInvalid}
-                        errorMessage={
-                          apptOffsetsInvalid
-                            ? t(
-                                "tools.appointmentOffsetsInvalid",
-                                "Up to five values, each between 1 and 8760 hours.",
-                              )
-                            : undefined
-                        }
-                      />
-                    </FormField>
-                    {form.apptOffsets.trim() !== "" && (
-                      <div className="flex items-center justify-between gap-3">
-                        <label
-                          htmlFor={apptAskConfirmId}
-                          data-clickable="true"
-                          className="text-sm text-text-primary"
-                        >
-                          {t(
-                            "tools.appointmentAskConfirm",
-                            "On the last reminder, ask if they will attend",
-                          )}
-                        </label>
-                        <Switch
-                          id={apptAskConfirmId}
-                          checked={form.apptAskConfirm}
-                          onCheckedChange={(v) =>
-                            setForm({ ...form, apptAskConfirm: v })
+                  </FormField>
+                  {form.apptAction === "book" && (
+                    <>
+                      <FormField
+                        label={t(
+                          "tools.appointmentStartPath",
+                          "Where the start time is",
+                        )}
+                        description={t(
+                          "tools.appointmentStartPathHint",
+                          "Dot-separated keys, with a number for a list position: data.items.0.start.",
+                        )}
+                      >
+                        <Input
+                          value={form.apptStartPath}
+                          onChange={(e) =>
+                            setForm({ ...form, apptStartPath: e.target.value })
+                          }
+                          placeholder="data.start"
+                          error={apptStartPathInvalid}
+                          errorMessage={
+                            apptStartPathInvalid
+                              ? t(
+                                  "tools.appointmentPathInvalid",
+                                  "Dot-separated keys, with a number for a list position: data.items.0.id",
+                                )
+                              : undefined
                           }
                         />
-                      </div>
-                    )}
-                  </>
-                )}
-              </>
-            )}
-          </div>
-
-          <div className="flex flex-col gap-3 rounded-md border border-border p-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex flex-col">
-                <label
-                  htmlFor={ackId}
-                  data-clickable="true"
-                  className="font-medium text-sm text-text-primary"
-                >
-                  {t("tools.ack", "Send a holding message")}
-                </label>
-                <span className="text-text-muted text-xs">
-                  {t(
-                    "tools.ackHint",
-                    "When on, the AI must write a short holding message before this (slow) tool runs — and the tool won't run until it does. The example below only sets the tone; it is never sent as-is.",
+                      </FormField>
+                      <PathPicker
+                        leaves={sampleParse.leaves}
+                        open={apptPicker === "start"}
+                        onToggle={() =>
+                          setApptPicker(apptPicker === "start" ? null : "start")
+                        }
+                        onPick={(path) => {
+                          setForm({ ...form, apptStartPath: path });
+                          setApptPicker(null);
+                        }}
+                        openLabel={t(
+                          "tools.appointmentPick",
+                          "Pick from the sample",
+                        )}
+                        closeLabel={t("tools.appointmentPickClose", "Close")}
+                      />
+                      <FormField
+                        label={t(
+                          "tools.appointmentSummaryPath",
+                          "Where the title is (optional)",
+                        )}
+                        description={t(
+                          "tools.appointmentSummaryPathHint",
+                          "Only used to describe the appointment to the AI. Leave empty if the response has no title.",
+                        )}
+                      >
+                        <Input
+                          value={form.apptSummaryPath}
+                          onChange={(e) =>
+                            setForm({
+                              ...form,
+                              apptSummaryPath: e.target.value,
+                            })
+                          }
+                          placeholder="data.title"
+                          error={apptSummaryPathInvalid}
+                          errorMessage={
+                            apptSummaryPathInvalid
+                              ? t(
+                                  "tools.appointmentPathInvalid",
+                                  "Dot-separated keys, with a number for a list position: data.items.0.id",
+                                )
+                              : undefined
+                          }
+                        />
+                      </FormField>
+                      <PathPicker
+                        leaves={sampleParse.leaves}
+                        open={apptPicker === "summary"}
+                        onToggle={() =>
+                          setApptPicker(
+                            apptPicker === "summary" ? null : "summary",
+                          )
+                        }
+                        onPick={(path) => {
+                          setForm({ ...form, apptSummaryPath: path });
+                          setApptPicker(null);
+                        }}
+                        openLabel={t(
+                          "tools.appointmentPick",
+                          "Pick from the sample",
+                        )}
+                        closeLabel={t("tools.appointmentPickClose", "Close")}
+                      />
+                      <FormField
+                        label={t(
+                          "tools.appointmentOffsets",
+                          "Remind the customer this many hours before",
+                        )}
+                        description={t(
+                          "tools.appointmentOffsetsHint",
+                          // The last sentence is a WARNING and it went missing once already: a booking
+                          // system that reminds the customer itself plus reminders here is two
+                          // notifications for one appointment, and nothing on this screen can tell
+                          // that the other system does it. Inline by the outcome-1 test in
+                          // docs/ui.md.
+                          "Enter up to five lead times from 1 to 8760 hours, separated by commas, such as 24, 1; empty disables reminders only. Leave it empty if your own booking system already reminds them.",
+                        )}
+                      >
+                        <Input
+                          value={form.apptOffsets}
+                          onChange={(e) =>
+                            setForm({ ...form, apptOffsets: e.target.value })
+                          }
+                          placeholder="24, 1"
+                          error={apptOffsetsInvalid}
+                          errorMessage={
+                            apptOffsetsInvalid
+                              ? t(
+                                  "tools.appointmentOffsetsInvalid",
+                                  "Up to five values, each between 1 and 8760 hours.",
+                                )
+                              : undefined
+                          }
+                        />
+                      </FormField>
+                      {form.apptOffsets.trim() !== "" && (
+                        <div className="flex items-center justify-between gap-3">
+                          <label
+                            htmlFor={apptAskConfirmId}
+                            data-clickable="true"
+                            className="text-sm text-text-primary"
+                          >
+                            {t(
+                              "tools.appointmentAskConfirm",
+                              "On the last reminder, ask if they will attend",
+                            )}
+                          </label>
+                          <Switch
+                            id={apptAskConfirmId}
+                            checked={form.apptAskConfirm}
+                            onCheckedChange={(v) =>
+                              setForm({ ...form, apptAskConfirm: v })
+                            }
+                          />
+                        </div>
+                      )}
+                    </>
                   )}
-                </span>
-              </div>
-              <Switch
-                id={ackId}
-                checked={form.ackEnabled}
-                onCheckedChange={(v) => setForm({ ...form, ackEnabled: v })}
-              />
+                </>
+              )}
             </div>
-            {form.ackEnabled && (
-              <div className="flex flex-col gap-1">
-                <span className="text-text-muted text-xs">
-                  {t(
-                    "tools.ackExampleLabel",
-                    "Tone example (the AI writes its own message):",
-                  )}
-                </span>
-                <Input
-                  value={form.ackMessage}
-                  onChange={(e) =>
-                    setForm({ ...form, ackMessage: e.target.value })
-                  }
-                  placeholder={t(
-                    "tools.ackPlaceholder",
-                    "Let me look into that for you…",
-                  )}
-                  error={
-                    ackInvalid || !!refusal.at("ackMessage", current.ackMessage)
-                  }
-                  errorMessage={
-                    ackInvalid
-                      ? t(
-                          "tools.ackRequired",
-                          "Add a tone example, or turn this off.",
-                        )
-                      : (refusal.at("ackMessage", current.ackMessage) ??
-                        undefined)
-                  }
+
+            <div className="flex flex-col gap-3 rounded-md border border-border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-1.5">
+                  <label
+                    htmlFor={ackId}
+                    data-clickable="true"
+                    className="font-medium text-sm text-text-primary"
+                  >
+                    {t("tools.ack", "Send a holding message")}
+                  </label>
+                  <HelpPopover
+                    content={t(
+                      "tools.ackHelp",
+                      "This option makes the agent notify the customer before starting a slow tool.\n\nThe tool starts only after the agent sends this message.\n\nThe example below sets the tone, but is never sent unchanged.",
+                    )}
+                    label={t("tools.ack", "Send a holding message")}
+                  />
+                </div>
+                <Switch
+                  id={ackId}
+                  checked={form.ackEnabled}
+                  onCheckedChange={(v) => setForm({ ...form, ackEnabled: v })}
                 />
               </div>
-            )}
-          </div>
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-// Editor for an enum field's allowed values (chips). Empty list ⇒ the runtime treats it as a free
-// string (z.enum requires at least one value).
-function EnumValuesEditor({
-  values,
-  onChange,
-}: {
-  values: string[];
-  onChange: (values: string[]) => void;
-}) {
-  const { t } = useTranslation();
-  const [draft, setDraft] = useState("");
-  const add = () => {
-    const v = draft.trim();
-    if (v && !values.includes(v)) onChange([...values, v]);
-    setDraft("");
-  };
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap gap-1.5">
-        {values.map((v) => (
-          <span
-            key={v}
-            className="inline-flex items-center gap-1 rounded-md bg-bg-tertiary px-2 py-0.5 text-text-secondary text-xs"
-          >
-            <code className="font-mono">{v}</code>
-            <button
-              type="button"
-              onClick={() => onChange(values.filter((x) => x !== v))}
-              aria-label={t("common.remove", "Remove")}
-              className="text-text-muted hover:text-error"
-            >
-              <Trash2 className="h-3 w-3" aria-hidden="true" />
-            </button>
-          </span>
-        ))}
-      </div>
-      <div className="flex items-center gap-1.5">
-        <Input
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              add();
-            }
-          }}
-          placeholder={t("tools.enumValuePlaceholder", "value")}
-          className="min-w-0 flex-1"
-        />
-        <Button type="button" variant="secondary" size="sm" onClick={add}>
-          {t("tools.addEnumValue", "Add value")}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-// The consolidated "AI fields" panel: one row per declared input the model fills in. Name + type
-// (+ enum values / array item type) + description + required. This is the single editing surface for
-// the model-facing contract; placement (URL/query/headers/body) only references {{name}}.
-function AiFieldsPanel({
-  value,
-  onChange,
-}: {
-  value: AiFieldRow[];
-  onChange: (rows: AiFieldRow[]) => void;
-}) {
-  const { t } = useTranslation();
-  const update = (i: number, patch: Partial<AiFieldRow>) =>
-    onChange(value.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
-  const typeLabels: Record<AiFieldType, string> = {
-    string: t("tools.typeString", "Text"),
-    integer: t("tools.typeInteger", "Integer"),
-    number: t("tools.typeNumber", "Number"),
-    boolean: t("tools.typeBoolean", "Yes/No"),
-    enum: t("tools.typeEnum", "List (enum)"),
-    array: t("tools.typeArray", "Array"),
-    object: t("tools.typeObject", "JSON object"),
-  };
-  return (
-    <div className="flex flex-col gap-2">
-      {value.length === 0 && (
-        <p className="text-text-muted text-xs">
-          {t("tools.noAiFields", "No AI fields yet.")}
-        </p>
-      )}
-      {value.map((row, i) => (
-        <div
-          key={row._id}
-          className="flex flex-col gap-2 rounded-md border border-border p-2"
-        >
-          <div className="flex items-center gap-2">
-            <Input
-              value={row.name}
-              onChange={(e) => update(i, { name: e.target.value })}
-              placeholder={t("tools.aiFieldName", "field_name")}
-              className="min-w-0 flex-1"
-            />
-            <Select
-              value={row.type}
-              onChange={(e) =>
-                update(i, { type: e.target.value as AiFieldType })
-              }
-              className="w-36 shrink-0"
-            >
-              {AI_FIELD_TYPES.map((ty) => (
-                <option key={ty} value={ty}>
-                  {typeLabels[ty]}
-                </option>
-              ))}
-            </Select>
-            <button
-              type="button"
-              onClick={() => onChange(value.filter((_, idx) => idx !== i))}
-              aria-label={t("common.remove", "Remove")}
-              className="shrink-0 rounded p-1.5 text-text-muted hover:text-error"
-            >
-              <Trash2 className="h-4 w-4" aria-hidden="true" />
-            </button>
-          </div>
-          {row.type === "enum" && (
-            <EnumValuesEditor
-              values={row.enumValues}
-              onChange={(enumValues) => update(i, { enumValues })}
-            />
-          )}
-          {row.type === "array" && (
-            <div className="flex items-center gap-2 text-text-secondary text-xs">
-              <span>{t("tools.arrayItemType", "Item type")}</span>
-              <Select
-                aria-label={t("tools.arrayItemType", "Item type")}
-                value={row.itemType}
-                onChange={(e) =>
-                  update(i, { itemType: e.target.value as ScalarFieldType })
-                }
-                className="w-36"
-              >
-                {SCALAR_FIELD_TYPES.map((ty) => (
-                  <option key={ty} value={ty}>
-                    {typeLabels[ty]}
-                  </option>
-                ))}
-              </Select>
+              {form.ackEnabled && (
+                <div className="flex flex-col gap-1">
+                  <span className="text-text-muted text-xs">
+                    {t(
+                      "tools.ackExampleLabel",
+                      "Tone example (the AI writes its own message):",
+                    )}
+                  </span>
+                  <Input
+                    value={form.ackMessage}
+                    onChange={(e) =>
+                      setForm({ ...form, ackMessage: e.target.value })
+                    }
+                    placeholder={t(
+                      "tools.ackPlaceholder",
+                      "Let me look into that for you…",
+                    )}
+                    error={
+                      ackInvalid ||
+                      !!refusal.at("ackMessage", current.ackMessage)
+                    }
+                    errorMessage={
+                      ackInvalid
+                        ? t(
+                            "tools.ackRequired",
+                            "Add a tone example, or turn this off.",
+                          )
+                        : (refusal.at("ackMessage", current.ackMessage) ??
+                          undefined)
+                    }
+                  />
+                </div>
+              )}
             </div>
-          )}
-          <Input
-            value={row.description}
-            onChange={(e) => update(i, { description: e.target.value })}
-            placeholder={t(
-              "tools.aiFieldDesc",
-              "What the AI should put here, e.g. 'the order number the customer gave'",
-            )}
-          />
-          <label className="flex w-fit items-center gap-2 text-text-secondary text-xs">
-            <input
-              type="checkbox"
-              checked={row.required}
-              onChange={(e) => update(i, { required: e.target.checked })}
-            />
-            {t("tools.aiFieldRequired", "Required")}
-          </label>
-        </div>
-      ))}
-      <Button
-        type="button"
-        variant="secondary"
-        size="sm"
-        onClick={() =>
-          onChange([
-            ...value,
-            {
-              _id: rid(),
-              name: "",
-              type: "string",
-              required: false,
-              description: "",
-              enumValues: [],
-              itemType: "string",
-            },
-          ])
-        }
-      >
-        <Plus className="h-4 w-4" aria-hidden="true" />
-        {t("tools.addAiField", "Add field")}
-      </Button>
-    </div>
+          </div>
+        )}
+      </Modal>
+      <ToolTestModal
+        modal={testModal}
+        onResponse={(raw, status) => {
+          // FORMATTED ON ARRIVAL, on a status whose body gets a template. This is not something the
+          // operator wrote: it is what we just fetched, and an API answers minified. Landing on one
+          // unreadable line and asking them to press Format is a step that has one right answer, so
+          // it is not a step. What comes back unreadable — an HTML error page, XML, plain text — is
+          // kept exactly as the server sent it, because then there is nothing to format and the raw
+          // body IS the diagnosis.
+          //
+          // And a body the model reads VERBATIM is kept verbatim whatever it holds: the preview
+          // shows a non-2xx sample raw, clipped the way the runtime clips it, so reformatting would
+          // preview a document the API never sent (round 5 of review).
+          //
+          // Safe to do here for the same reason Format is safe at all: `reindentJson` copies every
+          // literal out verbatim, so an id no JavaScript number can hold survives the trip.
+          const tidy = readsBodyVerbatim(status) ? null : reindentJson(raw);
+          setSample(tidy?.ok ? tidy.text : raw, status);
+        }}
+      />
+    </>
   );
 }
 

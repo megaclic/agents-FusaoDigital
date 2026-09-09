@@ -192,7 +192,7 @@ describe.skipIf(!dbUp)(
           name: "embed-blank",
           kind: "generic",
           status: "active",
-          secret: encryptJson(""),
+          secret: encryptJson("sk-live"),
         },
       });
       await updateEmbeddingSettings(
@@ -200,6 +200,14 @@ describe.skipIf(!dbUp)(
         { credentialRef: `vault:${row.id}` },
         appDb,
       );
+      // Emptied AFTER it was wired, because that is the only way this state is reachable now: the
+      // write boundary refuses a ref whose value is not the shape its kind declares (issue #471), so
+      // a blank active secret can be arrived at but never chosen. What it does not change is what
+      // this test is about — the reader still has to tell `empty` from `pending` and from `gone`.
+      await suDb.vaultEntry.update({
+        where: { id: row.id },
+        data: { secret: encryptJson("") },
+      });
       expect((await readEmbeddingBlock(ctxOf(id), appDb))?.reason).toBe(
         "credential_empty",
       );
@@ -254,6 +262,61 @@ describe.skipIf(!dbUp)(
       // The document did not move — it is still waiting for someone to index it, which is exactly the
       // state the badge must now describe instead of "blocked".
       expect((await readDoc(id, doc.id))?.status).toBe("UNINDEXED");
+    });
+
+    test("an active OpenAI-compatible credential preserves its base URL for RAG", async () => {
+      const { id } = await seedTenant("embed-base-url");
+      const entry = await createVaultEntry(
+        ctx(id),
+        {
+          name: "embed-compatible",
+          value: "internal-test-value",
+          kind: "openai_compatible",
+          baseUrl: "https://embedding.internal.example/v1",
+        },
+        undefined,
+        undefined,
+        appDb,
+      );
+      await updateEmbeddingSettings(
+        ctx(id),
+        { credentialRef: entry.ref },
+        appDb,
+      );
+      const config = await runScopedOn(appDb, ctx(id), (db) =>
+        resolveEmbeddingConfig(db, id, "text-embedding-3-small"),
+      );
+      expect(config.baseURL).toBe("https://embedding.internal.example/v1");
+      expect(config.model).toBe("text-embedding-3-small");
+    });
+
+    // `updateEmbeddingSettings` validates that the ref RESOLVES and nothing else, and four other
+    // kinds persist a baseUrl of their own. Honouring it for any kind means the operator who picks
+    // the Chatwoot credential here POSTs every chunk of their knowledge base at the Chatwoot host,
+    // with a request that looks entirely plausible on the way out.
+    test("a base URL belonging to another service never becomes the embedding endpoint", async () => {
+      const { id } = await seedTenant("embed-wrong-kind");
+      const entry = await createVaultEntry(
+        ctx(id),
+        {
+          name: "chatwoot-of-this-tenant",
+          value: "internal-test-value",
+          kind: "chatwoot_api_token",
+          baseUrl: "https://chatwoot.internal.example",
+        },
+        undefined,
+        undefined,
+        appDb,
+      );
+      await updateEmbeddingSettings(
+        ctx(id),
+        { credentialRef: entry.ref },
+        appDb,
+      );
+      const config = await runScopedOn(appDb, ctx(id), (db) =>
+        resolveEmbeddingConfig(db, id, "text-embedding-3-small"),
+      );
+      expect(config.baseURL).toBeUndefined();
     });
 
     // Review finding, round 4: this shape also rides on the documents list, which any authenticated

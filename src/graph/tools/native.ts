@@ -1,8 +1,17 @@
-import type { StructuredToolInterface } from "@langchain/core/tools";
+import { ToolMessage } from "@langchain/core/messages";
+import type {
+  StructuredToolInterface,
+  ToolRunnableConfig,
+} from "@langchain/core/tools";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
+import {
+  SKIP_REPLY_ACK,
+  SKIP_REPLY_MARK,
+  SKIP_REPLY_TOOL,
+} from "@/graph/silence";
 import { failableTool, toolFailure } from "@/graph/tools/failure";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
@@ -12,6 +21,7 @@ import type {
   CustomAttributeDef,
 } from "@/modules/chatwoot/client";
 import { type KanbanContext, matchKanbanStep } from "@/modules/chatwoot/kanban";
+import { withConversationLabels } from "@/modules/chatwoot/labels";
 import {
   attributesForModel,
   type ChatwootVocab,
@@ -61,7 +71,14 @@ import {
 // ToolCtx (the conversation + a ready client); the runtime resolves the per-agent allowlist
 // (fail-closed: a tool not in the allowlist is never exposed to the model).
 
-export { NATIVE_TOOL_NAMES, type NativeToolName } from "./catalog";
+import { HANDOFF_DONE_PREFIX, HANDOFF_TOOL_NAME } from "./catalog";
+
+export {
+  HANDOFF_DONE_PREFIX,
+  HANDOFF_TOOL_NAME,
+  NATIVE_TOOL_NAMES,
+  type NativeToolName,
+} from "./catalog";
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -389,10 +406,12 @@ function handoffTool(ctx: ToolCtx) {
           err: e,
         });
       }
-      return `Handed off to a human (status set to open).${assigned} The bot will stay silent now.`;
+      return `${HANDOFF_DONE_PREFIX} (status set to open).${assigned} The bot will stay silent now.`;
     },
     {
-      name: "handoff_to_human",
+      // From the catalog, because the hand-back decision matches results by this exact name
+      // (../handback.ts). Spelled here as a literal, a rename would leave that match silently false.
+      name: HANDOFF_TOOL_NAME,
       description: withOperatorNote(
         baseDescription,
         ctx,
@@ -732,15 +751,25 @@ function assignLabelTool(ctx: ToolCtx) {
         ]);
         return `Label "${clean}" added to the contact.`;
       }
-      const current = await ctx.client.getConversationLabels(
+      // Inside the conversation's label queue, with the observer's verdict and the nudge's own
+      // merge: the endpoint replaces the whole set, so an unqueued read-then-POST here erases what
+      // another writer added between the two (issue #477 review, round 3).
+      return withConversationLabels(
+        ctx.tenantId,
         ctx.conversationId,
+        async () => {
+          const current = await ctx.client.getConversationLabels(
+            ctx.conversationId,
+          );
+          if (current.includes(clean))
+            return `Label "${clean}" was already set.`;
+          await ctx.client.setConversationLabels(ctx.conversationId, [
+            ...current,
+            clean,
+          ]);
+          return `Label "${clean}" added to the conversation.`;
+        },
       );
-      if (current.includes(clean)) return `Label "${clean}" was already set.`;
-      await ctx.client.setConversationLabels(ctx.conversationId, [
-        ...current,
-        clean,
-      ]);
-      return `Label "${clean}" added to the conversation.`;
     },
     {
       name: "assign_label",
@@ -1157,10 +1186,24 @@ function scheduleMessageTool(ctx: ToolCtx) {
 // conversation timeline (via the tool flow log) as a "decided not to respond" marker.
 function skipReplyTool(_ctx: ToolCtx) {
   return tool(
-    async ({ reason }: { reason?: string }) => {
-      return reason
-        ? `Acknowledged: not replying this turn (${reason}). Produce no message now.`
-        : "Acknowledged: not replying this turn. Produce no message now.";
+    async ({ reason }: { reason?: string }, config: ToolRunnableConfig) => {
+      // The ack is what the MODEL reads — LangGraph calls it again after a tool result, and this
+      // sentence is the instruction that makes the turn end quiet.
+      const ack = reason
+        ? `${SKIP_REPLY_ACK} (${reason}). Produce no message now.`
+        : `${SKIP_REPLY_ACK}. Produce no message now.`;
+      // ...and the MARK is what identifies the tool, in `additional_kwargs`, out of reach of any
+      // response body (round 24). Returned as a whole `ToolMessage` for that, the same
+      // direct-tool-output passthrough `failableTool` uses; without a tool_call in scope (a direct
+      // invocation with plain args) it degrades to the plain string, as that one does.
+      const id = config?.toolCall?.id;
+      if (!id) return ack;
+      return new ToolMessage({
+        content: ack,
+        tool_call_id: id,
+        name: SKIP_REPLY_TOOL,
+        additional_kwargs: { [SKIP_REPLY_MARK]: true },
+      });
     },
     {
       name: "skip_reply",
@@ -1386,6 +1429,9 @@ function getCurrentTimeTool(ctx: ToolCtx) {
 }
 
 // allowed = undefined → all native tools; otherwise only the named subset (fail-closed).
+// No native tool takes CODE from the model: computation the model must not redo (check digits,
+// date arithmetic, parsing) is an operator-authored code tool (tools/code.ts), whose body the
+// operator wrote once and whose arguments are the only thing the model supplies.
 export function buildNativeTools(
   ctx: ToolCtx,
   allowed?: Iterable<string>,
@@ -1411,9 +1457,9 @@ export function buildNativeTools(
   return all.filter((t) => allow.has(t.name));
 }
 
-// Restricts a native allowlist to the UTILITY family (calculator/clock). The playground injects
-// this so context-free tools work there while conversation tools (which need a live client) stay
-// out. `allowed` undefined ⇒ all utility tools; otherwise the intersection with the agent's set.
+// The utility-only slice of an agent's native allowlist: `undefined` (no restriction) becomes every
+// utility name, otherwise the allowlist is filtered down to the ones that are utility tools. Used by
+// callers (the playground, Z-PRO's own toolset) that expose ONLY the context-free native tools.
 export function utilityNativeAllow(allowed?: Iterable<string>): string[] {
   if (!allowed) return [...UTILITY_NATIVE_TOOL_NAMES];
   const set = new Set(allowed);
@@ -1443,7 +1489,13 @@ export function buildSimulatedNativeTools(
   allowed?: Iterable<string>,
 ): StructuredToolInterface[] {
   return buildNativeTools(ctx, allowed).map((tl) =>
-    NATIVE_TOOL_CATEGORY[tl.name as NativeToolName] === "utility"
+    // NOTE: `skip_reply` is simulated-by-nature: it performs nothing, and its RETURN is the whole tool —
+    // "Produce no message now" is an instruction the model reads and acts on, since LangGraph calls
+    // the model again after a tool result. Replacing it with the generic `[simulated]` line makes
+    // the playground write a follow-up that production stays silent on, which is the simulation
+    // lying about the one decision it exists to show (issue #454, review round 3).
+    NATIVE_TOOL_CATEGORY[tl.name as NativeToolName] === "utility" ||
+    tl.name === SKIP_REPLY_TOOL
       ? tl
       : simulatedTool(tl),
   );

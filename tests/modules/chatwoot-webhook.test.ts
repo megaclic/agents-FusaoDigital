@@ -9,9 +9,12 @@ import {
 import {
   firstAudioAttachment,
   firstLocationAttachment,
+  humanReplyRoute,
+  isDeviceAttendantMessage,
   isHumanAgentMessage,
   isIncomingMessage,
   isNewHumanAgentMessage,
+  isNewHumanReplyToCustomer,
   isNewIncomingMessage,
   normalizeChatwootEvent,
   shouldBotHandle,
@@ -324,6 +327,8 @@ describe("runEagerMedia (eager STT/vision idempotency contract)", () => {
       conversationId: 90n,
       agentId: 11n,
       inboxId: 7n,
+      chatwootInboxId: null,
+      deliveryRowId: null,
     });
     expect(n.message?.transcribedText).toBe("olá mundo");
   });
@@ -342,6 +347,8 @@ describe("runEagerMedia (eager STT/vision idempotency contract)", () => {
       conversationId: 90n,
       agentId: 11n,
       inboxId: 7n,
+      chatwootInboxId: null,
+      deliveryRowId: null,
     });
     expect(n.message?.transcribedText).toBe("já feito");
   });
@@ -357,6 +364,8 @@ describe("runEagerMedia (eager STT/vision idempotency contract)", () => {
       conversationId: 90n,
       agentId: 11n,
       inboxId: 7n,
+      chatwootInboxId: null,
+      deliveryRowId: null,
     });
     expect(n.message?.transcribedText).toBeUndefined();
     expect(n.message?.imageDescription).toBeUndefined();
@@ -497,6 +506,167 @@ describe("isNewHumanAgentMessage (issue #187)", () => {
   test("false when the payload carries no sender", () => {
     const n = message({ sender: null });
     expect(n && isNewHumanAgentMessage(n)).toBe(false);
+  });
+});
+
+// The OTHER route a person answers by (issue #430): typed on the phone paired to the number the
+// inbox is connected to. The fork stores that echo sender-less, so the predicate above cannot see
+// it, and the three shapes Chatwoot itself produces are sender-less too — the whole content of this
+// block is telling them apart.
+describe("isDeviceAttendantMessage (issue #430)", () => {
+  // The provider whose send path reserves its WhatsApp id before the request, which is what makes an
+  // unmatched echo of our own reply impossible. The refusal on every other provider has its own case
+  // at the bottom.
+  const BAILEYS = { whatsappProvider: "baileys" };
+
+  const outgoing = (over: Record<string, unknown>) =>
+    normalizeChatwootEvent({
+      event: "message_created",
+      id: 2001,
+      content: "oi! sou a Ana, já te respondo",
+      message_type: "outgoing",
+      private: false,
+      sender: null,
+      conversation: {
+        id: 43,
+        inbox_id: 7,
+        status: "pending",
+        meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+      },
+      ...over,
+    });
+
+  // The shape captured off the wire on a live fork: outgoing, sender-less, and marked.
+  const device = (over: Record<string, unknown> = {}) =>
+    outgoing({
+      content_attributes: {
+        external_created_at: 1_787_948_360,
+        external_sender_name: "WhatsApp",
+      },
+      ...over,
+    });
+
+  test("true for a reply typed on the paired phone", () => {
+    const n = device();
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(true);
+    expect(n && isNewHumanReplyToCustomer(n, BAILEYS)).toBe(true);
+    expect(n && humanReplyRoute(n, BAILEYS)).toBe("device");
+  });
+
+  // MEASURED on a live fork, all three delivered to the bot on a pending, bot-owned conversation and
+  // indistinguishable from the row above except for the marker. Without it, an operator's automation
+  // rule reads as a person taking the conversation over.
+  test("false for the three sender-less shapes Chatwoot itself produces", () => {
+    for (const content_attributes of [
+      { automation_rule_id: 7 }, // an automation rule's send_message
+      {}, // a scheduled message whose author is not a User
+    ]) {
+      const n = outgoing({ content_attributes });
+      expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+      expect(n && isNewHumanReplyToCustomer(n, BAILEYS)).toBe(false);
+    }
+    const csat = outgoing({
+      content_attributes: {},
+      content_type: "input_csat",
+    });
+    expect(csat && isDeviceAttendantMessage(csat, BAILEYS)).toBe(false);
+  });
+
+  // Our own reply on a Baileys inbox comes back as an echo too. The fork's source-id reservation
+  // merges it into the row the send created, which is sender-typed and re-dispatched as an UPDATE —
+  // so it never reaches the sender-less branch. The clause is here for the case the reservation
+  // misses, where our own answer would otherwise silence our own agent.
+  test("false for our own bot's outgoing message", () => {
+    const n = device({
+      sender: { id: 9, name: "Atendente", type: "agent_bot" },
+    });
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+  });
+
+  test("false for a composer reply, which is the other predicate's job", () => {
+    const n = outgoing({ sender: { id: 5, name: "Ana", type: "user" } });
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+    expect(n && isNewHumanReplyToCustomer(n, BAILEYS)).toBe(true);
+    expect(n && humanReplyRoute(n, BAILEYS)).toBe("composer");
+  });
+
+  // A 👍 from the phone is stored as a real outgoing message, sender-less and marked, exactly like a
+  // reply. It is an acknowledgement, not somebody taking the conversation over.
+  test("false for a reaction sent from the phone", () => {
+    const n = device({
+      content: "👍",
+      content_attributes: {
+        external_sender_name: "WhatsApp",
+        is_reaction: true,
+      },
+    });
+    expect(n?.message?.isReaction).toBe(true);
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+  });
+
+  test("false for a private note", () => {
+    const n = device({ private: true });
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+  });
+
+  // A first pairing replays a year of history through the same writers. The fork never delivers one
+  // to a bot (SilentWrite suppresses AgentBotListener for the whole run, probed), so this clause is
+  // a cross-repo fence: the two ship on different clocks, and a batch that DID arrive would open and
+  // silence every conversation in it at once.
+  test("false for an imported message", () => {
+    const n = device({
+      content_attributes: {
+        external_sender_name: "WhatsApp",
+        imported: true,
+      },
+    });
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+  });
+
+  test("false for a template, an activity and an incoming message", () => {
+    for (const message_type of ["template", "activity", "incoming"]) {
+      const n = device({ message_type });
+      expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(false);
+    }
+  });
+
+  // THE PROVIDER, which the payload cannot answer and which decides whether this shape can be OUR
+  // OWN reply coming back. `zapi` writes the same marker and matches echoes by `source_id` alone, so
+  // a send whose response was lost comes back as a fresh sender-less outgoing message — the fork's
+  // own comment calls that shape "rendered as if an agent had replied from the phone". Acting on it
+  // would have the agent take the conversation away from itself.
+  test("refused on a provider whose send path does not reserve its id", () => {
+    const n = device();
+    for (const whatsappProvider of [
+      "zapi",
+      "whatsapp_cloud",
+      "default",
+      null,
+    ]) {
+      expect(n && isDeviceAttendantMessage(n, { whatsappProvider })).toBe(
+        false,
+      );
+      expect(n && humanReplyRoute(n, { whatsappProvider })).toBeNull();
+    }
+    for (const whatsappProvider of ["baileys", "native", "uazapi"]) {
+      expect(n && isDeviceAttendantMessage(n, { whatsappProvider })).toBe(true);
+    }
+  });
+
+  // The composer route is sender-typed, so no echo can wear it and no provider question arises.
+  test("the composer route is unaffected by the provider", () => {
+    const n = outgoing({ sender: { id: 5, name: "Ana", type: "user" } });
+    for (const whatsappProvider of ["zapi", null]) {
+      expect(n && humanReplyRoute(n, { whatsappProvider })).toBe("composer");
+    }
+  });
+
+  // Same rule as every other new-message predicate here: an update is our own write-back coming back
+  // around, and acting on one is how the voice-note loop happened.
+  test("message_updated is not a new reply", () => {
+    const n = device({ event: "message_updated" });
+    expect(n && isDeviceAttendantMessage(n, BAILEYS)).toBe(true);
+    expect(n && isNewHumanReplyToCustomer(n, BAILEYS)).toBe(false);
   });
 });
 

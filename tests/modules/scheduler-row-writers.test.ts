@@ -76,7 +76,9 @@ describe("who may create a scheduler job row", () => {
     const writers: string[] = [];
     for (const file of files) {
       if (createsASchedulerRow(await Bun.file(file).text())) {
-        writers.push(relative(root, file));
+        // node:path's `relative` uses OS-native separators (backslash on Windows); normalized
+        // here so the result matches the forward-slash literal OWNER is written with.
+        writers.push(relative(root, file).replaceAll("\\", "/"));
       }
     }
     expect(writers.sort()).toEqual([OWNER]);

@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import { broadcastDocumentEvent } from "@/api/features/realtime/realtime.service";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
@@ -10,11 +10,16 @@ import { AppError, NotFoundError } from "@/lib/errors";
 import { sanitizeErrorMessage } from "@/lib/redact";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { firstUnstorableField } from "@/lib/text";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 import { emitDeadLetter } from "@/modules/flowlog/dead-letter";
-import { cancelPendingJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  cancelPendingJob,
+  enqueueJob,
+  upsertJobRows,
+} from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
-import { resolveVaultRefState } from "@/modules/vault/service";
+import { resolveVaultEntryState } from "@/modules/vault/service";
 import { chunkText } from "./chunk";
 import { type EmbeddingConfig, embedTexts } from "./embeddings";
 import { toVectorLiteral } from "./sql";
@@ -47,12 +52,12 @@ export async function resolveEmbeddingStatus(
 ): Promise<EmbeddingStatus> {
   const settings = await readEmbeddingSettings(db, tenantId);
   if (!settings.credentialRef) return { ok: false, reason: "not_configured" };
-  // NOTE: The three failures are distinguished from ONE read (see resolveVaultRefState). A ref whose
+  // NOTE: The three failures are distinguished from ONE read (see resolveVaultEntryState). A ref whose
   // row is gone is not "pending": telling the operator to fill a credential that no longer exists
   // sends them looking for a row that is not there, so it falls back to the reason a workspace that
   // never configured one gets. An ACTIVE row holding a blank secret is neither — it is `empty`, and
   // that only stays distinguishable because the state and the value came from the same query.
-  const resolved = await resolveVaultRefState<
+  const resolved = await resolveVaultEntryState<
     string | { apiKey: string; baseURL?: string }
   >(db, settings.credentialRef);
   if (resolved.state === "not_found")
@@ -63,7 +68,7 @@ export async function resolveEmbeddingStatus(
       reason: "credential_pending",
       credentialRef: settings.credentialRef,
     };
-  const raw = resolved.value;
+  const raw = resolved.entry.secret;
   const { apiKey, baseURL: secretBaseURL } =
     typeof raw === "string" || !raw
       ? { apiKey: typeof raw === "string" ? raw : "", baseURL: undefined }
@@ -76,7 +81,22 @@ export async function resolveEmbeddingStatus(
     };
   return {
     ok: true,
-    config: { model, apiKey, baseURL: settings.baseURL ?? secretBaseURL },
+    config: {
+      model,
+      apiKey,
+      // The entry's baseUrl is honored ONLY for `openai_compatible`. `updateEmbeddingSettings`
+      // validates that this ref resolves and NOT what kind it is, while three other kinds require a
+      // baseUrl of their own (chatwoot_api_token, mcp_oauth, langfuse) and any kind at all may carry
+      // one. Without the kind test, an operator who picks the Chatwoot credential here does not get
+      // a 401 from OpenAI any more — they get every chunk of their knowledge base POSTed at the
+      // Chatwoot host.
+      baseURL:
+        settings.baseURL ??
+        (resolved.entry.kind === "openai_compatible"
+          ? resolved.entry.baseUrl
+          : null) ??
+        secretBaseURL,
+    },
   };
 }
 
@@ -109,6 +129,32 @@ export async function resolveEmbeddingConfig(
   );
 }
 
+// The same rule asked of the ROW a patch will produce, rather than of the arguments it carries.
+//
+// A knowledge base holds both numbers, and `chunkOverlap <= floor(chunkSize/2)` relates them, so a
+// patch that names one of them is still a statement about the pair. `updateKnowledgeBase` used to
+// validate only when both arrived and, when one did, compared it against a constant — which meant
+// either single-field update landed a state the two-field update refuses by name, and the refusal it
+// did print named a bound it had not checked (issue #524).
+//
+// Merging here rather than at each caller is what keeps the rule single: the preview and the apply
+// both hand it the row they read, and neither restates the arithmetic.
+export function assertChunkingUpdatable(
+  stored: { chunkSize: number; chunkOverlap: number },
+  patch: { chunkSize?: number; chunkOverlap?: number },
+): void {
+  // NOTE: it answers a CHUNKING patch, and a patch naming neither number is not one. Without this
+  // line a row already holding an invalid pair — the state the old branch let through, and the only
+  // reason such rows exist — would refuse a rename, reporting a bound on a field the caller never
+  // sent. The invariant is enforced going forward; it is not retroactive repair, and blocking
+  // unrelated edits until someone fixes the chunking is not the same thing as fixing it.
+  if (patch.chunkSize === undefined && patch.chunkOverlap === undefined) return;
+  validateChunkParams(
+    patch.chunkSize ?? stored.chunkSize,
+    patch.chunkOverlap ?? stored.chunkOverlap,
+  );
+}
+
 // Validation: chunkSize 100–8000, chunkOverlap 0–floor(chunkSize/2)
 export function validateChunkParams(
   chunkSize: number,
@@ -118,8 +164,10 @@ export function validateChunkParams(
     throw new AppError("chunkSize must be between 100 and 8000", 400);
   }
   if (chunkOverlap < 0 || chunkOverlap > Math.floor(chunkSize / 2)) {
+    // NOTE: the ceiling is spelled out because a patch may not carry the chunk size it is measured
+    // against: an operator sending only `chunkOverlap` cannot otherwise tell which number lost.
     throw new AppError(
-      "chunkOverlap must be between 0 and floor(chunkSize/2)",
+      `chunkOverlap must be between 0 and ${Math.floor(chunkSize / 2)} (floor(chunkSize/2), for chunkSize ${chunkSize})`,
       400,
     );
   }
@@ -163,6 +211,86 @@ export interface CreateDocumentParams {
   base?: PrismaClient;
 }
 
+// What a document's audit row carries, and the one thing it never does.
+//
+// Identity and shape: which base it belongs to, its title, where it came from, the file it arrived
+// as, and its indexing status. NEVER `content`. This is the payload most likely to carry a
+// customer's data, the row is append-only and readable by every tenant admin, and it outlives the
+// document — so the body is not in the projection and is not compared either: `chars` says a text
+// moved and how big it is, which is what a reader of the trail needs from it.
+type DocAuditRow = {
+  id: bigint;
+  knowledgeBaseId: bigint;
+  title: string;
+  sourceType: string;
+  fileName: string | null;
+  mimeType: string | null;
+  status: string;
+  chars: number;
+};
+
+function docAuditProjection(r: DocAuditRow) {
+  return {
+    id: String(r.id),
+    knowledgeBaseId: String(r.knowledgeBaseId),
+    title: r.title,
+    sourceType: r.sourceType,
+    fileName: r.fileName,
+    mimeType: r.mimeType,
+    status: r.status,
+    chars: r.chars,
+  };
+}
+
+// The row a projection is built from, with the row LOCKED and the body left in the database.
+//
+// `length(content)` rather than the column: an uploaded document holds up to 2,000,000 characters,
+// and pulling that across the wire to count it would put multi-megabyte transfers and allocations
+// inside a transaction that has five seconds to finish — for a number Postgres already knows.
+// `compareText` is the same idea applied to the edit's own question: the caller has to send the new
+// text anyway, so the comparison happens where the old text already is and what comes back is a
+// boolean instead of the previous body.
+async function readDocForAudit(
+  db: ScopedDb,
+  id: bigint,
+  compareText: string | null,
+): Promise<{ row: DocAuditRow; textMoved: boolean } | null> {
+  const rows = await db.$queryRaw<
+    {
+      id: bigint;
+      knowledge_base_id: bigint;
+      title: string;
+      source_type: string;
+      file_name: string | null;
+      mime_type: string | null;
+      status: string;
+      chars: number;
+      text_moved: boolean;
+    }[]
+  >`
+    SELECT id, knowledge_base_id, title, source_type, file_name, mime_type, status,
+           length(content) AS chars,
+           (content IS DISTINCT FROM ${compareText}::text) AS text_moved
+      FROM knowledge_documents
+     WHERE id = ${id}
+       FOR UPDATE`;
+  const r = rows[0];
+  if (!r) return null;
+  return {
+    row: {
+      id: r.id,
+      knowledgeBaseId: r.knowledge_base_id,
+      title: r.title,
+      sourceType: r.source_type,
+      fileName: r.file_name,
+      mimeType: r.mime_type,
+      status: r.status,
+      chars: Number(r.chars),
+    },
+    textMoved: r.text_moved,
+  };
+}
+
 // The whole write is held to what the columns can store, before anything is read or enqueued. It is
 // not a hypothetical shape: `extractText` decodes an uploaded .txt with `TextDecoder("utf-8")`, so a
 // file carrying a 0x00 byte hands a NUL straight to `content`, and Postgres refuses one in a `text`
@@ -193,7 +321,7 @@ export async function createDocument(
       select: { id: true },
     });
     if (!kb) throw new NotFoundError("knowledge base not found");
-    return db.knowledgeDocument.create({
+    const created = await db.knowledgeDocument.create({
       data: {
         tenantId,
         knowledgeBaseId,
@@ -206,6 +334,15 @@ export async function createDocument(
       },
       select: { id: true, status: true },
     });
+    const audited = await readDocForAudit(db, created.id, null);
+    if (audited) {
+      await auditMutation(db, ctx, {
+        action: "knowledge_document.create",
+        target: `knowledge_document:${created.id}`,
+        after: docAuditProjection(audited.row),
+      });
+    }
+    return created;
   });
 
   await enqueueJob({
@@ -311,8 +448,18 @@ export async function deleteDocument(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // NOTE: Read with the row LOCKED before the delete, so the row describes the document actually
+    // removed rather than a version an edit replaced in between.
+    const existing = await readDocForAudit(db, id, null);
     const res = await db.knowledgeDocument.deleteMany({ where: { id } });
     if (res.count === 0) throw new NotFoundError("document not found");
+    if (existing) {
+      await auditMutation(db, ctx, {
+        action: "knowledge_document.delete",
+        target: `knowledge_document:${id}`,
+        before: docAuditProjection(existing.row),
+      });
+    }
   });
 }
 
@@ -342,13 +489,21 @@ export async function updateDocument(
   ]);
 
   const { doc, reingest } = await runScopedOn(base, ctx, async (db) => {
-    const existing = await db.knowledgeDocument.findUnique({
-      where: { id },
-      select: { id: true, content: true },
-    });
+    // NOTE: LOCKED, because this reading is both the reingest decision and the row's `before`, and
+    // two overlapping edits would otherwise each compare against a text the other one replaced. The
+    // comparison happens in the DATABASE, where the old text already is: what comes back is whether
+    // it moved, not the previous body.
+    const existing = await readDocForAudit(
+      db,
+      id,
+      hasText ? (params.text as string) : null,
+    );
     if (!existing) throw new NotFoundError("document not found");
-    const reingest = hasText && params.text !== existing.content;
-    const updated = await db.knowledgeDocument.update({
+    // `hasText` here rather than in the statement: a null comparand is DISTINCT FROM any content,
+    // so the SQL answers `true` for a title-only edit. Asking it in the query would mean binding the
+    // body a second time, which is the transfer this helper exists to avoid.
+    const reingest = hasText && existing.textMoved;
+    await db.knowledgeDocument.update({
       where: { id },
       data: {
         ...(hasTitle ? { title: params.title } : {}),
@@ -356,8 +511,25 @@ export async function updateDocument(
           ? { content: params.text, status: "PENDING", error: null }
           : {}),
       },
-      select: { id: true, status: true, knowledgeBaseId: true },
+      select: { id: true },
     });
+    const after = await readDocForAudit(db, id, null);
+    if (!after) throw new NotFoundError("document not found");
+    const updated = after.row;
+    const beforeProj = docAuditProjection(existing.row);
+    const afterProj = docAuditProjection(updated);
+    // NOTE: The action this issue invents: `PATCH /v1/knowledge/documents/:id` has no MCP twin, so
+    // an edit to a document reached the trail through nothing at all. Recorded only when it moved,
+    // which for a body means its LENGTH moved or the title did: the text itself is neither carried
+    // nor compared here (`reingest` above compares it, and that is the ingest's business).
+    if (reingest || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, ctx, {
+        action: "knowledge_document.update",
+        target: `knowledge_document:${id}`,
+        before: beforeProj,
+        after: { ...afterProj, reindexed: reingest },
+      });
+    }
     return { doc: updated, reingest };
   });
 
@@ -384,6 +556,22 @@ export async function updateDocument(
   return { id: doc.id, status: doc.status };
 }
 
+// FAILED = errored ingestion (retry); UNINDEXED = imported-but-never-indexed (first index). Both
+// re-run through the same PENDING → ingest path; anything else is already on it or already done.
+//
+// Split out so the MCP preview can ask the same question the apply asks (#490). Its row passes a
+// document id that names no row, so it proved the ownership check and never this — and the preview
+// was already READING the status, to report it in a note saying "Re-queues a FAILED document",
+// while answering ok for a document that is not one (#510).
+export function assertDocumentRetryable(status: string): void {
+  if (status !== "FAILED" && status !== "UNINDEXED") {
+    throw new AppError(
+      "only FAILED or UNINDEXED documents can be re-indexed",
+      409,
+    );
+  }
+}
+
 export async function retryDocument(
   ctx: TenantContext,
   id: bigint,
@@ -391,23 +579,30 @@ export async function retryDocument(
 ): Promise<void> {
   const tenantId = ctx.tenantId as bigint;
   const doc = await runScopedOn(base, ctx, async (db) => {
+    // NOTE: LOCKED, because the status read here is the row's `before` and the 409 above it. Without
+    // it a concurrent ingest can move the document between the reading and the write, and the row
+    // would name a state this retry did not leave.
+    await db.$queryRaw`SELECT id FROM knowledge_documents WHERE id = ${id} FOR UPDATE`;
     const existing = await db.knowledgeDocument.findUnique({
       where: { id },
       select: { id: true, status: true, knowledgeBaseId: true },
     });
     if (!existing) throw new NotFoundError("document not found");
-    // FAILED = errored ingestion (retry); UNINDEXED = imported-but-never-indexed (first index). Both
-    // re-run through the same PENDING → ingest path.
-    if (existing.status !== "FAILED" && existing.status !== "UNINDEXED") {
-      throw new AppError(
-        "only FAILED or UNINDEXED documents can be re-indexed",
-        409,
-      );
-    }
-    await db.knowledgeDocument.updateMany({
+    assertDocumentRetryable(existing.status);
+    const { count } = await db.knowledgeDocument.updateMany({
       where: { id, status: { in: ["FAILED", "UNINDEXED"] } },
       data: { status: "PENDING", error: null },
     });
+    // NOTE: The condition IS the test: two operators pressing the button on the same failed document
+    // would otherwise both record a retry only one of them started.
+    if (count > 0) {
+      await auditMutation(db, ctx, {
+        action: "knowledge_document.retry",
+        target: `knowledge_document:${id}`,
+        before: { id: String(id), status: existing.status },
+        after: { id: String(id), status: "PENDING" },
+      });
+    }
     return existing;
   });
 
@@ -519,11 +714,47 @@ export async function reindexKnowledgeBase(
     if (!emb.ok) return { docs: targets, blocked: emb };
     // dry-run previews the count (below) without touching the docs.
     if (opts.dryRun) return { docs: targets, blocked: undefined };
-    await db.knowledgeDocument.updateMany({
-      where: { knowledgeBaseId, status: { in: statuses } },
-      data: { status: "PENDING", error: null },
+    // NOTE: WHICH documents the write moved, not which ones the listing above found. Two operators
+    // pressing reindex on the same base both read the same `targets`, and the second one moves none
+    // of them: it must neither record a queue it did not fill NOR re-arm the jobs below, which is
+    // why the ids come back from the UPDATE itself rather than from the snapshot.
+    //
+    const moved = await db.$queryRaw<{ id: bigint }[]>`
+      UPDATE knowledge_documents
+         SET status = 'PENDING', error = NULL, updated_at = now()
+       WHERE tenant_id = ${tenantId}
+         AND knowledge_base_id = ${knowledgeBaseId}
+         AND status IN (${Prisma.join(statuses.map((v) => Prisma.sql`${v}`))})
+      RETURNING id`;
+    // NOTE: The jobs IN THE SAME TRANSACTION as the transition they answer for. Enqueuing after the
+    // commit is what the single-document paths do, and in a loop of N it is the shape that leaves
+    // documents sitting in PENDING with no job: they are no longer UNINDEXED, so the next bulk
+    // reindex does not select them either, and only a per-document retry gets them back. Committing
+    // the status, the jobs and the row together makes the count in that row true by construction.
+    await upsertJobRows(db, {
+      tenantId,
+      kind: "RAG_INGEST",
+      runAt: new Date(),
+      // NOTE: Same as the single-document retry, in bulk: an operator asked for the whole base to
+      // be indexed again, and a document that failed on a previous embedding provider is exactly
+      // the one this is for.
+      rearm: "new-work",
+      rows: moved.map((d) => ({
+        dedupeKey: `doc:${d.id}`,
+        payload: { documentId: String(d.id) },
+      })),
     });
-    return { docs: targets, blocked: undefined };
+    if (moved.length > 0) {
+      await auditMutation(db, ctx, {
+        action: "knowledge.reindex",
+        target: `knowledge_base:${knowledgeBaseId}`,
+        after: {
+          queued: moved.length,
+          includeFailed: opts.includeFailed === true,
+        },
+      });
+    }
+    return { docs: moved, blocked: undefined };
   });
 
   if (outcome.blocked) {
@@ -533,18 +764,6 @@ export async function reindexKnowledgeBase(
   if (opts.dryRun) return { queued: outcome.docs.length };
 
   for (const d of outcome.docs) {
-    await enqueueJob({
-      tenantId,
-      kind: "RAG_INGEST",
-      dedupeKey: `doc:${d.id}`,
-      runAt: new Date(),
-      // NOTE: Same as the single-document retry, in bulk: an operator asked for the whole base to
-      // be indexed again, and a document that failed on a previous embedding provider is exactly
-      // the one this is for.
-      rearm: "new-work",
-      payload: { documentId: String(d.id) },
-      base,
-    });
     broadcastDocumentEvent(tenantId, {
       knowledgeBaseId: String(knowledgeBaseId),
       documentId: String(d.id),

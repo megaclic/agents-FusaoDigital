@@ -7,14 +7,16 @@ import {
 import {
   ALLOWED_ASSET_TYPES,
   ASSET_MAX_BYTES,
+  assertBrandingColorsUpdatable,
   type ColorUpdate,
   getGlobalBranding,
 } from "@/api/features/branding/branding.service";
 import basePrisma from "@/api/lib/prisma";
 import { updateTenant } from "@/api/v1/tenants.admin.service";
-import { getTenant } from "@/api/v1/tenants.service";
+import { assertTenantUpdatable, getTenant } from "@/api/v1/tenants.service";
 import { parseDbId } from "@/lib/db-id";
 import { AppError } from "@/lib/errors";
+import { withEntityLock } from "@/lib/locks";
 import {
   asSuperAdminOn,
   runScopedOn,
@@ -26,16 +28,19 @@ import {
   mergeBehaviorSettings,
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
+import { configHealthAfterWrite } from "@/modules/agents/config-health-read";
 import {
   credRefSlot,
   SETTINGS_CREDENTIAL_PATHS,
 } from "@/modules/agents/credential-paths";
 import {
+  assertNoClassifierOverlap,
   assertPromptSize,
   assertSettingsDebugWindow,
   assertSettingsModelFallback,
   assertSettingsTextSizes,
   assertSettingsToolPreconditions,
+  classifierTaxonomyLock,
   getAgent,
   listAgents,
   updateAgent,
@@ -43,9 +48,12 @@ import {
 import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { type AuditEntry, recordAudit } from "@/modules/audit/service";
 import type { LoadChatwootClientDeps } from "@/modules/chatwoot/instance";
+import type { ListAccountsDeps } from "@/modules/chatwoot/management";
 import { readDebugModes } from "@/modules/flowlog/debug-mode";
 import { getTenantSettings } from "@/modules/tenant-settings/service";
 import {
+  assertPendingVaultEntryCreatable,
+  assertVaultNameAvailable,
   createPendingVaultEntry,
   isVaultIdRef,
   resolveVaultRefByName,
@@ -81,6 +89,12 @@ export interface WriteDeps {
   // than answering from its arguments (`inbox_remove`: the write refuses a live inbox, so a preview
   // that cannot ask would approve what the apply rejects). Defaults to the real SSRF-validated one.
   makeClient?: LoadChatwootClientDeps["makeClient"];
+  // NOTE: injectable account-list probe, for the same reason as `makeClient` one line up and with
+  // the same lesson behind it. `deployment_set_accounts` measures its input against the accounts the
+  // deployment reports, so a preview that cannot reach that list falls through to the fallback cap
+  // and approves ids the apply refuses — the #490 divergence, reintroduced by a dep the transport
+  // could not thread (#503).
+  fetchProfile?: ListAccountsDeps["fetchProfile"];
 }
 
 // The one id parser for every MCP surface, read and write alike.
@@ -167,11 +181,40 @@ export function adminGate(
 
 // Read gate: mcp:read scope present AND a tenant target. Tenant-scoped reads need the same fence as
 // writes (a tenant-less SUPER_ADMIN token must target a tenant), but only the read scope.
+//
+// `requireTenant: false` is for the read that names its OWN trail instead of a tenant's: `audit_list`
+// with `scope=fleet|all` reads the rows keyed to no tenant, so a target is not merely unnecessary
+// there, it is a value the read has nowhere to put -- and on a deployment with no tenants at all,
+// demanding one would make those rows unreadable from MCP. The default is unchanged, so every other
+// caller keeps the fence; the role check that actually guards the wider trails is `listAudit`'s own.
 export function readGate(
   principal: VerifiedToken,
+  opts: { requireTenant?: boolean } = {},
 ): TenantContext | WriteResult {
   if (!hasScope(principal, "mcp:read")) {
     return err("insufficient_scope: this tool requires the mcp:read scope");
+  }
+  if (opts.requireTenant !== false && principal.tenantId === null) {
+    return err(
+      "no tenant target: the token must be scoped to a tenant (a SUPER_ADMIN must target one)",
+    );
+  }
+  return ctxOf(principal);
+}
+
+// The gate for a tool that serves an AUTHORING CONTRACT: `code_tool_schema` and
+// `document_template_schema`. Both are constants, both are named by a write tool's description as
+// the place the contract lives, and `filterScopes` (api/v1/mcp-oauth.controller.ts) grants exactly
+// the scopes a client asked for, so a token holding `mcp:write` and not `mcp:read` is a real token.
+// Gating these on read alone points that client at a tool it can neither list nor call, which is the
+// whole cost of having moved the contract out of the create description.
+export function authoringGate(
+  principal: VerifiedToken,
+): TenantContext | WriteResult {
+  if (!hasScope(principal, "mcp:read") && !hasScope(principal, "mcp:write")) {
+    return err(
+      "insufficient_scope: this tool requires the mcp:read or mcp:write scope",
+    );
   }
   if (principal.tenantId === null) {
     return err(
@@ -243,7 +286,7 @@ export async function resolveSecretRef(
   }
   // A PENDING entry (resolution.pending) intentionally resolves normally: callers may wire config to a
   // reference whose secret is not filled yet (the whole point of credential_create). The "fill it"
-  // alert is surfaced by configHealth + the vault list, not by failing the wiring here.
+  // alert is surfaced by config-health + the vault list, not by failing the wiring here.
   return { ref: resolution.ref };
 }
 
@@ -284,7 +327,7 @@ export interface CredentialCreateArgs {
 // for the operator to fill the secret in the console. The binding rule holds — this tool NEVER
 // receives a secret value. The pending entry can be referenced by other write tools immediately
 // (resolveSecretRef resolves it), but it resolves as "missing" at runtime until filled; the vault
-// list and the agent editor (configHealth) flag the pending state so the operator knows to complete it.
+// list and the agent editor (config-health) flag the pending state so the operator knows to complete it.
 export async function credentialCreate(
   principal: VerifiedToken,
   args: CredentialCreateArgs,
@@ -305,6 +348,29 @@ export async function credentialCreate(
 
   // dry-run is the default: create ONLY when dry_run is explicitly false.
   if (args.dry_run !== false) {
+    // NOTE: everything `createPendingVaultEntry` decides about its input — the name, the kind
+    // against the catalog, the connect-flow kinds that cannot be created pending, a required base
+    // URL, and the param name the kind has no use for (#488) — asked here before the preview
+    // answers. The apply below reaches the core, which asks it again; the pure function in the
+    // middle is what keeps the transport's `WriteResult` and the domain's `AppError` from drifting
+    // into two different verdicts (#490).
+    try {
+      const { name, kind } = assertPendingVaultEntryCreatable({
+        name: args.name,
+        kind: args.kind ?? null,
+        baseUrl: args.base_url ?? null,
+        paramName: args.param_name ?? null,
+      });
+      // ADVISORY, and the only preflight here that is. See `assertVaultNameAvailable`: it reads
+      // outside the write's transaction, so it answers the collision the operator already made,
+      // not a reservation. It takes the pair the line above NORMALIZED, since that is what the
+      // uniqueness is on.
+      await assertVaultNameAvailable(ctx, name, kind, base);
+    } catch (e) {
+      if (e instanceof AppError) return err(e.message);
+      if (e instanceof ZodError) return err(zodIssuesMessage(e));
+      throw e;
+    }
     return ok({ dryRun: true, target: "vault:new", preview });
   }
 
@@ -319,15 +385,6 @@ export async function credentialCreate(
       },
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "credential.create",
-      target: ref,
-      // No secret exists yet — the audit projection carries only the reference metadata.
-      before: {},
-      after: { name: args.name, kind, status: "pending" },
-    });
     return ok({
       dryRun: false,
       applied: true,
@@ -665,6 +722,23 @@ export async function agentSettingsSet(
     }
     const diff = diffFields(beforeProj, afterProj);
 
+    // THE PREVIEW ANSWERS WHAT THE APPLY WOULD (issue #477 review, round 17). The taxonomy-collision
+    // rule is the first refusal on this path that needs the DATABASE — every other one is a
+    // statement about the bag — so it sat behind the dry-run return, and the same payload previewed
+    // as valid and then failed. Asked here, in the same shape and against the same merged bag.
+    if (ctx.tenantId !== null) {
+      const lockTenant = ctx.tenantId;
+      await runScopedOn(base, ctx, (db) =>
+        withEntityLock(db, classifierTaxonomyLock(lockTenant), () =>
+          assertNoClassifierOverlap(db, agentId, {
+            settings: nextBag,
+            enabled: current.enabled,
+            mode: current.mode,
+          }),
+        ),
+      );
+    }
+
     // dry-run is the default: apply ONLY when dry_run is explicitly false.
     if (args.dry_run !== false) {
       return ok({ dryRun: true, target, diff });
@@ -688,6 +762,7 @@ export async function agentSettingsSet(
       applied: true,
       target,
       diff: diffFields(beforeProj, afterAppliedProj),
+      ...(await configHealthAfterWrite(ctx, agentId, base)),
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
@@ -727,6 +802,11 @@ export async function tenantUpdate(
     const target = `tenant:${tenantId}`;
 
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      assertTenantUpdatable(patch);
       const previewAfter = {
         name: patch.name ?? current.name,
       };
@@ -800,7 +880,7 @@ export async function brandingSet(
   }
 
   try {
-    const before = await getGlobalBranding();
+    const before = await getGlobalBranding(base);
     const beforeProj = {
       brandName: before.brandName,
       colorMode: before.colorMode,
@@ -815,7 +895,11 @@ export async function brandingSet(
 
     // dry-run is the default: apply ONLY when dry_run is explicitly false.
     if (args.dry_run !== false) {
-      // Preview reflects the requested patch (sanitization is applied on apply).
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      assertBrandingColorsUpdatable(update);
       const previewAfter = {
         brandName:
           update.brandName === undefined
@@ -946,7 +1030,7 @@ export async function brandingAssetSet(
 
   const target = `branding:asset:${kind}:${variant}`;
   try {
-    const before = await getGlobalBranding();
+    const before = await getGlobalBranding(base);
     const replacingExisting = before[kind][variant];
 
     // dry-run is the default: a binary has no field-level diff, so preview the metadata that WOULD

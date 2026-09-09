@@ -4,6 +4,9 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { sanitizeErrorMessage } from "@/lib/redact";
 import { unstorableProblem } from "@/lib/text";
 import { claimDueJobs, enqueueJob, failJob } from "@/modules/scheduler/service";
+// Both ledgers below count through the shared scan, so prose that NAMES a column or the guard is not
+// counted as a use of it (#424).
+import { countInSrc } from "@/tests/utils/source-text";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // THE GUARD AGAINST THE NEXT COLUMN THAT LOSES AN ERROR MESSAGE.
@@ -354,7 +357,13 @@ const ERROR_COLUMN_LINES: Record<string, [number, ErrorSite | string]> = {
   "src/modules/guardrails/gate.ts": [2, "flow-event"],
   "src/modules/guardrails/health.ts": [4, "read"],
   "src/modules/memory/compact.ts": [1, "flow-event"],
+  "src/modules/observe/job.ts": [1, "flow-event"],
   "src/modules/scheduler/service.ts": [4, "guarded + cleared"],
+  // The balloon send that no longer reports its failure by throwing (issue #429): the flow line is
+  // the only place an operator can see that part of a reply went missing.
+  // The poll's failure line: the Langfuse error text travels as a flow event (issue #426).
+  "src/modules/spend-ceiling/poll.ts": [2, "flow-event"],
+  "src/modules/split/service.ts": [1, "flow-event"],
   "src/modules/stt/service.ts": [2, "flow-event"],
   "src/modules/vision/service.ts": [2, "flow-event"],
   // Was 4 until issue #325 collapsed the two DEAD writes into `finalizeDead`; the line that went
@@ -368,7 +377,7 @@ const ERROR_COLUMN_LINES: Record<string, [number, ErrorSite | string]> = {
   // side counterparts above — this ledger predates Z-PRO's error-handling code and was never synced.
   "src/modules/zpro/failure.ts": [2, "guarded + cleared"],
   "src/modules/zpro/messages.ts": [2, "flow-event"],
-  "src/modules/zpro/runtime.ts": [3, "flow-event"],
+  "src/modules/zpro/runtime.ts": [4, "guarded + flow-event"],
   "src/modules/zpro/stt.ts": [2, "flow-event"],
   "src/modules/zpro/tools.ts": [1, "flow-event"],
   "src/modules/zpro/vision.ts": [2, "flow-event"],
@@ -388,23 +397,14 @@ const GUARD_CALLS: Record<string, number> = {
   "src/modules/flowlog/service.ts": 2,
   "src/modules/rag/documents.ts": 1,
   "src/modules/scheduler/service.ts": 2,
+  // The Langfuse error text, before it reaches `poll_error` (issue #426, review round 1).
+  "src/modules/spend-ceiling/poll.ts": 1,
   "src/modules/webhooks/outbound/worker.ts": 1,
   "src/modules/zpro/failure.ts": 2,
+  // The failed-turn flow-event's errorMessage (issue #71/#86 upstream parity), guarded the same way
+  // its Chatwoot-side counterpart in src/graph/runtime.ts is.
+  "src/modules/zpro/runtime.ts": 1,
 };
-
-async function countInSrc(re: RegExp): Promise<Record<string, number>> {
-  const { Glob } = await import("bun");
-  const found: Record<string, number> = {};
-  // Glob().scan() yields OS-native separators (backslashes on Windows); normalized here so the keys
-  // match the forward-slash literals every EXPECTED/GUARD_CALLS map below is written with.
-  for await (const rel of new Glob("**/*.{ts,tsx}").scan("src")) {
-    const normalized = rel.replaceAll("\\", "/");
-    const src = await Bun.file(`src/${normalized}`).text();
-    const n = (src.match(re) ?? []).length;
-    if (n > 0) found[`src/${normalized}`] = n;
-  }
-  return found;
-}
 
 describe("every line that names an error column is accounted for", () => {
   test("the file list and the per-file counts still match", async () => {

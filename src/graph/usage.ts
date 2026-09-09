@@ -3,6 +3,10 @@ import type { LLMResult } from "@langchain/core/outputs";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import {
+  recordDirectGeneration,
+  resolveLangfuseConfig,
+} from "@/graph/observability";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { emitOutbound } from "@/modules/webhooks/outbound/service";
@@ -74,6 +78,9 @@ export const USAGE_NODE_IS_AGENT_TURN: Readonly<Record<string, boolean>> =
     tts_normalize: true,
     memory_compact: true,
     vision: false,
+    // The OBSERVE job classifying a conversation the agent watches (issue #477): a model call on a
+    // conversation nobody of ours answers, so it is involvement in nothing the agent said.
+    observer: false,
   });
 
 // Consumed as an EXCLUSION, with `node: null` kept beside it: a row from before this column was
@@ -284,6 +291,14 @@ export function usageAttribution(flow: FlowContext): {
 // Records a billed call that did NOT go through LangChain, so no callback could have seen it: a
 // provider reached by raw fetch (vision). Best-effort, like the callback path — a ledger write
 // never breaks the call it is about.
+//
+// BOTH BOOKS, from one call site (#426, review round 2). The row below is the ledger; the dollar
+// ceiling reads Langfuse, which only prices the generations it was shown, and a call the LangChain
+// handler never saw is a call Langfuse never costed. So the same function writes the generation
+// too (`recordDirectGeneration`), with the tenant's own Langfuse resolved here rather than carried
+// in: the callers hold a `FlowContext`, and a context that had to carry a Langfuse credential to
+// every attachment would be the next thing a call site forgets to thread. A tenant with no Langfuse
+// keeps the row and skips the trace, which is the same asymmetry the turn path has.
 export async function recordDirectUsage(
   flow: FlowContext,
   row: {
@@ -309,6 +324,34 @@ export async function recordDirectUsage(
     });
   } catch (err) {
     logger.warn({ err, node: row.node }, "usage: direct capture failed");
+  }
+  try {
+    const cfg = await runScopedOn(
+      attr.base ?? basePrisma,
+      sysCtx(attr.tenantId),
+      (db) => resolveLangfuseConfig(db, attr.tenantId),
+    );
+    recordDirectGeneration(
+      cfg,
+      {
+        tenantId: attr.tenantId,
+        turnId: flow.turnId,
+        threadId: attr.threadId,
+        conversationId: attr.conversationId,
+        agentId: attr.agentId,
+        source: attr.source,
+      },
+      {
+        name: row.node,
+        model: row.model,
+        promptTokens: row.promptTokens,
+        completionTokens: row.completionTokens,
+        cachedReadTokens: row.cachedReadTokens,
+        cacheCreationTokens: row.cacheCreationTokens,
+      },
+    );
+  } catch (err) {
+    logger.warn({ err, node: row.node }, "usage: direct trace failed");
   }
 }
 

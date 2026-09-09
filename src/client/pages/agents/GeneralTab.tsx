@@ -20,6 +20,7 @@ import { isValidHttpUrl } from "@/client/lib/validation";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import { REASONING_EFFORTS } from "@/graph/openai-reasoning";
+import { AGENT_MODES, type AgentMode } from "@/modules/agents/mode";
 import type { Schedule } from "@/modules/business-hours/hours";
 import { CapabilityMap } from "./CapabilityMap";
 import { PromptPanel } from "./PromptPanel";
@@ -49,8 +50,8 @@ interface GeneralTabProps {
   setSystemPrompt: (v: string) => void;
   enabled: boolean;
   setEnabled: (v: boolean) => void;
-  mode: "test" | "production";
-  setMode: (v: "test" | "production") => void;
+  mode: AgentMode;
+  setMode: (v: AgentMode) => void;
   model: ModelState;
   setModel: React.Dispatch<React.SetStateAction<ModelState>>;
   modelCredBaseUrl: string | null;
@@ -58,7 +59,9 @@ interface GeneralTabProps {
   saving: boolean;
   onSave: () => void;
   onDiscard: () => void;
-  onOpenPlayground: () => void;
+  // Absent for a watcher (issue #494): the bar then shows no playground entry, the way the tab
+  // itself is not drawn for one.
+  onOpenPlayground?: () => void;
   // Opens the strong-confirm delete flow (owned by the editor page). Rendered as a danger zone at
   // the end of this tab instead of a header button.
   onDelete: () => void;
@@ -143,12 +146,12 @@ export function GeneralTab({
           label={t("editor.mode", "Mode")}
           description={t(
             "editor.modeHint",
-            "A test agent stays silent in a conversation until the customer sends /teste; production answers normally.",
+            "A test agent stays silent in a conversation until the customer sends /teste; production answers normally; monitoring receives and remembers every message and never answers.",
           )}
           group
         >
           <div className="inline-flex self-start rounded-lg border border-border bg-bg-tertiary p-0.5">
-            {(["test", "production"] as const).map((m) => (
+            {AGENT_MODES.map((m) => (
               <button
                 key={m}
                 type="button"
@@ -163,7 +166,9 @@ export function GeneralTab({
               >
                 {m === "test"
                   ? t("editor.modeTest", "Test")
-                  : t("editor.modeProduction", "Production")}
+                  : m === "monitoring"
+                    ? t("editor.modeMonitoring", "Monitoring")
+                    : t("editor.modeProduction", "Production")}
               </button>
             ))}
           </div>
@@ -350,7 +355,7 @@ export function GeneralTab({
         </Button>
       </Card>
 
-      {/* NOTE: Expand-to-modal view: the SAME editor/preview toggle, taller, sharing the lifted
+      {/* Expand-to-modal view: the SAME editor/preview toggle, taller, sharing the lifted
           prompt state so edits here and inline stay in sync. */}
       <Modal
         modal={promptModal}

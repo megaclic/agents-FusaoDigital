@@ -42,6 +42,8 @@ export function flowStageLabel(stage: string, t: TFunction): string {
       return t("logs.stage.presence", "Typing indicator");
     case "memory":
       return t("logs.stage.memory", "Memory");
+    case "observe":
+      return t("logs.stage.observe", "Observation");
     case "webhook":
       return t("logs.stage.webhook", "Outbound webhook");
     case "dead_letter":

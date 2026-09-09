@@ -78,6 +78,26 @@ export function buildGroups(
     });
   }
 
+  // Operator-authored code tools, by their display name (label). A grant whose code tool was deleted
+  // resolves to nothing, the way a stale HTTP or MCP grant does: the map shows what the agent can
+  // call.
+  const codeNames = grants
+    .filter((g) => g.source === "CODE")
+    .map((g) => {
+      const ct = catalog.codeTools.find((x) => x.id === g.codeToolDefinitionId);
+      // Disabled is the same as absent here: the assembly skips a disabled definition, so the model
+      // is never offered it, and a map that draws it claims a capability the agent does not have.
+      return ct?.enabled ? ct.label : undefined;
+    })
+    .filter((n): n is string => !!n);
+  if (codeNames.length > 0) {
+    groups.push({
+      key: "code",
+      label: t("editor.capabilities.code", "Code tools"),
+      items: codeNames,
+    });
+  }
+
   // MCP servers: one group per granted server, listing its selected tools (or the server itself when
   // none are individually selected).
   for (const g of grants.filter((x) => x.source === "MCP")) {
@@ -270,8 +290,11 @@ async function downloadPng(svgEl: SVGSVGElement, fileName: string, bg: string) {
 }
 
 // Renders the agent graph as an SVG inside the modal and lets the operator save it. mermaid is
-// lazy-imported (heavy dep, kept out of the initial bundle — loaded only when the operator opens the
-// graph) and rendered via mermaid.render (its dompurify sanitizes the SVG). On any failure it shows a
+// lazy-imported so its module body is only EVALUATED when the operator opens the graph, and rendered
+// via mermaid.render (its dompurify sanitizes the SVG). It is not kept out of the bundle: `Bun.build`
+// in build.ts sets no `splitting`, so it emits a single chunk and every `await import()` is inlined
+// into it. Measured on the current tree: mermaid is in dist/index-*.js, and wrapping another heavy
+// component in `React.lazy` grew that file instead of shrinking it. On any failure it shows a
 // fallback message. `fileName` is the slugified download name for the saved image.
 function GraphModalBody({
   code,
@@ -422,7 +445,9 @@ export function CapabilityMap({
             {t("editor.capabilities.title", "Capability map")}
           </span>
           <span className="text-text-muted text-xs">
-            {t("editor.capabilities.count", "{{n}} tools", { n: total })}
+            {t("editor.capabilities.count", "{{count}} tools", {
+              count: total,
+            })}
           </span>
         </button>
         {total > 0 && (

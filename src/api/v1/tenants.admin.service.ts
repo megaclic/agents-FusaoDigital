@@ -3,6 +3,8 @@ import basePrisma from "@/api/lib/prisma";
 import { ConflictError, ForbiddenError, NotFoundError } from "@/lib/errors";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
+  assertTenantCreatable,
+  assertTenantUpdatable,
   TENANT_SELECT,
   type TenantCreate,
   type TenantDto,
@@ -38,10 +40,15 @@ export async function createTenant(
   base: PrismaClient = basePrisma,
 ): Promise<TenantDto> {
   if (ctx.role !== "SUPER_ADMIN") throw new ForbiddenError();
+  // Asked here too, not only by the MCP preview (write-fleet.ts's tenantCreate): a REST body
+  // already carries this shape (Elysia's `t.Object` schema refuses an empty name/slug before the
+  // controller is even reached), but MCP's apply path calls straight into this function with
+  // nothing upstream re-checking it, so the core has to be the one place both transports agree.
+  const data = assertTenantCreatable(input);
   try {
     const tenant = await asSuperAdminOn(base, (db) =>
       db.tenant.create({
-        data: { name: input.name, slug: input.slug },
+        data: { name: data.name, slug: data.slug },
         select: TENANT_SELECT,
       }),
     );
@@ -63,20 +70,23 @@ export async function updateTenant(
   patch: TenantUpdate,
   base: PrismaClient = basePrisma,
 ): Promise<TenantDto> {
+  // Same reasoning as createTenant above: the REST body schema already refuses an empty name, but
+  // MCP's apply path (write.ts's tenantUpdate) reaches straight here, so the core re-asks it.
+  const data = assertTenantUpdatable(patch);
   try {
     const tenant =
       ctx.role === "SUPER_ADMIN"
         ? await asSuperAdminOn(base, (db) =>
             db.tenant.update({
               where: { id },
-              data: patch,
+              data,
               select: TENANT_SELECT,
             }),
           )
         : await runScopedOn(base, ctx, (db) =>
             db.tenant.update({
               where: { id },
-              data: patch,
+              data,
               select: TENANT_SELECT,
             }),
           );

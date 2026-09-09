@@ -212,6 +212,17 @@ export async function readSchedule(
   return row ? parseSchedule(row) : null;
 }
 
+// Everything `createBusinessHours` decides about its INPUT — the schema, the timezone, the windows
+// and the exceptions — before any database is involved. Split out so the MCP preview can ask the
+// same question the apply asks (#490).
+export function assertBusinessHoursCreatable(input: BusinessHoursCreate) {
+  const data = parseInput(businessHoursCreateSchema, input);
+  if (data.timezone) assertValidTimezone(data.timezone);
+  if (data.windows) assertValidWindows(data.windows);
+  if (data.exceptions) assertValidExceptions(data.exceptions);
+  return data;
+}
+
 export async function createBusinessHours(
   ctx: TenantContext,
   input: BusinessHoursCreate,
@@ -219,10 +230,7 @@ export async function createBusinessHours(
 ): Promise<BusinessHoursDto> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
-  const data = parseInput(businessHoursCreateSchema, input);
-  if (data.timezone) assertValidTimezone(data.timezone);
-  if (data.windows) assertValidWindows(data.windows);
-  if (data.exceptions) assertValidExceptions(data.exceptions);
+  const data = assertBusinessHoursCreatable(input);
   return runScopedOn(base, ctx, async (db) => {
     const row = await db.businessHours.create({
       data: {
@@ -245,16 +253,25 @@ export async function createBusinessHours(
   });
 }
 
+// The twin of `assertBusinessHoursCreatable`, for the patch. The create side has had its own since
+// #490 and this one went without: the MCP row for `business_hours_update` passes a schedule id that
+// names no row, so it proved the ownership check and none of the three rules below — and a preview
+// approved a timezone, a window and a holiday the apply refuses (#510).
+export function assertBusinessHoursUpdatable(patch: BusinessHoursUpdate) {
+  const data = parseInput(businessHoursUpdateSchema, patch);
+  if (data.timezone) assertValidTimezone(data.timezone);
+  if (data.windows) assertValidWindows(data.windows);
+  if (data.exceptions) assertValidExceptions(data.exceptions);
+  return data;
+}
+
 export async function updateBusinessHours(
   ctx: TenantContext,
   id: bigint,
   patch: BusinessHoursUpdate,
   base: PrismaClient = basePrisma,
 ): Promise<BusinessHoursDto> {
-  const data = parseInput(businessHoursUpdateSchema, patch);
-  if (data.timezone) assertValidTimezone(data.timezone);
-  if (data.windows) assertValidWindows(data.windows);
-  if (data.exceptions) assertValidExceptions(data.exceptions);
+  const data = assertBusinessHoursUpdatable(patch);
   return runScopedOn(base, ctx, async (db) => {
     const current = await db.businessHours.findUnique({
       where: { id },

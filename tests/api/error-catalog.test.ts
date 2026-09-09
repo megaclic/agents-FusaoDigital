@@ -120,6 +120,10 @@ const CLIENT_IDENTICAL_BY_DESIGN: readonly string[] = [
   "integrations.catalog.GOOGLE_DRIVE.label",
   "mcp.admin.clientNamePlaceholder",
   "nav.github",
+  // "item" is the same word in both languages, so the SINGULAR of this counter coincides while its
+  // plural ("items" / "itens") does not. The pair is the evidence: a waiver over the whole key would
+  // hide a real gap in the form that actually differs.
+  "tools.outputTemplateListLength_one",
   "nav.website",
   "vault.googleOAuth.scopeCalendar",
   "vault.googleOAuth.scopeContacts",
@@ -1114,7 +1118,16 @@ describe("both languages answer, and answer differently", () => {
       // pt-BR; an operator-configured support email, blank by default in both languages until set).
       // Each is named above with its category and reason, same discipline SAY_LESS_GRANDFATHERED's
       // one-entry growth already established for this file.
-      hasProOnlyKeys ? 111 : 109,
+      //
+      // Independently, upstream's own branch grew the SAME ledger by one, from 102 to 103: the entry
+      // that bought it is `tools.outputTemplateListLength_one`, pluralizing that counter (issue #509)
+      // created a SINGULAR form whose two languages coincide, because "item" is the same word in
+      // both. Its plural does not coincide, which is why the waiver names the form rather than the
+      // key.
+      //
+      // MERGED: both growths land on the same array (see CLIENT_IDENTICAL_BY_DESIGN above, which now
+      // carries both sets of entries), so the pin is the shared 100/102 base plus both deltas.
+      hasProOnlyKeys ? 112 : 110,
     );
     // NOT per edition any more, and that is the point: the list is empty in every tree, so the two
     // editions can no longer differ on it. The one entry that used to make them differ was waived

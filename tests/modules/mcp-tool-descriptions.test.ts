@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { CODE_TOOL_CONTEXT_NAMES } from "@/lib/code-tool-vocabulary";
 import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { buildMcpServer } from "@/modules/mcp/server";
@@ -79,6 +80,22 @@ describe("scope contract", () => {
     const reads = [...all].filter((n) => /(_list|_get|_schema)$/.test(n));
     expect(reads.length).toBeGreaterThan(5);
     expect(reads.filter((n) => !readOnly.has(n))).toEqual([]);
+  });
+
+  // `filterScopes` grants exactly the scopes a client asked for, so `mcp:write` without `mcp:read`
+  // is a real token. Its write tools point at the two authoring contracts for the vocabulary and the
+  // limits they no longer restate, so those two have to be LISTED for it: a description naming a
+  // tool the caller cannot see is worse than the duplication it replaced.
+  test("a write-only token lists the tools its writes point at", async () => {
+    const writeOnly = await listedFor(["mcp:write"]);
+    for (const named of ["code_tool_schema", "document_template_schema"]) {
+      expect([named, writeOnly.has(named)]).toEqual([named, true]);
+    }
+    // And they are still there for a reader, which is what the sweep above assumes.
+    const readOnly = await listedFor(["mcp:read"]);
+    for (const named of ["code_tool_schema", "document_template_schema"]) {
+      expect([named, readOnly.has(named)]).toEqual([named, true]);
+    }
   });
 
   test("a read-only token sees no write tool", async () => {
@@ -218,7 +235,21 @@ const SETTINGS_DESC_CEILING = 2_110;
 // (the Z-PRO entry channel) each add one field on an existing block, and `zproCrm` adds a whole new
 // block (`pipelineId` + `instructions`). None of the three has a Chatwoot equivalent to fold into,
 // so none compresses. Measured on the merged tree at 24,396.
-const SETTINGS_SCHEMA_CEILING = 24_400;
+//
+// Independently, upstream's own branch (not yet merged when the figure above was taken) raised the
+// same constant three more times: a block of one boolean, `takeover.onHumanReply` (issue #430, a new
+// BLOCK rather than a field, which is what makes it cost more than its own sentence) to 22,567; a
+// fourteenth NATIVE tool, `run_code` (issue #363 — `toolGuidance`/`toolPreconditions` carry one key
+// per native, so a native costs its name twice with no field of its own) to 22,960; and the
+// `monitoring` block of issue #477 (an `analysis` enum, two small sub-objects, a boolean, and
+// `labelGroups` — an array of objects with a name, an `exclusive` flag and an array of label titles;
+// trimmed as far as it goes, and none of what is left is discretionary) to 24,261.
+//
+// MERGED, and re-measured once more on the tree that came out of it, for the same reason the
+// paragraph above this one exists: the fork's 24,396 and upstream's 24,261 are each about a tree the
+// other had not landed on, and summing the two deltas over the shared 22,346 base writes a number
+// measured nowhere.
+const SETTINGS_SCHEMA_CEILING = 26_010; // Measured on the merged tree at 25,994; same small margin as elsewhere in this file.
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -374,6 +405,171 @@ describe("MCP tool descriptions", () => {
   // RAISED again for this fork's own Z-PRO settings-schema sync (the same delta SETTINGS_SCHEMA_CEILING
   // took above), which this whole-payload sum was never re-measured against. Measured on the merged
   // tree at 54,005 of schema; description stays under its existing ceiling.
+  //
+  // Independently, upstream's own branch (not yet merged when the figure above was taken) kept
+  // raising this same pair through its own sequence of tools, below.
+  //
+  // And the `takeover` block of issue #430 takes it to 52,154. One boolean, 54 characters of total
+  // payload, which is the honest price of a NEW block rather than a field on an existing one — the
+  // same 33 characters this addition cost above, published once here.
+  //
+  // The response template of #456 takes it to 52,910, and the increment is worth naming because it
+  // is the largest single one recorded here: 756 characters, all of it the `output_schema`
+  // description on `tool_create` and `tool_update`. A column that existed with a one-line
+  // description ("JSON Schema describing the tool response shape") now has a contract behind it —
+  // the shape that opts in, the path grammar, the fact that it renders BEFORE the clip, and what
+  // omitting it means — and a client that cannot read those writes a template the runtime refuses.
+  // Measured after a first draft that cost 1,092: the version that ships drops the prose and keeps
+  // the four facts, and the fuller wording lives on the REST/OpenAPI field, which no ceiling counts.
+  // The ceiling goes to 53,000.
+  //
+  // `agent_config_health` (#467) takes the DESCRIPTION total to 27,790, and it is the first entry
+  // here that moves that number rather than the schema one: a new tool pays its whole description,
+  // where a new field on an existing tool pays only its own line. 690 characters of it, measured
+  // against a first draft of 1,102 — the cut kept the four things a caller cannot act without (when
+  // to run it, that several of these are silent at runtime, what the three severities mean, and what
+  // `healthy` is computed from) and dropped the enumeration of every issue kind, which the caller
+  // reads off the result anyway. The fuller wording lives on the REST route's OpenAPI description,
+  // which no ceiling counts. The description ceiling goes to 27,900, and the schema one to 53,100:
+  // its input is one required string, and 47 characters is what the envelope of a minimal schema
+  // costs — the floor for any tool at all, worth recording as such.
+  //
+  // The list block of #459 takes the schema figure to 53,367: 410 characters, again the
+  // `output_schema` description on `tool_create` and `tool_update`, and again measured against a
+  // longer draft (484, which also said that blocks do not nest — dropped, because the write refuses
+  // a nested block with a sentence that says so, and a rule a caller learns by trying is not worth
+  // publishing on every session). What stays is what a caller cannot get by trying: the spelling of
+  // the block, that paths inside it are relative, that `{{.}}` is the item, and the 50-item cap,
+  // which the runtime applies silently from the caller's side. The ceiling goes to 53,500.
+  // `audit_list` (#401) moves the SCHEMA number and barely touches the other: the console grew a
+  // page over this trail and the endpoint grew with it, from `action`+`limit` to a keyset cursor, a
+  // date range and the actor, and the MCP twin takes the same surface because they are one core.
+  // Five new optional fields, 47 characters past the ceiling the list block left, which is the floor
+  // for them: a field line costs about that much and one of the five is a four-value enum published
+  // from `ACTOR_TYPES` rather than hand-listed. Nothing there
+  // is prose to cut. The description went the other way — the filter list came OUT of it, because
+  // the schema below already names every one of them, and what stayed is the four things a caller
+  // cannot read off the schema: the ordering, the sanitisation guarantee, the limit cap, and what
+  // `latestAt` answers, and the four fit in 27 characters LESS than the sentence they replaced, so
+  // the description ceiling does not move at all: `audit_list` ends up smaller than it was. The
+  // schema ceiling goes to 53,600.
+  //
+  //
+  // `run_code` (#363) takes the schema total from 53,367 to 53,760, and every character of it is on
+  // `agent_settings_set` (measured per tool, base against fix: one line differs). A native tool is
+  // not an MCP tool, so it publishes no description and no schema of its own here; what it costs is
+  // its NAME, once per native-keyed settings map (`toolGuidance`, `toolPreconditions`) — 393
+  // characters the tools/list of every session pays for a tool the session may never grant. The
+  // schema ceiling goes to 54,000. (First measured against the tree before #459's block: 53,047 to
+  // 53,440, under the 53,500 both branches had picked; the two additions do not overlap, so the
+  // rebase added them — and the next rebase, over the five audit-trail rounds that took the base to
+  // 53,547, measured 53,940.)
+  //
+  // The `monitoring` mode (#209) takes the description total to 27,901, one character past the
+  // ceiling `agent_config_health` left: `agent_create` and `agent_update` name the third value in
+  // the sentence that already named the other two ("'monitoring' (reads, never answers)"), which is
+  // what a caller cannot learn by trying, because a mode it does not know is a refused write. No
+  // tool was added. The description ceiling goes to 28,000. The schema side grows by the third
+  // value of the two `mode` enums, to 53,966; the schema ceiling holds at 54,000.
+  //
+  // `audit_list`'s `scope` (#520) takes the schema total from 53,966 to 54,024: 58 characters for a
+  // three-value optional enum, DERIVED from `AUDIT_SCOPES` rather than hand-listed, for the reason
+  // `actor_type` carries at its own site. It is the parameter that makes the rows keyed to no tenant
+  // reachable from this transport at all -- they are not filtered out of a tenant read, they are
+  // unreachable from it -- so a caller without it cannot ask the question, and a refusal it never
+  // sent teaches nothing. The description side pays for the semantics in nine words
+  // ("fleet/all need SUPER_ADMIN"), which is where the budget for it had to come from: descriptions
+  // stand at 27,990 of 28,000, ten characters short of anywhere to move it. The schema ceiling goes
+  // to 54,100.
+  //
+  // The five `code_tool_*` tools (#363) take the description total from 27,990 to 29,986 and the
+  // schema total from 54,024 to 54,899, remeasured against this base after the rebase over #520
+  // rather than carried over from the earlier one. The five tools are 1,909 of the description and
+  // 1,192 of the schema; the rest is the tree around them, measured per tool: `agent_tools_get`
+  // +32 and `agent_tools_set` +55/+76 for the fourth source, against `agent_settings_set` -393 on
+  // the schema, which is the native tool #363 retired leaving the two native-keyed settings maps.
+  // Five tools is where the cost is, and it is the cost `tool_*` paid: a list, a get and a
+  // create/update/delete, each with the dry-run line. `code_tool_create` is 1,145 of the 1,909 and
+  // carries what a caller cannot learn by trying, because the sandbox never answers a question a
+  // body does not ask: the twelve `context` keys, the CPU and memory limits, that a `throw` is an
+  // integration failure and a returned value a business outcome, and that a body which does not
+  // parse is SAVED and fails at call time. Trimmed first against a draft of 1,426: the example use
+  // cases, the `console.log` echo, the ES level, the spelling of the two warning kinds and the
+  // reason `description` is required (the schema already marks it) came out. The sentence naming
+  // the two CPF/CNPJ helpers came out with the helpers themselves, which is the 54 characters that
+  // pay for #520's `scope` and let the description ceiling stay where it was: 30,000, with the
+  // same 14-character margin #520 left itself. The schema ceiling goes to 54,900.
+  // A fifteenth read tool, `code_tool_schema` (issue #538), and it is the cheap half of the trade it
+  // exists to make: 246 characters of description and 85 of schema, against the `context` vocabulary
+  // it serves, which would otherwise have to grow `code_tool_create`'s description by every key,
+  // type and absent-when clause. Same shape as `document_template_schema` two paragraphs down, for
+  // the same measured reason.
+  //
+  // Then `code_tool_create` gave back what the schema tool exists to carry. It had been publishing
+  // the twelve `context` names, the limits and the failure clause in its own description, so every
+  // session paid for both copies of a contract only a caller writing a body needs, and the two could
+  // disagree — they already had, since the create description still called every limit a failure
+  // after `code_tool_schema` learned that arguments over `inputMaxChars` are not one. It now names
+  // the schema tool instead: 287 characters back.
+  //
+  // REMEASURED on the tree that ships, never summed: 29,945 and 54,984, so the ceilings go to 29,960
+  // and 55,000. The margins are 15 and 16, as thin as the ones they replace and on
+  // purpose: the point of a ceiling here is that the next tool has to be measured too.
+  //
+  // #547 moves both, in opposite directions, and again these are measured on this tree rather than
+  // added to the numbers above. `experiment_create` now says WHY `agent_id` is required (a variant
+  // resolves for one agent), which no caller can read off a schema that only marks it required, and
+  // that is 25 characters of description. The same change drops the `.nullable()` that made "no
+  // agent" expressible on the create and on the update, giving 45 characters of schema back, so the
+  // schema ceiling comes DOWN rather than staying where it was: a ratchet that only ever goes up
+  // stops measuring. Measured 29,970 and 54,939, so the ceilings go to 29,985 and 54,955, holding
+  // the same 15 and 16 margins.
+  // The trade `code_tool_schema` exists to make, asserted on the side that keeps giving it back:
+  // `code_tool_create` used to publish the whole vocabulary in its own description, so every session
+  // paid for both copies and the two could disagree — and had, on which limits count as failures. A
+  // ceiling would not catch the regression (it is an upper bound and the payload has room), so the
+  // rule is named here: the create description points at the schema tool and enumerates nothing.
+  test("code_tool_create points at the schema instead of restating it", async () => {
+    const d = (await descriptions()).get("code_tool_create");
+    expect(d).toBeDefined();
+    const desc = d as string;
+    expect(desc).toContain("code_tool_schema");
+    // The context vocabulary, the limits and the failure semantics are the schema tool's to serve.
+    for (const restated of CODE_TOOL_CONTEXT_NAMES) {
+      expect([restated, desc.includes(restated)]).toEqual([restated, false]);
+    }
+    for (const restated of ["TIMEZONE", "NOW_LOCAL", "1000 ms", "32 MB"]) {
+      expect([restated, desc.includes(restated)]).toEqual([restated, false]);
+    }
+  });
+
+  //
+  // `inbox_observe` / `inbox_unobserve` (#476) are the two tools this branch adds. Each pays its
+  // whole description, and the first says what a caller cannot learn by trying — that only a
+  // monitoring agent may observe, that the inbox keeps starting conversations open for whoever
+  // answers it, and that the attach needs the fazer.ai Chatwoot. The second is one sentence,
+  // mirroring the first. REMEASURED on this base after the rebase over #543/#547/#548, never summed
+  // from the earlier reading: 30,417 and 55,351 on this tree, so the ceilings go to 30,432 and
+  // 55,367 — the same 15 and 16 the paragraphs above keep, so the next tool has to be measured too.
+  // The deltas came out the same across both rebases (+447 and +412), which is what a description
+  // that names its own tools rather than the tree around it should do.
+  //
+  // The `monitoring` block of `agent_settings_set` (#477) leaves the description total where it is —
+  // no tool added and no sentence beyond the block's own — and grows the schema side alone. The
+  // 1,321 is the shape and not the prose: `labelGroups` is an array of objects with a name, an
+  // `exclusive` flag and an array of titles, and a nested block with an array of objects inside it
+  // costs more than its own sentences, the way `takeover` cost more than one boolean. It is not
+  // discretionary either — a client that cannot see `values` cannot write a group, and a group is
+  // the whole feature. Round 23 then bounded the two strings' LENGTH, which publishes as `maxLength`
+  // on the name and on the value: 76 characters more, for a rule a client would otherwise learn by
+  // having its save refused. REMEASURED on this base after the rebase over #543/#547/#548, never
+  // summed from the earlier reading: 30,417 and 56,748 on this tree, so the ceilings are 30,432 and
+  // 56,764 — the description one is #476's, untouched, and the schema one keeps the same 16.
+  //
+  // MERGED, and re-measured once more on the tree that came out of it, for the same reason
+  // SETTINGS_SCHEMA_CEILING's own merge paragraph exists: the fork's 54,005-of-schema figure and
+  // upstream's 30,432/56,764 pair are each about a tree the other had not landed on, so summing the
+  // two deltas would have written numbers measured nowhere.
   test("the whole tools/list payload stays under its ceiling", async () => {
     const all = await listed();
     let desc = 0;
@@ -382,8 +578,11 @@ describe("MCP tool descriptions", () => {
       desc += t.description.length;
       schema += t.schema.length;
     }
-    expect(desc).toBeLessThanOrEqual(27_250);
-    expect(schema).toBeLessThanOrEqual(54_100);
+    // REMEASURED on the merged tree, never summed: 30,584 and 58,820 (fork Z-PRO settings additions
+    // on top of upstream's monitoring/code-tools/audit-trail sequence). Same margin discipline as the
+    // paragraphs above: the ceilings go to 30,600 and 58,840.
+    expect(desc).toBeLessThanOrEqual(30_600);
+    expect(schema).toBeLessThanOrEqual(58_840);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

@@ -15,6 +15,10 @@ import {
   toolReferences,
   updateToolDefinition,
 } from "@/modules/tool-definitions/service";
+import {
+  runToolTest,
+  type ToolTestInput,
+} from "@/modules/tool-definitions/test-run";
 
 // The error catalog this controller's routes answer with. `bun i18n:extract` materialises
 // src/api/locales/*.json from these lines and prunes anything nothing references, and
@@ -22,6 +26,11 @@ import {
 // throw site rather than an English sentence on a pt-BR caller's screen.
 // translate('errors.toolDefinitionNotFound', 'Tool definition not found.')
 // translate('errors.toolNameTaken', 'That tool name is already in use.')
+// translate('errors.toolNameReserved', 'That name belongs to a built-in tool; choose another.')
+// translate('errors.urlTemplateNotAUrl', 'The request URL must be an http(s) URL, or a path starting with / when the credential carries a base URL')
+// translate('errors.urlTemplateNotHttp', 'The request URL must use http or https; {{protocol}} is not sent by this tool')
+// translate('errors.urlTemplateOriginInterpolated', 'The request URL may not put a placeholder in the scheme, host or port: the origin is fixed when the tool is written')
+// translate('errors.urlTemplateRelativeWithoutBase', 'A request URL starting with / takes its host from the credential base URL, and no credential here supplies one')
 
 // Custom HTTP tool definitions (per-tenant). TENANT_ADMIN; the scoped service is the hard
 // boundary. The deeper field validation lives in the service zod schema; the credential is a vault
@@ -80,15 +89,22 @@ export const writeBody = t.Object({
         "Static request headers; values may contain {{secret}} placeholders.",
     }),
   ),
+  // `t.Unknown`, not `t.Record`: the record schema REBUILDS the map, and a field named `__proto__`
+  // becomes the object's prototype on the way in — the service's refusal (code-tools/service.ts)
+  // would then judge a schema the caller never sent, and the tool would save with the declared
+  // argument missing. Measured: `t.Record` answers own keys `["cpf"]` for a body that also sent
+  // `__proto__`; `t.Unknown` keeps both. The shape is still described here and validated by the
+  // service's own zod.
   inputSchema: t.Optional(
-    t.Record(t.String(), t.Unknown(), {
+    t.Unknown({
       description:
         'Input fields the agent supplies, as a compact map: {"field": {"type": "string"|"integer"|"number"|"boolean"|"enum"|"array"|"object", "required"?, "description"?, "enumValues"?, "itemType"?}}. Standard JSON Schema ({"properties", "required"}) is accepted and converted to this shape on write.',
     }),
   ),
   outputSchema: t.Optional(
     t.Record(t.String(), t.Unknown(), {
-      description: "JSON Schema describing the tool response shape.",
+      description:
+        'How this tool\'s response should read by the time it reaches the model: {"mode": "template", "template": "**{{razao_social}}** — {{municipio}}\nStatus: {{situacao}}"}. A token is a dot-separated path into the response body, with a number for a list position (data.items.0.name); a path that does not resolve renders "(not returned)" and is reported on the tool stage. A list of unknown length renders through a block: {{#each items}}- {{name}}\n{{/each}} repeats its content per item, paths inside it are relative to the item, {{.}} is the item itself, blocks do not nest, and at most 50 items render, fewer when they would not fit the clip, with the rest counted. Rendered before the response is clipped, so a field past the clip is reachable. Omitted (or any other shape) hands the model the raw body, clipped, which is the old behaviour.',
     }),
   ),
   query: t.Optional(
@@ -248,6 +264,63 @@ export const toolsController = new Elysia({
       ),
       response: errors(400, 401, 403, 404, 409, 422),
       body: createBody,
+    },
+  )
+  // Run the definition on screen, unsaved, against the real API — the loop that makes a response
+  // template writable (issue #456). It goes out through the same `buildHttpTool` a turn uses, so
+  // every guard is the same code; see `modules/tool-definitions/test-run.ts` for why that matters
+  // and for what is deliberately NOT wired (no appointment registration, no customer ack).
+  .post(
+    "/test",
+    async ({ tenantContext, body }) => ({
+      instance: instanceIdentity,
+      result: await runToolTest(
+        ctxOrThrow(tenantContext),
+        body as unknown as ToolTestInput,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Test a tool definition",
+        "Issues one real request for the supplied (unsaved) HTTP tool definition and returns the provider's raw response alongside the exact text the model would receive. Adds no capability over saving the tool and calling it: the same allowlist, SSRF guard, redirect refusal and timeout apply. The request headers are never echoed back, and no appointment is registered. A definition this endpoint refuses answers 400; a provider that cannot be reached answers 502, and one that does not answer within the runtime's timeout answers 504.",
+      ),
+      // 502 and 504 are ROUTINE here, not exceptional: this endpoint's whole job is to call a
+      // third-party API the operator has just typed the address of, so a name that does not resolve
+      // and a provider that does not answer are among its ordinary outcomes. A contract that
+      // described only 4xx would have generated clients treating them as protocol violations.
+      response: errors(400, 401, 403, 404, 422, 502, 504),
+      body: t.Object({
+        definition: t.Object({
+          name: t.Optional(t.String()),
+          method: t.Optional(t.String()),
+          urlTemplate: t.String({
+            description:
+              "Absolute URL template, or a path when the credential carries a base URL.",
+          }),
+          allowedHosts: t.Optional(t.Array(t.String())),
+          headers: t.Optional(t.Record(t.String(), t.Unknown())),
+          // Same reason as writeBody's: a record schema rebuilds the map.
+          inputSchema: t.Optional(t.Unknown()),
+          query: t.Optional(t.Record(t.String(), t.Unknown())),
+          body: t.Optional(t.Record(t.String(), t.Unknown())),
+          credentialRef: t.Optional(t.Union([t.String(), t.Null()])),
+          expectedStatuses: t.Optional(t.Array(t.Number())),
+          outputSchema: t.Optional(t.Record(t.String(), t.Unknown())),
+        }),
+        args: t.Optional(
+          t.Record(t.String(), t.Unknown(), {
+            description:
+              "Values for the AI-filled fields, as the model would have supplied them.",
+          }),
+        ),
+        context: t.Optional(
+          t.Record(t.String(), t.String(), {
+            description:
+              "Values for the conversation/contact placeholders. Names outside the runtime's own list are ignored.",
+          }),
+        ),
+      }),
     },
   )
   .patch(

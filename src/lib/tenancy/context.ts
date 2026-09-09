@@ -1,7 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Prisma, UserRole } from "@/../generated/prisma/client";
 
-export type ActorType = "user" | "api_key" | "mcp" | "system";
+export { ACTOR_TYPES, type ActorType } from "./actor";
+
+import type { ActorType } from "./actor";
 
 export interface TenantContext {
   // NOTE: null only for SUPER_ADMIN operating fleet-wide. A tenant-scoped op with a
@@ -17,6 +19,10 @@ export interface TenantContext {
   // through. `mcp.agent_update` and a console PATCH are the same change, and they are the same
   // action, told apart here.
   actorType?: ActorType;
+  // For an "api_key" principal: when the person minting the key answered the password step-up, or
+  // null for a key that predates the rule (review round 3 on #308). Absent for every other actor.
+  // Read by `confirmStepUp` only.
+  stepUpAt?: Date | null;
 }
 
 // NOTE: branded transaction client. Only the TenancyProvider (runScoped/asSuperAdmin)

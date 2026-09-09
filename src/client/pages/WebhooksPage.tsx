@@ -227,11 +227,28 @@ export function WebhooksPage() {
                   ))}
                 </div>
                 <span className="text-text-muted text-xs">
+                  {/* Three states, not two. `hasSecret` says a secret is CONFIGURED and `secretRef`
+                      says which one — and they come apart for a value stored before #126 that names no
+                      vault entry, which the read refuses to hand out.
+
+                      The third sentence says CONFIGURED, never "signed": such a ref resolves to no
+                      row (`vaultRefWhere` sends it to id -1), so `outboundHeaders` gets a null secret
+                      and the delivery goes out unsigned. The operator needs both halves — the setting
+                      is there, and it is not doing anything.
+
+                      Three is what the ROW can answer. A ref whose vault entry was deleted or is
+                      still `pending` resolves to null in the worker just the same, and this still
+                      names it: seeing that needs the vault, not the row. */}
                   {sub.secretRef
                     ? t("webhooks.signedWith", "Signed with: {{ref}}", {
                         ref: sub.secretRef,
                       })
-                    : t("webhooks.unsigned", "Unsigned")}
+                    : sub.hasSecret
+                      ? t(
+                          "webhooks.signedUnavailable",
+                          "Signing secret set, but its credential is not in the vault: deliveries go unsigned",
+                        )
+                      : t("webhooks.unsigned", "Unsigned")}
                   {" · "}
                   {t("webhooks.createdAt", "Created {{date}}", {
                     date: formatDate(sub.createdAt),

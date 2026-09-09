@@ -21,7 +21,7 @@ import {
 } from "@/modules/flowlog/service";
 import { getSttProvider } from "@/modules/stt/providers";
 import { readSttConfig, type SttConfig } from "@/modules/stt/settings";
-import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { sysCtx } from "./ctx";
 import { decryptWhatsappMedia } from "./media-crypto";
 
@@ -100,9 +100,20 @@ export async function transcribeZproAudio(
     return skip("no_credential");
   }
   const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
-    tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
+    tryResolveApiKeyEntry(db, cfg.credentialRef as string),
   );
-  if (!entry) {
+  if (entry.state !== "ok") {
+    // Two reasons the credential cannot serve this, kept apart because the operator's move is not the
+    // same: gone or unfilled is a credential to re-pick, and the wrong KIND is one that belongs on
+    // another field (issue #471) — mirrors src/modules/stt/service.ts exactly.
+    if (entry.state === "unusable") {
+      logger.warn(
+        "zpro:stt: credential %s is a %s credential, which cannot be used as an API key — skipping",
+        cfg.credentialRef,
+        entry.kind,
+      );
+      return skip("credential_unusable");
+    }
     logger.warn(
       "zpro:stt: credential %s not found in the vault — skipping",
       cfg.credentialRef,

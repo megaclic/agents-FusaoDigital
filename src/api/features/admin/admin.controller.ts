@@ -1,5 +1,4 @@
 import { Elysia, t } from "elysia";
-import { getUserById, verifyPassword } from "@/api/features/auth/auth.service";
 import {
   createInvite,
   InviteEmailInUseError,
@@ -11,16 +10,27 @@ import { type AuthUser, authPlugin } from "@/api/lib/auth";
 import { translate } from "@/api/lib/i18n";
 import { doc, errors } from "@/api/lib/openapi";
 import { parseQueryCount, parseQueryId } from "@/api/lib/query-filters";
+import {
+  confirmStepUp,
+  STEP_UP_PASSWORD_DESCRIPTION,
+  stepUpPrincipalOf,
+} from "@/api/lib/step-up";
 import config from "@/config";
 import { optionalDbId, requireDbId } from "@/lib/db-id";
 import { UnauthorizedError } from "@/lib/errors";
+import type { TenantContext } from "@/lib/tenancy";
 import {
   CannotDeleteSelfError,
+  ConcurrentMoveError,
   deleteUser,
+  EmailTakenInTenantError,
   getAdminStats,
   getUsers,
   LastAdminError,
   listTenantsWithUserCounts,
+  TenantNotChangeableError,
+  TenantNotFoundError,
+  TenantRequiredError,
   UserNotInScopeError,
   updateUserRole,
 } from "./admin.service";
@@ -28,6 +38,23 @@ import {
 // One-time accept link (no mailer); the admin copies/sends it.
 function acceptUrl(token: string): string {
   return `${config.publicUrl.replace(/\/$/, "")}/accept-invite?token=${token}`;
+}
+
+// The principal these writes act as, built from the SESSION and never from the tenancy plugin.
+//
+// `tenantId` is the caller's HOME tenant, which for a SUPER_ADMIN is null (fleet-wide reach) — the
+// same scope `resolveScope(user, undefined)` already resolves for the reads. Mounting `tenancyPlugin`
+// here would hand these routes the `X-Tenant-Id` SELECTOR instead, and a fleet admin with a tenant
+// open in one tab would silently lose the ability to re-role anyone outside it. `actorType` is what
+// that plugin does supply elsewhere, so it is supplied here: without it a Bearer API key's writes
+// would all record as a cookie session.
+function actorOf(user: AuthUser): TenantContext {
+  return {
+    tenantId: user.tenantId,
+    userId: user.id,
+    role: user.role,
+    actorType: user.isApiKey ? "api_key" : "user",
+  };
 }
 
 // Resolves the tenant scope for a read/filter. A SUPER_ADMIN chooses explicitly via the
@@ -158,7 +185,11 @@ export const adminController = new Elysia({
       // addresses row 7 while failing string equality against `"7"`, and comparing the raw segment
       // let a caller past the guard that exists to stop them locking themselves out. Issue #371.
       const targetId = requireDbId(params.id);
-      if (user.id === targetId && body.role === "AGENT") {
+      // ANY self role change, not just the demote to AGENT. The narrower guard was only ever complete
+      // because the other transitions could not be stored: a fleet administrator naming a tenant can
+      // now make themselves that tenant's admin, and the next authentication lookup takes their fleet
+      // access away for good (#534). Nobody re-roles themselves here.
+      if (user.id === targetId) {
         set.status = 403;
         return {
           error: translate("errors.cannotDemoteSelf", "Cannot demote yourself"),
@@ -167,11 +198,10 @@ export const adminController = new Elysia({
       try {
         // A SUPER_ADMIN may re-role across tenants (own tenant is null → unscoped updateMany);
         // a TENANT_ADMIN is fenced to its own tenant.
-        const updated = await updateUserRole(
-          user.tenantId,
-          targetId,
-          body.role,
-        );
+        const updated = await updateUserRole(actorOf(user), targetId, {
+          role: body.role,
+          tenantId: optionalDbId(body.tenantId),
+        });
         return {
           user: {
             ...updated,
@@ -180,6 +210,63 @@ export const adminController = new Elysia({
           },
         };
       } catch (error) {
+        // The transition a fleet administrator's demotion describes is only storable with a tenant
+        // named, so an unnamed one is the request being wrong (422) and never the server failing
+        // (#534). The three below are the same idea: the row the write would produce cannot exist,
+        // and each says which half of it is the problem.
+        if (error instanceof ConcurrentMoveError) {
+          set.status = 409;
+          return {
+            error: translate(
+              "errors.userMovedConcurrently",
+              "This account was being changed by somebody else; try again",
+            ),
+          };
+        }
+        if (error instanceof TenantRequiredError) {
+          set.status = 422;
+          return {
+            error: translate(
+              "errors.demoteNeedsTenant",
+              "Choose the tenant this administrator will belong to",
+            ),
+          };
+        }
+        if (error instanceof TenantNotChangeableError) {
+          set.status = 422;
+          return {
+            error: translate(
+              "errors.roleChangeCannotMoveTenant",
+              "Only a fleet administrator's demotion can name a tenant",
+            ),
+          };
+        }
+        if (error instanceof TenantNotFoundError) {
+          set.status = 404;
+          return {
+            error: translate("errors.tenantNotFound", "Tenant not found"),
+          };
+        }
+        if (error instanceof EmailTakenInTenantError) {
+          set.status = 409;
+          return {
+            error: translate(
+              "errors.emailTakenInTenant",
+              "That tenant already has a user with this email",
+            ),
+          };
+        }
+        // The same invariant the delete answers with a 409, on the write that reduces the scope's
+        // administrator count without removing anybody (#496).
+        if (error instanceof LastAdminError) {
+          set.status = 409;
+          return {
+            error: translate(
+              "errors.lastAdminRole",
+              "Cannot demote the last admin of this scope",
+            ),
+          };
+        }
         if (error instanceof UserNotInScopeError) {
           set.status = 404;
           return {
@@ -197,16 +284,23 @@ export const adminController = new Elysia({
         role: t.Union([t.Literal("AGENT"), t.Literal("TENANT_ADMIN")], {
           description: "New role to assign to the user.",
         }),
+        tenantId: t.Optional(
+          t.String({
+            description:
+              "Tenant the user joins (BigInt string). REQUIRED when demoting a fleet administrator, who belongs to no tenant and cannot be stored without one; refused for anybody else.",
+          }),
+        ),
       }),
       detail: doc(
         "Update user role",
-        "Change a user's role within the caller's tenant scope.",
+        "Change a user's role within the caller's tenant scope. Demoting a fleet administrator must name the tenant they join. Refuses (409) to demote the last administrator of a scope.",
       ),
-      response: errors(400, 401, 403, 404, 422),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
-  // Permanently delete a user (within the caller's tenant scope). Step-up: the acting admin re-enters
-  // their password. Refuses to delete yourself or the last admin of a scope.
+  // Permanently delete a user (within the caller's tenant scope). Step-up (`confirmStepUp`): the
+  // acting admin re-enters their password; a Bearer key answers by itself. Refuses to delete yourself
+  // or the last admin of a scope.
   .delete(
     "/users/:id",
     async ({ params, body, set, getAuthUser }) => {
@@ -215,22 +309,9 @@ export const adminController = new Elysia({
         set.status = 401;
         return { error: translate("errors.unauthorized", "Unauthorized") };
       }
-      const acting = await getUserById(user.id);
-      if (
-        !acting?.passwordHash ||
-        !(await verifyPassword(body.password, acting.passwordHash))
-      ) {
-        set.status = 403;
-        return {
-          error: translate("errors.invalidPassword", "Incorrect password"),
-        };
-      }
+      await confirmStepUp(stepUpPrincipalOf(user), body.password);
       try {
-        await deleteUser(
-          resolveScope(user, undefined),
-          requireDbId(params.id),
-          user.id,
-        );
+        await deleteUser(actorOf(user), requireDbId(params.id));
         return { success: true };
       } catch (error) {
         if (error instanceof CannotDeleteSelfError) {
@@ -263,14 +344,13 @@ export const adminController = new Elysia({
         id: t.String({ description: "Target user id (BigInt string)." }),
       }),
       body: t.Object({
-        password: t.String({
-          minLength: 1,
-          description: "The acting admin's password (step-up confirmation).",
-        }),
+        password: t.Optional(
+          t.String({ minLength: 1, description: STEP_UP_PASSWORD_DESCRIPTION }),
+        ),
       }),
       detail: doc(
         "Delete user",
-        "Permanently delete a user within the caller's tenant scope. Requires the acting admin's password; cannot delete yourself or the last admin.",
+        "Permanently delete a user within the caller's tenant scope. Requires the acting admin's password for a session (a Bearer API key needs none); cannot delete yourself or the last admin.",
       ),
       response: errors(400, 401, 403, 404, 409, 422),
     },
@@ -300,11 +380,10 @@ export const adminController = new Elysia({
         };
       }
       try {
-        const invite = await createInvite({
+        const invite = await createInvite(actorOf(user), {
           tenantId: targetTenantId,
           email: body.email,
           role: body.role,
-          invitedById: user.id,
         });
         return {
           invite: {
@@ -378,9 +457,10 @@ export const adminController = new Elysia({
     "/invitations/:id",
     async ({ params, set, getAuthUser }) => {
       const user = await getAuthUser();
+      if (!user) throw new UnauthorizedError();
       try {
         // SUPER_ADMIN may revoke any invite (own tenant null → unscoped); others are fenced.
-        await revokeInvite(user?.tenantId ?? null, requireDbId(params.id));
+        await revokeInvite(actorOf(user), requireDbId(params.id));
         return { success: true };
       } catch (error) {
         if (error instanceof InviteNotFoundError) {

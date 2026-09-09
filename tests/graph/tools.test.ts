@@ -1013,3 +1013,22 @@ describe("handoffAnsweredTheTurn", () => {
     });
   }
 });
+
+// The design line drawn after PR #485: the model never authors code. Computation it must not redo
+// is an operator-authored code tool (tools/code.ts), so no native tool may take a `code` argument —
+// the shape a "run this snippet" tool has, whatever it is called.
+describe("no native tool takes code from the model", () => {
+  test("every native tool's schema is free of a `code` field, and no native is named run_code", () => {
+    const tools = buildNativeTools({
+      client: recordingClient().client,
+      conversationId: 1,
+    });
+    expect(tools.map((t) => t.name)).not.toContain("run_code");
+    for (const t of tools) {
+      const shape =
+        (t.schema as { shape?: Record<string, unknown> }).shape ?? {};
+      expect(Object.keys(shape), t.name).not.toContain("code");
+    }
+    expect(NATIVE_TOOL_NAMES).not.toContain("run_code");
+  });
+});

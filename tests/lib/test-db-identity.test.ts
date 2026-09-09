@@ -141,16 +141,26 @@ describe("the test database's name belongs to ONE checkout", () => {
   // aborts. Measured before this was decoded: `ENOENT: no such file or directory, scandir
   // '/private/tmp/tree%20with%20space/sub/prisma/migrations'`. Not exotic on macOS, where a home
   // directory can sit under one.
+  //
+  // The FIXTURE URLS are platform-shaped, not just the expectations: `fileURLToPath` on win32
+  // refuses a driveless `file:///tmp/...` URL outright ("File URL path must be an absolute path"),
+  // which is a hard TypeError rather than a decoding difference — so a POSIX-only literal here
+  // aborts the whole test on Windows instead of asserting the wrong thing on it. `resolve` also
+  // answers in the platform's own separator, which is why the expected strings branch too.
   test("a checkout path with a space is a path, not a percent-encoded one", () => {
+    const base =
+      process.platform === "win32" ? "file:///C:/tmp" : "file:///tmp";
+    const root = process.platform === "win32" ? "C:\\tmp" : "/tmp";
+    const sep = process.platform === "win32" ? "\\" : "/";
     expect(
-      checkoutRootFrom("file:///tmp/tree%20with%20space/tests/x.ts", ".."),
-    ).toBe("/tmp/tree with space");
+      checkoutRootFrom(`${base}/tree%20with%20space/tests/x.ts`, ".."),
+    ).toBe(`${root}${sep}tree with space`);
     // Not only the space: anything a `file://` URL escapes comes back escaped.
     expect(
-      checkoutRootFrom("file:///tmp/%C3%A7a%20va/lib/tests/x.ts", "../.."),
-    ).toBe("/tmp/ça va");
-    expect(checkoutRootFrom("file:///tmp/plain/tests/x.ts", "..")).toBe(
-      "/tmp/plain",
+      checkoutRootFrom(`${base}/%C3%A7a%20va/lib/tests/x.ts`, "../.."),
+    ).toBe(`${root}${sep}ça va`);
+    expect(checkoutRootFrom(`${base}/plain/tests/x.ts`, "..")).toBe(
+      `${root}${sep}plain`,
     );
   });
 
@@ -249,13 +259,21 @@ describe("the test database's name belongs to ONE checkout", () => {
 // The checksum is a real one of the name, so a fixture never accidentally matches a DIFFERENT
 // name's file: `sameSql` below builds the local side from the same function.
 const sumOf = (name: string) => createHash("sha256").update(name).digest("hex");
-const done = (...names: string[]): MigrationRow[] =>
-  names.map((migration_name) => ({
+// One stamp for the whole batch, taken BEFORE the map. `new Date()` per row lets the ARRAY's order
+// leak into `finished_at` whenever the clock ticks mid-map, and `finished_at` is exactly what
+// `appliedOutOfOrder` sorts on — so a deliberately shuffled fixture reported an inversion on a
+// loaded runner and none on a fast one. That is a flake about the fixture, not a finding about the
+// database. Deliberate ordering is expressed with `at(name, tick)` further down, which is what the
+// ordering tests use; `done` only means "these are applied".
+const done = (...names: string[]): MigrationRow[] => {
+  const finished_at = new Date();
+  return names.map((migration_name) => ({
     migration_name,
     checksum: sumOf(migration_name),
-    finished_at: new Date(),
+    finished_at,
     rolled_back_at: null,
   }));
+};
 const halfWay = (migration_name: string): MigrationRow => ({
   migration_name,
   checksum: sumOf(migration_name),

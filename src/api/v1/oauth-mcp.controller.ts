@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import { authPlugin } from "@/api/lib/auth";
-import { decryptJson, encryptJson } from "@/api/lib/crypto";
+import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import { doc, errors, htmlResponse } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
@@ -32,7 +32,11 @@ import {
   computeCodeChallenge,
   generateCodeVerifier,
 } from "@/modules/vault/oauth-core";
-import { vaultRefWhere } from "@/modules/vault/service";
+import {
+  dialableBaseUrl,
+  replaceVaultSecret,
+  vaultRefWhere,
+} from "@/modules/vault/service";
 
 // Generic MCP OAuth 2.1 *consumer* flow for the `mcp_oauth` vault kind (this app acting as an OAuth
 // client of an external MCP server — distinct from the PROVIDER-side mcpOAuthController under
@@ -110,7 +114,7 @@ async function loadMcpCredential(
     }
     return {
       cred: decryptJson<McpOAuthCredential>(entry.secret),
-      baseUrl: entry.baseUrl,
+      baseUrl: dialableBaseUrl(entry.kind, entry.baseUrl),
     };
   });
 }
@@ -173,12 +177,7 @@ export const oauthMcpVaultController = new Elysia({
         clientSecret,
         scopes: requestedScopes,
       };
-      await runScopedOn(basePrisma, ctx, async (db) => {
-        await db.vaultEntry.updateMany({
-          where: { id },
-          data: { secret: encryptJson(persisted) },
-        });
-      });
+      await replaceVaultSecret(ctx, id, persisted);
 
       const codeVerifier = generateCodeVerifier();
       const codeChallenge = computeCodeChallenge(codeVerifier);
@@ -254,12 +253,7 @@ export const oauthMcpVaultController = new Elysia({
         clientSecret: cred.clientSecret,
         scopes: cred.scopes,
       };
-      await runScopedOn(basePrisma, ctx, async (db) => {
-        await db.vaultEntry.updateMany({
-          where: { id },
-          data: { secret: encryptJson(stripped) },
-        });
-      });
+      await replaceVaultSecret(ctx, id, stripped);
       return { instance: instanceIdentity, ...projectMcpStatus(stripped) };
     },
     {
@@ -396,12 +390,17 @@ export const oauthMcpCallbackController = new Elysia({
           refreshToken: tokens.refreshToken ?? cred.refreshToken,
           expiresAt: Date.now() + tokens.expiresIn * 1000,
         };
-        await asSuperAdmin(async (db) => {
-          await db.vaultEntry.updateMany({
-            where: vaultRefWhere(`vault:${entryId}`),
-            data: { secret: encryptJson(merged) },
-          });
-        });
+        // NOTE: Same seam as the Google callback: the consent returned to the operator who
+        // started it, so this write is theirs and reaches the trail as a credential edit.
+        await replaceVaultSecret(
+          {
+            tenantId: requireDbId(state.tenantId),
+            userId: user.id,
+            role: user.role,
+          },
+          entryId,
+          merged,
+        );
 
         return htmlSuccess(origin);
       } catch (err) {

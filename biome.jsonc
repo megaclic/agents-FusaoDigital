@@ -90,6 +90,22 @@
           }
         }
       }
+    },
+    {
+      // Every `refusal.at(...)` call site in this file reads `currentRef.current[...]` in bracket
+      // notation on purpose, so the string is IDENTICAL to the wire key the ref stores it under
+      // (`currentRef.current[fieldName]` elsewhere in this same file uses a variable, which forces
+      // bracket notation there — literal-key sites stay consistent with it rather than mixing
+      // spellings). tests/client/editor-save-errors.test.ts asserts every one of these reads through
+      // the same bracket-notation spelling.
+      "includes": ["src/client/pages/agents/AgentEditorPage.tsx"],
+      "linter": {
+        "rules": {
+          "complexity": {
+            "useLiteralKeys": "off"
+          }
+        }
+      }
     }
   ]
 }

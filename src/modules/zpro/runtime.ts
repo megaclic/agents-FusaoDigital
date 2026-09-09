@@ -4,7 +4,7 @@
 // buildToolset/buildCallbacks/buildModelAndGraph diretamente: essas funções são estruturalmente
 // acopladas ao Chatwoot (exigem uma linha Conversation/Inbox mirror + um ChatwootClient para montar
 // as tools nativas). Z-PRO não tem esse mirror. Em vez disso, este módulo monta o turno reaproveitando
-// as peças do motor que SÃO genéricas: parseModelConfig/createChatModel, tryResolveVaultEntry,
+// as peças do motor que SÃO genéricas: parseModelConfig/createChatModel, tryResolveApiKeyEntry,
 // getCheckpointer, buildAgentGraph/lastAssistantText, o flowlog (emitFlowEvent/withFlowStage),
 // guardrails (input/output), TTS/STT/vision e as ferramentas RAG/HTTP/MCP/INTEGRATION + as 2 tools
 // nativas utilitárias (tools.ts).
@@ -60,9 +60,9 @@ import {
   type ResolvedModelConfig,
 } from "@/graph/models";
 import {
-  FOLLOWUP_SKIP_SENTINEL,
-  isNudgeSilent,
+  type AgentNudge,
   OUTSIDE_WINDOW_NOTE_PREFIX,
+  renderNudge,
 } from "@/graph/nudge";
 import {
   buildLangfuseHandler,
@@ -77,6 +77,12 @@ import {
   interpolatePromptVars,
 } from "@/graph/prompt";
 import { type AuditedSection, buildPromptAudit } from "@/graph/prompt-audit";
+import {
+  customerFacingReply,
+  followupSilenceChannel,
+  proactiveReply,
+  withFollowupSilenceChannel,
+} from "@/graph/silence";
 import { DEFAULT_TIMEZONE } from "@/graph/time";
 import { ToolFlowLogger } from "@/graph/tool-flowlog";
 import type { NativeToolName } from "@/graph/tools/catalog";
@@ -102,6 +108,7 @@ import {
   isAttributeContextEmpty,
   readAttributeContextConfig,
 } from "@/modules/chatwoot/attributes";
+import { ZPRO_TAKEN_OVER_DETAIL } from "@/modules/chatwoot/gate-close";
 import {
   type ContactAuthConfig,
   readContactAuthConfig,
@@ -139,7 +146,7 @@ import {
   shouldReplyWithAudio,
   type TtsConfig,
 } from "@/modules/tts/settings";
-import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { markAgentSending } from "./agent-echo";
 import { ZproClient } from "./client";
 import { readZproCrmConfig, type ZproCrmConfig } from "./crm";
@@ -338,12 +345,15 @@ export async function loadZproAgent(
     let apiKey = "";
     let credentialBaseUrl: string | null = null;
     if (mc.credentialRef) {
-      const entry = await tryResolveVaultEntry<string>(db, mc.credentialRef);
-      if (!entry) {
+      const entry = await tryResolveApiKeyEntry(db, mc.credentialRef);
+      if (entry.state !== "ok") {
         logger.warn(
-          "zpro: agent %s model credentialRef %s did not resolve — the agent cannot reply until it is fixed",
+          entry.state === "unusable"
+            ? "zpro: agent %s model credentialRef %s resolves to a %s credential, which cannot be used as an API key — the agent cannot reply until it is fixed"
+            : "zpro: agent %s model credentialRef %s did not resolve — the agent cannot reply until it is fixed",
           String(agent.id),
           mc.credentialRef,
+          entry.state === "unusable" ? entry.kind : "",
         );
         return null;
       }
@@ -358,18 +368,18 @@ export async function loadZproAgent(
     let guardrailsApiKey = "";
     let guardrailsCredentialBaseUrl: string | null = null;
     if (guardrails.enabled && guardrails.credentialRef) {
-      const gEntry = await tryResolveVaultEntry<string>(
-        db,
-        guardrails.credentialRef,
-      );
-      if (gEntry) {
+      const gEntry = await tryResolveApiKeyEntry(db, guardrails.credentialRef);
+      if (gEntry.state === "ok") {
         guardrailsApiKey = gEntry.secret;
         guardrailsCredentialBaseUrl = gEntry.baseUrl;
       } else {
         logger.warn(
-          "zpro: agent %s guardrails credentialRef %s did not resolve — guardrails analysis is skipped",
+          gEntry.state === "unusable"
+            ? "zpro: agent %s guardrails credentialRef %s resolves to a %s credential, which cannot be used as an API key — guardrails analysis is skipped"
+            : "zpro: agent %s guardrails credentialRef %s did not resolve — guardrails analysis is skipped",
           String(agent.id),
           guardrails.credentialRef,
+          gEntry.state === "unusable" ? gEntry.kind : "",
         );
       }
     }
@@ -381,18 +391,21 @@ export async function loadZproAgent(
     let modelFallbackApiKey = "";
     let modelFallbackCredentialBaseUrl: string | null = null;
     if (hasModelFallback(modelFallback) && modelFallback.credentialRef) {
-      const fEntry = await tryResolveVaultEntry<string>(
+      const fEntry = await tryResolveApiKeyEntry(
         db,
         modelFallback.credentialRef,
       );
-      if (fEntry) {
+      if (fEntry.state === "ok") {
         modelFallbackApiKey = fEntry.secret;
         modelFallbackCredentialBaseUrl = fEntry.baseUrl;
       } else {
         logger.warn(
-          "zpro: agent %s model fallback credentialRef %s did not resolve — there is nothing behind the provider",
+          fEntry.state === "unusable"
+            ? "zpro: agent %s model fallback credentialRef %s resolves to a %s credential, which cannot be used as an API key — there is nothing behind the provider"
+            : "zpro: agent %s model fallback credentialRef %s did not resolve — there is nothing behind the provider",
           String(agent.id),
           modelFallback.credentialRef,
+          fEntry.state === "unusable" ? fEntry.kind : "",
         );
       }
     }
@@ -450,6 +463,14 @@ export interface RunLoadedZproTurnParams {
   // debounce flush feeds a coalesced multi-message string that has no single backing ZproMessage).
   event: NormalizedZproEvent;
   text: string;
+  // Set ONLY by the proactive caller (runZproAgentNudge), which passes `text: ""` alongside this: the
+  // follow-up directive cannot be rendered until this turn's toolset is actually assembled (it needs
+  // to know whether `skip_reply` really bound — src/graph/silence.ts's followupSilenceChannel), which
+  // happens well after this function's other callers need `text` for the input guardrail. Rendered
+  // TWICE below for that reason: once provisionally (default channel, cheap and pure — the wording
+  // difference cannot matter to guardrail screening) so the guardrail has something to screen, and
+  // once for real once the toolset is known, which is what actually reaches the model.
+  nudge?: AgentNudge;
   turnId: string;
   userSentAudio: boolean;
   base: PrismaClient;
@@ -669,15 +690,10 @@ export async function deliverZproPendingDocument(
 export async function runLoadedZproTurn(
   params: RunLoadedZproTurnParams,
 ): Promise<RunLoadedZproTurnOutcome> {
-  const {
-    loaded,
-    tenantId,
-    zproInstanceId,
-    event: ev,
-    text,
-    turnId,
-    base,
-  } = params;
+  const { loaded, tenantId, zproInstanceId, event: ev, turnId, base } = params;
+  // Provisional render, default channel ("tool") — corrected below once the toolset is known. See
+  // the field comment on `nudge` for why this cannot simply be rendered once, up front.
+  let text = params.nudge ? renderNudge(params.nudge, true) : params.text;
   const threadId = zproThreadId(tenantId, zproInstanceId, ev.threadId);
   const ticketId = Number(ev.threadId);
 
@@ -869,6 +885,7 @@ export async function runLoadedZproTurn(
       conversationId,
       grounded,
       contactExtraInfoBag,
+      nativeToolsAllow,
     } = await loadZproAgentTools({
       base,
       tenantId,
@@ -889,8 +906,24 @@ export async function runLoadedZproTurn(
       companyName: loaded.companyName,
       contactExtraInfo: ev.extraInfo,
       sendImage: loaded.sendImageConfig,
+      // A follow-up must ALWAYS have a way to say nothing (mirrors src/graph/nudge.ts's own
+      // runAgentNudge exactly): `skip_reply` is not operator-revocable on THIS path, so
+      // loadZproAgentTools widens the native grant and drops any precondition standing on it before
+      // building the toolset — see withFollowupSilenceChannel in src/graph/silence.ts.
+      forceSilenceChannel: !!params.nudge,
     });
     const tools = [...agentTools];
+    // The REAL render, now that the toolset above is what actually got assembled — see the `nudge`
+    // field's comment on RunLoadedZproTurnParams for why this cannot happen any earlier. Answered
+    // against the transform rather than restated, so the grant above (forceSilenceChannel) and the
+    // channel here cannot drift apart (src/graph/silence.ts's followupSilenceChannel).
+    if (params.nudge) {
+      const silenceChannel = followupSilenceChannel(
+        { nativeToolsAllow },
+        tools,
+      );
+      text = renderNudge(params.nudge, true, silenceChannel);
+    }
     // Resolve {{nome_contato}}, {{primeiro_nome}}, {{telefone_contato}}, {{canal}}, {{nome_empresa}},
     // {{nome_agente}} e as variáveis de hora/data — mesmo interpolador sanitizado (proteção contra
     // prompt injection) que o Chatwoot usa via prepare.ts.
@@ -984,9 +1017,20 @@ export async function runLoadedZproTurn(
     // Precondition seam (issue #378) — one map keyed by tool NAME reaches every source already
     // merged into `tools` above, same six-line shape src/graph/prepare.ts uses. An agent with no
     // rules configured gets the same array back, untouched.
+    //
+    // On the nudge path, an operator condition on `skip_reply` would refuse the very call the
+    // directive above now depends on — the same "granted but unguarded" half of
+    // withFollowupSilenceChannel src/graph/nudge.ts's runAgentNudge applies to `cfg` up front; here
+    // it has to be applied separately because `loaded.toolPreconditions` lives apart from the tool
+    // SELECTIONS forceSilenceChannel already widened inside loadZproAgentTools.
+    const effectivePreconditions = params.nudge
+      ? withFollowupSilenceChannel({
+          toolPreconditions: loaded.toolPreconditions,
+        }).toolPreconditions
+      : loaded.toolPreconditions;
     const guardedTools = applyToolPreconditions(
       tools,
-      loaded.toolPreconditions,
+      effectivePreconditions,
       zproPreconditionStateLoader({ base, tenantId, conversationId }),
       (info) => emitFlowEvent(flow, preconditionFlowEvent(info)),
       (unmatched) => {
@@ -1136,19 +1180,34 @@ export async function runLoadedZproTurn(
           ),
       );
 
-      let reply = lastAssistantText(result.messages).trim();
-
-      // Proactive nudges (runZproAgentNudge, e.g. the inactivity follow-up sweep) instruct the
-      // model to reply with the exact FOLLOWUP_SKIP_SENTINEL token when no message is warranted.
-      // Chatwoot's own nudge path (src/graph/nudge.ts's runAgentNudge) detects/strips this BEFORE
-      // ever posting; this shared turn tail has no such check by default (a normal customer turn
-      // never rationally emits this token, since nothing prompts it to outside a nudge), so it's
-      // applied only when this turn IS a nudge. Missing this let a literal "[[SKIP]]" reach a real
-      // customer (confirmed live 2026-08-18) whenever the model chose silence on a follow-up.
-      if (params.proactive) {
-        reply = isNudgeSilent(reply)
-          ? ""
-          : reply.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
+      // Two rules, one per direction — mirrors src/graph/runtime.ts (reactive, customerFacingReply)
+      // and src/graph/nudge.ts (proactive, proactiveReply) exactly, rather than the hand-rolled
+      // sentinel strip this shared tail carried before: that strip ran ONLY for `params.proactive`,
+      // so a reactive turn had no sentinel guard at all — a normal customer message never rationally
+      // asks the model for FOLLOWUP_SKIP_SENTINEL, but a stray one (a transcript replay, a model that
+      // echoes an instruction) would have reached the customer raw. Proactive nudges
+      // (runZproAgentNudge, e.g. the inactivity follow-up sweep) instruct the model to reply with the
+      // exact token when no message is warranted; missing that strip let a literal "[[SKIP]]" reach a
+      // real customer (confirmed live 2026-08-18) whenever the model chose silence on a follow-up.
+      const drafted = params.proactive
+        ? proactiveReply(lastAssistantText(result.messages))
+        : customerFacingReply(lastAssistantText(result.messages));
+      let reply = drafted.text;
+      if (drafted.bySentinel) {
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          detail: { silenceTokenSuppressed: true },
+        });
+      }
+      if (drafted.carriesToken) {
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          detail: { silenceTokenInReply: true },
+        });
       }
 
       // Re-check AFTER the invoke: did a human take over WHILE the LLM call ran? Mirrors
@@ -1168,7 +1227,7 @@ export async function runLoadedZproTurn(
           emitFlowEvent(flow, {
             stage: "handoff",
             status: "ok",
-            detail: { outcome: "taken_over" },
+            detail: ZPRO_TAKEN_OVER_DETAIL,
           });
           return "taken-over";
         }
@@ -1553,6 +1612,7 @@ export async function runZproAgentTurn(
           agentId: loaded.agentId,
           threadId,
           base,
+          fullDetail: loaded.fullDetail,
         },
         {
           stage: "generate",

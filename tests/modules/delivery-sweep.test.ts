@@ -16,11 +16,13 @@ import {
 import { setConnectedAccounts } from "@/modules/chatwoot/management";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import { deliveryRecoveryDedupeKey } from "@/modules/chatwoot/recover-delivery";
+import { takeoverRecoveryDedupeKey } from "@/modules/chatwoot/recover-takeover";
 import {
   processChatwootDelivery,
   recordAndProcessChatwootDelivery,
 } from "@/modules/chatwoot/webhook";
 import { clearFlowLog, flowLogRows } from "@/tests/utils/flowlog";
+import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // A Chatwoot delivery stranded by a process death, and the sweep that says so (issue #228).
@@ -106,6 +108,10 @@ async function seedStrandedDelivery(over: {
   inboundMessageId?: number | null;
   status?: "PENDING" | "PROCESSING" | "DEAD";
   event?: string;
+  // What the delivery owed, when it owed the human-reply takeover (issue #439).
+  humanReplyShape?: string;
+  // Whose route it arrived on (issue #476).
+  routeObserved?: boolean | null;
 }): Promise<bigint> {
   deliverySeq += 1;
   const row = await suDb.chatwootWebhookDelivery.create({
@@ -122,6 +128,8 @@ async function seedStrandedDelivery(over: {
           : new Date(Date.now() - over.claimedAgoMs),
       conversationId: over.conversationId,
       inboundMessageId: over.inboundMessageId ?? null,
+      humanReplyShape: over.humanReplyShape ?? null,
+      routeObserved: over.routeObserved ?? null,
     },
     select: { id: true },
   });
@@ -143,7 +151,7 @@ async function statusOf(rowId: bigint) {
 // tenant-wide one on the argument — the exact reader tests/modules/flowlog-reader-scope.test.ts
 // exists to catch. The line that names no conversation is a different subject and has its own
 // reader below.
-async function deliveryLines(convDbId: bigint, waitMs = 2000) {
+async function deliveryLines(convDbId: bigint, waitMs = POLL_DEADLINE_MS) {
   const started = Date.now();
   while (true) {
     const rows = await flowLogRows(suDb, {
@@ -164,7 +172,7 @@ async function correctionOutcome(convId: number) {
     where: { tenantId, chatwootConversationId: convId },
     select: { id: true },
   });
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + POLL_DEADLINE_MS;
   let lines: Array<{ detail: unknown }> = [];
   while (Date.now() < deadline) {
     lines = await flowLogRows(suDb, {
@@ -180,9 +188,31 @@ async function correctionOutcome(convId: number) {
   return (line.detail as Record<string, unknown>).outcome;
 }
 
+// How many delivery lines a conversation has. Used in pairs: a rider conversation is polled up to
+// its expected count, and only then is the conversation under test read — an absence proved by a
+// deadline is a timeout, an absence read after a later line landed is a measurement.
+async function deliveryLinesFor(convId: number, awaitCount = 0) {
+  const conv = await suDb.conversation.findFirstOrThrow({
+    where: { tenantId, chatwootConversationId: convId },
+    select: { id: true },
+  });
+  const deadline = Date.now() + POLL_DEADLINE_MS;
+  let n = 0;
+  while (true) {
+    n = (
+      await flowLogRows(suDb, {
+        where: { tenantId, conversationId: conv.id, stage: "delivery" },
+        select: { detail: true },
+      })
+    ).length;
+    if (n >= awaitCount || Date.now() > deadline) return n;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
 // The line a strand leaves when the mirror does not know the conversation: no conversation id to
 // scope by, so it is found by its absence. Polled for the same reason as the scoped read.
-async function unscopedDeliveryLines(waitMs = 2000) {
+async function unscopedDeliveryLines(waitMs = POLL_DEADLINE_MS) {
   const started = Date.now();
   while (true) {
     const rows = await flowLogRows(suDb, {
@@ -857,6 +887,8 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
       claimedAt: null,
       conversationId: 8807,
       inboundMessageId: 9601,
+      humanReplyShape: null,
+      routeObserved: false,
     };
     // Somebody else claimed it.
     await suDb.chatwootWebhookDelivery.update({
@@ -1042,6 +1074,9 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
         inboundMessageId: messageId,
+        // A RESPONDER's row, which on this build always says so: a row still being worked settles
+        // only once it has stated it is not an observer's.
+        routeObserved: false,
       },
       select: { id: true },
     });
@@ -1139,6 +1174,140 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
     });
     await suDb.chatwootWebhookDelivery.deleteMany({
       where: { id: { in: [own.id, sibling.id, reportedSibling.id] } },
+    });
+    await clearFlowLog(suDb, { tenantId });
+    await suDb.schedulerJob.deleteMany({ where: { tenantId } });
+  });
+
+  // THE SAME QUESTION AT THE DIRECT PATH'S OWN SITE (issue #429). The flush has its own version of
+  // this test; the two settle their rows from separate lines, and the invariant is one — half an
+  // answer IS an answer for the loss list. Reported as merely `consumed`, a customer who HAS the
+  // first balloon reads as a customer nothing ever replied to.
+  //
+  // The other half of the pair is the badge: the direct path clears `lastError` on "posted", so the
+  // partial outcome has to survive all the way out of `runAgentTurn` for the conversation to keep
+  // the only operator-visible sign that the reply came out short.
+  test("a reply that arrived in half settles as ANSWERED, and leaves a badge", async () => {
+    const convId = 8877;
+    const messageId = 9722;
+    await seedConversation(convId);
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: { settings: { debounce: { enabled: false } } },
+    });
+    const reported = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `direct-partial-${process.pid}`,
+        event: "message_created",
+        status: "DEAD",
+        processedAt: new Date(Date.now() - 60_000),
+        receivedAt: new Date(Date.now() - 120_000),
+        conversationId: convId,
+        inboundMessageId: messageId,
+      },
+      select: { id: true },
+    });
+
+    const sent: Array<[number, string]> = [];
+    let sends = 0;
+    let nextId = 9000;
+    // Holds what it accepted and answers a read, the way the fork does: the reconciliation after a
+    // failed send asks it whether the balloon landed, and a stub that answers an empty page to that
+    // is a DEGRADED read, not a conversation with nothing in it (issue #499).
+    const stored: Array<{ id: number; content: string; type: number }> = [
+      { id: messageId, content: "oi", type: 0 },
+    ];
+    const client = {
+      getMessages: async (_c: number, q?: { before?: number }) => ({
+        payload: (q?.before === undefined
+          ? stored
+          : stored.filter((m) => m.id < (q.before as number))
+        ).map((m) => ({
+          id: m.id,
+          content: m.content,
+          message_type: m.type,
+          private: false,
+          content_attributes: {},
+        })),
+      }),
+      sendMessage: async (conversationId: number, content: string) => {
+        sends += 1;
+        // The second balloon AND the consolidated retry of the remainder. Neither reaches the far
+        // side, so the read-back proves their absence rather than leaving it in doubt.
+        if (sends >= 2) throw new Error("chatwoot 502");
+        sent.push([conversationId, content]);
+        const id = nextId++;
+        stored.push({ id, content, type: 1 });
+        return { id };
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+
+    const n = normalizeChatwootEvent({
+      event: "message_created",
+      id: messageId,
+      private: false,
+      content: "oi",
+      message_type: "incoming",
+      sender: { id: 77, name: "Cliente", type: null },
+      conversation: {
+        id: convId,
+        inbox_id: CHATWOOT_INBOX_ID,
+        status: "pending",
+        contact_inbox: { id: 61_000 + convId },
+        meta: { sender: { id: 77, name: "Cliente" } },
+        channel: "Channel::Api",
+        last_activity_at: Math.floor(Date.now() / 1000),
+        updated_at: Math.floor(Date.now() / 1000),
+      },
+    });
+    if (!n) throw new Error("payload did not normalize");
+    const own = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `direct-partial-own-${process.pid}`,
+        event: "message_created",
+        status: "PENDING",
+        conversationId: convId,
+        inboundMessageId: messageId,
+      },
+      select: { id: true },
+    });
+    await processChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryRowId: own.id,
+      agentBotId: AGENT_BOT_ID,
+      normalized: n,
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FakeListChatModel({
+            responses: ["Olá!\n\nJá te respondo.\n\nUm instante."],
+          }) as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        sleep: async () => {},
+      },
+    });
+
+    expect(sent).toEqual([[convId, "Olá!"]]);
+    expect(await correctionOutcome(convId)).toBe("answered_late");
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { lastError: true },
+    });
+    expect(conv.lastError).toContain("incompleta");
+
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: { settings: {} },
+    });
+    await suDb.chatwootWebhookDelivery.deleteMany({
+      where: { id: { in: [own.id, reported.id] } },
     });
     await clearFlowLog(suDb, { tenantId });
     await suDb.schedulerJob.deleteMany({ where: { tenantId } });
@@ -1375,21 +1544,158 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
     expect(neither.settlement).toBe("consumed");
   });
 
-  test("the direct path queues nothing, which is why it settles on every outcome", async () => {
-    // The premise under the unconditional settle in webhook.ts, asserted where it can fail loudly.
-    //
-    // The flush keeps "stale" open because a /reset can retire the job that queued it, and that
-    // withdrawal means nothing ever answered the burst. `runAgentTurn` has no job: the delivery IS
-    // the trigger, so `stillWanted` is null and no outcome on that path can be a withdrawal. Written
-    // as a source read because there is no input that reaches the branch — a run that cannot be
-    // called off cannot be asked to prove it stayed uncalled-off — and a rule no test can hold does
-    // not belong in the condition. If this ever stops being null, the settle above needs the same
-    // exception the flush has, and this is what says so.
-    const src = await Bun.file("src/graph/runtime.ts").text();
-    const call = src.slice(
-      src.indexOf("const outcome = await runLoadedTurn({"),
-    );
-    expect(call.slice(0, call.indexOf("});"))).toContain("stillWanted: null,");
+  test("a wide settlement never closes a TRANSCRIPTION's row", async () => {
+    // The observer's rule below, applied to the other row that answers nobody (issue #478 review,
+    // round 4). The transcribed `message_updated` names its message now, so without the event in the
+    // filter it matches the wide scope — and the two are deliveries of the SAME message, racing, so
+    // the creation's own settlement closes the update before its ingestion is armed. An enqueue
+    // failure or a death after that is then invisible to the sweep, which is what the throw at the
+    // tail of the receiver exists to prevent.
+    const convId = 8871;
+    const messageId = 9782;
+    const conv = await seedConversation(convId);
+    const mk = async (tag: string, event: string) =>
+      suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `evt-scope-${tag}-${process.pid}`,
+          event,
+          status: "PROCESSING",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: convId,
+          inboundMessageId: messageId,
+          routeObserved: false,
+        },
+        select: { id: true },
+      });
+    const creation = await mk("creation", "message_created");
+    const update = await mk("update", "message_updated");
+
+    await retireCoveredDeliveries({
+      tenantId,
+      instanceId,
+      conversationId: convId,
+      conversationRowId: conv.id,
+      settlement: "answered",
+      messageIds: [messageId],
+      base: appDb,
+    });
+
+    expect((await statusOf(creation.id)).status).toBe("PROCESSED");
+    expect((await statusOf(update.id)).status).toBe("PROCESSING");
+
+    await suDb.chatwootWebhookDelivery.deleteMany({
+      where: { id: { in: [creation.id, update.id] } },
+    });
+    await clearFlowLog(suDb, { tenantId });
+  });
+
+  test("a wide settlement never closes an OBSERVER's row", async () => {
+    // The wide scope exists because a human, a command or a gate answers the MESSAGE, whichever
+    // route carried it. That is true of every route that could have answered and false of the one
+    // that never could: the observer owes the memory instead, and pays it on its own schedule. Its
+    // ingestion can fail, and the throw that leaves the row for the sweep is the only thing between
+    // that and a message nothing remembers — worth nothing if another route already made the row
+    // terminal. The responder's own copy reaches the settlement with no observer of its own in
+    // view, so the exclusion has to live in the write.
+    const convId = 8878;
+    const messageId = 9781;
+    const conv = await seedConversation(convId);
+    const mk = async (tag: string, routeObserved: boolean | null) =>
+      suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `obs-scope-${tag}-${process.pid}`,
+          event: "message_created",
+          status: "PROCESSING",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: convId,
+          inboundMessageId: messageId,
+          routeObserved,
+        },
+        select: { id: true },
+      });
+    const watcher = await mk("watcher", true);
+    const responder = await mk("responder", false);
+    // A row an older build wrote, which states no role and must still settle: `not: true` would
+    // have excluded it in SQL and settled nothing at all.
+    // A row that has not STATED its role yet is not a row that said "not an observer": settled
+    // here it would close before its own route is done. Its tx2 closes it a moment later.
+    const undecided = await mk("undecided", null);
+    // ...but a TERMINAL row states nothing because nobody is left to state it, and leaving it open
+    // would keep a reported loss standing for a message a turn did handle. The correction path is
+    // deliberately not narrowed by the role.
+    const reportedLegacy = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `obs-scope-dead-${process.pid}`,
+        event: "message_created",
+        status: "DEAD",
+        receivedAt: new Date(Date.now() - 120_000),
+        processedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: messageId,
+      },
+      select: { id: true },
+    });
+
+    await retireCoveredDeliveries({
+      tenantId,
+      instanceId,
+      conversationId: convId,
+      conversationRowId: conv.id,
+      settlement: "consumed",
+      messageIds: [messageId],
+      base: appDb,
+    });
+
+    expect((await statusOf(watcher.id)).status).toBe("PROCESSING");
+    expect((await statusOf(responder.id)).status).toBe("PROCESSED");
+    expect((await statusOf(undecided.id)).status).toBe("PROCESSING");
+    expect((await statusOf(reportedLegacy.id)).status).toBe("PROCESSED");
+  });
+
+  test("an OBSERVER still settles its OWN row", async () => {
+    // The exclusion belongs to the wide scope alone. A single-row settlement already names the row
+    // it may touch, and the observer's own — the one path that settles after recording
+    // `routeObserved: true` — is exactly that shape: required to say `false` there it matched
+    // nothing, so a process exiting between the ingestion and tx2 left a handled delivery on the
+    // worklist for the sweep to report and replay.
+    const convId = 8879;
+    const messageId = 9782;
+    const conv = await seedConversation(convId);
+    const own = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `obs-own-${process.pid}`,
+        event: "message_created",
+        status: "PROCESSING",
+        receivedAt: new Date(Date.now() - 60_000),
+        claimedAt: new Date(Date.now() - 60_000),
+        conversationId: convId,
+        inboundMessageId: messageId,
+        routeObserved: true,
+      },
+      select: { id: true },
+    });
+
+    await retireCoveredDeliveries({
+      tenantId,
+      instanceId,
+      conversationId: convId,
+      conversationRowId: conv.id,
+      settlement: "consumed",
+      deliveryRowId: own.id,
+      base: appDb,
+    });
+
+    expect((await statusOf(own.id)).status).toBe("PROCESSED");
   });
 
   test("a gate taken because ANOTHER BOT holds it settles only our own row", async () => {
@@ -1476,6 +1782,9 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
         inboundMessageId: messageId,
+        // A RESPONDER's row, which on this build always says so: a row still being worked settles
+        // only once it has stated it is not an observer's.
+        routeObserved: false,
       },
       select: { id: true },
     });
@@ -1641,6 +1950,83 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
     expect(row.conversationId).toBe(convId);
     expect(row.inboundMessageId).toBe(messageId);
 
+    // The shape (issue #439) is filled by the same rule and from the same list, which is why the
+    // list is one list: a column added later must not be the one that gets left out of it. Asserted
+    // on a SECOND legacy row because this one carries a customer message — the shape is read only
+    // where the answer would otherwise be benign, so filling it on a row that owes a turn would be
+    // untestable through the verdict.
+    const legacyReply = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `legacy-reply-${process.pid}-${messageId}`,
+        event: "message_created",
+        status: "PENDING",
+        conversationId: null,
+        inboundMessageId: null,
+        humanReplyShape: null,
+      },
+      select: { id: true },
+    });
+    await deliverThrough(convId, messageId + 900, "outgoing", {
+      deliveryId: `legacy-reply-${process.pid}-${messageId}`,
+      sender: { id: 5, name: "Ana", type: "user" },
+    });
+    expect(
+      (
+        await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+          where: { id: legacyReply.id },
+          select: { humanReplyShape: true },
+        })
+      ).humanReplyShape,
+    ).toBe("composer");
+    await suDb.chatwootWebhookDelivery.delete({
+      where: { id: legacyReply.id },
+    });
+
+    // AND THE ROW A ROLLOUT ACTUALLY PRODUCES, which is not the one above: the build immediately
+    // before this one wrote both ids and no shape, so the row is PARTLY filled. Asked as one
+    // predicate over every column, the fill wants them all null and matches nothing here — the shape
+    // stays missing on exactly the rows the column was added for, and a strand of that delivery is
+    // then read as benign. Each fact answers only for itself.
+    const partial = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `rollout-partial-${process.pid}-${messageId}`,
+        event: "message_created",
+        status: "PENDING",
+        // What the previous build recorded, and what it could not.
+        conversationId: convId,
+        inboundMessageId: null,
+        humanReplyShape: null,
+        routeAgentBotId: null,
+      },
+      select: { id: true },
+    });
+    await deliverThrough(convId, messageId + 950, "outgoing", {
+      deliveryId: `rollout-partial-${process.pid}-${messageId}`,
+      sender: { id: 5, name: "Ana", type: "user" },
+    });
+    const filled = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: partial.id },
+      select: {
+        conversationId: true,
+        humanReplyShape: true,
+        routeAgentBotId: true,
+        humanReplyMessageId: true,
+      },
+    });
+    expect(filled.humanReplyShape).toBe("composer");
+    // The route the delivery arrived on, which the recovery asks ownership about (round 1, P1).
+    expect(filled.routeAgentBotId).toBe(AGENT_BOT_ID);
+    // And the message the fence orders by, filled by the same pass — a rollout row that gained the
+    // shape and not the coordinate would be a row the recovery reads as owed and cannot fence.
+    expect(filled.humanReplyMessageId).toBe(messageId + 950);
+    // And the column that was already right is untouched.
+    expect(filled.conversationId).toBe(convId);
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: partial.id } });
+
     // And only ever FILLS. A row this build already wrote holds the right values, and a redelivery
     // of it must not be able to move them — the ids are what the sweep and the retirement key on, so
     // a rewrite would point both at the wrong message.
@@ -1680,6 +2066,9 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
         inboundMessageId: messageId,
+        // A RESPONDER's row, which on this build always says so: a row still being worked settles
+        // only once it has stated it is not an observer's.
+        routeObserved: false,
       },
       select: { id: true },
     });
@@ -1714,6 +2103,247 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
     await clearFlowLog(suDb, { tenantId });
   });
 
+  // ISSUE #476. The same colleague's reply, on an OBSERVER's route. A takeover steps the RESPONDER
+  // off the conversation and an observer was never on it, so the job armed for it would answer
+  // `not-owed` and report nothing at all — which is how the observer's own lost ingestion became
+  // invisible. Terminal like its neighbour, counted apart, and never armed.
+  test("a strand on an observer's route owes no takeover and arms none", async () => {
+    const convId = 8907;
+    await seedConversation(convId);
+    const rowId = await seedStrandedDelivery({
+      conversationId: convId,
+      ageMs: STALE_MS * 3,
+      claimedAgoMs: STALE_MS * 3,
+      humanReplyShape: "composer",
+      routeObserved: true,
+    });
+
+    const counts = await sweepStrandedDeliveries({ tenantId, base: appDb });
+    expect(counts.observerStrands).toBe(1);
+    expect(counts.owed).toBe(0);
+    expect(counts.closed).toBe(0);
+    expect(counts.lost).toBe(0);
+    expect((await statusOf(rowId)).status).toBe("PROCESSED");
+    expect(
+      await suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "TAKEOVER_RECOVERY",
+          dedupeKey: takeoverRecoveryDedupeKey(rowId),
+        },
+      }),
+    ).toBe(0);
+    // No line either: this arm returns before the loss report, the same as its neighbour, and that
+    // absence is what the owed-takeover case below proves with a rider row rather than a deadline.
+
+    await suDb.chatwootWebhookDelivery.delete({ where: { id: rowId } });
+  });
+
+  // ISSUE #478. The `message_updated` that finally carried a voice note's transcription, stranded
+  // between the claim and the arm. It is the only readable form that message ever takes wherever no
+  // turn runs at creation, so the shipped `no-message` loses the whole of what the customer said and
+  // loses it silently — and `lost` is wrong the other way, since the routes this reaches were never
+  // going to reply. The row is DEAD because that is the state the delivery replay claims from, and
+  // it leaves DEAD on the next tick; what must not happen is the loss ALERT, which would page an
+  // operator about a customer nobody is keeping waiting.
+  //
+  // A GENUINE LOSS RIDES ALONG, seeded older so the batch's `received_at` order decides it second:
+  // once its line has landed, a line for the transcription row would have landed too, so reading
+  // one line rather than two is a measurement and not a timeout — the same rider the owed-takeover
+  // case below uses, for the same reason.
+  test("a stranded transcription is armed for replay without paging anyone", async () => {
+    const transcriptionConv = 8908;
+    const lossConv = 8909;
+    await seedConversation(transcriptionConv);
+    await seedConversation(lossConv);
+    const rowId = await seedStrandedDelivery({
+      conversationId: transcriptionConv,
+      ageMs: STALE_MS * 3,
+      claimedAgoMs: STALE_MS * 3,
+      event: "message_updated",
+      inboundMessageId: 9941,
+    });
+    const lossRowId = await seedStrandedDelivery({
+      conversationId: lossConv,
+      ageMs: STALE_MS * 2,
+      claimedAgoMs: STALE_MS * 2,
+      inboundMessageId: 9942,
+    });
+
+    const counts = await sweepStrandedDeliveries({ tenantId, base: appDb });
+    expect(counts.owedTranscription).toBe(1);
+    expect(counts.lost).toBe(1);
+    expect(counts.closed).toBe(0);
+    expect((await statusOf(rowId)).status).toBe("DEAD");
+    expect((await statusOf(lossRowId)).status).toBe("DEAD");
+    expect(
+      await suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "DELIVERY_RECOVERY",
+          dedupeKey: deliveryRecoveryDedupeKey(rowId),
+        },
+      }),
+    ).toBe(1);
+    // The rider's line landed; the transcription row's did not, which is the whole assertion.
+    expect(await deliveryLinesFor(lossConv, 1)).toBe(1);
+    expect(await deliveryLinesFor(transcriptionConv)).toBe(0);
+
+    await suDb.chatwootWebhookDelivery.deleteMany({
+      where: { id: { in: [rowId, lossRowId] } },
+    });
+    await clearFlowLog(suDb, { tenantId });
+  });
+
+  test("a strand that owed a takeover is closed, unreported, and armed for recovery", async () => {
+    // ISSUE #439. The row a process death leaves when the delivery it was working carried a
+    // COLLEAGUE's reply: `message_created`, no inbound message id (nothing a customer sent), and the
+    // shape the payload had. Before this, the classifier read it as the benign `no-message`, the
+    // sweep closed it, and the takeover issue #430 exists to write was simply gone.
+    //
+    // Three assertions, and each one is a different way the two neighbouring verdicts are wrong
+    // here: the row must be PROCESSED and not DEAD (a colleague's reply belongs on no loss
+    // worklist), no line may be written (`writeFlowEvent` DISPATCHES the alert as it writes, so a
+    // line here pages an operator about a message nobody lost), and the recovery must be armed.
+    //
+    // A SECOND ROW RIDES ALONG, and it is what makes "no line" mean anything. An absence proved by
+    // waiting is a deadline that expired, so a genuine LOSS is swept in the same pass, seeded OLDER
+    // so the batch's `received_at` order decides it second: once its line has landed, a line for the
+    // owed row would have landed too, and reading zero is a measurement rather than a timeout.
+    const owedConv = 8901;
+    const lossConv = 8904;
+    await seedConversation(owedConv);
+    await seedConversation(lossConv);
+    const rowId = await seedStrandedDelivery({
+      conversationId: owedConv,
+      ageMs: STALE_MS * 3,
+      claimedAgoMs: STALE_MS * 3,
+      humanReplyShape: "composer",
+    });
+    const lossRowId = await seedStrandedDelivery({
+      conversationId: lossConv,
+      ageMs: STALE_MS * 2,
+      claimedAgoMs: STALE_MS * 2,
+      inboundMessageId: 9931,
+    });
+
+    const counts = await sweepStrandedDeliveries({ tenantId, base: appDb });
+    expect(counts.owed).toBe(1);
+    expect(counts.lost).toBe(1);
+    // And not folded into `closed` either: the two are opposite outcomes wearing the same terminal
+    // state, and a caller reading `closed` would be told nothing was outstanding.
+    expect(counts.closed).toBe(0);
+    expect((await statusOf(rowId)).status).toBe("PROCESSED");
+    expect((await statusOf(lossRowId)).status).toBe("DEAD");
+
+    const job = await suDb.schedulerJob.findFirst({
+      where: {
+        tenantId,
+        kind: "TAKEOVER_RECOVERY",
+        dedupeKey: takeoverRecoveryDedupeKey(rowId),
+      },
+      select: { status: true, payload: true },
+    });
+    expect(job?.status).toBe("PENDING");
+    // A bigint does not survive JSON, so the id is carried as a string and the handler parses it
+    // back. Asserted because a payload that says `{}` costs nothing at arming time and loses the
+    // recovery at claim time.
+    expect(
+      (job?.payload as Record<string, unknown> | undefined)?.deliveryRowId,
+    ).toBe(String(rowId));
+    // No DELIVERY_RECOVERY for the owed row, which is the other half of "not `lost`": that kind
+    // spends a model turn, and the reply it would answer was ours. The loss row legitimately has
+    // one, so this is asked by dedupe key rather than by count.
+    expect(
+      await suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "DELIVERY_RECOVERY",
+          dedupeKey: deliveryRecoveryDedupeKey(rowId),
+        },
+      }),
+    ).toBe(0);
+
+    const owedRow = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: owedConv },
+      select: { id: true },
+    });
+    const lossRow = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: lossConv },
+      select: { id: true },
+    });
+    // The control: the loss line, which the sweep wrote after the owed row was decided.
+    expect(await deliveryLines(lossRow.id)).toHaveLength(1);
+    // And the measurement, taken with no wait of its own.
+    expect(
+      await flowLogRows(suDb, {
+        where: { tenantId, stage: "delivery", conversationId: owedRow.id },
+        select: { level: true },
+      }),
+    ).toHaveLength(0);
+
+    await suDb.schedulerJob.deleteMany({ where: { tenantId } });
+    await suDb.chatwootWebhookDelivery.deleteMany({
+      where: { id: { in: [rowId, lossRowId] } },
+    });
+    await clearFlowLog(suDb, { tenantId });
+  });
+
+  test("a strand carrying a customer message is a LOSS even when it also owed a takeover", async () => {
+    // The other direction of the same column, and the reason the shape is read only from the arm
+    // that was already answering benign. A row with an inbound message is a customer nobody
+    // answered, whatever else the delivery owed — and the recovery for THAT re-runs the delivery
+    // path, which runs the takeover on its way through.
+    const convId = 8902;
+    await seedConversation(convId);
+    const rowId = await seedStrandedDelivery({
+      conversationId: convId,
+      ageMs: STALE_MS * 2,
+      claimedAgoMs: STALE_MS * 2,
+      inboundMessageId: 9921,
+      humanReplyShape: "composer",
+    });
+
+    const counts = await sweepStrandedDeliveries({ tenantId, base: appDb });
+    expect(counts.lost).toBe(1);
+    expect(counts.owed).toBe(0);
+    expect((await statusOf(rowId)).status).toBe("DEAD");
+    expect(
+      await suDb.schedulerJob.count({
+        where: { tenantId, kind: "TAKEOVER_RECOVERY" },
+      }),
+    ).toBe(0);
+
+    await suDb.schedulerJob.deleteMany({ where: { tenantId } });
+    await suDb.chatwootWebhookDelivery.deleteMany({ where: { id: rowId } });
+    await clearFlowLog(suDb, { tenantId });
+  });
+
+  test("a strand that owed nothing is still closed with no recovery at all", async () => {
+    // The control the two cases above are measured against: the same row without the column, which
+    // is our own reply coming back around and every row an older build wrote. It must keep the
+    // behaviour it has — closed, silent, and nothing armed.
+    const convId = 8903;
+    await seedConversation(convId);
+    const rowId = await seedStrandedDelivery({
+      conversationId: convId,
+      ageMs: STALE_MS * 2,
+      claimedAgoMs: STALE_MS * 2,
+    });
+
+    const counts = await sweepStrandedDeliveries({ tenantId, base: appDb });
+    expect(counts.closed).toBe(1);
+    expect(counts.owed).toBe(0);
+    expect((await statusOf(rowId)).status).toBe("PROCESSED");
+    expect(
+      await suDb.schedulerJob.count({
+        where: { tenantId, kind: "TAKEOVER_RECOVERY" },
+      }),
+    ).toBe(0);
+
+    await suDb.chatwootWebhookDelivery.deleteMany({ where: { id: rowId } });
+  });
+
   test("stamps the claim, so the sweep dates the ATTEMPT and not the receipt", async () => {
     // Written by tx1, through the real path. Without it the sweep has only `received_at` to judge a
     // PROCESSING row by, and a redelivery that claims a long-stranded PENDING row would be reported
@@ -1730,6 +2360,55 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
     );
   });
 
+  test("the ledger records WHAT the delivery owed, at insert (issue #439)", async () => {
+    // The bridge the whole recovery stands on, and the one thing no later pass can reconstruct: the
+    // ledger deliberately stores no event body, so a delivery stranded before its takeover leaves
+    // only what the INSERT wrote. This runs the real receiver on the three shapes an outgoing
+    // `message_created` can have and reads the column back.
+    const convId = 8905;
+    await seedConversation(convId);
+
+    // A colleague typing in the CRM: sender-typed `user`, which needs no inbox to be sure of.
+    const composer = await deliverThrough(convId, 9941, "outgoing", {
+      sender: { id: 5, name: "Ana", type: "user" },
+      deliveryId: `owed-composer-${process.pid}`,
+    });
+    expect(composer.humanReplyShape).toBe("composer");
+    // And WHICH message it was, the coordinate the recovery's fence orders by (issue #469). Written
+    // beside the shape and from the same answer, so a row can never say a takeover was owed while
+    // leaving the fence for it blank.
+    expect(composer.humanReplyMessageId).toBe(9941);
+    // A reply typed on the paired phone, which the fork stores sender-less with the session marker.
+    // Stored as a SHAPE and not as a verdict: whether it is a person or an echo of our own reply is
+    // a question about the inbox's provider, and the recovery asks that one.
+    const device = await deliverThrough(convId, 9942, "outgoing", {
+      sender: null,
+      contentAttributes: {
+        external_created_at: Math.floor(Date.now() / 1000),
+        external_sender_name: "WhatsApp",
+      },
+      deliveryId: `owed-device-${process.pid}`,
+    });
+    expect(device.humanReplyShape).toBe("device");
+    expect(device.humanReplyMessageId).toBe(9942);
+    // Our own reply coming back around. Same event, same direction, and nothing owed — the case the
+    // classifier has always read as benign and still must.
+    const ours = await deliverThrough(convId, 9943, "outgoing", {
+      sender: { id: 9, name: "Atendente", type: "agent_bot" },
+      deliveryId: `owed-bot-${process.pid}`,
+    });
+    expect(ours.humanReplyShape).toBeNull();
+    // Nothing owed, nothing to order: the message id is recorded only where a takeover was.
+    expect(ours.humanReplyMessageId).toBeNull();
+    // And the customer's own message, which owes a TURN and not a side effect.
+    const incoming = await deliverThrough(convId, 9944, "incoming", {
+      deliveryId: `owed-incoming-${process.pid}`,
+    });
+    expect(incoming.humanReplyShape).toBeNull();
+    expect(incoming.humanReplyMessageId).toBeNull();
+    expect(incoming.inboundMessageId).toBe(9944);
+  });
+
   async function deliverThrough(
     convId: number,
     messageId: number,
@@ -1739,6 +2418,10 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
       deliveryId?: string;
       // Who holds the conversation, when it is not our bot. A human by default.
       assignee?: { type: string; id: number };
+      // Who WROTE the message, when it is not the contact — an operator typing in the composer
+      // (`type: "user"`) or our own bot's reply coming back (`type: "agent_bot"`).
+      sender?: { id: number; name: string; type: string | null } | null;
+      contentAttributes?: Record<string, unknown>;
     } = {},
   ) {
     const n = normalizeChatwootEvent({
@@ -1747,7 +2430,13 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
       private: false,
       content: "oi",
       message_type: direction,
-      sender: { id: 77, name: "Cliente", type: null },
+      sender:
+        over.sender === undefined
+          ? { id: 77, name: "Cliente", type: null }
+          : over.sender,
+      ...(over.contentAttributes
+        ? { content_attributes: over.contentAttributes }
+        : {}),
       conversation: {
         id: convId,
         inbox_id: CHATWOOT_INBOX_ID,
@@ -1783,6 +2472,8 @@ describe.skipIf(!dbUp)("a delivery stranded by a process death", () => {
         inboundMessageId: true,
         claimedAt: true,
         receivedAt: true,
+        humanReplyShape: true,
+        humanReplyMessageId: true,
       },
     });
   }

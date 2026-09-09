@@ -1,7 +1,9 @@
 /// <reference lib="dom" />
 
 import { afterEach, expect, test } from "bun:test";
+import { EditorView } from "@codemirror/view";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -78,25 +80,45 @@ function Harness() {
 // the URL field answer for the appointment section, and the section's caption answered for
 // "start time".
 function captionOf(label: Element): string {
-  return (label.querySelector("span")?.textContent ?? "").trim();
+  return (label.textContent ?? "").trim();
+}
+
+// A <FormField> label POINTS at its control (`htmlFor`) instead of wrapping it, so the control is
+// not a descendant to query for. Following the association is also the more honest check: it fails
+// if the label names nothing, which a subtree query cannot notice.
+function controlFor<T extends Element>(pattern: RegExp, what: string): T {
+  const label = Array.from(document.querySelectorAll("label")).find((l) =>
+    pattern.test(captionOf(l)),
+  ) as HTMLLabelElement | undefined;
+  const byFor = label?.htmlFor
+    ? (document.getElementById(label.htmlFor) as T | null)
+    : null;
+  // A `group` field has no single control to point at, so its heading is a <span> and the control
+  // inside carries its own aria-label. Both shapes are legitimate; which one a field uses is a
+  // property of its children, not something a test should depend on.
+  const byGroup =
+    byFor ??
+    (Array.from(document.querySelectorAll("[role='group']"))
+      .find((g) =>
+        pattern.test((g.querySelector("span")?.textContent ?? "").trim()),
+      )
+      ?.querySelector("input, select, textarea") as T | null | undefined);
+  if (!byGroup) throw new Error(`no ${what} captioned ${pattern}`);
+  return byGroup;
 }
 
 function inputFor(pattern: RegExp): HTMLInputElement {
-  const label = Array.from(document.querySelectorAll("label")).find((l) =>
-    pattern.test(captionOf(l)),
-  );
-  const input = label?.querySelector("input") as HTMLInputElement | null;
-  if (!input) throw new Error(`no field captioned ${pattern}`);
-  return input;
+  return controlFor<HTMLInputElement>(pattern, "field");
 }
 
-function textareaFor(pattern: RegExp): HTMLTextAreaElement {
-  const label = Array.from(document.querySelectorAll("label")).find((l) =>
-    pattern.test(captionOf(l)),
+// By the SENTENCE, not by the word "appointment": the URL field's own value is on screen too, and a
+// fixture URL like /v1/appointments made this selector return the URL label instead, so the test
+// failed for a reason that had nothing to do with the form.
+function actionSelect(): HTMLSelectElement {
+  return controlFor<HTMLSelectElement>(
+    /(books or cancels|marca ou cancela)/i,
+    "appointment action select",
   );
-  const el = label?.querySelector("textarea") as HTMLTextAreaElement | null;
-  if (!el) throw new Error(`no textarea captioned ${pattern}`);
-  return el;
 }
 
 function saveDisabled(): boolean {
@@ -118,14 +140,6 @@ function clickSave(): void {
 // By the SENTENCE, not by the word "appointment": the URL field's own value is on screen too, and a
 // fixture URL like /v1/appointments made this selector return the URL label instead — the test then
 // failed for a reason that had nothing to do with the form.
-function actionSelect(): HTMLSelectElement {
-  const label = Array.from(document.querySelectorAll("label")).find((l) =>
-    /(books or cancels|marca ou cancela)/i.test(captionOf(l)),
-  );
-  const sel = label?.querySelector("select") as HTMLSelectElement | null;
-  if (!sel) throw new Error("no appointment action select on screen");
-  return sel;
-}
 
 async function openForm() {
   serving();
@@ -250,21 +264,40 @@ test("offsets the runtime would not honour hold the save", async () => {
 // field is `data.appointment.id` is well-formed, passes every check, and reads nothing all the way
 // to production. Asserted on the VALUE the field ends up holding and on what is submitted, never on
 // the list appearing: a picker that renders and fills nothing looks identical.
+// THE SAMPLE IS A CODEMIRROR NOW (issue #562), so it is written by dispatching into its view rather
+// than by firing `change` on a textarea. Found by the accessible name on the contenteditable, which
+// is the element CodeMirror gives the `textbox` role to, so this does not depend on how many editors
+// the screen holds.
+function writeSample(text: string): void {
+  const content = Array.from(document.querySelectorAll(".cm-content")).find(
+    (el) =>
+      /resposta de exemplo|sample response/i.test(
+        el.getAttribute("aria-label") ?? "",
+      ),
+  );
+  if (!content) throw new Error("no sample editor on screen");
+  const view = EditorView.findFromDOM(
+    content.closest(".cm-editor") as HTMLElement,
+  ) as EditorView;
+  act(() => {
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: text },
+    });
+  });
+}
+
 test("a pasted sample fills the paths by clicking, and is never submitted", async () => {
   await openForm();
   fireEvent.change(actionSelect(), { target: { value: "book" } });
   await waitFor(() => expect(saveDisabled()).toBe(true));
 
-  const sample = textareaFor(/resposta de exemplo|sample response/i);
-  fireEvent.change(sample, {
-    target: {
-      value: JSON.stringify({
-        data: {
-          appointment: { id: "ap_9", starts_at: "2026-09-02T14:00:00-03:00" },
-        },
-      }),
-    },
-  });
+  writeSample(
+    JSON.stringify({
+      data: {
+        appointment: { id: "ap_9", starts_at: "2026-09-02T14:00:00-03:00" },
+      },
+    }),
+  );
 
   // One picker per field, so a click can only mean one target.
   const pickers = () =>

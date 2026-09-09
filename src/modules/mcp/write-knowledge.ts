@@ -2,8 +2,9 @@ import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
 import type { TenantContext } from "@/lib/tenancy";
 import { firstUnstorableField } from "@/lib/text";
-import { truncForAudit } from "@/modules/audit/projection";
 import {
+  assertChunkingUpdatable,
+  assertDocumentRetryable,
   createDocument,
   deleteDocument,
   type EmbeddingBlock,
@@ -13,6 +14,7 @@ import {
 } from "@/modules/rag/documents";
 import {
   approveApprovalItem,
+  assertKnowledgeBaseNameUsable,
   createKnowledgeBase,
   deleteKnowledgeBase,
   editApprovalItem,
@@ -29,7 +31,6 @@ import {
   gate,
   ok,
   parseMcpId,
-  recordMcpAudit,
   type WriteDeps,
   type WriteResult,
 } from "./write";
@@ -93,6 +94,9 @@ export async function knowledgeCreate(
   if (bad) return bad;
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it, and INSIDE the branch
+      // because the apply reaches the core, which asks it again (#490). Pure: it reads no row.
+      assertKnowledgeBaseNameUsable(args.name);
       return ok({
         dryRun: true,
         action: "create",
@@ -112,14 +116,6 @@ export async function knowledgeCreate(
       base,
     });
     const target = `knowledge_base:${created.id}`;
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge.create",
-      target,
-      before: null,
-      after: truncForAudit({ id: String(created.id), name: args.name }),
-    });
     return ok({ dryRun: false, applied: true, id: String(created.id), target });
   } catch (e) {
     return failOf(e);
@@ -169,14 +165,25 @@ export async function knowledgeUpdate(
     const beforeProj = {
       name: current.name,
       description: current.description,
+      chunkSize: current.chunkSize,
+      chunkOverlap: current.chunkOverlap,
     };
     if (args.dry_run !== false) {
+      assertKnowledgeBaseNameUsable(patch.name);
+      // NOTE: ADVISORY, and deliberately so: the bound is a fact about the row, and this read is outside
+      // the transaction the apply validates in, so a concurrent update can move the pair between the
+      // two halves. What it buys is that the ordinary case — an operator sending one of the two
+      // numbers — gets the same answer here as it will get there, instead of an approved preview of
+      // a write that cannot happen (#490, #524).
+      assertChunkingUpdatable(current, patch);
       const previewAfter = {
         name: patch.name ?? current.name,
         description:
           patch.description === undefined
             ? current.description
             : patch.description,
+        chunkSize: patch.chunkSize ?? current.chunkSize,
+        chunkOverlap: patch.chunkOverlap ?? current.chunkOverlap,
       };
       return ok({
         dryRun: true,
@@ -185,18 +192,6 @@ export async function knowledgeUpdate(
       });
     }
     await updateKnowledgeBase({ ctx, id, ...patch, base });
-    const after = await getKnowledgeBase({ ctx, id, base });
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge.update",
-      target,
-      before: truncForAudit(beforeProj),
-      after: truncForAudit({
-        name: after.name,
-        description: after.description,
-      }),
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -226,14 +221,6 @@ export async function knowledgeDelete(
       });
     }
     await deleteKnowledgeBase({ ctx, id, base });
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge.delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -264,6 +251,11 @@ export async function knowledgeDocumentCreate(
   if (bad) return bad;
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      await getKnowledgeBase({ ctx, id: kbId, base });
       return ok({
         dryRun: true,
         action: "create",
@@ -283,22 +275,10 @@ export async function knowledgeDocumentCreate(
       sourceType: "text",
       base,
     });
-    const target = `knowledge_document:${created.id}`;
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge_document.create",
-      target,
-      before: null,
-      after: truncForAudit({
-        id: String(created.id),
-        knowledgeBaseId: String(kbId),
-        title: args.title,
-      }),
-    });
     return ok({
       dryRun: false,
       applied: true,
+      target: `knowledge_document:${created.id}`,
       id: String(created.id),
       status: created.status,
       note: "Document queued for embedding (async); poll knowledge_documents_list for status.",
@@ -331,14 +311,6 @@ export async function knowledgeDocumentDelete(
       });
     }
     await deleteDocument(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge_document.delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -359,6 +331,10 @@ export async function knowledgeDocumentRetry(
     const current = await getDocument(ctx, id, base);
     const target = `knowledge_document:${id}`;
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, on the status this preview already had in hand. Reporting it
+      // in the note below is not asking it: a document that is INDEXED read back "would re-queue"
+      // and the apply answered 409 (#510).
+      assertDocumentRetryable(current.status);
       return ok({
         dryRun: true,
         action: "retry",
@@ -368,14 +344,6 @@ export async function knowledgeDocumentRetry(
       });
     }
     await retryDocument(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge_document.retry",
-      target,
-      before: truncForAudit({ status: current.status }),
-      after: truncForAudit({ status: "PENDING" }),
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -432,17 +400,6 @@ export async function knowledgeReindex(
         note: "Re-queues UNINDEXED documents (add include_failed to also recover FAILED). Acts ONLY when dry_run is false.",
       });
     }
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "knowledge.reindex",
-      target,
-      before: {},
-      after: truncForAudit({
-        queued: result.queued,
-        includeFailed: args.include_failed === true,
-      }),
-    });
     return ok({ dryRun: false, applied: true, target, queued: result.queued });
   } catch (e) {
     return failOf(e);
@@ -484,19 +441,6 @@ export async function knowledgeApprove(
       });
     }
     const result = await approveApprovalItem({ ctx, id, base });
-    if (result.outcome === "approved") {
-      await recordMcpAudit(ctx, base, {
-        actorId: principal.userId,
-        actorType: "mcp",
-        action: "knowledge.approve",
-        target,
-        before: null,
-        after: truncForAudit({
-          outcome: result.outcome,
-          chunks: result.chunks,
-        }),
-      });
-    }
     return ok({ dryRun: false, applied: true, target, result });
   } catch (e) {
     return failOf(e);
@@ -526,16 +470,6 @@ export async function knowledgeReject(
       });
     }
     const outcome = await rejectApprovalItem({ ctx, id, base });
-    if (outcome === "rejected") {
-      await recordMcpAudit(ctx, base, {
-        actorId: principal.userId,
-        actorType: "mcp",
-        action: "knowledge.reject",
-        target,
-        before: null,
-        after: truncForAudit({ outcome }),
-      });
-    }
     return ok({ dryRun: false, applied: true, target, outcome });
   } catch (e) {
     return failOf(e);
@@ -594,16 +528,6 @@ export async function knowledgeEdit(
       rationale: args.rationale,
       base,
     });
-    if (outcome === "updated") {
-      await recordMcpAudit(ctx, base, {
-        actorId: principal.userId,
-        actorType: "mcp",
-        action: "knowledge.edit",
-        target,
-        before: null,
-        after: truncForAudit({ outcome, title: args.title }),
-      });
-    }
     return ok({ dryRun: false, applied: true, target, outcome });
   } catch (e) {
     return failOf(e);

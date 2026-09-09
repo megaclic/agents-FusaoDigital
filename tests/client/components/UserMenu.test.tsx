@@ -1,6 +1,14 @@
 /// <reference lib="dom" />
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  spyOn,
+  test,
+} from "bun:test";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   act,
@@ -11,10 +19,10 @@ import {
 } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router";
+import { createTestI18n } from "@/tests/utils/i18n";
 
-const mockLogout = mock(async () => {});
+const mockLogout = mock(async () => true);
 const mockSetTheme = mock((_: string) => {});
-const mockChangeLanguage = mock(async (_: string) => {});
 
 mock.module("@/client/contexts/AuthContext", () => ({
   useAuth: () => ({
@@ -34,29 +42,36 @@ mock.module("@/client/contexts/ThemeContext", () => ({
   ThemeProvider: ({ children }: { children: ReactNode }) => children,
 }));
 
-mock.module("react-i18next", () => ({
-  useTranslation: () => ({
-    t: (_key: string, fallback?: string) => fallback ?? _key,
-    i18n: {
-      language: "en",
-      changeLanguage: mockChangeLanguage,
-    },
-  }),
-}));
+// A REAL i18next instance, held here so the language radio's effect can be read off it. See
+// tests/utils/i18n.tsx: a registry stub of `react-i18next` used to live here, and the `i18n` it
+// handed back was a literal `{ language: "en" }` that every file running afterwards imported.
+const i18n = createTestI18n();
+const changeLanguage = spyOn(i18n, "changeLanguage");
 
+import { I18nextProvider } from "react-i18next";
+import { ToastProvider } from "@/client/components/Toast";
 import { UserMenu } from "@/client/components/UserMenu";
 
 function renderMenu() {
   return render(
-    <TooltipPrimitive.Provider>
-      <MemoryRouter initialEntries={["/"]}>
-        <Routes>
-          <Route path="/" element={<UserMenu />} />
-          <Route path="/login" element={<div>LOGIN_PAGE_MARKER</div>} />
-          <Route path="/settings" element={<div>SETTINGS_PAGE_MARKER</div>} />
-        </Routes>
-      </MemoryRouter>
-    </TooltipPrimitive.Provider>,
+    <I18nextProvider i18n={i18n}>
+      {/* The menu tells the operator when a logout did not end the session, and `useToast` refuses
+          to run outside its provider. */}
+      <ToastProvider>
+        <TooltipPrimitive.Provider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Routes>
+              <Route path="/" element={<UserMenu />} />
+              <Route path="/login" element={<div>LOGIN_PAGE_MARKER</div>} />
+              <Route
+                path="/settings"
+                element={<div>SETTINGS_PAGE_MARKER</div>}
+              />
+            </Routes>
+          </MemoryRouter>
+        </TooltipPrimitive.Provider>
+      </ToastProvider>
+    </I18nextProvider>,
   );
 }
 
@@ -71,7 +86,7 @@ describe("UserMenu", () => {
   beforeEach(() => {
     mockLogout.mockClear();
     mockSetTheme.mockClear();
-    mockChangeLanguage.mockClear();
+    changeLanguage.mockClear();
   });
 
   afterEach(() => cleanup());
@@ -106,7 +121,7 @@ describe("UserMenu", () => {
     openDropdown();
     const ptRadio = screen.getByRole("menuitemradio", { name: /português/i });
     fireEvent.click(ptRadio);
-    expect(mockChangeLanguage).toHaveBeenCalledWith("pt-BR");
+    expect(changeLanguage).toHaveBeenCalledWith("pt-BR");
   });
 
   test("Settings menuitem navigates to /settings", () => {
@@ -129,10 +144,12 @@ describe("UserMenu", () => {
     expect(screen.getByText("LOGIN_PAGE_MARKER")).toBeInTheDocument();
   });
 
-  test("navigates to /login even if logout rejects", async () => {
-    mockLogout.mockImplementationOnce(async () => {
-      throw new Error("network");
-    });
+  // IT USED TO NAVIGATE WHATEVER HAPPENED, and that is the finding this replaces (#566, round 15).
+  // The cookie is HttpOnly, so a logout the server did not answer leaves the operator signed in:
+  // `/login` bounces a signed-in visitor to `redirectTo`, so the old behaviour cost them the route
+  // they were on and said nothing about why.
+  test("stays put and says so when the session did not end", async () => {
+    mockLogout.mockImplementationOnce(async () => false);
     renderMenu();
     openDropdown();
     const logoutItem = screen.getByRole("menuitem", { name: /logout/i });
@@ -140,6 +157,7 @@ describe("UserMenu", () => {
       fireEvent.click(logoutItem);
       await Promise.resolve();
     });
-    expect(screen.getByText("LOGIN_PAGE_MARKER")).toBeInTheDocument();
+    expect(screen.queryByText("LOGIN_PAGE_MARKER")).not.toBeInTheDocument();
+    expect(screen.getByText(/could not sign you out/i)).toBeInTheDocument();
   });
 });

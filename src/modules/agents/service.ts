@@ -9,11 +9,14 @@ import { NATIVE_TOOL_NAMES, RAG_TOOL_NAMES } from "@/graph/tools/catalog";
 import { parseDbId, requireDbId } from "@/lib/db-id";
 import {
   AppError,
+  ClassifierOverlapError,
   NotFoundError,
   TenantTargetRequiredError,
 } from "@/lib/errors";
+import { withEntityLock } from "@/lib/locks";
 import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { clipText } from "@/lib/text";
 import {
   agentUpdateAudit,
   auditSafe,
@@ -44,16 +47,30 @@ import {
   getToolpackToolNames,
   getToolpackToolViews,
 } from "@/modules/integrations/toolpacks";
-import { requireVaultRef } from "@/modules/vault/service";
+import {
+  firstLabelGroupConflict,
+  LABEL_GROUP_NAME_MAX,
+  LABEL_VALUE_MAX,
+  labelValuesOf,
+  RESERVED_GROUP_NAMES,
+} from "@/modules/observe/settings";
+import { lockToolNames } from "@/modules/tool-definitions/namespace";
+import { requireVaultRefFor } from "@/modules/vault/service";
+import {
+  AGENT_MODES,
+  type AgentMode,
+  isMonitoring,
+  normalizeAgentMode,
+} from "./mode";
 
 // Agent configuration CRUD — the config the whole system orbits (the same core the UI config
 // screen and the MCP `prompt_get/set` tools project over). All reads/writes are tenant-scoped;
 // updates touch only an explicit allowlist of fields (never tenantId/id).
 
 // Agent operating mode (item 1): a "test" agent stays silent in a conversation until /teste; a
-// "production" agent answers normally. New agents are created in "test".
-export const AGENT_MODES = ["test", "production"] as const;
-export type AgentMode = (typeof AGENT_MODES)[number];
+// "production" agent answers normally; a "monitoring" agent never answers (./mode.ts). New agents
+// are created in "test".
+export { AGENT_MODES, type AgentMode } from "./mode";
 
 export interface AgentDto {
   id: string;
@@ -110,7 +127,7 @@ export function toDto(a: {
       a.followUpHoursId === null ? null : String(a.followUpHoursId),
     transferWithSummary: a.transferWithSummary,
     enabled: a.enabled,
-    mode: a.mode === "test" ? "test" : "production",
+    mode: normalizeAgentMode(a.mode),
     settings: (a.settings ?? {}) as Record<string, unknown>,
     createdAt: a.createdAt,
     updatedAt: a.updatedAt,
@@ -179,7 +196,10 @@ export async function listAgentsPaged(
       db.agent.findMany({
         where,
         select: AGENT_SELECT,
-        orderBy: { [orderField]: order },
+        // The id breaks ties, so paging is DETERMINISTIC: two agents sharing a timestamp (or a name)
+        // could otherwise be ordered differently per query, and a walk over pages would return one
+        // twice and miss the other.
+        orderBy: [{ [orderField]: order }, { id: "asc" }],
         skip: offset,
         take: limit,
       }),
@@ -536,6 +556,181 @@ const namedOrNull = (v: unknown): string | null =>
 // then store a bag that has none — the exact half-named row this rule exists to refuse.
 export type SettingsWriteMode = "replace" | "merge";
 
+// THE SAME QUESTION FOR THE TAXONOMY, and in the shared service for the same reason (issue #477
+// review, round 12). The zod refinements on `BEHAVIOR_PATCH_SHAPE` only run on the MCP patch; REST
+// takes `settings` as an arbitrary record, so a reserved group name, a duplicate name or a value
+// two groups claim came back 200 and was then silently normalized away by `readLabelGroups` —
+// possibly leaving no group at all, which is how observation is switched off. One core, three
+// transports: the rule belongs where every write passes.
+//
+// Compared TRIMMED and case-folded on the name, the way the reader compares. A bag that is not a
+// list, or an entry that is not an object, is not this rule's business: `readLabelGroups` skips
+// those, and refusing here would turn a shape the reader already tolerates into a 400.
+// ...AND ACROSS THE CLASSIFIERS THAT SHARE A CONVERSATION (issue #477 review, round 16). The rule
+// above is the same one, asked inside one agent; an inbox can carry a monitoring RESPONDER and a
+// different OBSERVER, both classify every conversation on it, and Chatwoot's labels are ONE FLAT SET
+// per conversation. So two agents claiming `urgente` is the same contradiction as two groups
+// claiming it: A's exclusive `urgente → normal` removes the label B just wrote, B writes it back on
+// its next burst, and the pair flaps — with whatever automation the label triggers firing on every
+// flip. Neither taxonomy is wrong on its own, which is why this cannot be asked of one bag.
+//
+// Asked wherever the pairing can be created: this settings write, and the two bindings
+// (`bindInbox`, `observeInbox`). The cap is one responder plus one observer, so this compares at
+// most two taxonomies.
+// The lock every writer of a classifier taxonomy takes before checking and writing (issue #477
+// review, round 17). Two agents on one inbox each lock their OWN row, so both can read the other's
+// committed settings, both pass, and both commit the same value — the flap this invariant exists to
+// prevent, arrived at by two writers who each did everything right. One key per tenant rather than
+// per inbox, because an agent can share several inboxes and N locks is an ordering problem; the
+// contention it buys is nil, since editing a taxonomy is a console action measured in minutes.
+export const classifierTaxonomyLock = (tenantId: bigint): string =>
+  `observe-taxonomy:${String(tenantId)}`;
+
+export async function assertNoClassifierOverlap(
+  db: ScopedDb,
+  agentId: bigint,
+  // The state this write LEAVES the agent in, not the one it had. Symmetric with the peer filter
+  // below (issue #477 review, round 19): the flap needs two live writers, so a target that will not
+  // classify — disabled, or not monitoring — collides with nobody, and refusing there blocked an
+  // operator configuring a production responder's future taxonomy. The transitions that make it
+  // live (a flip to monitoring, a re-enable) are therefore writes this must be ASKED on, which is
+  // what `updateAgent` does with the three fields folded together.
+  target: { settings: unknown; enabled: boolean; mode: string },
+  // The inbox the pairing is being CREATED on, when a binding is asking. Omitted by the settings
+  // write, which asks about every inbox this agent already classifies.
+  onInboxId?: bigint,
+  // THE OPERATION IS REPLACING THE RESPONDER (issue #477 review, round 21). `bindInbox` overwrites
+  // `Inbox.agentId`, so the responder standing there right now is one this same call is about to
+  // remove: collected as a peer it made a monitoring agent unable to hand its inbox to another one
+  // sharing the taxonomy — the two never classify together, and the refusal was about a pairing
+  // that ends the moment the write lands. The observer beside it is untouched by the swap and is
+  // still checked. `observeInbox` passes nothing: there the responder stays.
+  replacesResponder = false,
+): Promise<void> {
+  if (!target.enabled || !isMonitoring(target.mode)) return;
+  const mine = labelValuesOf(target.settings);
+  if (mine.size === 0) return;
+  const inboxes = await db.inbox.findMany({
+    where:
+      onInboxId === undefined
+        ? { OR: [{ agentId }, { observers: { some: { agentId } } }] }
+        : { id: onInboxId },
+    // `Inbox.agentId` is a bare column and not a relation field, so the responder is collected here
+    // and read below together with the observers.
+    select: { agentId: true, observers: { select: { agentId: true } } },
+  });
+  const others = new Set<bigint>();
+  const outgoingResponder = replacesResponder && onInboxId !== undefined;
+  for (const inbox of inboxes) {
+    if (
+      !outgoingResponder &&
+      inbox.agentId !== null &&
+      inbox.agentId !== agentId
+    )
+      others.add(inbox.agentId);
+    for (const o of inbox.observers)
+      if (o.agentId !== agentId) others.add(o.agentId);
+  }
+  if (others.size === 0) return;
+  // ONLY THE AGENTS THAT ACTUALLY CLASSIFY (issue #477 review, round 18). The flap this refuses
+  // needs two live writers; a disabled peer, or one in `production` with a taxonomy stored for a
+  // mode it has not flipped to yet, writes nothing. Read without this, the rule refused a real
+  // observer over a dormant bag. The FLIP is where the pairing then becomes live, so `updateAgent`
+  // asks this on a patch that turns monitoring on even when it names no settings.
+  const agents = (
+    await db.agent.findMany({
+      where: { id: { in: [...others] } },
+      select: { name: true, settings: true, enabled: true, mode: true },
+    })
+  ).filter((a) => a.enabled && isMonitoring(a.mode));
+  for (const other of agents)
+    for (const value of labelValuesOf(other.settings))
+      if (mine.has(value))
+        throw new ClassifierOverlapError(
+          `settings.monitoring: "${value}" is already classified by "${other.name}" on an inbox this agent shares`,
+          400,
+          "errors.monitoringLabelValueTaken",
+          { value, agent: other.name },
+          "settings.monitoring.labelGroups",
+        );
+}
+
+export function assertMonitoringLabelGroups(settings: unknown): void {
+  const mon =
+    settings && typeof settings === "object"
+      ? (settings as Record<string, unknown>).monitoring
+      : undefined;
+  const raw =
+    mon && typeof mon === "object"
+      ? (mon as Record<string, unknown>).labelGroups
+      : undefined;
+  if (!Array.isArray(raw)) return;
+  const groups: { name: string; values: string[] }[] = [];
+  for (const g of raw) {
+    if (!g || typeof g !== "object") continue;
+    const bag = g as Record<string, unknown>;
+    const name = typeof bag.name === "string" ? bag.name.trim() : "";
+    if (name === "") continue;
+    // A RESERVED NAME IS REFUSED WHEREVER IT APPEARS, unlike the two conflicts below: it is a
+    // statement about the group alone, so the schema asks it as a field-level rule on every group
+    // rather than over the retained slice, and this assertion says the same thing.
+    if (RESERVED_GROUP_NAMES.has(name.toLowerCase()))
+      throw new AppError(
+        `settings.monitoring: "${name}" is a reserved group name`,
+        400,
+        "errors.monitoringReservedGroupName",
+        { name },
+        "settings.monitoring.labelGroups",
+      );
+    // A LENGTH IS A RULE ABOUT THE ENTRY ALONE (issue #477 review, round 23), asked per field like
+    // the reserved name above and not over the retained slice. Both strings reach the model
+    // verbatim — the prompt's `<labels>` block and the verdict schema's enum — so unbounded they
+    // make every tick fail on the provider's request limit, on a configuration that reads as valid.
+    if (name.length > LABEL_GROUP_NAME_MAX)
+      throw new AppError(
+        `settings.monitoring: the group name "${clipText(name, 40)}…" is longer than ${LABEL_GROUP_NAME_MAX} characters`,
+        400,
+        "errors.monitoringGroupNameTooLong",
+        { max: LABEL_GROUP_NAME_MAX },
+        "settings.monitoring.labelGroups",
+      );
+    const values = (Array.isArray(bag.values) ? bag.values : [])
+      .map((v) => (typeof v === "string" ? v.trim() : ""))
+      .filter((v) => v !== "");
+    for (const value of values)
+      if (value.length > LABEL_VALUE_MAX)
+        throw new AppError(
+          `settings.monitoring: the label "${clipText(value, 40)}…" is longer than ${LABEL_VALUE_MAX} characters`,
+          400,
+          "errors.monitoringLabelValueTooLong",
+          { max: LABEL_VALUE_MAX },
+          "settings.monitoring.labelGroups",
+        );
+    groups.push({ name, values });
+  }
+  // ONLY OVER WHAT THE READER RETAINS (issue #477 review, round 21). Asked of the same walk the
+  // schema asks, so the REST assertion and the zod shape cannot drift: past five groups or forty
+  // values the reader stores nothing, so a collision there is with an entry that will not exist, and
+  // the 400 was about a truncation this bag documents.
+  const conflict = firstLabelGroupConflict(groups);
+  if (conflict?.kind === "duplicate-name")
+    throw new AppError(
+      `settings.monitoring: two groups may not share the name "${conflict.name}"`,
+      400,
+      "errors.monitoringDuplicateGroupName",
+      { name: conflict.name },
+      "settings.monitoring.labelGroups",
+    );
+  if (conflict?.kind === "shared-value")
+    throw new AppError(
+      `settings.monitoring: "${conflict.value}" is listed by more than one group`,
+      400,
+      "errors.monitoringDuplicateLabelValue",
+      { value: conflict.value },
+      "settings.monitoring.labelGroups",
+    );
+}
+
 export function assertSettingsModelFallback(
   settings: unknown,
   stored: unknown,
@@ -603,14 +798,42 @@ function rawFullDetailUntil(settings: unknown): unknown {
 //
 // Canonical on the way in, not merely valid: requireVaultRef returns the one spelling every reader
 // agrees on, and it is written back where the ref was found.
+//
+// And USABLE on the way in, not merely present: `requireVaultRefFor` also asks whether an entry of
+// that kind can serve the field, which nothing did. Eight of these nine fields read a plain API key
+// and hand it to a provider SDK; a `google_oauth` entry holds `{ clientId, clientSecret }`, so it
+// resolved, stored, and reached `createChatModel` as an object typed `string` (#471).
 async function assertCredentialRefsResolve(
   db: ScopedDb,
   next: { modelConfig?: unknown; settings?: unknown },
   stored: { modelConfig?: unknown; settings?: unknown },
 ): Promise<void> {
   for (const write of collectCredentialRefWrites(next, stored)) {
-    write.replace(await requireVaultRef(db, write.ref, write.path));
+    write.replace(
+      await requireVaultRefFor(db, write.ref, write.path, write.use),
+    );
   }
+}
+
+// The credential half of `createAgent`'s verdict, on its own scoped read. ADVISORY: the entry it
+// finds can be deleted or re-kinded before the apply lands, and the copy inside the write's
+// transaction stays the authority.
+//
+// NOTE: it REWRITES the refs it was handed, because `assertCredentialRefsResolve` does — canonical
+// on the way in is the point of that function. The preview echoes the payload it validated, so what
+// the operator reads back is the spelling the apply would store, not the one they typed.
+export async function assertCredentialRefsUsable(
+  ctx: TenantContext,
+  next: { modelConfig?: unknown; settings?: unknown },
+  base: PrismaClient = basePrisma,
+  // The bag this write REPLACES. `{}` on create, where nothing is stored yet and every ref the
+  // payload carries is one this write introduces; the stored row on update, because "did this write
+  // change the ref" can only be asked of the value being replaced.
+  stored: { modelConfig?: unknown; settings?: unknown } = {},
+): Promise<void> {
+  await runScopedOn(base, ctx, (db) =>
+    assertCredentialRefsResolve(db, next, stored),
+  );
 }
 
 // Allowlist of editable fields. tenantId/id are never touched; modelConfig/settings must be
@@ -647,16 +870,22 @@ export const agentUpdateSchema = z
 
 export type AgentUpdate = z.infer<typeof agentUpdateSchema>;
 
-export async function updateAgent(
-  ctx: TenantContext,
-  id: bigint,
-  patch: AgentUpdate,
-  base: PrismaClient = basePrisma,
-  // Optimistic concurrency (editor): when set, the update only applies if the row's updatedAt still
-  // matches; a mismatch yields 409 (errors.agentModifiedElsewhere) instead of silently overwriting a
-  // change made elsewhere (another tab, the REST API, or the MCP server). Omitted ⇒ last-write-wins.
-  opts: { expectedUpdatedAt?: Date } = {},
-): Promise<AgentDto> {
+// Everything `updateAgent` decides about its PATCH before any database is involved: the prompt
+// size, the schema, the model config, the "nothing to update" refusal, and the two schedule ids.
+// Split out so the MCP preview can ask the same question the apply asks (#490) — that preview had
+// no preflight at all, and its fence row passed an agent id that does not exist, so it proved the
+// not-found path and nothing else.
+//
+// The two ids come back parsed, for the same reason `assertAgentCreatable` hands them back: a
+// second `requireDbId` in the caller could disagree with this one about which row was asked for.
+export function assertAgentUpdatable(patch: AgentUpdate): {
+  data: AgentUpdate;
+  rest: Omit<AgentUpdate, "businessHoursId" | "followUpHoursId">;
+  hasBh: boolean;
+  hasFuh: boolean;
+  businessHoursId: bigint | null;
+  followUpHoursId: bigint | null;
+} {
   assertPromptSize(patch.systemPrompt);
   const data = parseInput(agentUpdateSchema, patch);
   validateModelConfigForWrite(data.modelConfig);
@@ -670,51 +899,87 @@ export async function updateAgent(
       "errors.noUpdatableFields",
     );
   }
-  // NOTE: refused, not collapsed into the NotFound the ownership check below raises. This used
-  // to answer 404 for a non-numeric id, which tells a caller who mistyped that the row is gone —
-  // and the same file already answered 400 for a malformed tool-grant id (`bigOrThrow`), so one
-  // mistake got two answers depending on which field carried it. Issue #407.
-  const bhId =
-    hasBh && businessHoursId !== null
-      ? requireDbId(businessHoursId, "businessHoursId")
-      : null;
-  const fuhId =
-    hasFuh && followUpHoursId !== null
-      ? requireDbId(followUpHoursId, "followUpHoursId")
-      : null;
+  // NOTE: refused, not collapsed into the NotFound the ownership check raises. This used to answer
+  // 404 for a non-numeric id, which tells a caller who mistyped that the row is gone — and the same
+  // file already answered 400 for a malformed tool-grant id (`bigOrThrow`), so one mistake got two
+  // answers depending on which field carried it. Issue #407.
+  return {
+    data,
+    rest,
+    hasBh,
+    hasFuh,
+    businessHoursId:
+      hasBh && businessHoursId !== null
+        ? requireDbId(businessHoursId, "businessHoursId")
+        : null,
+    followUpHoursId:
+      hasFuh && followUpHoursId !== null
+        ? requireDbId(followUpHoursId, "followUpHoursId")
+        : null,
+  };
+}
+
+// THE OBSERVER REFUSAL, ASKABLE ON ITS OWN (issue #476 review, round 46). `updateAgent` refuses to
+// save a non-monitoring mode on an agent that observes an inbox, and `deleteAgent` refuses to delete
+// one — both from inside their transactions, where an MCP dry run never goes. A preview that cannot
+// ask the same question approves what the apply then rejects, and the caller learns the truth from
+// the 422; the previews call this instead, so the two answers cannot drift.
+//
+// Scoped like every other read here, and it asks about the AGENT rather than about the move: a
+// production agent a race left observing is refused the same way, which is the state `updateAgent`
+// deliberately refuses against.
+export async function assertAgentNotObserving(
+  ctx: TenantContext,
+  id: bigint,
+  base?: PrismaClient,
+): Promise<void> {
+  const observing = await runScopedOn(base ?? basePrisma, ctx, (db) =>
+    db.inboxObserver.count({ where: { agentId: id } }),
+  );
+  if (observing > 0) {
+    throw new AppError(
+      "this agent observes inboxes; remove it as an observer first",
+      422,
+      "errors.agentObservesInboxes",
+    );
+  }
+}
+
+export async function updateAgent(
+  ctx: TenantContext,
+  id: bigint,
+  patch: AgentUpdate,
+  base: PrismaClient = basePrisma,
+  // Optimistic concurrency (editor): when set, the update only applies if the row's updatedAt still
+  // matches; a mismatch yields 409 (errors.agentModifiedElsewhere) instead of silently overwriting a
+  // change made elsewhere (another tab, the REST API, or the MCP server). Omitted ⇒ last-write-wins.
+  opts: { expectedUpdatedAt?: Date } = {},
+): Promise<AgentDto> {
+  const {
+    rest,
+    hasBh,
+    hasFuh,
+    businessHoursId: bhId,
+    followUpHoursId: fuhId,
+  } = assertAgentUpdatable(patch);
   const dto = await runScopedOn(base, ctx, async (db) => {
-    if (bhId !== null) {
-      const bh = await db.businessHours.findUnique({
-        where: { id: bhId },
-        select: { id: true },
-      });
-      if (!bh) {
-        throw new NotFoundError(
-          "business hours not found",
-          "errors.businessHoursNotFound",
-        );
-      }
-    }
-    if (fuhId !== null) {
-      const fuh = await db.businessHours.findUnique({
-        where: { id: fuhId },
-        select: { id: true },
-      });
-      if (!fuh) {
-        throw new NotFoundError(
-          "business hours not found",
-          "errors.businessHoursNotFound",
-        );
-      }
-    }
+    await assertSchedulesExistOn(db, bhId, fuhId);
     const updateData: Record<string, unknown> = { ...rest };
     if (hasBh) updateData.businessHoursId = bhId;
     if (hasFuh) updateData.followUpHoursId = fuhId;
     // NOTE: Arm the follow-up backlog fence on the OFF→ON transition of the effective state. The row
-    // lock (FOR UPDATE, held to commit — runScopedOn is one interactive transaction) serializes the
+    // lock (held to commit — runScopedOn is one interactive transaction) serializes the
     // read-compute-write against concurrent saves: without it, a save that read the old ON state
     // could land last after another save turned follow-up OFF, restoring ON with the STALE watermark
     // and re-exposing the pre-arm backlog to the sweep. RLS still applies to the raw read.
+    //
+    // NO KEY UPDATE rather than FOR UPDATE, and the difference is who else waits. Both conflict with
+    // each other and with the `FOR UPDATE` that `deleteAgent` takes, so the serialization this note
+    // is about is unchanged; what NO KEY UPDATE stops conflicting with is `FOR KEY SHARE`, which is
+    // the lock a foreign key takes to REFERENCE this row. A save that also blocked references would
+    // block `bindInbox`, which holds the Chatwoot account row while it asks (#546), so renaming an
+    // agent would stall binds, syncs and disconnects for an account it has nothing to do with. This
+    // statement changes no key, which is exactly the case the weaker mode exists for.
     const beforeRows = await db.$queryRaw<
       Array<{
         enabled: boolean;
@@ -723,7 +988,7 @@ export async function updateAgent(
         model_config: unknown;
         updated_at: Date;
       }>
-    >`SELECT enabled, mode, settings, model_config, updated_at FROM agents WHERE id = ${id} FOR UPDATE`;
+    >`SELECT enabled, mode, settings, model_config, updated_at FROM agents WHERE id = ${id} FOR NO KEY UPDATE`;
     const before = beforeRows[0];
     // NOTE: read AFTER the lock, and that order is the whole point. The raw lock above reads the
     // four columns the follow-up fence needs; the trail answers for every column an operator can
@@ -757,7 +1022,63 @@ export async function updateAgent(
     assertSettingsTextSizes(rest.settings, before?.settings);
     assertSettingsDebugWindow(rest.settings, before?.settings);
     assertSettingsModelFallback(rest.settings, before?.settings, "replace");
+    assertMonitoringLabelGroups(rest.settings);
+    // ...asked on a patch that TURNS MONITORING ON as well, even when it names no settings (issue
+    // #477 review, round 18): the peer filter only counts agents that classify, so the flip itself
+    // is the moment a dormant taxonomy becomes a live second writer. The bag checked is then the
+    // stored one.
+    // ...asked on any write that could make this agent a LIVE classifier, which is the three fields
+    // folded together (issue #477 review, round 19): a flip to monitoring, a re-enable, or a new
+    // taxonomy. Each alone is invisible to the others — a `{enabled: true}` patch names neither of
+    // the first two — and the assertion itself decides whether the resulting state classifies.
+    if (
+      ctx.tenantId !== null &&
+      (rest.settings !== undefined ||
+        rest.mode !== undefined ||
+        rest.enabled !== undefined)
+    ) {
+      const lockTenant = ctx.tenantId;
+      const effective = {
+        settings: rest.settings ?? before?.settings,
+        enabled:
+          typeof rest.enabled === "boolean"
+            ? rest.enabled
+            : (before?.enabled ?? false),
+        mode:
+          typeof rest.mode === "string"
+            ? rest.mode
+            : String(before?.mode ?? ""),
+      };
+      await withEntityLock(db, classifierTaxonomyLock(lockTenant), () =>
+        assertNoClassifierOverlap(db, id, effective),
+      );
+    }
     assertSettingsToolPreconditions(rest.settings, before?.settings);
+    // NOTE: An OBSERVER of an inbox (issue #476) is a monitoring agent by construction — the route it
+    // holds answers nothing whatever the mode says — so the mode is not this agent's to leave while
+    // it observes. Refused rather than kept silently on the observer's path: an operator promoting a
+    // watcher expects answers, and the honest answer is that the binding has to go first. Inside
+    // the lock. A promotion that lands while an attach is in flight (the row is written only once
+    // Chatwoot agreed) leaves a production observer; the receiver honours the row, and this refusal
+    // holds from then on.
+    //
+    // ASKED OF THE TARGET, not of the move (issue #476 review, round 7): the same race that leaves a
+    // production observer would then let every later write past this guard — production to test, and
+    // back — because the mode it is leaving is no longer monitoring. What the refusal is about is
+    // the state it refuses to save, so a non-monitoring mode with an observer row standing is
+    // refused whatever the row said before.
+    if (before && rest.mode !== undefined && !isMonitoring(rest.mode)) {
+      const observing = await db.inboxObserver.count({
+        where: { agentId: id },
+      });
+      if (observing > 0) {
+        throw new AppError(
+          "this agent observes inboxes; remove it as an observer first",
+          422,
+          "errors.agentObservesInboxes",
+        );
+      }
+    }
     // NOTE: Inside the lock and against the same row, for the reason above: "did this write change
     // the ref" has to be asked of the value this write replaces. It also rewrites `rest` in place,
     // so the normalization below copies the canonical bag rather than the submitted one.
@@ -898,27 +1219,90 @@ export const agentCreateSchema = z
   .strict();
 export type AgentCreate = z.infer<typeof agentCreateSchema>;
 
+// Everything `createAgent` can refuse about an input WITHOUT reading the database, as one call. It
+// exists so the MCP dry run can answer with the same verdict the apply will: the preview returns
+// before the core is ever reached, so a rule that lives only inside `createAgent` is a rule the
+// preview promises away (issue #490). Returns the parsed row so the caller does not parse twice.
+// The two schedule ids EXIST, asked on whatever scoped handle the caller already has. It reads,
+// so it lives here rather than in `assertAgentCreatable`, which is pure.
+async function assertSchedulesExistOn(
+  db: ScopedDb,
+  businessHoursId: bigint | null,
+  followUpHoursId: bigint | null,
+): Promise<void> {
+  for (const id of [businessHoursId, followUpHoursId]) {
+    if (id === null) continue;
+    const row = await db.businessHours.findUnique({
+      where: { id },
+      select: { id: true },
+    });
+    if (!row) {
+      throw new NotFoundError(
+        "business hours not found",
+        "errors.businessHoursNotFound",
+      );
+    }
+  }
+}
+
+// The half of `createAgent`'s verdict that has to read. ADVISORY, like the uniqueness checks: the
+// schedule it finds can be deleted before the apply arrives, and the scoped read inside the write
+// stays the authority. `assertAgentCreatable` already parses both ids and hands them back, so the
+// preview passes those rather than parsing a second time — a caller that re-parsed could disagree
+// with the write about which row it even asked for.
+export async function assertSchedulesExist(
+  ctx: TenantContext,
+  businessHoursId: bigint | null,
+  followUpHoursId: bigint | null,
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  if (businessHoursId === null && followUpHoursId === null) return;
+  await runScopedOn(base, ctx, (db) =>
+    assertSchedulesExistOn(db, businessHoursId, followUpHoursId),
+  );
+}
+
+export function assertAgentCreatable(input: AgentCreate): {
+  data: AgentCreate;
+  businessHoursId: bigint | null;
+  followUpHoursId: bigint | null;
+} {
+  assertPromptSize(input.systemPrompt);
+  assertSettingsTextSizes(input.settings, undefined);
+  assertSettingsDebugWindow(input.settings, undefined);
+  assertSettingsModelFallback(input.settings, undefined, "replace");
+  assertMonitoringLabelGroups(input.settings);
+  assertSettingsToolPreconditions(input.settings, undefined);
+  const data = parseInput(agentCreateSchema, input);
+  validateModelConfigForWrite(data.modelConfig);
+  // NOTE: the two schedule ids are parsed HERE and handed back, not left to the caller. They are a
+  // pure judgement about the input — a malformed id, or one past the column's range — and leaving
+  // them out let the preview approve an `agent_create` the apply then 400s on. The ids come back
+  // rather than being parsed twice, so the two readings cannot disagree.
+  return {
+    data,
+    businessHoursId:
+      data.businessHoursId != null
+        ? requireDbId(data.businessHoursId, "businessHoursId")
+        : null,
+    followUpHoursId:
+      data.followUpHoursId != null
+        ? requireDbId(data.followUpHoursId, "followUpHoursId")
+        : null,
+  };
+}
+
 export async function createAgent(
   ctx: TenantContext,
   input: AgentCreate,
   base: PrismaClient = basePrisma,
 ): Promise<AgentDto> {
   const tenantId = requireTenant(ctx);
-  assertPromptSize(input.systemPrompt);
-  assertSettingsTextSizes(input.settings, undefined);
-  assertSettingsDebugWindow(input.settings, undefined);
-  assertSettingsModelFallback(input.settings, undefined, "replace");
-  assertSettingsToolPreconditions(input.settings, undefined);
-  const data = parseInput(agentCreateSchema, input);
-  validateModelConfigForWrite(data.modelConfig);
-  const bhId =
-    data.businessHoursId != null
-      ? requireDbId(data.businessHoursId, "businessHoursId")
-      : null;
-  const fuhId =
-    data.followUpHoursId != null
-      ? requireDbId(data.followUpHoursId, "followUpHoursId")
-      : null;
+  const {
+    data,
+    businessHoursId: bhId,
+    followUpHoursId: fuhId,
+  } = assertAgentCreatable(input);
   const dto = await runScopedOn(base, ctx, async (db) => {
     if (bhId !== null) {
       const bh = await db.businessHours.findUnique({
@@ -1007,11 +1391,23 @@ export async function deleteAgent(
     const doomedRows = await db.$queryRaw<Array<{ name: string }>>`
       SELECT name FROM agents WHERE id = ${id} FOR UPDATE`;
     const doomed = doomedRows[0];
+    // NOTE: An OBSERVER binding (issue #476) is a bot attached on Chatwoot's side, and the cascade
+    // below would retire the row and the route token while the fork kept delivering to a bot that
+    // is gone. The detach is a Chatwoot call, which this transaction cannot make, so the deletion
+    // is refused while the agent observes anything — the same answer its mode change gets.
+    const observing = await db.inboxObserver.count({ where: { agentId: id } });
+    if (observing > 0) {
+      throw new AppError(
+        "this agent observes inboxes; remove it as an observer first",
+        422,
+        "errors.agentObservesInboxes",
+      );
+    }
     // Inbox.agentId and Experiment.agentId are plain references (no FK cascade) — null them so a
     // deleted agent leaves no dangling binding. AgentToolSelection cascades via its FK.
     await db.inbox.updateMany({
       where: { agentId: id },
-      data: { agentId: null },
+      data: { agentId: null, responderBoundAt: null },
     });
     await db.experiment.updateMany({
       where: { agentId: id },
@@ -1042,6 +1438,14 @@ export async function cloneAgent(
 ): Promise<AgentDto> {
   const tenantId = requireTenant(ctx);
   return runScopedOn(base, ctx, async (db) => {
+    // The namespace lock BEFORE the grants are read, for the reason `replaceAgentToolSelections`
+    // gives and one step earlier: a clone copies target ids out of one agent and writes them under
+    // another, so a tool deleted between the read and the insert leaves the copy pointing at a row
+    // that is gone. The foreign key then refuses it, and because the whole clone is one transaction
+    // the operator loses the agent, not the grant (round 35). Behind the lock the delete either
+    // goes first, and its cascade takes the source grant with it so there is nothing to copy, or it
+    // waits and takes both rows afterwards.
+    await lockToolNames(db);
     const src = await db.agent.findUnique({
       where: { id },
       select: {
@@ -1067,6 +1471,7 @@ export async function cloneAgent(
         mcpServerConnectionId: true,
         integrationInstanceId: true,
         documentTemplateId: true,
+        codeToolDefinitionId: true,
         knowledgeBaseIds: true,
         enabledTools: true,
       },
@@ -1096,6 +1501,7 @@ export async function cloneAgent(
           mcpServerConnectionId: g.mcpServerConnectionId,
           integrationInstanceId: g.integrationInstanceId,
           documentTemplateId: g.documentTemplateId,
+          codeToolDefinitionId: g.codeToolDefinitionId,
           knowledgeBaseIds: g.knowledgeBaseIds,
           enabledTools: g.enabledTools,
         })),
@@ -1124,6 +1530,7 @@ const AGENT_TOOL_SOURCES = [
   "MCP",
   "INTEGRATION",
   "DOCUMENT",
+  "CODE",
 ] as const;
 type AgentToolSourceLit = (typeof AGENT_TOOL_SOURCES)[number];
 
@@ -1133,6 +1540,7 @@ export interface ToolGrantInput {
   mcpServerConnectionId?: string | null;
   integrationInstanceId?: string | null;
   documentTemplateId?: string | null;
+  codeToolDefinitionId?: string | null;
   knowledgeBaseIds?: string[];
   enabledTools?: string[];
 }
@@ -1143,6 +1551,7 @@ export interface ToolGrantDto {
   mcpServerConnectionId: string | null;
   integrationInstanceId: string | null;
   documentTemplateId: string | null;
+  codeToolDefinitionId: string | null;
   knowledgeBaseIds: string[];
   enabledTools: string[];
 }
@@ -1170,6 +1579,8 @@ export interface ToolSelectionView {
         args: { name: string; description?: string; required: boolean }[];
       }[];
     }[];
+    // Operator-authored code tools (issue #363); `name` is what the agent calls.
+    codeTools: { id: string; name: string; label: string; enabled: boolean }[];
     documentTemplates: {
       id: string;
       name: string;
@@ -1207,6 +1618,7 @@ interface NormalizedGrant {
   mcpServerConnectionId: bigint | null;
   integrationInstanceId: bigint | null;
   documentTemplateId: bigint | null;
+  codeToolDefinitionId: bigint | null;
   knowledgeBaseIds: bigint[];
   enabledTools: string[];
 }
@@ -1246,6 +1658,7 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
   let sawNative = false;
   let sawRag = false;
   const httpSeen = new Set<string>();
+  const codeSeen = new Set<string>();
   const mcpSeen = new Set<string>();
   const intSeen = new Set<string>();
   const docSeen = new Set<string>();
@@ -1281,6 +1694,7 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
           mcpServerConnectionId: null,
           integrationInstanceId: null,
           documentTemplateId: null,
+          codeToolDefinitionId: null,
           knowledgeBaseIds: [],
           enabledTools,
         });
@@ -1322,6 +1736,7 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
           mcpServerConnectionId: null,
           integrationInstanceId: null,
           documentTemplateId: null,
+          codeToolDefinitionId: null,
           knowledgeBaseIds,
           enabledTools: ragTools,
         });
@@ -1344,6 +1759,7 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
           mcpServerConnectionId: null,
           integrationInstanceId: null,
           documentTemplateId: null,
+          codeToolDefinitionId: null,
           knowledgeBaseIds: [],
           enabledTools: [],
         });
@@ -1366,6 +1782,7 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
           mcpServerConnectionId: id,
           integrationInstanceId: null,
           documentTemplateId: null,
+          codeToolDefinitionId: null,
           knowledgeBaseIds: [],
           enabledTools,
         });
@@ -1388,6 +1805,7 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
           mcpServerConnectionId: null,
           integrationInstanceId: id,
           documentTemplateId: null,
+          codeToolDefinitionId: null,
           knowledgeBaseIds: [],
           enabledTools,
         });
@@ -1410,9 +1828,34 @@ function normalizeGrants(input: ToolGrantInput[]): NormalizedGrant[] {
           mcpServerConnectionId: null,
           integrationInstanceId: null,
           documentTemplateId: id,
+          codeToolDefinitionId: null,
           // NOTE: no enabledTools. A template grant exposes exactly one tool — the one derived from
           // that template — so there is nothing to narrow, and an allowlist here would be a second
           // switch for the grant itself.
+          knowledgeBaseIds: [],
+          enabledTools: [],
+        });
+        break;
+      }
+      case "CODE": {
+        const id = bigOrThrow(g.codeToolDefinitionId, "codeToolDefinitionId");
+        if (codeSeen.has(String(id))) {
+          throw new AppError(
+            "duplicate CODE grant",
+            400,
+            "errors.toolGrantDuplicate",
+            { source: "CODE" },
+          );
+        }
+        codeSeen.add(String(id));
+        out.push({
+          source: "CODE",
+          toolDefinitionId: null,
+          mcpServerConnectionId: null,
+          integrationInstanceId: null,
+          documentTemplateId: null,
+          codeToolDefinitionId: id,
+          // NOTE: one tool per grant, like a document template: nothing to narrow.
           knowledgeBaseIds: [],
           enabledTools: [],
         });
@@ -1436,6 +1879,7 @@ function toGrantDto(g: {
   mcpServerConnectionId: bigint | null;
   integrationInstanceId: bigint | null;
   documentTemplateId: bigint | null;
+  codeToolDefinitionId: bigint | null;
   knowledgeBaseIds: bigint[];
   enabledTools: string[];
 }): ToolGrantDto {
@@ -1449,6 +1893,8 @@ function toGrantDto(g: {
       g.integrationInstanceId === null ? null : String(g.integrationInstanceId),
     documentTemplateId:
       g.documentTemplateId === null ? null : String(g.documentTemplateId),
+    codeToolDefinitionId:
+      g.codeToolDefinitionId === null ? null : String(g.codeToolDefinitionId),
     knowledgeBaseIds: g.knowledgeBaseIds.map((k) => String(k)),
     enabledTools: g.enabledTools,
   };
@@ -1470,6 +1916,7 @@ async function readGrantSet(
       mcpServerConnectionId: true,
       integrationInstanceId: true,
       documentTemplateId: true,
+      codeToolDefinitionId: true,
       knowledgeBaseIds: true,
       enabledTools: true,
     },
@@ -1490,6 +1937,7 @@ async function buildToolSelectionView(
       mcpServerConnectionId: true,
       integrationInstanceId: true,
       documentTemplateId: true,
+      codeToolDefinitionId: true,
       knowledgeBaseIds: true,
       enabledTools: true,
     },
@@ -1514,6 +1962,10 @@ async function buildToolSelectionView(
   });
   const knowledgeBases = await db.knowledgeBase.findMany({
     select: { id: true, name: true, description: true },
+    orderBy: { name: "asc" },
+  });
+  const codeTools = await db.codeToolDefinition.findMany({
+    select: { id: true, name: true, label: true, enabled: true },
     orderBy: { name: "asc" },
   });
   const documentTemplates = await db.documentTemplate.findMany({
@@ -1578,6 +2030,12 @@ async function buildToolSelectionView(
         description: k.description,
         unindexedCount: unindexedByKb.get(k.id) ?? 0,
       })),
+      codeTools: codeTools.map((c) => ({
+        id: String(c.id),
+        name: c.name,
+        label: c.label,
+        enabled: c.enabled,
+      })),
       documentTemplates: documentTemplates.map((d) => ({
         id: String(d.id),
         name: d.name,
@@ -1591,6 +2049,53 @@ async function buildToolSelectionView(
       })),
     },
   };
+}
+
+// The knowledge bases THIS agent is granted that still hold documents nobody indexed — the two
+// facts the configuration-health read needs out of the whole tool catalog.
+//
+// A query of its own rather than a projection of `getAgentToolSelections`, and the difference is not
+// tidiness: that view loads every tool definition, MCP connection, integration instance, knowledge
+// base and document-template body the TENANT has, then groups the unindexed documents of all of
+// them. It is the right shape for the editor, which draws all of it. Health is now read on every
+// agent write, so paying for the tenant's whole catalog there makes an unrelated `agent_update`
+// scale with how much the tenant has configured.
+//
+// Scoped twice on purpose: to the agent's RAG grant, and to the bases that grant names.
+export async function listKnowledgeBasesNeedingIndex(
+  ctx: TenantContext,
+  agentId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<{ id: string; name: string }[]> {
+  return runScopedOn(base, ctx, async (db) => {
+    // ONE row, and that is a fact about the table rather than a convention worth defending here:
+    // `CREATE UNIQUE INDEX ats_rag_uq ON agent_tool_selections (agent_id) WHERE source = 'RAG'`
+    // (the init migration). A second RAG grant is refused by Postgres, so reading "all of them" and
+    // merging would be code standing guard over a state that cannot exist. Written down because the
+    // question comes up looking answerable in TypeScript — `replaceAgentToolSelections` also throws
+    // `duplicate RAG grant`, which reads like the only thing holding the line, and it is not.
+    const grant = await db.agentToolSelection.findFirst({
+      where: { agentId, source: "RAG" },
+      select: { knowledgeBaseIds: true },
+    });
+    const ids = grant?.knowledgeBaseIds ?? [];
+    if (ids.length === 0) return [];
+    const unindexed = await db.knowledgeDocument.groupBy({
+      by: ["knowledgeBaseId"],
+      where: { status: "UNINDEXED", knowledgeBaseId: { in: ids } },
+      _count: { _all: true },
+    });
+    const needing = unindexed
+      .filter((g) => g._count._all > 0)
+      .map((g) => g.knowledgeBaseId);
+    if (needing.length === 0) return [];
+    const bases = await db.knowledgeBase.findMany({
+      where: { id: { in: needing } },
+      select: { id: true, name: true },
+      orderBy: { name: "asc" },
+    });
+    return bases.map((k) => ({ id: String(k.id), name: k.name }));
+  });
 }
 
 export async function getAgentToolSelections(
@@ -1612,6 +2117,182 @@ export async function getAgentToolSelections(
 
 // Replace-the-set: the editor sends the full desired grant set; we validate ownership + the
 // integration tool allowlist, then atomically delete-and-recreate the agent's grants.
+// Every id list here comes off an UNCAPPED array on the published schema (`grants`, and
+// `knowledgeBaseIds` inside each one), and each id is a BIND PARAMETER: Postgres takes at most
+// 32,767, so one grant carrying 40k knowledge-base ids raised "The query parameter limit supported
+// by your database is exceeded" rather than refusing. That was already true of the apply; making the
+// preview ask the same question would have doubled the surface, and the dry run is the call an
+// operator makes FIRST. Measured at 40,000 ids: a crash on both halves before this, a refusal on
+// both after. Same shape as `deployment_set_accounts` (#492), same chunk.
+const ID_CHUNK = 1000;
+
+// SHORT-CIRCUITS on the first deficient chunk, and the reason is that the answer is already known
+// there: a chunk that finds fewer rows than it asked for cannot be rescued by a later one. Without
+// it a grant of 500,000 ids that names nothing spent 500 queries to reach a refusal the first one
+// had settled (measured: 637ms; with the exit, one query).
+//
+// It is NOT the transaction timeout the review round suspected. `runScopedOn` gives 5s and the
+// unshortened loop stayed three orders of magnitude inside it at every size a published schema can
+// deliver — 40k ids in 94ms, 200k in 261ms, 500k in 637ms. The exit is worth having on its own
+// terms; the timeout it was proposed to avoid does not happen.
+async function assertAllPresent(
+  ids: bigint[],
+  count: (chunk: bigint[]) => Promise<number>,
+  missing: () => never,
+): Promise<void> {
+  for (let i = 0; i < ids.length; i += ID_CHUNK) {
+    const chunk = ids.slice(i, i + ID_CHUNK);
+    if ((await count(chunk)) !== chunk.length) missing();
+  }
+}
+
+// Every id inside a grant array, checked against what the tenant actually has: an HTTP grant naming
+// no tool, an MCP grant naming no connection, and the same for document templates, code tools,
+// knowledge bases and integrations (plus the sub-tool allowlist an integration publishes). Split out of
+// `replaceAgentToolSelections` so the preview can ask it (#490): the fence row for `agent_tools_set`
+// passes `grants: []` behind an agent id that names no agent, so it proved the ownership check and
+// none of this — and a preview echoed back `nextGrants` for a set the apply refuses (#510).
+async function assertGrantTargetsExist(
+  db: ScopedDb,
+  grants: NormalizedGrant[],
+): Promise<void> {
+  const tdIds = [
+    ...new Set(
+      grants
+        .filter((g) => g.source === "HTTP")
+        .map((g) => g.toolDefinitionId as bigint),
+    ),
+  ];
+  const mcpIds = [
+    ...new Set(
+      grants
+        .filter((g) => g.source === "MCP")
+        .map((g) => g.mcpServerConnectionId as bigint),
+    ),
+  ];
+  const intIds = [
+    ...new Set(
+      grants
+        .filter((g) => g.source === "INTEGRATION")
+        .map((g) => g.integrationInstanceId as bigint),
+    ),
+  ];
+  const docIds = [
+    ...new Set(
+      grants
+        .filter((g) => g.source === "DOCUMENT")
+        .map((g) => g.documentTemplateId as bigint),
+    ),
+  ];
+  const codeIds = [
+    ...new Set(
+      grants
+        .filter((g) => g.source === "CODE")
+        .map((g) => g.codeToolDefinitionId as bigint),
+    ),
+  ];
+  const kbIds = [...new Set(grants.flatMap((g) => g.knowledgeBaseIds))];
+
+  await assertAllPresent(
+    tdIds,
+    (ids) => db.toolDefinition.count({ where: { id: { in: ids } } }),
+    () => {
+      throw new NotFoundError(
+        "tool definition not found",
+        "errors.toolDefinitionNotFound",
+      );
+    },
+  );
+  await assertAllPresent(
+    mcpIds,
+    (ids) => db.mcpServerConnection.count({ where: { id: { in: ids } } }),
+    () => {
+      throw new NotFoundError(
+        "mcp connection not found",
+        "errors.mcpConnectionNotFound",
+      );
+    },
+  );
+  await assertAllPresent(
+    docIds,
+    (ids) => db.documentTemplate.count({ where: { id: { in: ids } } }),
+    () => {
+      throw new NotFoundError(
+        "document template not found",
+        "errors.documentTemplateNotFound",
+      );
+    },
+  );
+  await assertAllPresent(
+    codeIds,
+    (ids) => db.codeToolDefinition.count({ where: { id: { in: ids } } }),
+    () => {
+      throw new NotFoundError("code tool not found", "errors.codeToolNotFound");
+    },
+  );
+  await assertAllPresent(
+    kbIds,
+    (ids) => db.knowledgeBase.count({ where: { id: { in: ids } } }),
+    () => {
+      throw new NotFoundError(
+        "knowledge base not found",
+        "errors.knowledgeBaseNotFound",
+      );
+    },
+  );
+  if (intIds.length > 0) {
+    // This one GATHERS rather than counts (the catalog type of each instance is the next rule's
+    // input), so its short-circuit is the same comparison one chunk at a time.
+    const instances: Array<{ id: bigint; catalogType: string }> = [];
+    for (let i = 0; i < intIds.length; i += ID_CHUNK) {
+      const chunk = intIds.slice(i, i + ID_CHUNK);
+      const rows = await db.integrationInstance.findMany({
+        where: { id: { in: chunk } },
+        select: { id: true, catalogType: true },
+      });
+      if (rows.length !== chunk.length) {
+        throw new NotFoundError(
+          "integration instance not found",
+          "errors.integrationInstanceNotFound",
+        );
+      }
+      instances.push(...rows);
+    }
+    const typeById = new Map(
+      instances.map((i) => [String(i.id), i.catalogType]),
+    );
+    for (const g of grants) {
+      if (g.source !== "INTEGRATION") continue;
+      const catalogType = typeById.get(String(g.integrationInstanceId));
+      const allowed = new Set(
+        catalogType ? getToolpackToolNames(catalogType) : [],
+      );
+      const bad = g.enabledTools.find((t) => !allowed.has(t));
+      if (bad) {
+        throw new AppError(
+          `tool ${bad} is not available for integration ${catalogType}`,
+          400,
+          "errors.toolGrantToolNotInIntegration",
+          { tool: bad, integration: String(catalogType) },
+        );
+      }
+    }
+  }
+}
+
+// The ADVISORY wrapper, and the word is load-bearing for the same reason as everywhere else on this
+// surface: it opens its own scoped read outside the write's transaction, so a tool deleted between
+// the preview and the apply still refuses there. The check inside `replaceAgentToolSelections`
+// stays the authority; this only moves the refusal an operator actually hits to where they asked.
+export async function assertAgentToolGrantsResolvable(
+  ctx: TenantContext,
+  input: ToolGrantInput[],
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  const grants = normalizeGrants(input);
+  await runScopedOn(base, ctx, (db) => assertGrantTargetsExist(db, grants));
+}
+
 export async function replaceAgentToolSelections(
   ctx: TenantContext,
   agentId: bigint,
@@ -1624,14 +2305,27 @@ export async function replaceAgentToolSelections(
   const tenantId = requireTenant(ctx);
   const grants = normalizeGrants(input);
   const view = await runScopedOn(base, ctx, async (db) => {
+    // The NAMESPACE lock first, before the agent row, and the order is the whole point. Deleting a
+    // tool takes this lock, then the tool row FOR UPDATE, then cascades into the selection rows;
+    // this path took the agent row, deleted the selection rows and then asked the foreign key for
+    // the tool row. Two transactions, each holding what the other needs next, which PostgreSQL
+    // resolves by killing one: measured on the real pair, `40P01 deadlock detected`, surfacing as a
+    // 500 on whichever lost (round 34). Behind this lock the two are serialized and neither can be
+    // half-done when the other starts. Grant saves are an operator action, so the cost of holding
+    // one lock per tenant across them is not a cost anyone can feel.
+    await lockToolNames(db);
     // NOTE: the agent row is LOCKED before its version is read, and the grant snapshot below is
     // taken under that lock. The set lives in another table with no version of its own, so this row
     // is what serializes two replacements against each other: unlocked, one call can read set A,
     // wait while another commits B, and then write A back while its audit row claims A→A. The
     // agent is also what `expectedUpdatedAt` is checked against, so the precondition and the
     // snapshot now answer for the same instant. RLS still applies to the raw read.
+    //
+    // NO KEY UPDATE for the reason `updateAgent` gives above: it serializes replacements and still
+    // conflicts with the delete, and it stops conflicting with the `FOR KEY SHARE` a reference to
+    // this agent takes, which is what keeps a grant save out of the way of `bindInbox` (#546).
     const locked = await db.$queryRaw<Array<{ updated_at: Date }>>`
-      SELECT updated_at FROM agents WHERE id = ${agentId} FOR UPDATE`;
+      SELECT updated_at FROM agents WHERE id = ${agentId} FOR NO KEY UPDATE`;
     const agent = locked[0] ? { updatedAt: locked[0].updated_at } : null;
     if (!agent) {
       throw new NotFoundError("agent not found", "errors.agentNotFound");
@@ -1647,111 +2341,7 @@ export async function replaceAgentToolSelections(
       );
     }
 
-    const tdIds = [
-      ...new Set(
-        grants
-          .filter((g) => g.source === "HTTP")
-          .map((g) => g.toolDefinitionId as bigint),
-      ),
-    ];
-    const mcpIds = [
-      ...new Set(
-        grants
-          .filter((g) => g.source === "MCP")
-          .map((g) => g.mcpServerConnectionId as bigint),
-      ),
-    ];
-    const intIds = [
-      ...new Set(
-        grants
-          .filter((g) => g.source === "INTEGRATION")
-          .map((g) => g.integrationInstanceId as bigint),
-      ),
-    ];
-    const docIds = [
-      ...new Set(
-        grants
-          .filter((g) => g.source === "DOCUMENT")
-          .map((g) => g.documentTemplateId as bigint),
-      ),
-    ];
-    const kbIds = [...new Set(grants.flatMap((g) => g.knowledgeBaseIds))];
-
-    if (tdIds.length > 0) {
-      const found = await db.toolDefinition.count({
-        where: { id: { in: tdIds } },
-      });
-      if (found !== tdIds.length) {
-        throw new NotFoundError(
-          "tool definition not found",
-          "errors.toolDefinitionNotFound",
-        );
-      }
-    }
-    if (mcpIds.length > 0) {
-      const found = await db.mcpServerConnection.count({
-        where: { id: { in: mcpIds } },
-      });
-      if (found !== mcpIds.length) {
-        throw new NotFoundError(
-          "mcp connection not found",
-          "errors.mcpConnectionNotFound",
-        );
-      }
-    }
-    if (docIds.length > 0) {
-      const found = await db.documentTemplate.count({
-        where: { id: { in: docIds } },
-      });
-      if (found !== docIds.length) {
-        throw new NotFoundError(
-          "document template not found",
-          "errors.documentTemplateNotFound",
-        );
-      }
-    }
-    if (kbIds.length > 0) {
-      const found = await db.knowledgeBase.count({
-        where: { id: { in: kbIds } },
-      });
-      if (found !== kbIds.length) {
-        throw new NotFoundError(
-          "knowledge base not found",
-          "errors.knowledgeBaseNotFound",
-        );
-      }
-    }
-    if (intIds.length > 0) {
-      const instances = await db.integrationInstance.findMany({
-        where: { id: { in: intIds } },
-        select: { id: true, catalogType: true },
-      });
-      if (instances.length !== intIds.length) {
-        throw new NotFoundError(
-          "integration instance not found",
-          "errors.integrationInstanceNotFound",
-        );
-      }
-      const typeById = new Map(
-        instances.map((i) => [String(i.id), i.catalogType]),
-      );
-      for (const g of grants) {
-        if (g.source !== "INTEGRATION") continue;
-        const catalogType = typeById.get(String(g.integrationInstanceId));
-        const allowed = new Set(
-          catalogType ? getToolpackToolNames(catalogType) : [],
-        );
-        const bad = g.enabledTools.find((t) => !allowed.has(t));
-        if (bad) {
-          throw new AppError(
-            `tool ${bad} is not available for integration ${catalogType}`,
-            400,
-            "errors.toolGrantToolNotInIntegration",
-            { tool: bad, integration: String(catalogType) },
-          );
-        }
-      }
-    }
+    await assertGrantTargetsExist(db, grants);
 
     // The set as it stands, read before the delete-and-recreate replaces it. Same shape the view
     // returns, so the row's two halves are comparable.
@@ -1767,6 +2357,7 @@ export async function replaceAgentToolSelections(
           mcpServerConnectionId: g.mcpServerConnectionId,
           integrationInstanceId: g.integrationInstanceId,
           documentTemplateId: g.documentTemplateId,
+          codeToolDefinitionId: g.codeToolDefinitionId,
           knowledgeBaseIds: g.knowledgeBaseIds,
           enabledTools: g.enabledTools,
         })),
@@ -1791,6 +2382,24 @@ export async function replaceAgentToolSelections(
       });
     }
     return next;
+  }).catch(async (err: unknown) => {
+    // A target can be DELETED between `assertGrantTargetsExist` above and the insert: the check
+    // reads the row, a delete commits in the gap, and the foreign key refuses the selection. That
+    // is the same event as "no such tool", which the check itself would have reported a moment
+    // earlier, so it gets the same terminal answer instead of a 500 for the console and a bare
+    // P2003 in the log (round 31). The precedent, and the reasoning, is `issueDocument`'s in
+    // documents/issue.ts.
+    //
+    // WHICH target vanished is asked afterwards, in a fresh scoped read, rather than parsed out of
+    // the driver's constraint name: the aborted transaction can answer nothing,
+    // `assertGrantTargetsExist` already knows how to name every source, and re-asking it costs one
+    // round trip on a path that is already losing a race. If it now finds everything (the row came
+    // back, or the key that failed was the agent's own), the original error stands rather than
+    // being dressed up as a not-found.
+    if (err instanceof Error && (err as { code?: string }).code === "P2003") {
+      await runScopedOn(base, ctx, (db) => assertGrantTargetsExist(db, grants));
+    }
+    throw err;
   });
   // Heads-up for any open editor (other tab / another operator) — best-effort, metadata-only.
   if (ctx.tenantId !== null && view.agentUpdatedAt) {

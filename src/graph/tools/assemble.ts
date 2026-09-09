@@ -6,6 +6,7 @@ import { parseTemplateContent } from "@/modules/documents/validate";
 import type { IntegrationSelection } from "@/modules/integrations/toolpacks";
 import { isManagedOAuthKind } from "@/modules/vault/secret-types";
 import {
+  dialableBaseUrl,
   formatVaultRef,
   readVaultRefId,
   tryResolveVaultEntry,
@@ -68,6 +69,18 @@ export interface LoadedHttpToolDef {
   // forgotten in the `select` reads as `undefined` and normalizes to "declare nothing", which is a
   // feature going silently missing rather than failing.
   appointment: unknown;
+  // What this tool's response should look like by the time it reaches the model (issue #456).
+  // Required for the same reason as the two above.
+  outputSchema: unknown;
+}
+
+// An operator-authored code tool, as the turn builds it (tools/code.ts). Required fields for the
+// same reason `LoadedHttpToolDef` keeps them required: the `select` below enumerates the columns.
+export interface LoadedCodeToolDef {
+  name: string;
+  description: string;
+  inputSchema: unknown;
+  code: string;
 }
 
 export interface AgentToolSelections {
@@ -79,6 +92,7 @@ export interface AgentToolSelections {
   // undefined ⇒ no RAG (no RAG row, or an empty tool allowlist — fail-closed).
   ragConfig?: RagConfig;
   httpToolDefs: LoadedHttpToolDef[];
+  codeToolDefs: LoadedCodeToolDef[];
   mcpSelections: McpSelection[];
   integrationSelections: IntegrationSelection[];
   // Fail-closed like HTTP/MCP/integration/RAG: a document template the agent was not granted is
@@ -132,14 +146,16 @@ export interface AgentToolSelections {
 // within one catalog type the name is already a total order. Adding the catalogType key first killed
 // no test in the mutation battery, which is what a rule with no observable effect looks like.
 //
-// HTTP and document grants stay on the id: their exposed names are the definition's name and
-// `send_<slug>`, both unique per tenant, so no two of them can contest a name and the order is
-// invisible either way (asserted in tests/graph/tool-grant-order.test.ts).
+// HTTP, code and document grants stay on the id: their exposed names are the definition's name
+// (unique per tenant across the HTTP and code tables, checked in the services) and `send_<slug>`,
+// so no two of them can contest a name and the order is invisible either way (asserted in
+// tests/graph/tool-grant-order.test.ts).
 const GRANT_ORDER: Prisma.AgentToolSelectionOrderByWithRelationInput[] = [
   { source: "asc" },
   { mcpServerConnectionId: "asc" },
   { integrationInstanceId: "asc" },
   { toolDefinitionId: "asc" },
+  { codeToolDefinitionId: "asc" },
   { documentTemplateId: "asc" },
 ];
 
@@ -205,6 +221,7 @@ export async function loadToolSelections(
           ackMessage: true,
           expectedStatuses: true,
           appointment: true,
+          outputSchema: true,
         },
       },
       mcpServerConnection: {
@@ -228,6 +245,15 @@ export async function loadToolSelections(
           enabled: true,
         },
       },
+      codeToolDefinition: {
+        select: {
+          name: true,
+          description: true,
+          inputSchema: true,
+          code: true,
+          enabled: true,
+        },
+      },
       documentTemplate: {
         select: {
           id: true,
@@ -248,6 +274,7 @@ export async function loadToolSelections(
 
   const result: AgentToolSelections = {
     httpToolDefs: [],
+    codeToolDefs: [],
     mcpSelections: [],
     integrationSelections: [],
     documentSelections: [],
@@ -289,6 +316,7 @@ export async function loadToolSelections(
           body: td.body,
           expectedStatuses: td.expectedStatuses,
           appointment: td.appointment,
+          outputSchema: td.outputSchema,
         });
         break;
       }
@@ -300,10 +328,7 @@ export async function loadToolSelections(
         let credentialKind: string | null = null;
         let credentialParamName: string | null = null;
         if (conn.credentialRef) {
-          const entry = await tryResolveVaultEntry<unknown>(
-            db,
-            conn.credentialRef,
-          );
+          const entry = await tryResolveVaultEntry(db, conn.credentialRef);
           credentialKind = entry?.kind ?? null;
           credentialParamName = entry?.paramName ?? null;
           credentialBaseUrl = entry?.baseUrl ?? null;
@@ -340,6 +365,17 @@ export async function loadToolSelections(
           config: (inst.config ?? {}) as Record<string, unknown>,
           credentialRef: inst.credentialRef,
           enabledTools: row.enabledTools,
+        });
+        break;
+      }
+      case "CODE": {
+        const cd = row.codeToolDefinition;
+        if (!cd?.enabled) break;
+        result.codeToolDefs.push({
+          name: cd.name,
+          description: cd.description,
+          inputSchema: cd.inputSchema,
+          code: cd.code,
         });
         break;
       }
@@ -415,7 +451,9 @@ export async function loadToolSelections(
         : null;
       d.credentialKind = meta?.kind ?? null;
       d.credentialParamName = meta?.paramName ?? null;
-      d.credentialBaseUrl = meta?.baseUrl ?? null;
+      d.credentialBaseUrl = meta
+        ? dialableBaseUrl(meta.kind, meta.baseUrl)
+        : null;
     }
   }
   return result;
@@ -426,7 +464,8 @@ export interface HttpToolBuildDeps {
   allowHttp?: boolean;
   // Posts a per-tool "I'll look into that…" ack to the customer before a slow tool runs. Wired only
   // on a real conversation (the playground/nudge build omits it) — see prepare.ts buildToolset.
-  emitAck?: (message: string) => Promise<void>;
+  // An explicit `false` says the run was called off after the ack, and the tool does not run.
+  emitAck?: (message: string) => Promise<boolean | undefined>;
   // Conversation/contact context for {{placeholder}} interpolation in fixed fields, headers, URL and
   // the raw body (e.g. {{conversation_id}}, {{contact_name}}). Never a secret.
   context?: Record<string, string>;
@@ -465,6 +504,7 @@ export function buildHttpTools(
       body: d.body,
       expectedStatuses: d.expectedStatuses,
       appointment: d.appointment,
+      outputSchema: d.outputSchema,
     };
     return buildHttpTool(def, deps);
   });

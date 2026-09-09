@@ -100,7 +100,14 @@ function save() {
 // holding a happy-dom element serializes a cyclic tree and hangs the runner.
 function shownInsideFieldOf(field: string, message: string): number {
   const control = inputFor(field);
-  const box = control.closest("label") ?? control.parentElement;
+  // Reached through the LABEL, because a <FormField> is a flat stack: the label points at the
+  // control (`htmlFor`) rather than wrapping it, so neither one contains the other and the message
+  // is a sibling of both. Walking up from the control instead would land inside `Input`'s own
+  // wrapper divs, which are not the field.
+  const label = document.querySelector(
+    `label[for="${CSS.escape(control.id)}"]`,
+  );
+  const box = label?.closest("div");
   return Array.from(box?.querySelectorAll("*") ?? []).filter(
     (el) => el.textContent === message && el.children.length === 0,
   ).length;

@@ -7,10 +7,12 @@ import { parseDbId } from "@/lib/db-id";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
+import { agentStillSpeaks } from "@/modules/agents/speaks";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { episodeTestActivatedAt } from "@/modules/channel-redirect/episode";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
+import { withConversationLabels } from "@/modules/chatwoot/labels";
 import {
   parseLiveConversation,
   shouldBotHandle,
@@ -52,9 +54,15 @@ import {
   threadBelongsToTenant,
 } from "./checkpointer";
 import { lastAssistantText } from "./graph";
+import { owesHandbackNote } from "./handback";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
-import { conversationDividerMessage, nudgeMessage } from "./markers";
+import {
+  conversationDividerMessage,
+  humanHandbackMessage,
+  nudgeMessage,
+  turnWasCalledOff,
+} from "./markers";
 import {
   type AgentConfig,
   buildCallbacks,
@@ -64,6 +72,18 @@ import {
 } from "./prepare";
 import { undoRefusedTurn } from "./refused-turn";
 import type { RuntimeDeps } from "./runtime";
+import {
+  FOLLOWUP_SKIP_SENTINEL,
+  followupSilenceChannel,
+  inertToolsFor,
+  isNudgeSilent,
+  proactiveReply,
+  withFollowupSilenceChannel,
+  withoutLoneSilenceTool,
+} from "./silence";
+
+export { FOLLOWUP_SKIP_SENTINEL, isNudgeSilent };
+
 import {
   clearTurnOwning,
   markTurnOwning,
@@ -248,28 +268,6 @@ export const OUTSIDE_WINDOW_NOTE_PREFIX =
   "⏳ Fora da janela de 24h do WhatsApp: a mensagem abaixo NÃO foi enviada ao cliente. " +
   "Para reengajar fora da janela, configure um template aprovado (HSM) na aba Comportamento do agente.\n\n";
 
-// Explicit "no follow-up" signal. We ask the model to emit EXACTLY this token when a proactive
-// message isn't warranted, instead of "reply with an empty message" — models routinely NARRATE
-// their emptiness ("(empty — nothing to do yet)") instead of returning truly empty text, and that
-// non-empty narration would otherwise get posted to the customer. A distinctive sentinel is
-// detectable and is stripped before any post so it can never leak.
-export const FOLLOWUP_SKIP_SENTINEL = "[[SKIP]]";
-
-// True when the model declined to follow up: empty, the skip sentinel (tolerating wrapping quotes),
-// a bare "SKIP", or a parenthetical-only "narrated emptiness" (the failure mode that leaked before).
-export function isNudgeSilent(reply: string): boolean {
-  const trimmed = reply.trim();
-  if (!trimmed) return true;
-  const stripped = trimmed.replace(/^["'`]+|["'`]+$/g, "").trim();
-  if (stripped === FOLLOWUP_SKIP_SENTINEL) return true;
-  if (stripped.toUpperCase() === "SKIP") return true;
-  // A reply that is ONLY a parenthetical starting with empty/nothing/none (pt-BR + EN) → silence.
-  if (/^\((?:empty|vazi|nothing|none|nada|sem|n\/a)[^)]*\)$/i.test(stripped)) {
-    return true;
-  }
-  return false;
-}
-
 // External free-text is UNTRUSTED (the inbound poster controls it). Collapse control chars and
 // newlines to a single line (so it cannot forge multi-line "system" framing), drop the data fence
 // token, and bound the length. Never let this text read as instructions.
@@ -290,6 +288,11 @@ function sanitizeFreeText(s: string, max: number): string {
 export function renderNudge(
   n: AgentNudge,
   canMessageCustomer: boolean,
+  // Which silence channel this agent HAS. The tool is the one that leaves nothing to imitate and is
+  // the default; an agent that revoked every tool cannot be handed a schema at all (a plain chat
+  // model, an `openai-compatible` endpoint that 400s on function definitions), so for it the token
+  // is still the only way to say nothing. Asking for a tool that is not bound would produce text.
+  silenceChannel: "tool" | "sentinel" = "tool",
 ): string {
   const facts = [`source=${sanitizeFreeText(n.source, 60)}`];
   if (n.kind) facts.push(`kind=${sanitizeFreeText(n.kind, 40)}`);
@@ -309,9 +312,20 @@ export function renderNudge(
       }
     }
   }
+  // WHY A TOOL AND NOT A TOKEN (issue #454). This used to ask for the literal string `[[SKIP]]`,
+  // which made silence a MESSAGE — and the memory thread is keyed per contact-inbox, so every silent
+  // follow-up left an assistant turn whose whole content was that token, on the same thread a later
+  // ordinary turn loads. The model then reproduced it in a reactive turn where nothing stripped it,
+  // and it went to the customer. `docs/graph.md` states the rule this violated: fix a leak at the
+  // SOURCE, never by stripping the reply. `skip_reply` already exists, already means exactly this on
+  // the reactive path, and leaves a tool call rather than text — so there is nothing to imitate.
+  const silenceInstruction =
+    silenceChannel === "tool"
+      ? "call the `skip_reply` tool and produce NO text (end your turn)"
+      : `reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else`;
   const directive = canMessageCustomer
-    ? `An external system event just occurred for this conversation. By default, send a brief, warm, helpful proactive message to the customer about it — keep it short and natural, in the conversation's language. Lean toward reaching out: a timely follow-up is usually welcome. Stay silent ONLY if a message would clearly be unhelpful, premature, duplicated, or annoying; in that rare case reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else.`
-    : `A human agent is currently handling this conversation. Do NOT message the customer. If the event is worth flagging, write a short internal note for the human; otherwise reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else.`;
+    ? `An external system event just occurred for this conversation. By default, send a brief, warm, helpful proactive message to the customer about it — keep it short and natural, in the conversation's language. Lean toward reaching out: a timely follow-up is usually welcome. Stay silent ONLY if a message would clearly be unhelpful, premature, duplicated, or annoying; in that rare case ${silenceInstruction}.`
+    : `A human agent is currently handling this conversation. Do NOT message the customer. If the event is worth flagging, write a short internal note for the human; otherwise ${silenceInstruction}.`;
   const parts = [
     directive,
     "",
@@ -533,31 +547,59 @@ export async function runAgentNudge(
     // back with. On a row migrated before those columns existed the marks are null, so the next
     // delayed conversation event would be accepted as the first versioned word on a conversation
     // this GET just verified. The write below no-ops when there is genuinely nothing to store.
+    // WHAT THE ROW SAYS AFTER THE RECONCILE, not what the snapshot said. The two differ on exactly
+    // one thing and it is the thing this gate is for: a local status claim (issue #436), which is a
+    // transition this side has written and Chatwoot has not confirmed. A snapshot read while the
+    // toggle is on the wire still says `pending`, and taking it at face value here sends a follow-up
+    // into a conversation a colleague has just answered in — the mirror refuses that write and this
+    // probe would go ahead anyway.
+    //
+    // The live read stays the source of truth for everything else, which is why this gate exists at
+    // all (a lost resolve webhook leaves the mirror pending forever). `reconcileMirrorFromLive`
+    // returns the row AFTER its own ordering decided, so it IS the live read wherever the live read
+    // won.
+    let decided: {
+      status: string;
+      assigneeType: string | null;
+      assigneeId: number | null;
+    } = live;
     try {
-      await reconcileMirrorFromLive({
+      const outcome = await reconcileMirrorFromLive({
         tenantId,
         instanceId,
         conversationId,
         live,
         base,
       });
+      // ONLY when a claim is what refused it. Everything else the reconcile declines to write is
+      // declined for an ordering reason, and there the live read is still the newer word — a snapshot
+      // that says `resolved` over a mirror a delayed reopen already advanced is exactly the case this
+      // gate exists for, and taking the row there would send into a conversation the operator closed.
+      if (outcome.refusedByStatusClaim && outcome.state)
+        decided = outcome.state;
       // NOTE: Keep the in-memory snapshot in step so a second probe only re-writes on a NEW divergence.
-      loaded.status = live.status;
+      loaded.status = decided.status;
       loaded.statusAt = live.updatedAt;
-      loaded.assigneeType = live.assigneeType;
-      loaded.assigneeId = live.assigneeId;
+      loaded.assigneeType = decided.assigneeType;
+      loaded.assigneeId = decided.assigneeId;
       loaded.assigneeName = live.assigneeName;
     } catch (err) {
+      // FAILING CLOSED, like the fetch above, and for a sharper reason: the one thing this probe
+      // needs the reconcile for is the local claim, which the snapshot in hand cannot show. Carrying
+      // on with that snapshot is carrying on with the exact reading the claim exists to refuse — a
+      // pre-toggle `pending`, bot-owned — and this gate would then send over the colleague who just
+      // replied (issue #468, round 10). A skipped follow-up costs a follow-up.
       logger.warn(
         { err, conversationId: String(conversationId) },
-        "agentNudge: mirror reconcile failed",
+        "agentNudge: mirror reconcile failed — failing closed",
       );
+      return "unavailable";
     }
     const owned = shouldBotHandle(
       {
-        assigneeType: live.assigneeType,
-        status: live.status,
-        assigneeId: live.assigneeId,
+        assigneeType: decided.assigneeType,
+        status: decided.status,
+        assigneeId: decided.assigneeId,
       },
       { ourAgentBotId: cfg.agentBotId },
     );
@@ -565,8 +607,8 @@ export async function runAgentNudge(
       logger.info(
         "agentNudge: live state not bot-owned (conv=%s status=%s assignee=%s) — skipping",
         String(conversationId),
-        live.status,
-        live.assigneeType ?? "none",
+        decided.status,
+        decided.assigneeType ?? "none",
       );
     }
     return owned ? "owned" : "not-owned";
@@ -586,8 +628,36 @@ export async function runAgentNudge(
   // `strict` selects which question is being asked; see RunAgentTurnParams.stillWanted. Only the ask
   // inside the thread's critical section, before anything is written, wants an unreadable answer to
   // stop the run.
-  const stillWanted = async (strict = false): Promise<boolean> =>
-    params.stillWanted === undefined || (await params.stillWanted({ strict }));
+  //
+  // And the operator's own silences ride the same ask (issue #209 review, rounds 3 and 4): the
+  // config was loaded before the model call, and an agent switched off or flipped to monitoring
+  // inside it — or inside the ownership probe, the guardrail judge, the screening of the promised
+  // line — sends nothing: not the reply, not the template, not the line a transfer promised. In
+  // the wrapper rather than beside one send, so every ask below carries it. The mode read fails
+  // OPEN even on the strict ask: an unreadable row is not evidence of a withdrawal, and the strict
+  // question is about the episode, which `params.stillWanted` still answers strictly.
+  //
+  // WHICH silence, latched on the first refusal (round 8): a run retired by /reset ends the episode
+  // ("stale"), a run the operator silenced is REPAIRABLE — the reminder ladder retries
+  // "agent-unavailable" the way it does for an agent switched off before the nudge ran, and a
+  // flip to monitoring answers those retries at the config load. The episode is asked first, so a
+  // run that lost both answers "stale".
+  let silenced = false;
+  const stillWanted = async (strict = false): Promise<boolean> => {
+    if (
+      params.stillWanted !== undefined &&
+      !(await params.stillWanted({ strict }))
+    ) {
+      return false;
+    }
+    if (!(await agentStillSpeaks(tenantId, cfg.agentId, base))) {
+      silenced = true;
+      return false;
+    }
+    return true;
+  };
+  const standDown = (): "stale" | "agent-unavailable" =>
+    silenced ? "agent-unavailable" : "stale";
 
   // THE RULE for the asks below, because a check placed by intuition is a check the next branch is
   // born without: ONE ask per stretch of I/O that precedes a write, and never any I/O between an ask
@@ -617,7 +687,7 @@ export async function runAgentNudge(
   // than the money, though — an invoked graph writes the proactive turn into the conversation's
   // thread, so a retired job asked only at the send boundary would still leave memory of a message
   // nobody received.
-  if (!(await stillWanted())) return "stale";
+  if (!(await stillWanted())) return standDown();
 
   // THE TENANT'S OWN CEILING, asked here for the reason the line above states: before any model
   // spend. A proactive nudge has nobody waiting on the other end, so there is no copy and no handoff
@@ -633,7 +703,7 @@ export async function runAgentNudge(
   // line is `error` severity for `over`, so it pages the alert channels, and the announcement CLAIMS
   // the occasion window as it decides — a line written about a retired job would also swallow the
   // window the next attempt's real refusal needs. Nothing was refused, so nothing is reported.
-  if (!(await stillWanted())) return "stale";
+  if (!(await stillWanted())) return standDown();
   // ONE LINE PER OCCASION, not per attempt. A refused nudge is repairable, so the caller reschedules
   // it every fifteen minutes for two hours (`nudge-retry.ts`) — and the ceiling it walks into is one
   // unchanging fact, not eight refusals. Windowed to the ladder it has to outlast, and keyed by the
@@ -646,8 +716,8 @@ export async function runAgentNudge(
     logger.info(
       "nudge: spend ceiling reached (conv=%s used=%s ceiling=%s) — nothing was sent",
       String(conversationId),
-      String(ceiling.usedTokens),
-      String(ceiling.ceilingTokens),
+      String(ceiling.usedUsd),
+      String(ceiling.ceilingUsd),
     );
     return "over-ceiling";
   }
@@ -666,25 +736,28 @@ export async function runAgentNudge(
         { ourAgentBotId: cfg.agentBotId },
       );
 
-  const handoffState = {
-    customerMessage: null as string | null,
-    completed: false,
-  };
-
-  // Asked once before the send and once after moderation, which is why it is a closure and not two
-  // reads: the answer has to be produced the same way both times, or the second one would be a
-  // different question wearing the first one's name. Each mode keeps its own semantics — the
-  // live-gated path re-probes Chatwoot itself (the pre-invoke GET only covers the window BEFORE the
-  // model ran), the event-nudge path reads the mirror.
-  const botStillOwnsIt = async (): Promise<
-    "ours" | "not-ours" | "unavailable"
-  > => {
+  // WHO OWNS IT ACCORDING TO THE MIRROR, RIGHT NOW (issue #457, review round 6). `canMessagePre` is
+  // computed once, up here, and the hand-back note is written far below — after the ingestion drain,
+  // after the queue, and after a durable claim that WAITS on an append's lease and on the row lock a
+  // /reset holds. A person taking the conversation over inside that window leaves `canMessagePre`
+  // saying `true` while the answer has changed, and the note would then state that a human
+  // attendance ended while the human is in it. The post-invoke probe suppresses the SEND, and it
+  // cannot unwrite a message already appended to the thread.
+  //
+  // The mirror rather than a live probe, deliberately: this is asked inside the claim's critical
+  // section, and an HTTP round trip there holds the per-thread queue for the length of somebody
+  // else's network. The mirror is what the assignment webhook writes, so it is the same source
+  // `canMessagePre` used — just read at the moment it is used instead of half a minute earlier.
+  const botOwnsItNow = async (): Promise<boolean> => {
+    // LIVE WHERE THE CALLER ASKED FOR LIVE (issue #457, review round 7). `requireLiveBotOwnership`
+    // exists because in that mode the mirror is not trusted: the assignment webhook can be delayed or
+    // lost, and the send path re-probes Chatwoot rather than reading the row. A note is durable and
+    // the post-invoke probe cannot unwrite it, so it gets the same certainty the send does — and only
+    // that mode pays the round trip inside the claim. An unanswerable probe leaves the note owed.
     if (params.requireLiveBotOwnership) {
-      const post = await probeLiveOwnership();
-      if (post === "unavailable") return "unavailable";
-      return post === "not-owned" ? "not-ours" : "ours";
+      return (await probeLiveOwnership()) === "owned";
     }
-    const ours = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    return await runScopedOn(base, sysCtx(tenantId), async (db) => {
       const conv = await db.conversation.findUnique({
         where: {
           tenantId_chatwootInstanceId_chatwootConversationId: {
@@ -704,7 +777,27 @@ export async function runAgentNudge(
         { ourAgentBotId: cfg.agentBotId },
       );
     });
-    return ours ? "ours" : "not-ours";
+  };
+
+  const handoffState = {
+    customerMessage: null as string | null,
+    completed: false,
+  };
+
+  // Asked once before the send and once after moderation, which is why it is a closure and not two
+  // reads: the answer has to be produced the same way both times, or the second one would be a
+  // different question wearing the first one's name. Each mode keeps its own semantics — the
+  // live-gated path re-probes Chatwoot itself (the pre-invoke GET only covers the window BEFORE the
+  // model ran), the event-nudge path reads the mirror.
+  const botStillOwnsIt = async (): Promise<
+    "ours" | "not-ours" | "unavailable"
+  > => {
+    if (params.requireLiveBotOwnership) {
+      const post = await probeLiveOwnership();
+      if (post === "unavailable") return "unavailable";
+      return post === "not-owned" ? "not-ours" : "ours";
+    }
+    return (await botOwnsItNow()) ? "ours" : "not-ours";
   };
 
   // `canMessage` is the caller's own proof of ownership, not a shared variable: the branches below
@@ -738,14 +831,24 @@ export async function runAgentNudge(
     const labels = actions.assignLabels?.filter((l) => l.trim());
     if (labels && labels.length > 0) {
       try {
-        const current = await client.getConversationLabels(conversationId);
-        // The GET is a Chatwoot round trip, so the answer above is about a moment before it. Same
-        // rule as the resolve below, and the labels need it for the same reason: /reset peels the
-        // episode's labels off on purpose, and a SET carrying the merged list puts them back on a
-        // conversation the operator was told had been cleared.
-        if (!(await stillWanted())) return "stale";
-        const merged = [...new Set([...current, ...labels])];
-        await client.setConversationLabels(conversationId, merged);
+        // Inside the conversation's label queue, with `assign_label` and the observer's verdict:
+        // the endpoint replaces the whole set (issue #477 review, round 3).
+        const stale = await withConversationLabels(
+          tenantId,
+          conversationId,
+          async () => {
+            const current = await client.getConversationLabels(conversationId);
+            // The GET is a Chatwoot round trip, so the answer above is about a moment before it.
+            // Same rule as the resolve below, and the labels need it for the same reason: /reset
+            // peels the episode's labels off on purpose, and a SET carrying the merged list puts
+            // them back on a conversation the operator was told had been cleared.
+            if (!(await stillWanted())) return true;
+            const merged = [...new Set([...current, ...labels])];
+            await client.setConversationLabels(conversationId, merged);
+            return false;
+          },
+        );
+        if (stale) return "stale";
       } catch (err) {
         logger.warn(
           { err, conversationId: String(conversationId) },
@@ -841,7 +944,7 @@ export async function runAgentNudge(
         canMessage: stillOurs === "ours",
         allowResolve: false,
       });
-      return applied === "stale" ? "stale" : "silent";
+      return applied === "stale" ? standDown() : "silent";
     }
     // Allowed, and the ownership probe above happened BEFORE a round-trip that may have taken ten
     // seconds. The same reason the refusal re-asks: a human who took the conversation during the
@@ -865,24 +968,38 @@ export async function runAgentNudge(
     cfg = withAuthContextSection(cfg, auth.context ?? null);
   }
 
-  const tools = await buildToolset(
-    cfg,
-    {
-      tenantId,
-      instanceId,
-      base,
-      client,
-      conversationId,
-      threadId: params.threadId,
-      // NOTE: The live probe's answer where this path has one, the mirror's otherwise. resolve_conversation
-      // runs immediately on a nudge turn (no turnState), so this is what tells its close apart from
-      // one that had already happened — but only as a FALLBACK: this snapshot is taken before
-      // `graph.invoke`, and the tool fires during a model call that can run for a minute, so the
-      // tool re-reads the live state itself and falls back here only when that read fails.
-      observed: { status: loaded.status, statusAt: loaded.statusAt },
-      handoffState,
-    },
-    { buildNativeTools, mcp: params.deps?.mcp, flow },
+  // A follow-up must ALWAYS have a way to say nothing, so `skip_reply` is not an operator-revocable
+  // capability on this path — it is the protocol. Revoking it used to leave the token as the only
+  // silence channel, which is the leak above; leaving it revocable now would leave the model with no
+  // channel at all, and a follow-up with nothing to say would have to say something.
+  const nudgeCfg: AgentConfig = withFollowupSilenceChannel(cfg);
+  // ...and taken back out when it turns out to be the whole toolset: an agent whose other sources
+  // yielded nothing is tool-less in practice, and binding one no-op tool at a provider that refuses
+  // schemas costs the entire follow-up (round 12). `followupSilenceChannel` then reads `sentinel`
+  // off this same list, so the directive and the binding cannot disagree.
+  const tools = withoutLoneSilenceTool(
+    nudgeCfg,
+    await buildToolset(
+      nudgeCfg,
+      {
+        tenantId,
+        instanceId,
+        base,
+        client,
+        conversationId,
+        threadId: params.threadId,
+        // The slow-tool ack's own ask, after its send (issue #209 review, round 10).
+        stillWanted: () => stillWanted(),
+        // NOTE: The live probe's answer where this path has one, the mirror's otherwise. resolve_conversation
+        // runs immediately on a nudge turn (no turnState), so this is what tells its close apart from
+        // one that had already happened — but only as a FALLBACK: this snapshot is taken before
+        // `graph.invoke`, and the tool fires during a model call that can run for a minute, so the
+        // tool re-reads the live state itself and falls back here only when that read fails.
+        observed: { status: loaded.status, statusAt: loaded.statusAt },
+        handoffState,
+      },
+      { buildNativeTools, mcp: params.deps?.mcp, flow },
+    ),
   );
 
   // 3. Model + graph + callbacks (node="nudge").
@@ -893,6 +1010,16 @@ export async function runAgentNudge(
   const graph = await buildModelAndGraph(cfg, tools, {
     makeModel: params.deps?.makeModel,
     checkpointer,
+    // THE SAME SEAM THE REACTIVE TURN HANDS DOWN (issue #449), and this path needs it for the same
+    // reason it needs the other fifteen asks: a nudge runs from a scheduler job, `/reset` retires
+    // that job, and every ask above and below sits BETWEEN two steps. A tool call happens inside
+    // one, so a retirement landing while the model call is in flight left `assign_label` and
+    // `set_custom_attribute` free to write to the conversation the operator just cleared.
+    //
+    // Always present (issue #209 review, round 5): the local helper also reads the switch and the
+    // mode, which can change under a nudge nothing scheduled, so the ask is no longer one that
+    // always answers yes for such a caller.
+    stillWanted: () => stillWanted(),
     // Same warn line the reactive turn leaves: a proactive send that only worked on the second
     // attempt must not read like a clean one, and this path can page an alert channel.
     onModelRetry: ({ attempt, provider, model }) =>
@@ -1047,6 +1174,7 @@ export async function runAgentNudge(
       makeModel: params.deps?.makeModel,
       // Same sink as this turn's own callbacks (see the buildCallbacks call above).
       persistUsage: params.deps?.persistUsage,
+      langfuseCfg: cfg.langfuseCfg,
     })("output", text);
 
   // What the transfer promised the customer, delivered on the way OUT of the turn — whatever the way
@@ -1130,6 +1258,11 @@ export async function runAgentNudge(
   let claimedGraphThread = false;
   let graphOwner: ThreadOwner | null = null;
   let graphHold: TurnHold | null = null;
+  // The hand-back note this run owes and could not append durably — an older invoke is reading the
+  // channel, so an append beside it is erased. It rides in this run's own invoke input instead
+  // (issue #457, review round 6): deferring the WRITE is right, deferring the correction is not,
+  // because this invoke is the one that would otherwise read a transfer with no ending.
+  let handbackDeferred = false;
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
     // BARRIER (issue #194), for the same reason the reactive turn has one: a proactive turn reads
@@ -1170,6 +1303,49 @@ export async function runAgentNudge(
       if (contactInboxId === null) {
         markTurnInFlight(graphThreadId);
         claimedGraphThread = true;
+        // THE HAND-BACK NOTE on this thread too (issue #457). The block further down never runs for
+        // it — this branch returns first — and skipping it would leave the fix undone on a path the
+        // runtime supports: a successful handoff is written by the turn's OWN invoke whatever the
+        // thread is keyed by, so the evidence that makes a model stay quiet is here as well, and a
+        // proactive send can be the first turn after the person hands it back.
+        //
+        // Same two gates the keyed path uses, minus the one that has no answer here: `canMessagePre`
+        // false is this nudge running in human-handling mode on purpose, and there is no
+        // `markTurnOwning` on this branch, so whether an older invoke is reading is unknowable. That
+        // makes the write best-effort, and the derived model is what makes best-effort enough — a
+        // note erased by an older invoke is simply owed again to the next turn, because nothing was
+        // consumed to write it.
+        {
+          const fallbackGraph = buildThreadStateGraph(checkpointer);
+          const channelNow = (
+            (
+              await fallbackGraph.getState({
+                configurable: { thread_id: graphThreadId },
+              })
+            ).values as { messages?: BaseMessage[] } | undefined
+          )?.messages;
+          // Ownership asked LAST, immediately before the write, for the reason the keyed branch
+          // gives: the channel read above is its own round trip, and an answer from before it is
+          // stale by exactly that much.
+          if (
+            // Both answers, for the reason the keyed branch above states.
+            canMessagePre &&
+            owesHandbackNote(channelNow ?? []) &&
+            (await botOwnsItNow().catch((err) => {
+              logger.warn(
+                { err, conv: conversationId },
+                "hand-back note: ownership read failed; leaving the note owed",
+              );
+              return false;
+            }))
+          ) {
+            await fallbackGraph.updateState(
+              { configurable: { thread_id: graphThreadId } },
+              { messages: [humanHandbackMessage(conversationId)] },
+              THREAD_STATE_NODE,
+            );
+          }
+        }
         return {
           writeDivider: false,
           advanceMarker: false,
@@ -1241,6 +1417,57 @@ export async function runAgentNudge(
           THREAD_STATE_NODE,
         );
       }
+      // THE HAND-BACK NOTE, here as well as in the reactive turn (issue #457). A proactive send can
+      // be the FIRST model turn after a person hands the conversation back — a follow-up ladder, an
+      // appointment reminder, an inbound-domain nudge — and it invokes the same persisted thread. If
+      // only the reactive turn wrote it, this one would run against the old transfer context and
+      // could go quiet or hand off again, with the correction arriving on some later turn.
+      const channelNow = (
+        (
+          await buildThreadStateGraph(checkpointer).getState({
+            configurable: { thread_id: graphThreadId },
+          })
+        ).values as { messages?: BaseMessage[] } | undefined
+      )?.messages;
+      // NOT WHILE A HUMAN STILL OWNS IT, and not beside an older invoke. `canMessagePre` false is
+      // this nudge running in human-handling mode on purpose — it asks the model for an internal
+      // note instead of a customer message — so announcing that the human attendance ended would
+      // contradict the directive it is about to send itself. And `anotherInvokeIsReading` is the
+      // divider's rule: an invoke that started earlier saves the channel it loaded and erases what
+      // was appended beside it.
+      // A read that cannot run leaves the note OWED, and the next turn asks again — this is the one
+      // thing in this section that costs nothing to defer, and a throw here would escape to the
+      // scheduler, which retries the whole job and re-posts everything it already sent. Asked after
+      // the channel read above and only when the note is actually owed: that read is a round trip of
+      // its own, and this is the last thing before the write.
+      if (
+        // BOTH ANSWERS, and they guard opposite races. `canMessagePre` is what this run IS: false
+        // means the whole nudge was prepared in human-handling mode, and `renderNudge` is about to
+        // tell the model that a person is handling the conversation — a note beside that directive
+        // would put two contradictory statements in one model call. The fresh read is what the world
+        // IS: it catches the person taking the conversation over after the pre-gate. A hand-back that
+        // lands mid-preparation leaves the note owed, and the next turn — prepared in bot mode, with
+        // a directive that agrees with it — writes it.
+        canMessagePre &&
+        owesHandbackNote(channelNow ?? []) &&
+        (await botOwnsItNow().catch((err) => {
+          logger.warn(
+            { err, conv: conversationId },
+            "hand-back note: ownership read failed; leaving the note owed",
+          );
+          return false;
+        }))
+      ) {
+        if (anotherInvokeIsReading) {
+          handbackDeferred = true;
+        } else {
+          await buildThreadStateGraph(checkpointer).updateState(
+            { configurable: { thread_id: graphThreadId } },
+            { messages: [humanHandbackMessage(conversationId)] },
+            THREAD_STATE_NODE,
+          );
+        }
+      }
       // The sidecar row is what resolve-time compaction reads to know which attendance the thread
       // is on. A nudge that opens a conversation used to leave it absent, and the job then exited
       // at its generation fence with the attendance never summarized.
@@ -1262,7 +1489,9 @@ export async function runAgentNudge(
       return decided;
     });
     // `stillWanted` said no inside the critical section: the run was retired while this got here.
-    if (claim === null) return "stale";
+    // The latched reason, not the literal (round 13): the strict ask inside the claim reads the
+    // switch and the mode too, and a reminder abandoned as "stale" is one the ladder never retries.
+    if (claim === null) return standDown();
     if (claim.closedConversationId !== null && contactInboxId !== null) {
       // Outside the critical section: this arms a job of its own and has no business inside the
       // ordering the queue exists to provide.
@@ -1283,7 +1512,7 @@ export async function runAgentNudge(
     // move and `armCompaction` — the last of which opens a transaction of its own, outside the lock.
     // The invoke persists the channel, which is the write /reset is clearing, so it gets its own.
     // Same placement `runLoadedTurn` uses, for the same reason.
-    if (!(await stillWanted())) return "stale";
+    if (!(await stillWanted())) return standDown();
 
     // 4. Invoke with the normalized event as a HUMAN turn. It must NOT be a SystemMessage: the agent
     // node already prepends the one-and-only system prompt, and a second system message in the thread
@@ -1293,12 +1522,35 @@ export async function runAgentNudge(
     // the tool can complete the transfer and the model's next step can then fail. The label and the
     // follow-up stamp are deliberately NOT applied there — the turn failed, and the only thing that
     // cannot wait for a retry is the sentence the customer was promised.
+    // RE-DERIVED IMMEDIATELY BEFORE THE INVOKE (issue #457, review round 10), for the reason
+    // ../graph/runtime.ts gives at its own: the invoke this deferred to can finish and append the
+    // note itself in between, and carrying ours as well would put two in the channel.
+    const carriedHandback =
+      handbackDeferred &&
+      owesHandbackNote(
+        (
+          (
+            await buildThreadStateGraph(checkpointer).getState({
+              configurable: { thread_id: graphThreadId },
+            })
+          ).values as { messages?: BaseMessage[] } | undefined
+        )?.messages ?? [],
+      );
     result = await graph
       .invoke(
         {
           messages: [
+            // The deferred note, before the directive, for the reason the reactive turn gives at its
+            // own invoke (../graph/runtime.ts): the write had to wait, the correction did not.
+            ...(carriedHandback ? [humanHandbackMessage(conversationId)] : []),
             nudgeMessage(
-              renderNudge(params.nudge, canMessagePre),
+              renderNudge(
+                params.nudge,
+                canMessagePre,
+                // Asked of THIS turn's assembled toolset, not of the config that asked for it: a
+                // grant that produced no bound tool would otherwise have the directive name one.
+                followupSilenceChannel(nudgeCfg, tools),
+              ),
               conversationId,
             ),
           ],
@@ -1346,10 +1598,19 @@ export async function runAgentNudge(
     outcome: RunAgentNudgeOutcome,
   ): Promise<RunAgentNudgeOutcome> => {
     const plan = await undoRefusedTurn({
+      // `skip_reply` counts as inert only when the NATIVE one is what got bound. A custom HTTP tool
+      // may legitimately carry that name (`toolDefinitionCreateSchema` reserves none), and that one
+      // really calls something — removing a turn after it ran is the case `actedOnTheWorld` exists
+      // to prevent.
+      inertTools: inertToolsFor(nudgeCfg),
       checkpointer,
       graphThreadId,
       produced: result.messages,
       kind: "proactive",
+      // Same reason the reactive path passes it: this runs just after the durable claim was
+      // released, which is exactly when another replica may start. Null off a contact inbox.
+      owner: graphOwner,
+      base,
     }).catch((err) => {
       // NOTE: best-effort, and loudly. The send was already suppressed, so a failed rollback costs
       // the next turn a message the customer never saw, which is the defect this exists to close,
@@ -1380,13 +1641,82 @@ export async function runAgentNudge(
     return outcome;
   };
 
+  // SILENCE IS NOT A REFUSAL, and it still leaves words behind. `refuse` above is for a turn the
+  // customer got none of because something stopped it; this is a turn that concluded correctly, as
+  // silence — and the model may have written the SENTINEL, or a narrated "(nada a fazer)", to say so.
+  // Nothing of that reached anyone, and the memory thread is shared per contact-inbox, so the next
+  // ordinary turn reads it as a sentence the customer was told and can reproduce it: issue #454's own
+  // defect, surviving in the one place the tool channel does not reach.
+  //
+  // It reaches here for the tool-less agents alone, which is what makes it the LAST residue rather
+  // than the main one: every agent that can bind a tool says nothing by calling `skip_reply`, whose
+  // call leaves no imitable text. Those that cannot are told to use the token, and this takes the
+  // token back out.
+  //
+  // Nothing to take back when the model produced no text at all — `planTurnRollback` would still
+  // remove the directive, but a turn that wrote nothing left nothing to be read as something said,
+  // and paying a checkpointer round trip for it on every silent follow-up is the cost this avoids.
+  const takeBackUndeliveredSilence = async (
+    wroteText: boolean,
+  ): Promise<void> => {
+    if (!wroteText) return;
+    const plan = await undoRefusedTurn({
+      checkpointer,
+      graphThreadId,
+      produced: result.messages,
+      // THE REACTIVE PLAN, on the proactive path, and the two are not interchangeable here. The
+      // proactive plan takes the whole turn — directive and answer — and therefore has to keep
+      // EVERYTHING the moment a tool ran, because the directive and the act are one slice and no
+      // removal can undo an act. That is right for a REFUSAL, where the question is whether the turn
+      // may be erased. It is wrong for SILENCE: a follow-up that labelled the conversation and then
+      // said nothing leaves the token in the thread, and `tool-ran` removes not one word of it.
+      //
+      // The reactive plan names the removable part directly — the trailing run of assistant messages
+      // that neither called a tool nor are a tool result — so the act sits OUTSIDE it by
+      // construction: the tool call and its result stay, and only the sentence nobody read comes
+      // out. The directive stays with them, which is the more faithful history anyway: an event the
+      // agent chose not to answer is exactly what happened (#455, review round 19).
+      kind: "reactive",
+      owner: graphOwner,
+      base,
+    }).catch((err) => {
+      logger.warn(
+        { err, conversationId: String(conversationId) },
+        "agentNudge: could not take back a silent turn's own words",
+      );
+      return null;
+    });
+    if (plan?.action === "remove") {
+      logger.info(
+        "agentNudge took a silent turn's own words back out: conv=%s messages=%d",
+        String(conversationId),
+        plan.ids.length,
+      );
+    } else if (plan) {
+      // NOTE: Named rather than silent, for the reason `refuse` names its own miss: the history still holds
+      // words nobody received, and the next turn will read them.
+      logger.warn(
+        "agentNudge could not take a silent turn's words back out: conv=%s reason=%s",
+        String(conversationId),
+        plan.reason,
+      );
+    }
+  };
+
+  // THE BOUNDARY'S REFUSAL IS NOT A SILENT TURN, and read from here the two are identical: both end
+  // on an empty assistant message. Asked of the RESULT rather than of the fence, because the fence is
+  // the thing that can have changed its mind — `stillWanted` below reads the switch and the mode live, so an
+  // operator who switched the agent off during the model call and back on by now answers yes, and
+  // this turn would advance the ladder and leave its own refusal in shared history (issue #449,
+  // review round 5). Before `drafted`, which is the first line that treats the empty turn as a
+  // result.
+  if (turnWasCalledOff(result.messages)) return refuse(standDown());
+
   // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
   // stray sentinel occurrence from a real reply so it can't leak into the customer message.
-  const replyRaw = lastAssistantText(result.messages);
-  const silent = isNudgeSilent(replyRaw);
-  const reply = silent
-    ? ""
-    : replyRaw.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
+  const drafted = proactiveReply(lastAssistantText(result.messages));
+  const silent = drafted.silent;
+  const reply = drafted.text;
 
   // 5. Re-check ownership at post time (a human may have taken over during model execution). Needed
   // for BOTH the customer message AND the deterministic post-actions. The live-gated path re-probes
@@ -1416,7 +1746,7 @@ export async function runAgentNudge(
   //
   // The later checks answer for later model calls — the guardrail judge's, and the screening inside
   // deliverPromisedLine — not for this one.
-  if (!(await stillWanted())) return refuse("stale");
+  if (!(await stillWanted())) return refuse(standDown());
 
   let canMessagePost: boolean;
   if (handedOff) {
@@ -1428,7 +1758,7 @@ export async function runAgentNudge(
     // check above this block answers for the model call, not for this round trip. Above the
     // `unavailable` return as well, so a retired run reports what it is rather than asking for a
     // retry it must not get.
-    if (!(await stillWanted())) return refuse("stale");
+    if (!(await stillWanted())) return refuse(standDown());
     // Fail closed: nothing has been posted yet, so a probe that could not run costs a retry and
     // nothing else.
     if (owned === "unavailable") return refuse("live-unavailable");
@@ -1459,7 +1789,7 @@ export async function runAgentNudge(
   // just cleared and re-armed the sequence the command ended — and the post-actions below would have
   // relabelled and resolved it on the way out. The transfer itself still stands: the tool ran inside
   // the graph and this fence was never able to reverse it.
-  if (promised === "stale") return refuse("stale");
+  if (promised === "stale") return refuse(standDown());
   if (promised) {
     if (promised !== "silent") markFollowUp(promised);
     await applyPostActions({ canMessage: canMessagePost });
@@ -1472,6 +1802,7 @@ export async function runAgentNudge(
     // Keyed on the TRANSFER, not on the suppression: a conversation the human queue now owns is not
     // ours to close, even when the closing line never made it out.
     await applyPostActions({ canMessage: canMessagePost });
+    await takeBackUndeliveredSilence(drafted.wroteText);
     return "silent";
   }
 
@@ -1569,7 +1900,7 @@ export async function runAgentNudge(
     // ABOVE the suppression branch, for the reason the check outside this block sits above the silent
     // one: suppression posts no message but still fires the post-actions, so a check placed after it
     // guards only the sends and lets the judge's stretch of time reach the labels and the resolve.
-    if (!(await stillWanted())) return refuse("stale");
+    if (!(await stillWanted())) return refuse(standDown());
     if (screened === null) {
       await applyPostActions({ canMessage: canMessagePost });
       return "silent";

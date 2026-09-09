@@ -18,6 +18,7 @@ import {
   parseZproThreadId,
   resolveZproDebounceConfig,
 } from "@/modules/zpro/debounce";
+import { burnSchedulerJobId } from "../../utils/scheduler";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -63,9 +64,11 @@ describe("parseZproThreadId", () => {
 let tenantId = 0n;
 let zproInstanceId = 0n;
 let agentId = 0n;
+let phantomJobId = 0n;
 
 describe.skipIf(!dbUp)("zpro debounce (DB-backed)", () => {
   beforeAll(async () => {
+    phantomJobId = await burnSchedulerJobId(suDb);
     const t = await suDb.tenant.create({
       data: { name: "ZproDebounce", slug: `zpro-debounce-${process.pid}` },
     });
@@ -138,7 +141,7 @@ describe.skipIf(!dbUp)("zpro debounce (DB-backed)", () => {
     payload: Record<string, unknown> = {},
   ): ClaimedJob {
     return {
-      id: 1n,
+      id: phantomJobId,
       tenantId,
       kind: "DEBOUNCE",
       payload: { threadId, ...payload },

@@ -17,6 +17,7 @@ import { doc, errors } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
+import { requireDbId } from "@/lib/db-id";
 import {
   AppError,
   ConflictError,
@@ -137,10 +138,10 @@ export const zproAdminController = new Elysia({
     "/instances",
     async ({ tenantContext }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const tenantId = ctx.tenantId as bigint;
+      // No explicit tenant filter: `runScopedOn` already scopes this read via RLS, the same way
+      // every other tenant-scoped list read in this codebase does.
       const rows = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproInstance.findMany({
-          where: { tenantId },
           select: INSTANCE_SELECT,
           orderBy: { createdAt: "asc" },
         }),
@@ -153,14 +154,18 @@ export const zproAdminController = new Elysia({
         "List Z-PRO instances",
         "Lists all Z-PRO instances for the tenant.",
       ),
-      response: errors(401, 403),
+      response: errors(401, 403, 404),
     },
   )
   .post(
     "/instances",
     async ({ tenantContext, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const tenantId = ctx.tenantId as bigint;
+      // Narrowed here, not cast: this is a fresh row with no prior instance to read a tenantId off
+      // of, and `ctx` is the same context `runScopedOn` verifies below — never a bare id handed to
+      // a different function that would rebuild its own.
+      if (ctx.tenantId === null) throw new TenantTargetRequiredError();
+      const tenantId = ctx.tenantId;
       const row = await runScopedOn(basePrisma, ctx, async (db) => {
         // (tenantId, whatsappId) is unconditionally unique (not partial on disconnectedAt), so a
         // prior soft-disconnected instance at this whatsappId is revived in place instead of
@@ -229,7 +234,7 @@ export const zproAdminController = new Elysia({
         "Create Z-PRO instance",
         "Registers a new Z-PRO instance for the tenant (or revives a matching soft-disconnected one).",
       ),
-      response: errors(400, 401, 403, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .post(
@@ -270,14 +275,14 @@ export const zproAdminController = new Elysia({
         "Probe Z-PRO connection",
         "Tests connectivity and credentials against a Z-PRO instance and lists its available channels. Does not persist anything — used by the add-instance flow to let the operator pick a channel instead of typing whatsappId manually.",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 422),
     },
   )
   .patch(
     "/instances/:id",
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const row = await runScopedOn(basePrisma, ctx, async (db) => {
         const existing = await db.zproInstance.findUnique({
           where: { id },
@@ -339,14 +344,14 @@ export const zproAdminController = new Elysia({
         "Update Z-PRO instance",
         "Updates credentials or name of a Z-PRO instance.",
       ),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .delete(
     "/instances/:id",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       await runScopedOn(basePrisma, ctx, async (db) => {
         const existing = await db.zproInstance.findUnique({
           where: { id },
@@ -385,12 +390,11 @@ export const zproAdminController = new Elysia({
     "/instances/:id/bind",
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const tenantId = ctx.tenantId as bigint;
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const row = await runScopedOn(basePrisma, ctx, async (db) => {
         const instance = await db.zproInstance.findUnique({
           where: { id },
-          select: { id: true, disconnectedAt: true },
+          select: { id: true, disconnectedAt: true, tenantId: true },
         });
         if (!instance) {
           throw new NotFoundError(
@@ -398,9 +402,12 @@ export const zproAdminController = new Elysia({
             "errors.zproInstanceNotFound",
           );
         }
+        // Read off the instance RLS already resolved, never off the request's own context: a
+        // row's id is not a selector.
+        const tenantId = instance.tenantId;
         if (body.agentId === null) {
           await db.zproAgentBinding.deleteMany({
-            where: { zproInstanceId: id, tenantId },
+            where: { zproInstanceId: id },
           });
         } else {
           if (instance.disconnectedAt !== null) {
@@ -410,7 +417,7 @@ export const zproAdminController = new Elysia({
               "errors.zproInstanceDisconnected",
             );
           }
-          const agentId = BigInt(body.agentId);
+          const agentId = requireDbId(body.agentId, "agentId");
           const agent = await db.agent.findUnique({
             where: { id: agentId },
             select: { id: true },
@@ -421,7 +428,7 @@ export const zproAdminController = new Elysia({
           // One agent per instance: replace rather than stack, so exactly one binding exists — the
           // runtime's loadZproAgent picks the first (only) match.
           await db.zproAgentBinding.deleteMany({
-            where: { zproInstanceId: id, tenantId },
+            where: { zproInstanceId: id },
           });
           await db.zproAgentBinding.create({
             data: { tenantId, zproInstanceId: id, agentId },
@@ -448,7 +455,7 @@ export const zproAdminController = new Elysia({
         "Bind agent to Z-PRO instance",
         "Links or unlinks an agent to a Z-PRO instance.",
       ),
-      response: errors(400, 401, 403, 404, 409),
+      response: errors(400, 401, 403, 404, 409, 422),
     },
   )
   .get(
@@ -473,7 +480,7 @@ export const zproAdminController = new Elysia({
     "/queues/:agentId",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const agentId = BigInt(params.agentId);
+      const agentId = requireDbId(params.agentId, "agentId");
       return runScopedOn(basePrisma, ctx, async (db) => {
         const bindings = await db.zproAgentBinding.findMany({
           where: { agentId },
@@ -515,7 +522,7 @@ export const zproAdminController = new Elysia({
         "List Z-PRO queues",
         "Read live queues from the Z-PRO instance an agent is bound to (for handoff/route-to-queue targeting).",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
     },
   )
   // Live tags for the follow-up step's "assign label" picker — Z-PRO's counterpart to
@@ -527,7 +534,7 @@ export const zproAdminController = new Elysia({
     "/tags/:agentId",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const agentId = BigInt(params.agentId);
+      const agentId = requireDbId(params.agentId, "agentId");
       return runScopedOn(basePrisma, ctx, async (db) => {
         const bindings = await db.zproAgentBinding.findMany({
           where: { agentId },
@@ -569,6 +576,6 @@ export const zproAdminController = new Elysia({
         "List Z-PRO tags",
         "Read live tags from the Z-PRO instance an agent is bound to (for the follow-up label picker).",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
     },
   );

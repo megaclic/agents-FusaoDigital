@@ -53,6 +53,13 @@ const cases: Array<{
     live: true,
   },
   {
+    // Nothing else here excludes a third mode: without this arm a monitoring agent with follow-up
+    // switched on chases the customer it is forbidden to answer (issue #209).
+    name: "a monitoring agent, whatever the conversation says",
+    patch: { agentMode: "monitoring", testActivatedAt: new Date() },
+    live: false,
+  },
+  {
     name: "a human took the conversation",
     patch: { assigneeType: "User" },
     live: false,
@@ -127,7 +134,10 @@ describe('mirrorHolder: "not-asked" — who may say it', () => {
     for (const entry of readdirSync(dir)) {
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-      else if (full.endsWith(".ts") || full.endsWith(".tsx")) out.push(full);
+      // node:path's `join` uses OS-native separators (backslash on Windows); normalized here so
+      // the result matches the forward-slash literal this file's assertion expects.
+      else if (full.endsWith(".ts") || full.endsWith(".tsx"))
+        out.push(full.replaceAll("\\", "/"));
     }
     return out;
   }

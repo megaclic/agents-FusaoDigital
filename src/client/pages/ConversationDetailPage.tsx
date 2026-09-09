@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Clock,
   ExternalLink,
+  Eye,
   Lock,
   Megaphone,
   Paperclip,
@@ -41,6 +42,7 @@ import {
   Button,
   Card,
   DataBoundary,
+  HelpPopover,
   Markdown,
   MediaAudio,
   MediaImage,
@@ -52,6 +54,7 @@ import {
   Tooltip,
   useToast,
 } from "@/client/components";
+import { MonitoringBadge } from "@/client/components/MonitoringBadge";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
@@ -1498,6 +1501,18 @@ export function ConversationDetailPage() {
           t("conversation.reengage.posted", "The AI replied."),
           "success",
         );
+      } else if (data.outcome === "posted-partial") {
+        // NOT the `noReply` fallback it used to land in (issue #429). Part of the answer IS with the
+        // customer, and telling the operator nothing was sent invites them to re-engage again — which
+        // re-runs the turn and sends that part a second time. Warning, not success: the reply came
+        // out short and the conversation carries the badge saying so.
+        showToast(
+          t(
+            "conversation.reengage.postedPartial",
+            "The AI replied, but part of the answer did not reach the customer.",
+          ),
+          "warning",
+        );
       } else if (data.outcome === "gate-closed") {
         showToast(
           t(
@@ -1518,7 +1533,7 @@ export function ConversationDetailPage() {
         showToast(
           t(
             "conversation.reengage.overCeiling",
-            "This month's token ceiling has been reached, so the AI did not reply. Raise it in Settings or wait for the next month.",
+            "This month's spend ceiling has been reached, so the AI did not reply. Raise it in Settings or wait for the next month.",
           ),
           "warning",
         );
@@ -1552,6 +1567,98 @@ export function ConversationDetailPage() {
   // places that genuinely mean a person (the header's assignee line).
   const heldByOther = conv?.heldByAnotherParty === true;
   const isHuman = conv?.assigneeType === "User";
+  // Whether anything ANSWERS this inbox (issue #495): a responder bound, switched on, and not in
+  // monitoring mode. The three actions that hand the conversation to the AI — return, reopen (the
+  // same operation on a resolved one) and respond now — are offered only then. Without one, the
+  // server refuses the return (409) and the reengage (`no-agent`); offering the button first just
+  // parked the conversation pending with nobody on it, on an inbox an observer only watches.
+  // ...AND A BOT TO ANSWER WITH (issue #495 review, round 2). A binding is not an identity: with the
+  // `ChatwootAgentBot` row gone — an instance reconnected, the bot deleted upstream, the reconcile
+  // not run — the server refuses the return with a 409 and the re-engage cannot load the agent, so
+  // offering either just hands the operator a button that fails.
+  const responderAnswers =
+    conv?.agentId != null &&
+    conv.agentEnabled === true &&
+    conv.agentHasBot === true &&
+    conv.agentMode !== "monitoring" &&
+    // NOTE: ...and a `test` agent answers only where `/teste` activated it (issue #495 review,
+    // round 11). The server refuses the hand-back for an unactivated one with
+    // `errors.returnAgentTestSilent`, so offering the button is offering a 409. `testActivatedAt`
+    // here is already the EPISODE's answer (issue #261) rather than this row's stamp, which is the
+    // same question the server asks, so a conversation activated through its redirect sibling keeps
+    // the button.
+    (conv.agentMode !== "test" || conv.testActivatedAt != null);
+  // WHY the actions are missing, in the operator's words (issue #495 review, round 13). Hiding them
+  // on its own is the half that leaves somebody looking for a button that is not there, with no way
+  // to tell a deliberate rule from a bug — and this predicate reads the MIRROR, so on the one
+  // conversation where it is wrong the operator had nothing at all to go on. Derived from fields the
+  // detail already carries, so it costs no call; a null here is either "everything is fine" or "no
+  // agent is bound", which the panel above already says on its own.
+  // TWO STRINGS, NOT ONE (issue #494 manual test): a `label` short enough to sit in the action row
+  // beside the buttons it replaces, and the sentence that says what to DO about it, behind the row's
+  // `?`. One sentence inline was the first shape and it broke the layout — the row is a flex line of
+  // buttons, and a hundred-and-twenty-character sentence dropped into it wraps and pushes the
+  // navigation around. docs/ui.md is right that a detected misconfiguration belongs on screen rather
+  // than behind an affordance; what belongs there is the CONDITION, which is three words, and not
+  // the remediation, which is a sentence.
+  //
+  // NO RESPONDER AT ALL is the FIRST case, not the excluded one (issue #495 review, round 16).
+  // Round 13 left it out saying the panel above already says it, and the panel does not: with no
+  // assignee it prints the generic "AI" label, which claims an answerer this inbox does not have,
+  // and with a person on it it prints their name and the inbox. Either way the three actions vanish
+  // with nothing on screen naming the cause, which is the very state the server refuses by name
+  // (`errors.returnNoResponder`).
+  const noResponder: { label: string; detail: string } | null =
+    conv == null || responderAnswers
+      ? null
+      : conv.agentId == null
+        ? {
+            label: t("conversation.responderNoneShort", "No agent bound"),
+            detail: t(
+              "conversation.responderNone",
+              "No agent is bound to this inbox, so the conversation cannot be handed back to one.",
+            ),
+          }
+        : conv.agentEnabled !== true
+          ? {
+              label: t("conversation.responderOffShort", "Agent switched off"),
+              detail: t(
+                "conversation.responderOff",
+                "This inbox's agent is switched off, so the conversation cannot be handed back to it.",
+              ),
+            }
+          : conv.agentMode === "monitoring"
+            ? {
+                label: t(
+                  "conversation.responderObservesShort",
+                  "Agent only observes",
+                ),
+                detail: t(
+                  "conversation.responderObserves",
+                  "This inbox's agent only observes; it does not answer, so the conversation cannot be handed back to it.",
+                ),
+              }
+            : conv.agentHasBot !== true
+              ? {
+                  label: t(
+                    "conversation.responderNoBotShort",
+                    "Agent has no bot",
+                  ),
+                  detail: t(
+                    "conversation.responderNoBot",
+                    "This inbox's agent has no bot on this Chatwoot; reconnect the instance before handing the conversation back.",
+                  ),
+                }
+              : {
+                  label: t(
+                    "conversation.responderTestSilentShort",
+                    "Agent not activated here",
+                  ),
+                  detail: t(
+                    "conversation.responderTestSilent",
+                    "This inbox's agent is in test mode and was not activated on this conversation, so it would answer nothing.",
+                  ),
+                };
   // Deep link to this conversation in the operator's Chatwoot (build from the instance origin/account).
   const chatwootUrl = conv
     ? `${conv.chatwootBaseUrl}/app/accounts/${conv.accountId}/conversations/${conv.chatwootConversationId}`
@@ -1601,6 +1708,7 @@ export function ConversationDetailPage() {
                         state={conv.testActivatedAt ? "active" : "waiting"}
                       />
                     )}
+                    {conv.agentMode === "monitoring" && <MonitoringBadge />}
                     {conv.outOfHours && <OutOfHoursBadge />}
                   </div>
                   <p className="mt-0.5 flex items-center gap-1.5 text-sm text-text-muted">
@@ -1622,6 +1730,26 @@ export function ConversationDetailPage() {
                       </>
                     )}
                     {conv.inbox?.name ? ` · ${conv.inbox.name}` : ""}
+                    {conv.observers.length > 0 ? (
+                      <span className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[11px] text-text-secondary">
+                        <Eye className="h-3 w-3" aria-hidden="true" />
+                        {t("conversations.observedByLabel", "Observed by")}
+                        {/* Each observer is a link to its own page (issue #494): the badge was the
+                            only place the watcher acting on this conversation was named, and it
+                            led nowhere. */}
+                        {conv.observers.map((o, i) => (
+                          <span key={o.id}>
+                            {i > 0 ? ", " : null}
+                            <Link
+                              to={`/agents/${o.id}/general?from=/conversations/${id}`}
+                              className="underline-offset-2 hover:underline"
+                            >
+                              {o.name}
+                            </Link>
+                          </span>
+                        ))}
+                      </span>
+                    ) : null}
                     {!isHuman && conv.agentModel ? (
                       <span className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
                         {conv.agentModel}
@@ -1708,7 +1836,16 @@ export function ConversationDetailPage() {
                       {t("conversation.handoff", "Handoff to human")}
                     </Button>
                   )}
-                  {conv.status === "resolved" && (
+                  {noResponder !== null && (
+                    <span className="inline-flex items-center gap-1 text-text-muted text-xs">
+                      {noResponder.label}
+                      <HelpPopover
+                        content={noResponder.detail}
+                        label={noResponder.label}
+                      />
+                    </span>
+                  )}
+                  {conv.status === "resolved" && responderAnswers && (
                     <Button
                       variant="secondary"
                       size="sm"
@@ -1728,6 +1865,7 @@ export function ConversationDetailPage() {
                       differently labelled buttons for one action. Reopen is the right label for a
                       closed conversation whoever holds it, so it keeps that state alone. */}
                   {conv.status !== "resolved" &&
+                    responderAnswers &&
                     (heldByOther || conv.status !== "pending") && (
                       <Button
                         variant="secondary"
@@ -1745,7 +1883,8 @@ export function ConversationDetailPage() {
                     )}
                   {offerReengage &&
                     conv.status === "pending" &&
-                    !heldByOther && (
+                    !heldByOther &&
+                    responderAnswers && (
                       <Button
                         variant="primary"
                         size="sm"
@@ -1804,6 +1943,25 @@ export function ConversationDetailPage() {
                       {t("conversation.configureAgent", "Configure agent")}
                     </Link>
                   )}
+                  {/* With no responder, the observer is the only agent acting on this conversation,
+                      and the page offered no way to reach it (issue #494). */}
+                  {!conv.agentId &&
+                    conv.observers.map((o) => (
+                      <Link
+                        key={o.id}
+                        to={`/agents/${o.id}/general?from=/conversations/${id}`}
+                        className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-sm text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                      >
+                        <Settings className="h-4 w-4" aria-hidden="true" />
+                        {t(
+                          "conversation.configureObserver",
+                          "Configure {{name}}",
+                          {
+                            name: o.name,
+                          },
+                        )}
+                      </Link>
+                    ))}
                 </div>
               </div>
             </Card>
@@ -1827,15 +1985,20 @@ export function ConversationDetailPage() {
                     </p>
                   </div>
                 </div>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={busy}
-                  onClick={reengage}
-                >
-                  <RotateCcw className="h-4 w-4" aria-hidden="true" />
-                  {t("conversation.reengage.action", "Re-engage")}
-                </Button>
+                {/* Gated like the other two (issue #495 review, round 1): this button calls the
+                    same endpoint, which answers `no-agent` on an inbox nothing answers, and a
+                    conversation keeps its `lastError` long after its responder was unbound. */}
+                {responderAnswers && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={busy}
+                    onClick={reengage}
+                  >
+                    <RotateCcw className="h-4 w-4" aria-hidden="true" />
+                    {t("conversation.reengage.action", "Re-engage")}
+                  </Button>
+                )}
               </Card>
             )}
 

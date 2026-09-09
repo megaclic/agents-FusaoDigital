@@ -81,7 +81,10 @@ function tsFiles(dir: string): string[] {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) out.push(...tsFiles(p));
-    else if (e.name.endsWith(".ts") || e.name.endsWith(".tsx")) out.push(p);
+    // node:path's `join` uses OS-native separators (backslash on Windows); normalized here so
+    // the result matches the forward-slash literal OWNER is written with.
+    else if (e.name.endsWith(".ts") || e.name.endsWith(".tsx"))
+      out.push(p.replaceAll("\\", "/"));
   }
   return out;
 }

@@ -16,6 +16,7 @@ import {
 import { parseDbId } from "@/lib/db-id";
 import type { ScopedDb, TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
+import { isMonitoring } from "@/modules/agents/mode";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
   readToolPreconditions,
@@ -89,7 +90,7 @@ import { llmNormalizeForSpeech } from "@/modules/tts/normalize";
 import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 import { readTtsConfig, type TtsConfig } from "@/modules/tts/settings";
 import { resolveInjectableCredential } from "@/modules/vault/injectable";
-import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { chatwootThreadId, getCheckpointer } from "./checkpointer";
 import {
   type FallbackConfig,
@@ -121,11 +122,13 @@ import { type AuditedSection, buildPromptAudit } from "./prompt-audit";
 import { DEFAULT_TIMEZONE, zonedWallClockToInstant } from "./time";
 import {
   buildHttpTools,
+  type LoadedCodeToolDef,
   type LoadedHttpToolDef,
   loadToolSelections,
   type RagConfig,
 } from "./tools/assemble";
-import type { NativeToolName } from "./tools/catalog";
+import { NATIVE_TOOL_NAMES, type NativeToolName } from "./tools/catalog";
+import { buildCodeTools } from "./tools/code";
 import { buildDocumentTools, type DocumentSelection } from "./tools/documents";
 import {
   buildMcpContextSection,
@@ -197,6 +200,8 @@ export interface AgentConfig {
   transferWithSummary: boolean;
   nativeToolsAllow?: string[];
   httpToolDefs: LoadedHttpToolDef[];
+  // Operator-authored code tools granted to this agent (issue #363).
+  codeToolDefs: LoadedCodeToolDef[];
   mcpSelections: McpSelection[];
   integrationSelections: IntegrationSelection[];
   documentSelections: DocumentSelection[];
@@ -333,6 +338,10 @@ export async function loadAgentConfig(
   args: LoadAgentArgs,
   opts: {
     ignoreDisabled?: boolean;
+    // The caller never speaks to the customer (memory compaction summarizes a closed attendance), so
+    // a monitoring agent's config may load for it. Distinct from `ignoreDisabled`: a switched-off
+    // agent is a deliberate operator state that the same callers keep honouring.
+    ignoreMode?: boolean;
     overrides?: AgentConfigOverrides;
     // Skips the A/B variant resolution. Resolving one is not a read: it INSERTS the thread's
     // assignment when there is none, and that row lands in the denominator of every result for the
@@ -350,6 +359,7 @@ export async function loadAgentConfig(
       systemPrompt: true,
       modelConfig: true,
       enabled: true,
+      mode: true,
       transferWithSummary: true,
       settings: true,
       businessHoursId: true,
@@ -358,6 +368,14 @@ export async function loadAgentConfig(
   if (!agent) return null;
   // The `enabled` toggle gates production auto-replies; the playground tests config regardless.
   if (!agent.enabled && !opts.ignoreDisabled) return null;
+  // A monitoring agent never answers, and this is the seam that guarantees it (issue #209): every
+  // caller that posts to the customer — the reactive turn, the guardrail's replacement, the nudges,
+  // the slow-tool ack — loads its config here first, so refusing here is refusing them all. The
+  // playground still loads it (`ignoreDisabled`, an operator talking to the agent in a fenced
+  // thread), and so does a caller that says it never speaks (`ignoreMode`).
+  if (isMonitoring(agent.mode) && !opts.ignoreDisabled && !opts.ignoreMode) {
+    return null;
+  }
   // Live override (playground): effective prompt/model/settings come from the draft when present;
   // everything else (grants, ids, tenant) stays as saved. The secret is still resolved from the
   // vault by credentialRef below — the draft never carries it.
@@ -368,15 +386,23 @@ export async function loadAgentConfig(
   let apiKey = "";
   let credentialBaseUrl: string | null = null;
   if (mc.credentialRef) {
-    const entry = await tryResolveVaultEntry<string>(db, mc.credentialRef);
-    if (!entry) {
+    const entry = await tryResolveApiKeyEntry(db, mc.credentialRef);
+    if (entry.state !== "ok") {
       // A credentialRef that no longer resolves (deleted / still-pending / a NAME passed where a
       // vault:<id> ref is required) otherwise makes the agent go silent with no trace — the turn just
       // returns null. Log it so the silent no-reply is diagnosable.
+      //
+      // `unusable` is the same silence for a different reason and gets its own sentence: the entry is
+      // there and filled, and its KIND cannot be an API key (a `google_oauth` pair, a managed blob, a
+      // secret the catalog says never leaves). Told apart because the fix is not the same — one is
+      // "fill or re-pick this credential", the other is "this credential belongs on another field".
       logger.warn(
-        "agent %s: model credentialRef %s did not resolve — the agent cannot reply until it is fixed",
+        entry.state === "unusable"
+          ? "agent %s: model credentialRef %s resolves to a %s credential, which cannot be used as an API key — the agent cannot reply until it is fixed"
+          : "agent %s: model credentialRef %s did not resolve — the agent cannot reply until it is fixed",
         String(args.agentId),
         mc.credentialRef,
+        entry.state === "unusable" ? entry.kind : "",
       );
       return null;
     }
@@ -390,18 +416,18 @@ export async function loadAgentConfig(
   let guardrailsApiKey = "";
   let guardrailsCredentialBaseUrl: string | null = null;
   if (guardrails.enabled && guardrails.credentialRef) {
-    const gEntry = await tryResolveVaultEntry<string>(
-      db,
-      guardrails.credentialRef,
-    );
-    if (gEntry) {
+    const gEntry = await tryResolveApiKeyEntry(db, guardrails.credentialRef);
+    if (gEntry.state === "ok") {
       guardrailsApiKey = gEntry.secret;
       guardrailsCredentialBaseUrl = gEntry.baseUrl;
     } else {
       logger.warn(
-        "agent %s: guardrails credentialRef %s did not resolve — guardrails analysis is skipped",
+        gEntry.state === "unusable"
+          ? "agent %s: guardrails credentialRef %s resolves to a %s credential, which cannot be used as an API key — guardrails analysis is skipped"
+          : "agent %s: guardrails credentialRef %s did not resolve — guardrails analysis is skipped",
         String(args.agentId),
         guardrails.credentialRef,
+        gEntry.state === "unusable" ? gEntry.kind : "",
       );
     }
   }
@@ -413,18 +439,21 @@ export async function loadAgentConfig(
   let ttsNormalizeApiKey = "";
   let ttsNormalizeCredentialBaseUrl: string | null = null;
   if (ttsCfg.normalize && ttsCfg.normalizeCredentialRef) {
-    const nEntry = await tryResolveVaultEntry<string>(
+    const nEntry = await tryResolveApiKeyEntry(
       db,
       ttsCfg.normalizeCredentialRef,
     );
-    if (nEntry) {
+    if (nEntry.state === "ok") {
       ttsNormalizeApiKey = nEntry.secret;
       ttsNormalizeCredentialBaseUrl = nEntry.baseUrl;
     } else {
       logger.warn(
-        "agent %s: tts normalize credentialRef %s did not resolve, so the speech rewrite is skipped",
+        nEntry.state === "unusable"
+          ? "agent %s: tts normalize credentialRef %s resolves to a %s credential, which cannot be used as an API key, so the speech rewrite is skipped"
+          : "agent %s: tts normalize credentialRef %s did not resolve, so the speech rewrite is skipped",
         String(args.agentId),
         ttsCfg.normalizeCredentialRef,
+        nEntry.state === "unusable" ? nEntry.kind : "",
       );
     }
   }
@@ -436,18 +465,18 @@ export async function loadAgentConfig(
   let modelFallbackApiKey = "";
   let modelFallbackCredentialBaseUrl: string | null = null;
   if (hasModelFallback(fallbackCfg) && fallbackCfg.credentialRef) {
-    const fEntry = await tryResolveVaultEntry<string>(
-      db,
-      fallbackCfg.credentialRef,
-    );
-    if (fEntry) {
+    const fEntry = await tryResolveApiKeyEntry(db, fallbackCfg.credentialRef);
+    if (fEntry.state === "ok") {
       modelFallbackApiKey = fEntry.secret;
       modelFallbackCredentialBaseUrl = fEntry.baseUrl;
     } else {
       logger.warn(
-        "agent %s: model fallback credentialRef %s did not resolve, so there is nothing behind the provider",
+        fEntry.state === "unusable"
+          ? "agent %s: model fallback credentialRef %s resolves to a %s credential, which cannot be used as an API key, so there is nothing behind the provider"
+          : "agent %s: model fallback credentialRef %s did not resolve, so there is nothing behind the provider",
         String(args.agentId),
         fallbackCfg.credentialRef,
+        fEntry.state === "unusable" ? fEntry.kind : "",
       );
     }
   }
@@ -460,18 +489,18 @@ export async function loadAgentConfig(
   let memoryCompactionApiKey = "";
   let memoryCompactionCredentialBaseUrl: string | null = null;
   if (memoryCfg.enabled && memoryCfg.credentialRef) {
-    const mEntry = await tryResolveVaultEntry<string>(
-      db,
-      memoryCfg.credentialRef,
-    );
-    if (mEntry) {
+    const mEntry = await tryResolveApiKeyEntry(db, memoryCfg.credentialRef);
+    if (mEntry.state === "ok") {
       memoryCompactionApiKey = mEntry.secret;
       memoryCompactionCredentialBaseUrl = mEntry.baseUrl;
     } else {
       logger.warn(
-        "agent %s: memory compaction credentialRef %s did not resolve, so the attendance summary is not written",
+        mEntry.state === "unusable"
+          ? "agent %s: memory compaction credentialRef %s resolves to a %s credential, which cannot be used as an API key, so the attendance summary is not written"
+          : "agent %s: memory compaction credentialRef %s did not resolve, so the attendance summary is not written",
         String(args.agentId),
         memoryCfg.credentialRef,
+        mEntry.state === "unusable" ? mEntry.kind : "",
       );
     }
   }
@@ -753,6 +782,7 @@ export async function loadAgentConfig(
     transferWithSummary: agent.transferWithSummary,
     nativeToolsAllow: sel.nativeToolsAllow,
     httpToolDefs: sel.httpToolDefs,
+    codeToolDefs: sel.codeToolDefs,
     mcpSelections: sel.mcpSelections,
     integrationSelections: sel.integrationSelections,
     documentSelections: sel.documentSelections,
@@ -812,6 +842,11 @@ export interface ToolsetCtx {
   client: ChatwootClient;
   conversationId: number;
   threadId: string;
+  // The caller's send fence, for the one customer-facing write a tool makes on its own: the
+  // slow-tool ack, whose send is a wait the graph's own ask at the tool boundary sits before
+  // (issue #209 review, round 10). Asked after that send, before the typing indicator and before
+  // the tool runs; absent, both proceed.
+  stillWanted?: () => Promise<boolean>;
   // The conversation's status as this turn observed it, before any close of ours. Feeds the
   // IMMEDIATE resolve_conversation path (nudge turns, which carry no turnState): a close that had
   // already happened when the turn started is not the agent's. See record-resolution.ts rule 2.
@@ -968,11 +1003,23 @@ export async function buildToolset(
   // indicator) before the tool runs. Wired ONLY on a real conversation (conversationId > 0) — the
   // playground builds its toolset with conversationId 0 and a dummy client, so acks never fire
   // there. Best-effort: any failure is swallowed so it can never block the actual tool call.
+  //
+  // Answers whether the tool may still RUN. The ack's send is a wait of its own, after the graph's
+  // ask at the tool boundary, and a run called off inside it — the operator's flip to monitoring
+  // (issue #209 review, round 10) — must show no typing indicator and make no request after it.
+  // Only an explicit `false` stops the tool; a fence that could not answer is not a withdrawal.
   const emitAck =
     ctx.conversationId > 0
-      ? async (message: string) => {
+      ? async (message: string): Promise<boolean> => {
           try {
             await ctx.client.sendMessage(ctx.conversationId, message);
+            if (ctx.stillWanted && !(await ctx.stillWanted())) {
+              logger.info(
+                "tool ack: the run was called off after the acknowledgement (conv=%s); the tool will not run",
+                String(ctx.conversationId),
+              );
+              return false;
+            }
             await ctx.client.toggleTyping(ctx.conversationId, true);
           } catch (e) {
             logger.warn(
@@ -981,6 +1028,7 @@ export async function buildToolset(
               e instanceof Error ? e.message : String(e),
             );
           }
+          return true;
         }
       : undefined;
   const mcpTools = await loadMcpToolsForAgent(ctx.tenantId, cfg.mcpSelections, {
@@ -1118,91 +1166,116 @@ export async function buildToolset(
   }
   // The order below IS the precedence when two sources claim one name — see unique-names.ts. Native
   // first, because those are the tools the operator cannot rename.
-  const { tools, dropped } = dropDuplicateToolNames([
-    ...deps.buildNativeTools(
-      {
-        client: ctx.client,
-        conversationId: ctx.conversationId,
-        turnState: ctx.turnState,
-        handoffState: ctx.handoffState,
-        transferWithSummary: cfg.transferWithSummary,
-        handoff: effectiveHandoff,
-        handoffTargets,
-        tenantId: ctx.tenantId,
-        base: ctx.base,
-        contactDbId: cfg.contactDbId,
-        conversationDbId: cfg.conversationDbId,
-        observed: ctx.observed,
-        contactVoiceReply: cfg.contactVoiceReply,
-        timezone: cfg.timezone,
-        vocab,
-        kanban,
-        sendImage: cfg.sendImageConfig,
-        fetchImpl: ctx.imageDeps?.fetchImpl,
-        assertSafe: ctx.imageDeps?.assertSafe,
-        toolInstructions,
-        onSideEffectError,
-        threadId: ctx.threadId,
-      },
-      cfg.nativeToolsAllow,
-    ),
-    ...buildDocumentTools(cfg.documentSelections, {
-      tenantId: ctx.tenantId,
+  const nativeTools = deps.buildNativeTools(
+    {
+      client: ctx.client,
+      conversationId: ctx.conversationId,
       turnState: ctx.turnState,
-      // The document is bound to the conversation by its THREAD key, never by the conversation id
-      // alone: that id only identifies a conversation within one Chatwoot account, and a tenant can
-      // have several. Absent off a real conversation, and the document is then issued unbound.
-      threadId: apptThreadId ?? undefined,
-      chatwootInstanceId: ctx.conversationId > 0 ? ctx.instanceId : null,
-      conversationDbId: cfg.conversationDbId,
+      handoffState: ctx.handoffState,
+      transferWithSummary: cfg.transferWithSummary,
+      handoff: effectiveHandoff,
+      handoffTargets,
+      tenantId: ctx.tenantId,
       base: ctx.base,
-      storageDir: ctx.documentsStorageDir,
-      // The same zone the agent tells the time in, so a document's date and a message saying "hoje"
-      // cannot disagree by a day.
+      contactDbId: cfg.contactDbId,
+      conversationDbId: cfg.conversationDbId,
+      observed: ctx.observed,
+      contactVoiceReply: cfg.contactVoiceReply,
       timezone: cfg.timezone,
-      simulate: deps.simulateDocuments,
-    }),
-    ...buildHttpTools(cfg.httpToolDefs, {
-      resolveCredential,
-      emitAck,
-      // HTTP tools are https-only unless allowHttp. In dev (where SSRF_ALLOW_PRIVATE_TARGETS is on by
-      // default) operators legitimately point tools at local http services (see .env.example); prod
-      // keeps the flag false → https-only. Ties the two so a local HTTP tool works without extra config.
-      allowHttp: config.ssrf.allowPrivateTargets,
-      context: {
-        ...(ctx.conversationId > 0
-          ? { conversation_id: String(ctx.conversationId) }
-          : {}),
-        ...(ctx.messageId && ctx.messageId > 0
-          ? { message_id: String(ctx.messageId) }
-          : {}),
-        ...cfg.httpToolContext,
-      },
-      // The zone an offset-less start from a declared response is read in. Same value the documents
-      // tool gets, and for the same reason: two readers of the operator's own wall clock must not
-      // disagree by three hours.
-      timezone: cfg.timezone,
-      // The same two closures the toolpacks get, for a tool whose DEFINITION declares that its
-      // response describes an appointment (issue #352). Wired identically: undefined on the
-      // playground, where nothing is recorded, and the declaration then simply does nothing.
-      appointmentBooked: appointmentBookedFn,
-      cancelAppointment: cancelAppointmentFn,
+      vocab,
+      kanban,
+      sendImage: cfg.sendImageConfig,
+      fetchImpl: ctx.imageDeps?.fetchImpl,
+      assertSafe: ctx.imageDeps?.assertSafe,
+      toolInstructions,
       onSideEffectError,
-    }),
-    ...mcpTools,
-    ...toolpackTools,
-    ...buildRagTools(
-      {
+      // Needed by `schedule_message` (arms a SCHEDULED_MESSAGE SchedulerJob) to key the job's thread.
+      threadId: ctx.threadId,
+    },
+    cfg.nativeToolsAllow,
+  );
+  // The names no other source may answer under, which is every native name this agent did NOT build:
+  // the ones it did are already first in the list and win by order. See unique-names.ts for why the
+  // reservation cannot be left to ordering alone.
+  const builtNativeNames = new Set(nativeTools.map((t) => t.name));
+  // The conversation variables an HTTP tool's {{context}} placeholders read and a code tool's
+  // `context` argument carries: one object, so the two kinds cannot disagree about a name.
+  const turnContext = {
+    ...(ctx.conversationId > 0
+      ? { conversation_id: String(ctx.conversationId) }
+      : {}),
+    ...(ctx.messageId && ctx.messageId > 0
+      ? { message_id: String(ctx.messageId) }
+      : {}),
+    ...cfg.httpToolContext,
+  };
+  const { tools, dropped } = dropDuplicateToolNames(
+    [
+      ...nativeTools,
+      ...buildDocumentTools(cfg.documentSelections, {
         tenantId: ctx.tenantId,
+        turnState: ctx.turnState,
+        // The document is bound to the conversation by its THREAD key, never by the conversation id
+        // alone: that id only identifies a conversation within one Chatwoot account, and a tenant can
+        // have several. Absent off a real conversation, and the document is then issued unbound.
+        threadId: apptThreadId ?? undefined,
+        chatwootInstanceId: ctx.conversationId > 0 ? ctx.instanceId : null,
+        conversationDbId: cfg.conversationDbId,
         base: ctx.base,
-        knowledgeBaseIds: cfg.ragConfig?.knowledgeBaseIds ?? [],
-        knowledgeBases: cfg.ragConfig?.knowledgeBases,
-        threadId: ctx.threadId,
-        maxDistance: cfg.ragConfig?.maxDistance,
-      },
-      cfg.ragConfig?.tools,
-    ),
-  ]);
+        storageDir: ctx.documentsStorageDir,
+        // The same zone the agent tells the time in, so a document's date and a message saying "hoje"
+        // cannot disagree by a day.
+        timezone: cfg.timezone,
+        simulate: deps.simulateDocuments,
+      }),
+      ...buildHttpTools(cfg.httpToolDefs, {
+        resolveCredential,
+        emitAck,
+        // HTTP tools are https-only unless allowHttp. In dev (where SSRF_ALLOW_PRIVATE_TARGETS is on by
+        // default) operators legitimately point tools at local http services (see .env.example); prod
+        // keeps the flag false → https-only. Ties the two so a local HTTP tool works without extra config.
+        allowHttp: config.ssrf.allowPrivateTargets,
+        context: turnContext,
+        // The zone an offset-less start from a declared response is read in. Same value the documents
+        // tool gets, and for the same reason: two readers of the operator's own wall clock must not
+        // disagree by three hours.
+        timezone: cfg.timezone,
+        // The same two closures the toolpacks get, for a tool whose DEFINITION declares that its
+        // response describes an appointment (issue #352). Wired identically: undefined on the
+        // playground, where nothing is recorded, and the declaration then simply does nothing.
+        appointmentBooked: appointmentBookedFn,
+        cancelAppointment: cancelAppointmentFn,
+        onSideEffectError,
+      }),
+      ...buildCodeTools(cfg.codeToolDefs, {
+        timezone: cfg.timezone,
+        context: turnContext,
+        // The two attribute bags, read when the tool is CALLED, through the same loader a
+        // precondition uses (tool-preconditions.ts is the one vocabulary for both). Off a real
+        // conversation the ids are null and the bags come back empty.
+        loadState: preconditionStateLoader({
+          base: ctx.base,
+          tenantId: ctx.tenantId,
+          conversationDbId: cfg.conversationDbId ?? null,
+          contactDbId: cfg.contactDbId ?? null,
+        }),
+      }),
+      ...mcpTools,
+      ...toolpackTools,
+      ...buildRagTools(
+        {
+          tenantId: ctx.tenantId,
+          base: ctx.base,
+          knowledgeBaseIds: cfg.ragConfig?.knowledgeBaseIds ?? [],
+          knowledgeBases: cfg.ragConfig?.knowledgeBases,
+          threadId: ctx.threadId,
+          maxDistance: cfg.ragConfig?.maxDistance,
+        },
+        cfg.ragConfig?.tools,
+      ),
+    ],
+    NATIVE_TOOL_NAMES.filter((n) => !builtNativeNames.has(n)),
+  );
   // NOTE: The precondition seam, and the reason the whole feature is six lines: every source's tools have
   // already been merged into ONE name-unique list above, so a map keyed by name reaches native,
   // document, HTTP, MCP, toolpack and RAG at once. An agent with no preconditions gets the same
@@ -1472,6 +1545,11 @@ export interface GraphBuildDeps {
     model: string;
     reason: string;
   }) => void;
+  // The caller's own "is this run still wanted", carried down to the graph's TOOL BOUNDARY, which is
+  // the one seam inside the invoke (issue #449). The reactive turn and the nudge both pass one; the
+  // playground passes none and the tool node is then exactly what it was. No `strict`: the graph
+  // states why.
+  stillWanted?: () => Promise<boolean>;
   // WHICH FALLBACK could not be built, carried and NOT optional, for the reason the other three
   // fallback events carry it: the line is written by handlers whose only other labels are the
   // PRIMARY's, so a `reason` on its own gets published under the name of the model that is working.
@@ -1498,7 +1576,7 @@ export interface GraphBuildDeps {
 //   * named but unrunnable — `resolveModelOverride` refused the destination (unknown provider, a key
 //                            that belongs to another vendor, an endpoint that would be dropped);
 //   * named with a credential that did not resolve — the ref is stale or was deleted.
-function buildFallbackModel(
+export function buildFallbackModel(
   cfg: AgentConfig,
   makeModel: (mc: ResolvedModelConfig) => BaseChatModel,
   deps: GraphBuildDeps,
@@ -1615,5 +1693,6 @@ export async function buildModelAndGraph(
     onModelFallbackFailed: deps.onModelFallbackFailed,
     maxHistoryTokens: cfg.maxHistoryTokens,
     onHistoryTrim: deps.onHistoryTrim,
+    stillWanted: deps.stillWanted,
   });
 }

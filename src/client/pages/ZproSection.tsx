@@ -480,7 +480,8 @@ export function ZproSection() {
       .bind.post({ agentId });
     if (err) {
       showToast(
-        apiErrorMessage(err) || t("zpro.bindError", "Could not bind the agent."),
+        apiErrorMessage(err) ||
+          t("zpro.bindError", "Could not bind the agent."),
         "error",
       );
       throw err;

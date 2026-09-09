@@ -1,6 +1,7 @@
 import { forwardRef, useId } from "react";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/client/lib/utils";
+import { mergeDescribedBy, useFormField } from "./FormFieldContext";
 
 type TextareaProps = React.TextareaHTMLAttributes<HTMLTextAreaElement> & {
   error?: boolean;
@@ -26,6 +27,7 @@ const COUNTER_FROM = 0.8;
 export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
   ({ className, error, errorMessage, helperText, rows = 5, ...props }, ref) => {
     const { t } = useTranslation();
+    const field = useFormField();
     const max = typeof props.maxLength === "number" ? props.maxLength : null;
     // Raw length: the same thing the browser enforces `maxLength` against, and the same thing the
     // write boundary refuses on (see modules/agents/text-caps.ts). Measuring the trimmed value put
@@ -35,16 +37,32 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
     const over = max !== null && count !== null && count > max;
     const showCount =
       max !== null && count !== null && count >= max * COUNTER_FROM;
-    const hasError = error || !!errorMessage || over;
+    // The field's `error` counts too: a FormField-level refusal has to mark the box it is about.
+    const hasError =
+      error ||
+      !!errorMessage ||
+      over ||
+      !!field.invalid ||
+      props["aria-invalid"] === true ||
+      props["aria-invalid"] === "true";
     const descriptionId = useId();
     const hasDescription = !!errorMessage || !!helperText || over;
     return (
       <div className="w-full">
         <textarea
+          // {...props} FIRST, for the reason spelled out in Input.tsx.
+          {...props}
           ref={ref}
           rows={rows}
           aria-invalid={hasError || undefined}
-          aria-describedby={hasDescription ? descriptionId : undefined}
+          id={props.id ?? field.controlId}
+          aria-labelledby={props["aria-labelledby"] ?? field.labelledById}
+          required={props.required ?? field.required}
+          aria-describedby={mergeDescribedBy(
+            field.describedById,
+            props["aria-describedby"],
+            hasDescription ? descriptionId : undefined,
+          )}
           className={cn(
             // overflow-x-hidden: the textarea always wraps (pre-wrap + break-word), so it never needs a
             // horizontal scrollbar — pinning it off kills the spurious x-scrollbar track/flash.
@@ -52,7 +70,6 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
             { "border-error": hasError },
             className,
           )}
-          {...props}
         />
         {showCount && (
           <span

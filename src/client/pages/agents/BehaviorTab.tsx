@@ -3,6 +3,7 @@ import {
   ArrowRightLeft,
   Brain,
   CalendarClock,
+  Eye,
   Gauge,
   Image,
   ImagePlus,
@@ -17,6 +18,7 @@ import {
   ScrollText,
   ShieldCheck,
   Trash2,
+  UserRoundCheck,
   Volume2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -27,6 +29,7 @@ import {
   type ComboItem,
   CredentialPicker,
   FormField,
+  HelpPopover,
   Input,
   ModelPicker,
   type ScheduleOption,
@@ -49,6 +52,7 @@ import { serverNow, serverNowDate } from "@/client/lib/serverClock";
 import { isValidHttpUrl } from "@/client/lib/validation";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
+import type { AgentMode } from "@/modules/agents/mode";
 import {
   EXTRACTION_PROMPT_MAX,
   FOLLOW_UP_INSTRUCTIONS_MAX,
@@ -77,6 +81,8 @@ import {
   overridePickerSource,
   overrideProviderChanged,
 } from "./modelOverrideForm";
+import { ObservationSection } from "./ObservationSection";
+import type { ObservationState } from "./observationFormState";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
 import {
@@ -216,6 +222,12 @@ export interface SendImageState {
   allowedHosts: string;
 }
 
+// NOTE: Mirrors agent.settings.takeover / readTakeoverConfig. Its own block rather than a field on
+// `handoff`, because the Tools tab REPLACES that one wholesale on every save.
+export interface TakeoverState {
+  onHumanReply: boolean;
+}
+
 // NOTE: Which Chatwoot custom attributes the agent sees the CURRENT VALUES of (one key list per
 // scope). Mirrors agent.settings.attributeContext / readAttributeContextConfig.
 interface AttributeContextState {
@@ -291,6 +303,11 @@ interface BehaviorTabProps {
   limits: LimitsState;
   memory: MemoryState;
   setMemory: React.Dispatch<React.SetStateAction<MemoryState>>;
+  // The agent's mode decides which sections are drawn (issue #494): a watcher never answers, so
+  // the sections that configure how it answers are hidden, and the Observation block appears.
+  mode: AgentMode;
+  observation: ObservationState;
+  setObservation: React.Dispatch<React.SetStateAction<ObservationState>>;
   modelFallback: ModelFallbackState;
   setModelFallback: React.Dispatch<React.SetStateAction<ModelFallbackState>>;
   modelFallbackCredBaseUrl: string | null;
@@ -313,6 +330,8 @@ interface BehaviorTabProps {
   setLimits: React.Dispatch<React.SetStateAction<LimitsState>>;
   sendImage: SendImageState;
   setSendImage: React.Dispatch<React.SetStateAction<SendImageState>>;
+  takeover: TakeoverState;
+  setTakeover: React.Dispatch<React.SetStateAction<TakeoverState>>;
   attributeContext: AttributeContextState;
   setAttributeContext: React.Dispatch<
     React.SetStateAction<AttributeContextState>
@@ -329,7 +348,9 @@ interface BehaviorTabProps {
   saving: boolean;
   onSave: () => void;
   onDiscard: () => void;
-  onOpenPlayground: () => void;
+  // Absent for a watcher (issue #494): the bar then shows no playground entry, the way the tab
+  // itself is not drawn for one.
+  onOpenPlayground?: () => void;
 }
 
 function toScheduleOption(h: Hours): ScheduleOption {
@@ -1020,6 +1041,34 @@ function FollowUpStepsEditor({
   );
 }
 
+// What a WATCHER's Behavior tab shows (issue #494): the block that runs for an agent in
+// monitoring mode, and the three that apply to any agent whatever it does with a message. The
+// rest — availability, grouping, audio, split, data in context, images, authorization, takeover,
+// execution limits, the proactive ladder — decide how the agent ANSWERS, and a monitoring agent
+// never does; drawn for one, they read as if it could. Hidden, not unmounted (`Section.hidden`):
+// the form keeps its state, and flipping the mode back shows it again untouched.
+export const MONITORING_SECTIONS: ReadonlySet<string> = new Set([
+  "observation",
+  "memory",
+  "observability",
+  // THE FALLBACK IS BACK, because the runtime changed under it (issue #567). It was removed in the
+  // round-5 review of #494 for a true reason — `runObserve` called `runModelCall` bare, so a second
+  // model configured here protected no verdict, and drawing the section made a promise the runtime
+  // did not keep. `runObserve` now passes the agent's own `modelFallback`, so the section is
+  // configuring something again.
+  "modelFallback",
+  //
+  // NOTE: STT AND VISION RUN FOR A WATCHER (issue #494 review, round 2), so their controls have to
+  // reachable. The receiver's `watcherReads` path runs `runEagerMedia` under the OBSERVER's own
+  // settings whenever that route is the one that will remember the message — an observer on an inbox
+  // with no responder is exactly that — and a watcher that remembers an audio as an attachment
+  // marker instead of its transcription remembers nothing of it. Hidden here, together with their
+  // configuration warnings, the operator could neither switch them on nor repair a broken
+  // credential, and audio, images and documents reached observation with nothing extracted.
+  "stt",
+  "vision",
+]);
+
 export function BehaviorTab({
   agentId,
   channelBinding,
@@ -1055,6 +1104,9 @@ export function BehaviorTab({
   limits,
   memory,
   setMemory,
+  mode,
+  observation,
+  setObservation,
   modelFallback,
   setModelFallback,
   modelFallbackCredBaseUrl,
@@ -1066,6 +1118,8 @@ export function BehaviorTab({
   setLimits,
   sendImage,
   setSendImage,
+  takeover,
+  setTakeover,
   attributeContext,
   setAttributeContext,
   serviceWindow,
@@ -1359,6 +1413,11 @@ export function BehaviorTab({
       label: t("editor.contactAuth", "Contact authorization"),
     },
     {
+      id: "takeover",
+      icon: UserRoundCheck,
+      label: t("editor.takeover", "When a person answers"),
+    },
+    {
       id: "limits",
       icon: Gauge,
       label: t("editor.limits", "Execution limits"),
@@ -1385,13 +1444,32 @@ export function BehaviorTab({
     },
   ];
 
+  const watcher = mode === "monitoring";
+  const visibleSections = watcher
+    ? [
+        {
+          id: "observation",
+          icon: Eye,
+          label: t("editor.observation", "Observation"),
+        },
+        ...sections.filter((s) => MONITORING_SECTIONS.has(s.id)),
+      ]
+    : sections;
+
   return (
     <div className="flex grow flex-col gap-4">
       <div className="flex gap-6">
-        <SectionNav sections={sections} />
+        <SectionNav sections={visibleSections} />
         <div className="flex min-w-0 grow flex-col gap-4">
+          {watcher && (
+            <ObservationSection
+              observation={observation}
+              setObservation={setObservation}
+            />
+          )}
           <Section
             id="availability"
+            hidden={watcher}
             icon={CalendarClock}
             title={t("editor.availability", "Availability")}
             description={t(
@@ -1428,7 +1506,7 @@ export function BehaviorTab({
                 error={refusals.awayMessage}
                 description={t(
                   "editor.awayMessageHint",
-                  'Sent to the customer while the agent is outside these hours, at most once a day per conversation. Write {next_open} (or {proximo_atendimento} for a Portuguese message) where the next opening should appear: the customer reads something like "Monday, 08/25, 09:00".',
+                  "Sent once a day per conversation; use {next_open}, or {proximo_atendimento} in Portuguese, for the next opening.",
                 )}
               >
                 <Textarea
@@ -1447,6 +1525,7 @@ export function BehaviorTab({
 
           <Section
             id="debounce"
+            hidden={watcher}
             icon={Layers}
             title={t("editor.debounce", "Message grouping (debounce)")}
             description={t(
@@ -1831,6 +1910,7 @@ export function BehaviorTab({
 
           <Section
             id="tts"
+            hidden={watcher}
             icon={Volume2}
             title={t("editor.tts", "Audio replies (text-to-speech)")}
             description={t(
@@ -1906,6 +1986,9 @@ export function BehaviorTab({
                 <div className="grid gap-4 sm:grid-cols-2">
                   <FormField
                     label={t("editor.ttsVoice", "Voice")}
+                    // A ComboBox-based picker, not one focusable control: `group` per the
+                    // repo rule, so the label names the group instead of dangling.
+                    group
                     description={t(
                       "editor.ttsVoiceHint",
                       "Voice id/name (required for ElevenLabs).",
@@ -1926,6 +2009,9 @@ export function BehaviorTab({
                   </FormField>
                   <FormField
                     label={t("editor.ttsModel", "Model")}
+                    // A ComboBox-based picker, not one focusable control: `group` per the
+                    // repo rule, so the label names the group instead of dangling.
+                    group
                     description={t(
                       "editor.ttsModelHint",
                       "Leave blank for the provider default.",
@@ -1950,27 +2036,24 @@ export function BehaviorTab({
                       "editor.ttsNormalize",
                       "Rewrite the reply to be spoken, not read",
                     )}
-                  />
-                  <p className="text-text-muted text-xs">
-                    {t(
-                      "editor.ttsNormalizeHint",
-                      "One extra model call per audio reply: numbers, dates and amounts come out in words, and a list of options becomes a sentence a person would say out loud. It appears on the Logs as its own step and on the dashboard as its own usage.",
+                    help={t(
+                      "editor.ttsNormalizeHelp",
+                      "This option prepares audio replies to be heard rather than read.\n\nNumbers, dates, and amounts become words, while lists of options become natural spoken sentences.\n\nThe AI processes each audio reply one extra time. Logs show this as a separate step, and the dashboard tracks its usage separately.",
                     )}
-                  </p>
+                  />
                 </div>
                 {tts.normalize && (
                   <div className="flex flex-col gap-3">
-                    <div>
-                      <p className="font-medium text-sm">
-                        {t("editor.ttsNormalizeModel", "Rewrite model")}
-                      </p>
-                      <p className="text-text-muted text-xs">
-                        {t(
-                          "editor.ttsNormalizeModelHint",
-                          "Leave it on the agent's model to change nothing. Rewriting an answer that already exists is a simpler job than writing it, so a cheaper model usually does it just as well, on every audio reply.",
+                    <p className="flex items-center gap-1.5 font-medium text-sm">
+                      {t("editor.ttsNormalizeModel", "Rewrite model")}
+                      <HelpPopover
+                        content={t(
+                          "editor.ttsNormalizeModelHelp",
+                          "The rewrite model adjusts the text before each audio reply is generated.\n\nA cheaper model lowers the cost of these replies and is usually enough for this task, which is simpler than writing the answer.\n\nRewriting runs for every audio reply. Agent model uses the same model as the conversation.",
                         )}
-                      </p>
-                    </div>
+                        label={t("editor.ttsNormalizeModel", "Rewrite model")}
+                      />
+                    </p>
                     <FormField label={t("editor.provider", "Provider")}>
                       <Select
                         value={tts.normalizeProvider}
@@ -2208,7 +2291,7 @@ export function BehaviorTab({
                           "The provider enables it by default; pick a value only to override that.",
                         )}
                       >
-                        {/* NOTE: a Select, not a Switch: this knob has THREE states, and a switch
+                        {/* a Select, not a Switch: this knob has THREE states, and a switch
                             would render the untouched "leave it to the voice" as visibly off while
                             the provider actually turns it on. */}
                         <Select
@@ -2247,6 +2330,7 @@ export function BehaviorTab({
 
           <Section
             id="split"
+            hidden={watcher}
             icon={Scissors}
             title={t("editor.split", "Reply in multiple messages")}
             description={t(
@@ -2324,32 +2408,33 @@ export function BehaviorTab({
               (src/modules/chatwoot/attributes.ts) never get populated by the Z-PRO mirror, which
               writes ZproConversation instead. Hidden for a Z-PRO-only agent instead of letting the
               operator select keys that render as `filled="no"` forever, burning prompt tokens with
-              zero effect. */}
-          {channelBinding.chatwoot && (
-            <Section
-              id="attributeContext"
-              icon={ListChecks}
-              title={t("editor.attributeContext", "Data in context")}
-              description={t(
-                "editor.attributeContextHint",
-                'Chatwoot custom attributes whose CURRENT values the agent sees on every turn, so it knows what has already been collected and what is still missing. Pick only what matters to the conversation — everything selected goes into the prompt. The agent only writes them back when it has the "Set attribute" tool; without it they are read-only context.',
-              )}
-            >
-              <AttributeContextPickers
-                agentId={agentId}
-                attributeContext={attributeContext}
-                setAttributeContext={setAttributeContext}
-              />
-            </Section>
-          )}
+              zero effect — and hidden (not unmounted, same issue #494 pattern) for a monitoring-mode
+              agent, which never writes a reply to carry this context on. */}
+          <Section
+            id="attributeContext"
+            hidden={watcher || !channelBinding.chatwoot}
+            icon={ListChecks}
+            title={t("editor.attributeContext", "Data in context")}
+            help={t(
+              "editor.attributeContextHelp",
+              'This selection defines which current Chatwoot attribute values the agent receives whenever it replies.\n\nChoose only the data needed for the conversation. The agent uses these values to track what has been collected and what is still missing.\n\nWithout the "Set attribute" tool, the agent can read these values but cannot change them.',
+            )}
+          >
+            <AttributeContextPickers
+              agentId={agentId}
+              attributeContext={attributeContext}
+              setAttributeContext={setAttributeContext}
+            />
+          </Section>
 
           <Section
             id="sendImage"
+            hidden={watcher}
             icon={ImagePlus}
             title={t("editor.sendImage", "Sending images")}
-            description={t(
-              "editor.sendImageHint",
-              'Hosts the agent may fetch an image from when it uses the "Send image" tool. The agent chooses the URL, so this list is what decides where it can actually go: leave it empty and every attempt is refused. Output guardrails read text and never the picture itself, so this list is the only control over what an image may show. It has no effect unless the tool is granted on the Tools tab.',
+            help={t(
+              "editor.sendImageHelp",
+              'This list defines which sites the agent may fetch images from with the "Send image" tool.\n\nThe agent chooses the address, but it can only access sites on this list. An empty list blocks every attempt.\n\nOutput checks inspect the text, not the image. The list restricts the source, not its contents, and only applies when the tool is granted on the Tools tab.',
             )}
           >
             <FormField
@@ -2370,10 +2455,11 @@ export function BehaviorTab({
 
           <Section
             id="contactAuth"
+            hidden={watcher}
             icon={ShieldCheck}
             title={t("editor.contactAuth", "Contact authorization")}
-            description={t(
-              "editor.contactAuthHint",
+            help={t(
+              "editor.contactAuthHelp",
               "Before answering, ask an external system whether this contact may be served, by the identity Chatwoot holds for them (phone, email, identifier). By default every message is re-checked, so revoking on your side takes effect immediately. While the check denies or cannot answer, the agent stays silent to the customer and the operator gets a private note. It does not run in the playground.",
             )}
           >
@@ -2491,22 +2577,20 @@ export function BehaviorTab({
                       "editor.contactAuthIncludeText",
                       "Send the customer's message text",
                     )}
-                  />
-                  <p className="text-text-muted text-xs">
-                    {t(
-                      "editor.contactAuthIncludeTextHint",
-                      "The triggering message travels as its own message.text field, apart from the mirrored identity, so your endpoint can accept an unlock code the customer sends. It is never logged.",
+                    help={t(
+                      "editor.contactAuthIncludeTextHelp",
+                      "This option sends the customer's message with the Contact authorization check.\n\nThis lets the check accept a code sent in that message.\n\nThe text remains separate from the contact's identity and never appears in Logs.",
                     )}
-                  </p>
+                  />
                 </div>
                 <FormField
                   label={t(
                     "editor.contactAuthMode",
                     "How often the endpoint is asked",
                   )}
-                  description={t(
-                    "editor.contactAuthModeHint",
-                    "Every message is the default: your endpoint owns the answer, so revoking there takes effect on the contact's next message. Reusing calls it until it first says yes, which suits an expensive endpoint and an unlock flow.",
+                  help={t(
+                    "editor.contactAuthModeHelp",
+                    'Sets how often the external system checks whether the contact is authorized.\n\n"Every message" is the default and applies a revocation on the contact\'s next message.\n\n"Reuse" keeps checking until the first approval, then stores it for the selected period. During that time, a revocation in the external system has no effect.',
                   )}
                 >
                   <Select
@@ -2535,9 +2619,9 @@ export function BehaviorTab({
                       "editor.contactAuthGrantTtl",
                       "Reuse the answer for (s)",
                     )}
-                    description={t(
-                      "editor.contactAuthGrantTtlHint",
-                      "60-2,592,000 (30 days). A refusal is never stored, and a stored answer stops counting when the contact's phone, email or identifier changes. Changing this field, the URL or the credential only suspends the stored answers while the new value stands: it is not a way to clear them. To stop reusing altogether, switch back to asking on every message.",
+                    help={t(
+                      "editor.contactAuthGrantTtlHelp",
+                      "Sets how long an approval may be reused, from 60 to 2,592,000 seconds, or 30 days.\n\nDenials are never stored. An approval stops applying when the contact's phone number, email, or identifier changes.\n\nChanging the period, address, or credential does not delete stored approvals. To stop reusing them, choose to check every message.",
                     )}
                   >
                     <Input
@@ -2611,7 +2695,28 @@ export function BehaviorTab({
           </Section>
 
           <Section
+            id="takeover"
+            hidden={watcher}
+            icon={UserRoundCheck}
+            title={t("editor.takeover", "When a person answers")}
+            help={t(
+              "editor.takeoverHelp",
+              "A colleague replying to the customer in a conversation the agent is handling, from the Chatwoot composer or from the phone paired to this WhatsApp number, moves the conversation to the human queue and the agent stops answering it. Chatwoot does not do this on its own: without this, the conversation stays with the agent and it answers over the person on the next customer message. To hand a conversation back, use the Return to AI action on the Conversations page.",
+            )}
+          >
+            <SwitchField
+              checked={takeover.onHumanReply}
+              onCheckedChange={(v) => setTakeover({ onHumanReply: v })}
+              label={t(
+                "editor.takeoverOnHumanReply",
+                "Stop answering when a person replies to the customer",
+              )}
+            />
+          </Section>
+
+          <Section
             id="limits"
+            hidden={watcher}
             icon={Gauge}
             title={t("editor.limits", "Execution limits")}
             description={t(
@@ -2641,7 +2746,11 @@ export function BehaviorTab({
                 label={t("editor.limitsMaxHistoryTokens", "History ceiling")}
                 description={t(
                   "editor.limitsMaxHistoryTokensHint",
-                  "The agent remembers every conversation it has had with this contact on this channel, and sends all of it on every turn, so a returning customer gets slower and more expensive the more they talk. This caps how much of that memory travels: older attendances stop being sent once the cap is reached, and the conversation being answered is never dropped. The count is an estimate and runs low on tool-heavy threads, and the instructions and tool definitions are not counted at all, so set it below the budget you actually have. Empty = no ceiling. 2,000-1,000,000.",
+                  "Empty means no ceiling. Between 2,000 and 1,000,000.",
+                )}
+                help={t(
+                  "editor.limitsMaxHistoryTokensHelp",
+                  "The agent sends this contact's whole history on every turn. The more a customer talks, the slower and costlier their answers get.\n\nThe ceiling cuts that off: once it is reached, the oldest attendances stop travelling. The conversation being answered never does.\n\nThe count is an estimate, runs low on tool-heavy threads, and leaves out the instructions and the tool definitions. Set it under the budget you actually have.",
                 )}
               >
                 <Input
@@ -2662,9 +2771,9 @@ export function BehaviorTab({
             id="memory"
             icon={Brain}
             title={t("editor.memory", "Memory")}
-            description={t(
-              "editor.memoryHint",
-              'The agent remembers every conversation it has had with this contact on this channel. When an attendance ends, its messages are replaced by a summary of it, so the memory becomes "N summarized attendances + the current one". What survives a summary is the useful part: who the contact is, what was agreed, what was left open. Exact wording does not, so turn this off if the agent must be able to quote an old conversation word for word. The summary is written by the agent\'s own model, after the reply is sent, so no customer waits for it. It runs once for every attendance that ends, including the ones your team handled without the agent.',
+            help={t(
+              "editor.memoryHelp",
+              "Memory keeps this contact's conversations on this channel available to the agent for future replies.\n\nWhen an attendance ends, the agent replaces its messages with a summary of key details, agreements, and open issues. The current attendance stays complete.\n\nExact wording is lost, so turn this off if the agent must quote past conversations. Every closed attendance is summarized, including those handled by your team, but only after the customer receives a reply.",
             )}
           >
             <SwitchField
@@ -2679,17 +2788,16 @@ export function BehaviorTab({
             />
             {memory.compactionEnabled && (
               <div className="flex flex-col gap-3">
-                <div>
-                  <p className="font-medium text-sm">
-                    {t("editor.memoryModel", "Summary model")}
-                  </p>
-                  <p className="text-text-muted text-xs">
-                    {t(
-                      "editor.memoryModelHint",
-                      "Leave it on the agent's model to change nothing. This is the one place where a cheaper model is usually the wrong trade: the summary is not read once, it becomes what the agent knows about this contact from then on, it is never rewritten, and a weaker model tends to drop the customer's name while writing more. Measured on one vendor's cheapest model: the name was lost on one attendance in five. Change it only with a model you have compared yourself.",
+                <p className="flex items-center gap-1.5 font-medium text-sm">
+                  {t("editor.memoryModel", "Summary model")}
+                  <HelpPopover
+                    content={t(
+                      "editor.memoryModelHelp",
+                      "Leave this on the agent's model unless you've compared alternatives.\n\nThe summary isn't read once: it becomes what the agent knows about that contact from then on, and is never rewritten.\n\nThis is the wrong place to cut costs: on one vendor's cheapest model, the customer's name was lost in one attendance in five.",
                     )}
-                  </p>
-                </div>
+                    label={t("editor.memoryModel", "Summary model")}
+                  />
+                </p>
                 <FormField label={t("editor.provider", "Provider")}>
                   <Select
                     value={memory.provider}
@@ -2723,7 +2831,7 @@ export function BehaviorTab({
                   error={refusals.memoryCredential}
                   description={t(
                     "editor.memoryCredentialHint",
-                    "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own the summary is not written and the attendance stays in the thread raw.",
+                    "Required when summaries use another provider; without its own key, the attendance is not summarized.",
                   )}
                   group
                 >
@@ -2838,8 +2946,8 @@ export function BehaviorTab({
             id="modelFallback"
             icon={LifeBuoy}
             title={t("editor.modelFallback", "Fallback provider")}
-            description={t(
-              "editor.modelFallbackHint",
+            help={t(
+              "editor.modelFallbackHelp",
               "Where a turn goes when the agent's own provider cannot take it: rate-limited, overloaded, or not answering. Only those. A key the provider rejected, a model id it does not know, or a request it refused are NOT failed over, because the second provider would answer them fine and you would never find out the first one is broken \u2014 you would just be billed by both. Leave it empty and nothing changes: a turn that fails today keeps failing the same way.",
             )}
           >
@@ -2884,7 +2992,7 @@ export function BehaviorTab({
                   label={t("editor.credential", "API key")}
                   description={t(
                     "editor.modelFallbackCredentialHint",
-                    "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own there is nothing behind the provider and the turn fails as it would with no fallback at all.",
+                    "Required when the fallback uses another provider; without its own key, it cannot handle the request.",
                   )}
                   group
                 >
@@ -3005,9 +3113,9 @@ export function BehaviorTab({
             id="observability"
             icon={ScrollText}
             title={t("editor.observability", "Logs")}
-            description={t(
-              "editor.observabilityHint",
-              'By default a tool line on the Logs page records the SHAPE of each argument and result ({ cpf: "string(11)" }): enough to see which arguments the agent sent, which it left out and whether a format is wrong, with no customer data. Turning the switch on records the values themselves, which is what answers which record it actually looked up, and keeps those values for the whole log retention window, including in every log export. Turn it on while investigating, off afterwards.',
+            help={t(
+              "editor.observabilityHelp",
+              'By default, Logs show only the shape of data sent to and returned by tools, such as { cpf: "string(11)" }, without customer values.\n\nTurning this on records the actual values, so you can identify which record the agent accessed. Those values are also included in exports.\n\nThe data remains for the full Logs retention period. Turn this on while investigating an issue, then turn it off.',
             )}
           >
             {debugModesOn && (
@@ -3067,7 +3175,16 @@ export function BehaviorTab({
                 "editor.observabilityFullDetail",
                 "Store log detail in full (expires on its own)",
               )}
+              help={t("editor.observabilityFullDetailHelp", {
+                defaultValue:
+                  "Log lines limit each stored string to 2,000 characters, which can hide the end of a long system prompt.\n\nTurn this on to keep them whole for {{hours}}h. The 2,000-character limit returns automatically.",
+                hours: FULL_DETAIL_ARM_HOURS,
+              })}
             />
+            {/* State, not help: the sentence exists only while the window is open, which is
+                exactly when the operator needs to know when it closes. What the switch DOES moved
+                to the `?` on its label. A permanent explanation under a switch is the shape this
+                page had too much of (docs/ui.md → Where help goes). */}
             <p className="text-text-secondary text-xs">
               {/* Which of the two sentences depends on whether this deadline is the SAVED one.
                   Both are "the window is open until X", and only the unsaved one is waiting on a
@@ -3086,16 +3203,13 @@ export function BehaviorTab({
                       when:
                         observability.fullDetailUntil?.toLocaleString() ?? "",
                     })
-                : t("editor.observabilityFullDetailHint", {
-                    defaultValue:
-                      "A log line cuts every stored string at 2,000 characters, which is where a long system prompt stops being readable on the Logs page. This keeps them whole for the next {{hours}}h, then goes back to cutting them without anyone having to remember.",
-                    hours: FULL_DETAIL_ARM_HOURS,
-                  })}
+                : null}
             </p>
           </Section>
 
           <Section
             id="proactive"
+            hidden={watcher}
             icon={Megaphone}
             title={t("editor.proactiveSection", "Proactive messages")}
             description={t(
@@ -3240,7 +3354,7 @@ export function BehaviorTab({
                   <span>
                     {t(
                       "editor.svcWindowZproHint",
-                      "For Z-PRO tickets, this only takes effect on instances explicitly marked as official WhatsApp Business API (WABA) in Channels → FusaoChatBot CRM. Other Z-PRO instances (Baileys, UazAPI, etc.) always send free-form.",
+                      "For Z-PRO tickets, this only applies to instances marked official WhatsApp Business API (WABA) in Channels → FusaoChatBot CRM. Other instances always send free-form.",
                     )}
                   </span>
                 </div>
@@ -3329,16 +3443,25 @@ export function BehaviorTab({
         onSave={onSave}
         onDiscard={onDiscard}
         saveDisabled={
-          contactAuthUrlInvalid ||
+          // NOTE: Only what a DRAWN section can explain and fix (issue #494 review, round 3). These
+          // read the STORED bag as well as the form, so a watcher carrying a legacy bad TTS
+          // normalizer or authorization URL — an import, an API write, a mode flipped on a
+          // configured agent — had Save dead on a tab whose only editable block is Observation, with
+          // no field on screen saying why. The sections a watcher draws keep their validators; the
+          // answer-only ones are asked only where their fields are.
           sttBaseUrlInvalid ||
           visionBaseUrlInvalid ||
-          normalizeBaseUrlInvalid ||
-          normalizeBaseUrlUnsupported ||
           memoryBaseUrlInvalid ||
           memoryBaseUrlUnsupported ||
+          // The fallback's three moved back OUT of the watcher exemption with the section (issue
+          // #567): they are asked wherever their fields are, and the fields are on screen again.
           fallbackBaseUrlInvalid ||
           fallbackBaseUrlUnsupported ||
-          fallbackModelMissing
+          fallbackModelMissing ||
+          (!watcher &&
+            (contactAuthUrlInvalid ||
+              normalizeBaseUrlInvalid ||
+              normalizeBaseUrlUnsupported))
         }
         onOpenPlayground={onOpenPlayground}
       />

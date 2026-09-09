@@ -2,16 +2,24 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
+import type { AuditAction } from "@/lib/audit/actions";
 import { AppError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { auditMutation } from "@/modules/audit/service";
 import { unprintableProblem } from "@/modules/documents/printable";
+import { syncTenantSpendPoll } from "@/modules/spend-ceiling/arm";
 import {
   readSpendCeilingConfig,
   type SpendCeilingConfig,
+  type SpendCeilingLegacyStored,
+  type SpendCeilingStored,
   spendCeilingSettingsSchema,
 } from "@/modules/spend-ceiling/settings";
-import { requireVaultRef, vaultRefWhere } from "@/modules/vault/service";
+import {
+  requireVaultRef,
+  requireVaultRefFor,
+  vaultRefWhere,
+} from "@/modules/vault/service";
 
 // Per-tenant settings live in the Tenant.settings JSON column. RLS scopes the row to the active
 // tenant (the runtime role may read/update its own row), so the same reader works at runtime
@@ -217,7 +225,8 @@ async function patchBlock<
     | EmbeddingSettings
     | LangfuseSettings
     | CompanySettings
-    | SpendCeilingConfig,
+    | SpendCeilingStored
+    | SpendCeilingLegacyStored,
 >(
   ctx: TenantContext,
   base: PrismaClient,
@@ -226,7 +235,7 @@ async function patchBlock<
   // MOVED without carrying what it holds. The company profile is the block that needs the
   // difference: see `sides` below for the shape the other three use.
   audit: {
-    action: string;
+    action: AuditAction;
     target: string;
     project: (
       before: Record<string, unknown>,
@@ -258,6 +267,24 @@ async function patchBlock<
   });
 }
 
+// The ref rule and the KIND rule for the embedding key, in one place so the MCP preview can ask them
+// (#490). Resolving the ref answers neither: `resolveSecretRef` only checks that the entry exists,
+// and `tenant_settings_update` previewed "will wire" for a `google_oauth` (which does not yield a
+// plain string) and an `mcp_env` (which is `neverOutbound`) that the apply refuses (#510, review
+// round 2).
+//
+// ADVISORY when the preview calls it, authoritative when the write does: it reads outside the
+// write's transaction, so a kind changed in between still answers there.
+export async function assertEmbeddingCredentialUsable(
+  ctx: TenantContext,
+  ref: string,
+  base: PrismaClient = basePrisma,
+): Promise<string> {
+  return runScopedOn(base, ctx, (db) =>
+    requireVaultRefFor(db, ref, "embedding.credentialRef", "embeddingKey"),
+  );
+}
+
 export async function updateEmbeddingSettings(
   ctx: TenantContext,
   patch: Partial<EmbeddingSettings>,
@@ -268,13 +295,16 @@ export async function updateEmbeddingSettings(
   // stored it and indexing then failed with no credential the operator could see was wrong (#254).
   // The block holds one field, so naming it IS changing it — there is no unrelated save to protect
   // here, unlike the agent's bags.
+  //
+  // `…For` and not the plain ref check: this key is read as a plain string and POSTed to the
+  // embedding provider, and this module's own comment in rag/documents.ts already said the kind was
+  // never checked — an operator picking the Chatwoot credential here got every chunk of their
+  // knowledge base POSTed at the Chatwoot host. Issue #471.
   const incoming = patch.credentialRef;
   const credentialRef =
     incoming == null
       ? incoming
-      : await runScopedOn(base, ctx, (db) =>
-          requireVaultRef(db, incoming, "embedding.credentialRef"),
-        );
+      : await assertEmbeddingCredentialUsable(ctx, incoming, base);
   return patchBlock(
     ctx,
     base,
@@ -319,6 +349,36 @@ export interface LangfuseUpdateInput {
 
 // Updates the langfuse block. credentialRef, when provided non-null, is validated against the vault
 // (must exist and be kind "langfuse"). null clears it.
+// The ref rule and the KIND rule, in one place so the MCP preview can ask them (#490). Resolving the
+// ref is not asking the second one: `vault:<id>` names an entry of any kind, and `tenant_settings_update`
+// previewed "will wire" for a generic credential the apply refuses to store (#510).
+//
+// ADVISORY when the preview calls it, authoritative when the write does: it reads outside the write's
+// transaction, so a kind changed in between still answers there.
+export async function assertLangfuseCredentialUsable(
+  ctx: TenantContext,
+  ref: string,
+  base: PrismaClient = basePrisma,
+): Promise<string> {
+  return runScopedOn(base, ctx, async (db) => {
+    const canonical = await requireVaultRef(db, ref, "langfuse.credentialRef");
+    const entry = await db.vaultEntry.findFirst({
+      where: vaultRefWhere(canonical),
+      select: { kind: true },
+    });
+    if (entry?.kind !== "langfuse") {
+      throw new AppError(
+        "credential must be of kind 'langfuse'",
+        400,
+        "errors.invalidCredentialKind",
+        { kind: "langfuse" },
+        "langfuse.credentialRef",
+      );
+    }
+    return canonical;
+  });
+}
+
 export async function updateLangfuse(
   ctx: TenantContext,
   input: LangfuseUpdateInput,
@@ -341,32 +401,15 @@ export async function updateLangfuse(
       // and reports a working credential as unavailable; and an entry created empty on purpose
       // (credential_create) was refused for having no secret yet, which is the one case the write
       // boundary admits deliberately. Both are the ref rule, so both answer to the ref check (#254).
-      const ref = input.credentialRef;
-      credentialRef = await runScopedOn(base, ctx, async (db) => {
-        const canonical = await requireVaultRef(
-          db,
-          ref,
-          "langfuse.credentialRef",
-        );
-        const entry = await db.vaultEntry.findFirst({
-          where: vaultRefWhere(canonical),
-          select: { kind: true },
-        });
-        if (entry?.kind !== "langfuse") {
-          throw new AppError(
-            "credential must be of kind 'langfuse'",
-            400,
-            "errors.invalidCredentialKind",
-            { kind: "langfuse" },
-            "langfuse.credentialRef",
-          );
-        }
-        return canonical;
-      });
+      credentialRef = await assertLangfuseCredentialUsable(
+        ctx,
+        input.credentialRef,
+        base,
+      );
     }
   }
 
-  return patchBlock(
+  const next = await patchBlock(
     ctx,
     base,
     "langfuse",
@@ -401,6 +444,10 @@ export async function updateLangfuse(
       });
     },
   );
+  // A Langfuse save changes what the spend ceiling's poll would find (#426, review round 15): a
+  // credential added or removed is learned now, not at the next period.
+  await syncTenantSpendPoll(requireTenantId(ctx), base);
+  return next;
 }
 
 export type CompanyUpdateInput = Partial<
@@ -543,7 +590,7 @@ export async function updateSpendCeiling(
   patch: SpendCeilingUpdateInput,
   base: PrismaClient = basePrisma,
 ): Promise<SpendCeilingConfig> {
-  return patchBlock(
+  const next = await patchBlock(
     ctx,
     base,
     "spendCeiling",
@@ -565,8 +612,8 @@ export async function updateSpendCeiling(
         const b = readSpendCeilingConfig(raw);
         return {
           enabled: b.enabled,
-          monthlyInboxTokens: b.monthlyInboxTokens,
-          monthlyPlaygroundTokens: b.monthlyPlaygroundTokens,
+          monthlyInboxUsd: b.monthlyInboxUsd,
+          monthlyPlaygroundUsd: b.monthlyPlaygroundUsd,
           warnAtPercent: b.warnAtPercent,
           handoffEnabled: b.handoffEnabled,
           noticeCooldownSeconds: b.noticeCooldownSeconds,
@@ -580,10 +627,37 @@ export async function updateSpendCeiling(
         };
       }),
     },
-    (raw) => {
+    (raw): SpendCeilingStored | SpendCeilingLegacyStored => {
       const current = readSpendCeilingConfig(raw);
+      // What is stored is the schema's output: the dollar fields and not the token ones, which is
+      // how a save in dollars retires a block written in tokens (`legacyTokens`).
       // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
-      return spendCeilingSettingsSchema.parse({ ...current, ...patch });
+      const stored = spendCeilingSettingsSchema.parse({ ...current, ...patch });
+      // ...unless the patch names no dollar field and the block is still in tokens: the console saves
+      // the whole block, but the API takes partial patches, and an operator changing only the
+      // customer's sentence has not seen the new unit. Merging against the synthesized zeroes would
+      // store a dollar block and drop the one warning that the old ceiling is no longer enforced
+      // (review round 1). The token keys stay until a patch names a dollar figure.
+      const touchesUsd =
+        patch.monthlyInboxUsd !== undefined ||
+        patch.monthlyPlaygroundUsd !== undefined;
+      if (current.legacyTokens && !touchesUsd) {
+        const {
+          monthlyInboxUsd: _inbox,
+          monthlyPlaygroundUsd: _playground,
+          ...rest
+        } = stored;
+        return {
+          ...rest,
+          monthlyInboxTokens: current.legacyTokens.inbox,
+          monthlyPlaygroundTokens: current.legacyTokens.playground,
+        };
+      }
+      return stored;
     },
   );
+  // The poll that keeps the figure fresh follows the switch: armed while the ceiling is on, cancelled
+  // when it is off (issue #426). Best-effort inside, so it never fails the save.
+  await syncTenantSpendPoll(requireTenantId(ctx), base);
+  return readSpendCeilingConfig({ spendCeiling: next });
 }

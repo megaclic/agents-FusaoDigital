@@ -4,6 +4,7 @@ import {
   AIMessage,
   type BaseMessage,
   HumanMessage,
+  ToolMessage,
 } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
@@ -16,6 +17,7 @@ import { isTurnInFlight } from "@/graph/inflight";
 import { armIngest, ingestHandler } from "@/graph/ingest-job";
 import {
   conversationStamp,
+  HUMAN_HANDBACK_NOTE,
   isConversationDivider,
   isNudgeTurn,
   stampedConversationId,
@@ -28,8 +30,13 @@ import {
   renderNudge,
   runAgentNudge,
 } from "@/graph/nudge";
-import { claimIngestWrite, releaseIngestWrite } from "@/graph/thread-claim";
+import {
+  claimIngestWrite,
+  markTurnOwning,
+  releaseIngestWrite,
+} from "@/graph/thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
+import { HANDOFF_DONE_PREFIX } from "@/graph/tools/catalog";
 import { MAX_DB_ID } from "@/lib/db-id";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { selectClosedPrefix } from "@/modules/memory/cut";
@@ -52,12 +59,42 @@ describe("renderNudge (prompt-injection boundary)", () => {
     expect(out).toContain("UNTRUSTED external event data");
   });
 
-  test("leans toward sending and signals no-follow-up via the sentinel (not 'empty')", () => {
-    const out = renderNudge({ source: "followup", kind: "inactivity" }, true);
+  // Issue #454. Silence used to be a TOKEN the directive asked for, which made it a message: it
+  // landed in the per-contact thread and a later reactive turn copied it to the customer. It is a
+  // TOOL CALL now — `skip_reply`, which already means this on the reactive path — so a silent
+  // follow-up leaves nothing in the transcript for anyone to imitate. The absence of the token is
+  // the regression guard: this is the cause, and the strip elsewhere is only the backstop.
+  // Round 7: the directive asks for whichever channel the agent HAS. An agent with no tools cannot
+  // be handed a schema, so for it the token is still the only way to say nothing — and the strip
+  // backstop is what keeps that from reaching a customer.
+  test("a tool-less agent is still told to use the token", () => {
+    const out = renderNudge(
+      { source: "followup", kind: "inactivity" },
+      true,
+      "sentinel",
+    );
     expect(out).toContain(FOLLOWUP_SKIP_SENTINEL);
-    expect(out.toLowerCase()).toContain("by default");
-    // It must NOT instruct the brittle "reply with an empty message" anymore.
-    expect(out.toLowerCase()).not.toContain("empty message");
+    expect(out).not.toContain("skip_reply");
+  });
+
+  test("leans toward sending and asks for a tool call, never a token", () => {
+    for (const canMessageCustomer of [true, false]) {
+      const out = renderNudge(
+        { source: "followup", kind: "inactivity" },
+        canMessageCustomer,
+      );
+      expect(out).toContain("skip_reply");
+      expect(out).not.toContain(FOLLOWUP_SKIP_SENTINEL);
+      expect(out).not.toContain("SKIP]]");
+      // Nor the brittle "reply with an empty message" the token had replaced.
+      expect(out.toLowerCase()).not.toContain("empty message");
+    }
+    expect(
+      renderNudge(
+        { source: "followup", kind: "inactivity" },
+        true,
+      ).toLowerCase(),
+    ).toContain("by default");
   });
 
   test("malicious multiline summary cannot forge a system block", () => {
@@ -373,6 +410,58 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(s.notes).toEqual([]);
   });
 
+  // The other half of the #454 cause fix. A follow-up must ALWAYS have a way to say nothing: the
+  // directive now asks for `skip_reply`, and `skip_reply` is an operator-revocable native tool. An
+  // agent that revoked it would leave the model with no silence channel at all — and a follow-up
+  // with nothing to say would then have to say something, which is the leak by another road.
+  test("a follow-up keeps skip_reply even when the agent revoked it", async () => {
+    const agent = await suDb.agent.findFirstOrThrow({ where: { tenantId } });
+    const sel = await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        // Deliberately WITHOUT skip_reply, which is the whole point.
+        enabledTools: ["private_note", "assign_label"],
+        knowledgeBaseIds: [],
+      },
+      select: { id: true },
+    });
+    const seen: string[][] = [];
+    class ToolCapturingModel {
+      async invoke() {
+        return new AIMessage("Pagamento confirmado!");
+      }
+      bindTools(tools: Array<{ name: string }>) {
+        seen.push(tools.map((t) => t.name));
+        return { invoke: () => this.invoke() };
+      }
+    }
+    await seedConv(9454, null);
+    const s2 = stub();
+    try {
+      await runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:9454`,
+        nudge: { source: "ASAAS", status: "paid", value: 100, currency: "BRL" },
+        base: appDb,
+        deps: {
+          makeModel: () => new ToolCapturingModel() as never,
+          makeClient: s2.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      });
+    } finally {
+      await suDb.agentToolSelection.delete({ where: { id: sel.id } });
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    // Forced in, and the revocation still respected for everything else.
+    expect(seen[0]).toContain("skip_reply");
+    expect(seen[0]).toContain("private_note");
+    expect(seen[0]).not.toContain("resolve_conversation");
+  });
+
   // A follow-up invokes on the SAME memory thread a reactive turn does, so it is the second producer
   // of the compaction claim (src/graph/inflight.ts). Left unclaimed, a compaction firing while a
   // nudge is thinking has its rewrite undone the moment the nudge finishes, because an invoke saves
@@ -489,6 +578,179 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     // The thread was neither written to nor left claimed.
     expect(isTurnInFlight(graphThreadId)).toBe(false);
     expect(generated).toBe(0);
+  });
+
+  // ISSUE #449, on the path that owns fifteen of these asks and had none where it mattered. All of
+  // them sit BETWEEN two steps; a tool call happens inside one, so a retirement landing while the
+  // model call is in flight left the nudge's own tools free to write. `assign_label` is the one this
+  // asserts because the client stub records it, and it is one of the three the issue names.
+  test("a job retired during the model call does not get its tools run", async () => {
+    // Ids of this test's own, and picked against the whole file rather than the neighbour: this
+    // suite shares one tenant, so a reused contact-inbox makes another test's
+    // `agentThread.findUnique` read the row THIS turn wrote, and a reused conversation does the same
+    // to its thread.
+    const contactInboxId = 8890;
+    await seedConv(9889, null, new Date(), contactInboxId);
+    const s = stub();
+    let wanted = true;
+    let rounds = 0;
+    // Flipped INSIDE the model call, which is the window: every ask before it has been answered and
+    // the next one comes after the invoke has already run the tools.
+    class RetiredMidCallModel extends BaseChatModel {
+      constructor() {
+        super({});
+      }
+      _llmType() {
+        return "fake-retired-mid-call";
+      }
+      async _generate(): Promise<ChatResult> {
+        rounds += 1;
+        wanted = false;
+        const message =
+          rounds === 1
+            ? new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "assign_label",
+                    args: { label: "seguimento", scope: "conversation" },
+                    id: "call_449_nudge",
+                  },
+                ],
+              })
+            : new AIMessage("Tudo certo?");
+        return { generations: [{ text: "", message }] };
+      }
+    }
+
+    const cp = new MemorySaver();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9889`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      stillWanted: async () => wanted,
+      base: appDb,
+      deps: {
+        makeModel: () => new RetiredMidCallModel(),
+        makeClient: s.makeClient,
+        checkpointer: cp,
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("stale");
+    // The label the retired run would have written onto the conversation.
+    expect(s.labelSets).toEqual([]);
+    // And nothing was said either, which the asks after the invoke already covered.
+    expect(s.messages).toEqual([]);
+    // ONE round: the refusal ends the turn instead of routing back to the model.
+    expect(rounds).toBe(1);
+    // AND THE THREAD IS CLEAN. The rollback keeps a turn whose tools ACTED, because no removal here
+    // can undo a write to the outside world — and a refused call looks exactly like one that ran
+    // unless the planner can tell them apart. It can: the graph marks its own refusal. Without that,
+    // the retired nudge's directive, its tool call and the refusal all stay in shared memory.
+    const left =
+      (
+        (
+          await buildThreadStateGraph(cp).getState({
+            configurable: {
+              thread_id: contactInboxThreadId(
+                tenantId,
+                instanceId,
+                contactInboxId,
+              ),
+            },
+          })
+        ).values as { messages?: BaseMessage[] }
+      ).messages ?? [];
+    expect(left).toEqual([]);
+  });
+
+  // REVIEW ROUND 5, and it is the same non-monotonicity that put the empty terminator there. The
+  // fences this path hands down are not all one-way: the channel-redirect one reads `agent.enabled`
+  // on every ask, so an operator who switches the agent off during the model call and back on before
+  // the post-invoke check gets a `true` there. The refused turn then reads as an ordinary SILENT one
+  // — both end on an empty assistant message — and this run would advance the ladder and leave its
+  // own refusal in shared history. What tells them apart is the RESULT, not the fence.
+  test("a fence that flips back to yes does not turn a refused turn into a silent one", async () => {
+    const contactInboxId = 8891;
+    await seedConv(9890, null, new Date(), contactInboxId);
+    const s = stub();
+    let generated = false;
+    let refusedOnce = false;
+    class CallsThenWouldAnswer extends BaseChatModel {
+      constructor() {
+        super({});
+      }
+      _llmType() {
+        return "fake-flip-back";
+      }
+      async _generate(): Promise<ChatResult> {
+        generated = true;
+        return {
+          generations: [
+            {
+              text: "",
+              message: new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "assign_label",
+                    args: { label: "seguimento", scope: "conversation" },
+                    id: "call_449_flip",
+                  },
+                ],
+              }),
+            },
+          ],
+        };
+      }
+    }
+
+    const cp = new MemorySaver();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9890`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      // False exactly once, on the first ask AFTER the model produced its call — which is the tool
+      // boundary's — and yes to everything before and after it.
+      stillWanted: async () => {
+        if (generated && !refusedOnce) {
+          refusedOnce = true;
+          return false;
+        }
+        return true;
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new CallsThenWouldAnswer(),
+        makeClient: s.makeClient,
+        checkpointer: cp,
+        persistUsage: async () => {},
+      },
+    });
+
+    // The boundary refused, so the run is withdrawn — not "the agent had nothing to say", which is
+    // what the caller advances its ladder on.
+    expect(outcome).toBe("stale");
+    expect(refusedOnce).toBe(true);
+    expect(s.labelSets).toEqual([]);
+    expect(s.messages).toEqual([]);
+    const after =
+      (
+        (
+          await buildThreadStateGraph(cp).getState({
+            configurable: {
+              thread_id: contactInboxThreadId(
+                tenantId,
+                instanceId,
+                contactInboxId,
+              ),
+            },
+          })
+        ).values as { messages?: BaseMessage[] }
+      ).messages ?? [];
+    expect(after).toEqual([]);
   });
 
   // THE BARRIER (issue #194), at the third reader of the memory thread. A nudge is a model call on
@@ -844,6 +1106,639 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     // The divider is prompt content, and it rides in the nudge's OWN invoke: written separately just
     // before it, the invoke would save the channel it had already loaded and erase it.
     expect(messages.some((m) => isConversationDivider(m))).toBe(true);
+  });
+
+  // A PROACTIVE SEND CAN BE THE FIRST TURN AFTER A HAND-BACK (issue #457, review round 1). A
+  // follow-up ladder, an appointment reminder or an inbound-domain nudge invokes this same persisted
+  // thread, and if only the reactive turn wrote the note this one would run against the old transfer
+  // context — the very context that makes a model go quiet or hand off again — with the correction
+  // arriving on some later turn.
+  test("a nudge after a hand-back writes the note, once", async () => {
+    const contactInboxId = 8857;
+    await seedConv(957, null, new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    // The thread as a handed-off conversation leaves it: the agent's own transfer call, with nothing
+    // saying that stretch ended.
+    await buildThreadStateGraph(saver).updateState(
+      {
+        configurable: {
+          thread_id: contactInboxThreadId(tenantId, instanceId, contactInboxId),
+        },
+      },
+      {
+        messages: [
+          new AIMessage({
+            content: "",
+            tool_calls: [{ name: "handoff_to_human", args: {}, id: "h1" }],
+          }),
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:957`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("messaged");
+
+    const cp = await saver.get({
+      configurable: {
+        thread_id: contactInboxThreadId(tenantId, instanceId, contactInboxId),
+      },
+    });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(true);
+    // ONE note: a second nudge on the same thread finds it already there and adds nothing.
+    expect(
+      messages.filter((m) => String(m.content) === HUMAN_HANDBACK_NOTE).length,
+    ).toBe(1);
+  });
+
+  // THE DEFERRED NOTE STILL REACHES THIS TURN (issue #457, review round 6). An older invoke reading
+  // the channel means the durable append would be erased — but the nudge that owes the note is the
+  // one about to run against the transfer context, so the correction rides in its own invoke input
+  // instead. Deferring the WRITE is right; deferring the correction would keep the defect for one
+  // more turn, which on a proactive send is the one message the customer gets.
+  test("a nudge defers the durable note and carries it in the invoke", async () => {
+    const contactInboxId = 8860;
+    await seedConv(962, null, new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: graphThreadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    // Another invoke is already reading this channel, which is what `markTurnOwning` answers with
+    // `heldBefore` when this run takes its own claim.
+    const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+    await markTurnOwning(owner, appDb);
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:962`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    const texts = messages.map((m) => String(m.content));
+    // Present exactly once, and before the nudge directive the invoke carried it with.
+    expect(texts.filter((t) => t === HUMAN_HANDBACK_NOTE)).toHaveLength(1);
+    expect(texts.indexOf(HUMAN_HANDBACK_NOTE)).toBeLessThan(
+      messages.findIndex((m) => isNudgeTurn(m)),
+    );
+    // AND NOT APPENDED BESIDE THE OLDER INVOKE: a durable `updateState` writes the note in a
+    // checkpoint of its own, before the nudge directive exists. Carried by the invoke, the two enter
+    // together — so the OLDEST checkpoint that has the note has the directive too.
+    const withNote: BaseMessage[][] = [];
+    for await (const c of saver.list({
+      configurable: { thread_id: graphThreadId },
+    })) {
+      const ms = ((c.checkpoint.channel_values as { messages?: BaseMessage[] })
+        ?.messages ?? []) as BaseMessage[];
+      if (ms.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE))
+        withNote.push(ms);
+    }
+    // `list` reads newest-first, so the oldest is last.
+    expect(withNote.at(-1)?.some((m) => isNudgeTurn(m))).toBe(true);
+  });
+
+  // LIVE WHERE THE CALLER ASKED FOR LIVE (issue #457, review round 7). `requireLiveBotOwnership` is
+  // the mode that does not trust the mirror: the assignment webhook can be delayed or lost, and the
+  // send path re-probes Chatwoot instead of reading the row. The note is durable and no later probe
+  // can unwrite it, so it gets the same certainty the send gets — here the mirror still says the bot
+  // owns it and the live conversation says a person does.
+  test("a live-gated nudge asks Chatwoot, not the mirror, before the note", async () => {
+    const contactInboxId = 8861;
+    await seedConv(963, null, new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const s = stub();
+    // The takeover lands AFTER the pre-gate probe: the first live read is what lets the run proceed
+    // at all, and every one after it reports the person. The mirror row seeded above still says the
+    // bot owns it, which is the whole point — this mode does not trust it.
+    let liveReads = 0;
+    const client = {
+      ...(await s.makeClient()),
+      getConversation: async (c: number) => ({
+        id: c,
+        status: ++liveReads === 1 ? "pending" : "open",
+        meta: liveReads === 1 ? {} : { assignee: { id: 5 } },
+      }),
+    } as unknown as ChatwootClient;
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:963`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      requireLiveBotOwnership: true,
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: async () => client,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(false);
+    // The control: the run really did get past the pre-gate, so the absence above is the note's own
+    // probe and not an early refusal.
+    expect(liveReads).toBeGreaterThan(1);
+  });
+
+  // A LOCAL CLAIM THE SOURCE HAS NOT CONFIRMED (issue #436, review round 4). This gate deliberately
+  // does not trust the mirror, and that is right for everything Chatwoot knows and wrong for the one
+  // thing it does not: a transition this side has already written. While the takeover's toggle is on
+  // the wire the REST snapshot still says `pending` and bot-owned, so a probe reading it at face
+  // value sends a follow-up into a conversation a colleague has just answered in — the mirror
+  // refuses that write, and the probe would go ahead anyway.
+  //
+  // `reconcileMirrorFromLive` returns the row AFTER its own ordering decided, so it is the live read
+  // wherever the live read won and the claim where it did not.
+  test("a live-gated nudge does not send over a status claim the source has not confirmed", async () => {
+    const convId = 966;
+    await seedConv(convId, null);
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: convId },
+      // What the takeover leaves behind between its compare-and-swap and its reconcile.
+      data: {
+        status: "open",
+        chatwootStatusAt: 1_788_000_000.5,
+        statusClaimUntil: new Date(Date.now() + 30_000),
+        statusClaimFrom: "pending",
+        statusClaimStampedAt: null,
+      },
+    });
+    const s = stub();
+    const client = {
+      ...(await s.makeClient()),
+      // Chatwoot has not committed the toggle yet, so it answers with the state the takeover decided
+      // about — the one reading this gate cannot tell from a conversation nobody has touched.
+      getConversation: async (c: number) => ({
+        id: c,
+        status: "pending",
+        updated_at: 1_788_000_001.5,
+        meta: {},
+      }),
+    } as unknown as ChatwootClient;
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:${convId}`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      requireLiveBotOwnership: true,
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(s.messages).toEqual([]);
+    // ...and the claim is still what the row says: the probe read it, it did not overwrite it.
+    const row = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { status: true },
+    });
+    expect(row.status).toBe("open");
+  });
+
+  // ...AND WHEN THE RECONCILE CANNOT ANSWER, THE PROBE STANDS DOWN (issue #468, round 10). The one
+  // thing this gate needs the reconcile for is the claim, which the snapshot in hand cannot show, so
+  // carrying on with that snapshot is carrying on with the exact reading the claim exists to refuse.
+  test("a live-gated nudge stands down when the reconcile cannot be read", async () => {
+    const convId = 967;
+    await seedConv(convId, null);
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: convId },
+      data: {
+        status: "open",
+        chatwootStatusAt: 1_788_000_000.5,
+        statusClaimUntil: new Date(Date.now() + 30_000),
+        statusClaimFrom: "pending",
+        statusClaimStampedAt: null,
+      },
+    });
+    // The reconcile's OWN read, and nothing else: it is the only one that asks for the claim columns.
+    const unreadable = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            if (sel?.statusClaimStampedAt === true) {
+              throw new Error("mirror unreadable");
+            }
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as typeof appDb;
+    const s = stub();
+    const client = {
+      ...(await s.makeClient()),
+      getConversation: async (c: number) => ({
+        id: c,
+        status: "pending",
+        updated_at: 1_788_000_001.5,
+        meta: {},
+      }),
+    } as unknown as ChatwootClient;
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:${convId}`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      requireLiveBotOwnership: true,
+      base: unreadable,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(s.messages).toEqual([]);
+  });
+
+  // A TAKEOVER INSIDE THE WINDOW (issue #457, review round 6). `canMessagePre` is decided at the top
+  // of the run and the note is written far below — after the ingestion drain, after the queue, and
+  // after a claim that WAITS on an append's lease and on the row lock a /reset holds. A person taking
+  // the conversation over in there leaves the old answer saying the bot owns it, and the note would
+  // then announce that a human attendance ended while the human is in it. Nothing later can unwrite
+  // it: the post-invoke probe suppresses the SEND, and the thread keeps the message.
+  test("a takeover after the pre-gate stops the note", async () => {
+    const contactInboxId = 8859;
+    await seedConv(961, null, new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    // The takeover lands between the two reads: the config load sees a bot-owned conversation (so
+    // `canMessagePre` is true), and the ownership read beside the note sees the person.
+    const brittle = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            const isOwnershipRead =
+              !!sel &&
+              Object.keys(sel).length === 3 &&
+              sel.assigneeType === true &&
+              sel.assigneeId === true &&
+              sel.status === true;
+            const row = await query(args);
+            if (!isOwnershipRead || row === null) return row;
+            return { ...(row as object), assigneeType: "User", status: "open" };
+          },
+        },
+      },
+    }) as unknown as typeof appDb;
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:961`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: brittle,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(false);
+  });
+
+  // THE RACE IN THE OTHER DIRECTION (issue #457, review round 9). A nudge that STARTS while a person
+  // holds the conversation is prepared in human-handling mode: `renderNudge` will tell the model that
+  // a human is handling it and ask for an internal note. If the hand-back lands during that
+  // preparation, the fresh ownership read says the bot owns it — and writing the note there would put
+  // two contradictory statements in one model call. It stays owed; the next turn, prepared in bot
+  // mode with a directive that agrees with it, writes it.
+  test("a hand-back mid-preparation leaves the note for the next turn", async () => {
+    const contactInboxId = 8862;
+    // The conversation a person holds when the run starts: `canMessagePre` is false.
+    await seedConv(965, "User", new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    // …and the hand-back landing during preparation: every ownership-shaped read says the bot has it.
+    const brittle = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            const isOwnershipRead =
+              !!sel &&
+              Object.keys(sel).length === 3 &&
+              sel.assigneeType === true &&
+              sel.assigneeId === true &&
+              sel.status === true;
+            const row = await query(args);
+            if (!isOwnershipRead || row === null) return row;
+            return {
+              ...(row as object),
+              assigneeType: null,
+              assigneeId: null,
+              status: "pending",
+            };
+          },
+        },
+      },
+    }) as unknown as typeof appDb;
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:965`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: brittle,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    // Not in the thread, and not in what the model was handed either: the directive it ran with says
+    // a person is handling the conversation.
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(false);
+  });
+
+  // And the same guard on the fallback branch, asked after the channel read and immediately before
+  // the write (issue #457, review round 7): the `getState` above it is its own round trip, so an
+  // ownership answer from before it is stale by exactly that much.
+  test("a takeover stops the note on a conversation-keyed thread too", async () => {
+    await seedConv(964, null, new Date());
+    const saver = new MemorySaver();
+    const threadId = `${tenantId}:${instanceId}:964`;
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const brittle = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            const isOwnershipRead =
+              !!sel &&
+              Object.keys(sel).length === 3 &&
+              sel.assigneeType === true &&
+              sel.assigneeId === true &&
+              sel.status === true;
+            const row = await query(args);
+            if (!isOwnershipRead || row === null) return row;
+            return { ...(row as object), assigneeType: "User", status: "open" };
+          },
+        },
+      },
+    }) as unknown as typeof appDb;
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: brittle,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(false);
+  });
+
+  // THE CONVERSATION-KEYED FALLBACK THREAD (issue #457, review round 4). When the contact-inbox is
+  // unknown the nudge claims the thread and returns early, before any of the bookkeeping above — so
+  // the note has to be written on that branch or not at all, and this is a path the runtime supports
+  // and a turn that can be the first one after a hand-back, exactly like the keyed one.
+  test("a nudge on a conversation-keyed thread writes the note too", async () => {
+    await seedConv(959, null, new Date());
+    const saver = new MemorySaver();
+    const threadId = `${tenantId}:${instanceId}:959`;
+    // The evidence reaches this thread the same way: a successful handoff is written by the turn's
+    // OWN invoke, whatever the thread is keyed by.
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new AIMessage({
+            content: "",
+            tool_calls: [{ name: "handoff_to_human", args: {}, id: "h9" }],
+          }),
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h9",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("messaged");
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.filter((m) => String(m.content) === HUMAN_HANDBACK_NOTE).length,
+    ).toBe(1);
+  });
+
+  // And the same gate on that branch, for the same reason: this nudge runs in human-handling mode on
+  // purpose, and the note would contradict the directive it is about to act on.
+  test("a nudge on a conversation-keyed thread a human holds writes no note", async () => {
+    await seedConv(960, "User", new Date());
+    const saver = new MemorySaver();
+    const threadId = `${tenantId}:${instanceId}:960`;
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h9",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(false);
+  });
+
+  // NOT WHILE A HUMAN STILL OWNS IT (issue #457, review round 3). A nudge on a human-held conversation
+  // runs in human-handling mode ON PURPOSE — it asks the model for an internal note instead of a
+  // customer message — so a note saying the human attendance ended would contradict the very
+  // directive it is about to act on, and would persist a transition that did not happen.
+  test("a nudge while a human holds the conversation writes no hand-back note", async () => {
+    const contactInboxId = 8858;
+    await seedConv(958, "User", new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:958`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE),
+    ).toBe(false);
   });
 
   // The sidecar row is what resolve-time compaction reads to know which attendance the thread is on.
@@ -2372,7 +3267,9 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         await seedConv(9972, null);
         const s = stub();
         // Only the ownership read is broken, and only its SECOND call: the first one is what decides
-        // the turn may post at all, and breaking that would test a different branch entirely.
+        // the turn may post at all, and breaking that would test a different branch entirely. The
+        // hand-back note takes a read with this same projection (#457), but only when a note is
+        // actually owed — this thread carries no handoff, so it asks for none.
         let ownershipReads = 0;
         const brittle = appDb.$extends({
           query: {
@@ -3551,6 +4448,70 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(outcome).toBe("silent");
     expect(s.messages).toEqual([]);
     expect(s.notes).toEqual([]);
+  });
+
+  // Round 12, and it is the WIRING of the rule, not the rule: `tests/graph/silence.test.ts` proves
+  // `withoutLoneSilenceTool` in isolation, and this proves the follow-up applies it.
+  //
+  // The defect it stands on: granting the channel used to be gated on whether a source was
+  // CONFIGURED, and a source can be configured and yield nothing (an MCP server that is down). The
+  // grant then handed a lone function schema to an endpoint that had been running tool-less on the
+  // sentinel, and the whole follow-up fails at the provider — a token that leaks traded for a
+  // follow-up that never runs. The model here IS such an endpoint: `bindTools` throws.
+  test("a tool-less agent's follow-up binds nothing and stays silent", async () => {
+    await seedConv(9074, null);
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId },
+      select: { id: true },
+    });
+    // A NATIVE grant row with an empty list is how "every native revoked" is really configured — the
+    // absence of a row means ALL of them, so writing settings would have configured nothing.
+    const grant = await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: [],
+        knowledgeBaseIds: [],
+      },
+      select: { id: true },
+    });
+    const s = stub();
+    let bound = 0;
+    class SchemaRefusingModel extends BaseChatModel {
+      _llmType() {
+        return "schema-refusing";
+      }
+      override bindTools(_tools: unknown): never {
+        bound++;
+        throw new Error("400 this endpoint does not support function calling");
+      }
+      async _generate(): Promise<ChatResult> {
+        const text = FOLLOWUP_SKIP_SENTINEL;
+        return {
+          generations: [{ text, message: new AIMessage(text) }],
+        };
+      }
+    }
+    try {
+      const outcome = await runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:9074`,
+        nudge: { source: "followup", kind: "inactivity" },
+        base: appDb,
+        deps: {
+          makeModel: () => new SchemaRefusingModel({}),
+          makeClient: s.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      });
+      expect(bound).toBe(0);
+      expect(outcome).toBe("silent");
+      expect(s.messages).toEqual([]);
+    } finally {
+      await suDb.agentToolSelection.delete({ where: { id: grant.id } });
+    }
   });
 
   test("narrated-emptiness reply does not leak to the customer", async () => {

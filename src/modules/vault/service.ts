@@ -6,17 +6,32 @@ import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { SETTINGS_CREDENTIAL_PATHS } from "@/modules/agents/credential-paths";
 import {
+  markUndisclosed,
+  redactEndpoint,
+  undisclosedMoved,
+} from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
+import {
   runSecretTest,
   type SecretTestDeps,
   type SecretTestResult,
 } from "./secret-test";
 import {
+  BASE_URL_KIND_IDS,
+  type CredentialUse,
+  credentialServes,
   getSecretTypeFields,
   isManagedOAuthKind,
   isSecretTypeId,
+  PARAM_NAME_KIND_IDS,
+  readsPlainKey,
+  secretTypeFits,
   secretTypeIsManagedBlob,
   secretTypeNeedsParamName,
+  secretTypeRefusesBaseUrl,
+  secretTypeRefusesParamName,
   secretTypeRequiresBaseUrl,
+  secretValueFitsKind,
 } from "./secret-types";
 
 // Tenant-scoped secret vault. Secrets are encryptJson() base64 blobs in a String column
@@ -69,6 +84,39 @@ export function readVaultRefId(ref: string): bigint | null {
     return null;
   }
   return id < 0n || id > MAX_DB_ID ? null : id;
+}
+
+// The one form of a STORED ref that is safe to hand to a reader, or null when the stored value does
+// not name an entry at all.
+//
+// Every ref column was guarded by `requireVaultRef` on all of its writers in one commit (#126, and
+// the two `secretRef` columns are the measured case); before it the schema was
+// `z.string().min(1).max(128)` and the value went in verbatim. So a row can hold arbitrary text — an
+// API caller who read the field name as "the secret" and typed one in put it there — and a projection
+// that echoes the column publishes it to every reader of that projection, which is exactly what the
+// promise "the signing secret never leaves the vault" says cannot happen.
+//
+// What it proves is that the value IS a reference — the prefix plus an in-range integer — and not that
+// the entry exists. That distinction is deliberate, and it is why the guard can stay a pure function.
+// A ref whose entry was DELETED still comes back, so the picker can say "Credential unavailable" and
+// the operator learns what happened; verifying existence would replace that with silence and put a
+// tenant-scoped query inside every projection, including the ones that run in an audit transaction.
+//
+// The bound is what makes that safe rather than merely cheap: the output is never the stored string.
+// It is `vault:` plus the DECIMAL rendering of a parsed BigInt in [0, MAX_DB_ID], so `vault:0x1F4`
+// leaves as `vault:500` and everything an HMAC secret actually looks like — hex, base64, `sha256=…`,
+// any bare name — reads as null. Reaching the remaining sliver takes a stored value of the form
+// `vault:<digits>`, which is reference syntax: someone writing a raw secret writes the secret, not the
+// prefix. (Review round 5 read this as a secret-disclosure path; the table in
+// `tests/modules/alert-channel-secret-roundtrip.test.ts` is the measurement.)
+//
+// Canonical rather than verbatim for the values it DOES read: `vault: 7`, `vault:0007` and `vault:0x7`
+// all name entry 7, and echoing the stored spelling would hand a client back something
+// `requireVaultRef` refuses on the way in — a rename turned into an unsavable form.
+export function readableVaultRef(stored: string | null): string | null {
+  if (stored === null) return null;
+  const id = readVaultRefId(stored);
+  return id === null ? null : formatVaultRef(id);
 }
 
 export function vaultRefWhere(ref: string): { id: bigint } {
@@ -152,6 +200,60 @@ export interface ResolvedVaultEntry<T = unknown> {
   name: string;
 }
 
+export type VaultEntryResolution<T> =
+  | { state: "filled"; entry: ResolvedVaultEntry<T> }
+  | { state: "pending" }
+  | { state: "not_found" };
+
+// The base URL a consumer may DIAL, which is not always the one in the row.
+//
+// The write boundary refuses a base URL on a kind that has no use for one (#504), and refusing only
+// there leaves every row an older build wrote still redirecting: the model path, vision, STT, TTS,
+// the HTTP-tool base and the MCP connection URL all read this field off the RESOLVED entry without
+// asking the kind. A rule that only covers new writes is a rule that does not cover the installs it
+// was written for.
+//
+// The row is not touched. `listVaultInfos` still reports the stored value, so the console can show an
+// operator what is sitting in a field its own form never rendered — and nothing dials it.
+export function dialableBaseUrl(
+  kind: string | null,
+  baseUrl: string | null,
+): string | null {
+  return secretTypeRefusesBaseUrl(kind) ? null : baseUrl;
+}
+
+// State-aware variant for callers that need both operator-facing pending/not-found diagnostics and
+// active-entry metadata such as baseUrl. Keeping this separate avoids changing the generic
+// resolveVaultRefState value contract used by existing secret-only consumers.
+export async function resolveVaultEntryState<T = unknown>(
+  db: ScopedDb,
+  ref: string,
+): Promise<VaultEntryResolution<T>> {
+  const entry = await db.vaultEntry.findFirst({
+    where: vaultRefWhere(ref),
+    select: {
+      secret: true,
+      kind: true,
+      baseUrl: true,
+      paramName: true,
+      name: true,
+      status: true,
+    },
+  });
+  if (!entry) return { state: "not_found" };
+  if (entry.status === "pending") return { state: "pending" };
+  return {
+    state: "filled",
+    entry: {
+      secret: decryptJson<T>(entry.secret),
+      kind: entry.kind,
+      baseUrl: dialableBaseUrl(entry.kind, entry.baseUrl),
+      paramName: entry.paramName,
+      name: entry.name,
+    },
+  };
+}
+
 export async function resolveVaultEntry<T = unknown>(
   db: ScopedDb,
   ref: string,
@@ -172,16 +274,23 @@ export async function resolveVaultEntry<T = unknown>(
   return {
     secret: decryptJson<T>(entry.secret),
     kind: entry.kind,
-    baseUrl: entry.baseUrl,
+    baseUrl: dialableBaseUrl(entry.kind, entry.baseUrl),
     paramName: entry.paramName,
     name: entry.name,
   };
 }
 
-export async function tryResolveVaultEntry<T = unknown>(
+// The secret comes back as `unknown` and the generic parameter is gone ON PURPOSE. It used to
+// default to `unknown` and be spelled `<string>` at ten call sites, where it was not a check but an
+// assertion: `decryptJson<T>` casts, so a `google_oauth` entry's `{ clientId, clientSecret }` was
+// typed `string` all the way into `createChatModel` (issue #471). Callers that need a string now say
+// so through `tryResolveApiKeyEntry`, or narrow it themselves; the six that already narrowed keep
+// compiling unchanged, and the ten that did not could not be missed, because the compiler is what
+// found them.
+export async function tryResolveVaultEntry(
   db: ScopedDb,
   ref: string,
-): Promise<ResolvedVaultEntry<T> | null> {
+): Promise<ResolvedVaultEntry | null> {
   const entry = await db.vaultEntry.findFirst({
     where: vaultRefWhere(ref),
     select: {
@@ -195,11 +304,51 @@ export async function tryResolveVaultEntry<T = unknown>(
   });
   if (!entry || entry.status === "pending") return null;
   return {
-    secret: decryptJson<T>(entry.secret),
+    secret: decryptJson(entry.secret),
     kind: entry.kind,
-    baseUrl: entry.baseUrl,
+    baseUrl: dialableBaseUrl(entry.kind, entry.baseUrl),
     paramName: entry.paramName,
     name: entry.name,
+  };
+}
+
+// The same resolution for a field that reads a PLAIN API KEY and hands it to somebody else's SDK —
+// the agent's model and its four model overrides, STT, TTS and vision. Three outcomes rather than
+// two, because the operator's move differs and the log line that names it is the only trace any of
+// these leave: a ref that no longer resolves is a credential to re-pick or fill, and one that
+// resolves to the wrong KIND is a credential that belongs on another field.
+//
+// The shape check is belt AND braces on the kind check, and neither is redundant. The kind is the
+// catalog's declaration; the value is what is actually stored, and the two can disagree — a legacy
+// entry created before the kind existed, or a managed blob whose connect flow never ran.
+export type ApiKeyResolution =
+  | { state: "ok"; secret: string; baseUrl: string | null }
+  // Deleted, never resolvable, or referenced with its secret not filled in yet.
+  | { state: "unresolved" }
+  // Present and filled, and this is not a credential this field can use.
+  | { state: "unusable"; kind: string };
+
+export async function tryResolveApiKeyEntry(
+  db: ScopedDb,
+  ref: string,
+): Promise<ApiKeyResolution> {
+  const entry = await tryResolveVaultEntry(db, ref);
+  if (!entry) return { state: "unresolved" };
+  // The same two predicates the write boundary and config-health use, and `secretValueFitsKind`
+  // rather than a local `typeof`: the local one accepted an empty string, so an active legacy row
+  // holding `""` was refused on the way IN and handed to the provider as a blank key on the way OUT.
+  // The two readings of "unfit" have one source now, which is the only way they stay one answer.
+  if (
+    !secretTypeFits(entry.kind, "apiKey") ||
+    !secretValueFitsKind(entry.kind, entry.secret) ||
+    typeof entry.secret !== "string"
+  ) {
+    return { state: "unusable", kind: entry.kind };
+  }
+  return {
+    state: "ok",
+    secret: entry.secret,
+    baseUrl: dialableBaseUrl(entry.kind, entry.baseUrl),
   };
 }
 
@@ -222,7 +371,23 @@ export async function resolveVaultRefByName(
   kind?: string | null,
   base: PrismaClient = basePrisma,
 ): Promise<VaultNameResolution> {
-  return runScopedOn(base, ctx, async (db) => {
+  return runScopedOn(base, ctx, (db) =>
+    resolveVaultRefByNameOn(db, name, kind),
+  );
+}
+
+// The same lookup, on a transaction the caller already opened — the read half of the pair whose
+// write half is `ensurePendingVaultEntryOn`. The agent import asks this question once per credential
+// the bundle names and then creates what it did not find, so a lookup on a separate connection
+// cannot see the rows the import has already written: a bundle referencing the same missing
+// credential twice under trim-equivalent spellings resolved the second one as missing too, and the
+// insert then collided with the row from the first. Same transaction, same answer.
+export async function resolveVaultRefByNameOn(
+  db: ScopedDb,
+  name: string,
+  kind?: string | null,
+): Promise<VaultNameResolution> {
+  {
     const where = kind != null ? { name, kind } : { name };
     const rows = await db.vaultEntry.findMany({
       where,
@@ -243,7 +408,7 @@ export async function resolveVaultRefByName(
     // Multiple entries share the name with different kinds.
     const kinds = [...new Set(rows.map((r) => r.kind))].sort();
     return { status: "ambiguous", kinds } as const;
-  });
+  }
 }
 
 // A ref on its way INTO a column, checked against the tenant's vault and returned in the one
@@ -316,6 +481,155 @@ export async function requireVaultRef(
   return formatVaultRef(entry.id);
 }
 
+// `requireVaultRef` plus the question it never asked: can an entry of THIS KIND supply what the
+// field reads? The two are separate functions rather than one parameter because the ref rule reaches
+// thirteen call sites and this one does not: four of them (langfuse, the two integration credentials,
+// and the webhook/alert signing secrets) answer a THIRD question — a fixed kind, or a string consumed
+// locally and never sent anywhere — and folding those into the two-value `CredentialUse` would have
+// meant inventing a use for each just to satisfy a required parameter. What this covers is the fields
+// whose use is already declared: the agent's nine (SETTINGS_CREDENTIAL_PATHS + modelConfig) and the
+// tenant's embedding key. Issue #471.
+//
+// The field is in the English sentence as well as in `AppError.field`, which is a duplication the
+// other vault refusals do not carry. MCP hands `message` to the caller verbatim on a surface with no
+// structured error channel, and `agent_settings_set` patches several credentialled blocks in one
+// call: without the path, "credential vault:32 cannot serve this field" names no field to fix.
+//
+// Refused rather than reported, and that is the split `credential-paths.ts` already documents: the
+// operator is at the keyboard and the reference is the thing they just picked. What is ALREADY stored
+// is left alone and reported by config-health, so one unusable pairing cannot freeze every other
+// edit of the agent that holds it.
+// Decrypts a stored blob far enough to answer "is this the shape its kind declares?", and never
+// further: the value is judged and dropped, never returned or logged.
+//
+// THREE answers, not two, and the third is the one that matters. A blob that cannot be decrypted at
+// all — a rotated `ENCRYPTION_KEY`, a truncated row — is not a malformed value, it is a value nobody
+// can read, and collapsing it into "unfit" would make a key rotation refuse every agent write in the
+// workspace while blaming the credential's TYPE for it. That is a real problem with a different
+// cause, a different fix and no verdict here today; this change is about shape, and inventing an
+// answer for it would be inventing a diagnosis. So `unreadable` never refuses and never warns, and
+// the runtime keeps failing on it exactly as it did before.
+type ValueVerdict = "fits" | "unfit" | "unreadable";
+
+function vaultValueVerdict(
+  kind: string | null,
+  encrypted: string,
+): ValueVerdict {
+  let value: unknown;
+  try {
+    value = decryptJson(encrypted);
+  } catch {
+    return "unreadable";
+  }
+  return secretValueFitsKind(kind, value) ? "fits" : "unfit";
+}
+
+// The permissive projection every caller here wants: only a value that was READ and judged wrong
+// counts against the credential.
+function vaultValueFits(kind: string | null, encrypted: string): boolean {
+  return vaultValueVerdict(kind, encrypted) !== "unfit";
+}
+
+// What the vault says about one ref beyond its existence, for the two callers that judge a PAIRING
+// without being the write boundary: the import warning and (through listVaultInfos) config-health.
+// One function so the three surfaces cannot end up asking different halves of the same question,
+// which is the defect this whole change is about. Null when the ref names no row in this tenant.
+export interface VaultEntryFacts {
+  kind: string;
+  valueFitsKind: boolean;
+  // The operator-supplied header/query name, for the two kinds that read one, and the base URL a
+  // relative tool template is resolved against. Part of the facts and not a second lookup because
+  // WHERE the credential lands is as much a property of the entry as whether it fits, and the base
+  // is part of the URL the tool actually requests — placeholders in it included (#504).
+  paramName: string | null;
+  baseUrl: string | null;
+}
+
+export async function readVaultRefFacts(
+  db: ScopedDb,
+  ref: string,
+): Promise<VaultEntryFacts | null> {
+  const row = await db.vaultEntry.findFirst({
+    where: vaultRefWhere(ref),
+    select: {
+      kind: true,
+      status: true,
+      secret: true,
+      paramName: true,
+      baseUrl: true,
+    },
+  });
+  if (!row) return null;
+  return {
+    kind: row.kind,
+    valueFitsKind:
+      row.status === "pending" || vaultValueFits(row.kind, row.secret),
+    paramName: row.paramName,
+    baseUrl: row.baseUrl,
+  };
+}
+
+export async function requireVaultRefFor(
+  db: ScopedDb,
+  ref: string,
+  field: string,
+  use: CredentialUse,
+): Promise<string> {
+  const canonical = await requireVaultRef(db, ref, field);
+  const entry = await db.vaultEntry.findFirst({
+    where: vaultRefWhere(canonical),
+    select: { kind: true, status: true, secret: true },
+  });
+  // Gone between the two reads: `requireVaultRef` has already answered for existence, and inventing
+  // a second refusal here would report a race as a shape problem.
+  if (!entry) return canonical;
+  // TWO questions, because the runtime asks two and a boundary that asks fewer accepts a
+  // configuration the turn then refuses — with config-health calling it healthy in between, which is
+  // the exact asymmetry this change exists to remove. The kind is the catalog's declaration; the
+  // value is what is in the row, and `validateVaultValue` is not the only way one gets written.
+  //
+  // A PENDING entry is exempt from the value half and only from that half: it has no secret yet by
+  // design (`credential_create` writes exactly that), and refusing it would break the reference-first
+  // flow the write boundary admits deliberately. Its KIND is already knowable and is still checked.
+  // A PENDING entry has no value yet by design (`credential_create` writes exactly that), so it is
+  // reported as `valueFitsKind` and judged on its KIND alone — the one exemption, and only on the
+  // value half. Refusing it would break the reference-first flow the write boundary admits on purpose.
+  if (
+    credentialServes(
+      {
+        kind: entry.kind,
+        valueFitsKind:
+          entry.status === "pending" ||
+          vaultValueFits(entry.kind, entry.secret),
+      },
+      use,
+    )
+  ) {
+    return canonical;
+  }
+  // Two spellings of one refusal, written out rather than ternaried into one `new AppError`. The
+  // error-catalog fence reads the key and its interpolation values out of the SOURCE, and a key
+  // computed in the argument position is invisible to it: it reported the outbound sentence as a key
+  // nothing throws and the API-key one as thrown without its `{{kind}}`. Both readings were right
+  // about the text and wrong about the code, which is the fence doing its job.
+  if (readsPlainKey(use)) {
+    throw new AppError(
+      `${field}: credential "${ref}" (kind "${entry.kind}") cannot serve a field that reads a plain API key`,
+      400,
+      "errors.credentialKindUnusableAsKey",
+      { kind: entry.kind },
+      field,
+    );
+  }
+  throw new AppError(
+    `${field}: credential "${ref}" (kind "${entry.kind}") is never sent outbound and cannot authenticate a request`,
+    400,
+    "errors.credentialKindUnusableOutbound",
+    { kind: entry.kind },
+    field,
+  );
+}
+
 export async function vaultNameByRef(
   ctx: TenantContext,
   ref: string,
@@ -335,7 +649,7 @@ export async function vaultNameByRef(
 const HTTPS_RE = /^https?:\/\//i;
 const PARAM_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
-function validateBaseUrl(raw: string): string {
+export function validateBaseUrl(raw: string): string {
   const trimmed = raw.trim();
   if (!trimmed) return "";
   if (!HTTPS_RE.test(trimmed)) {
@@ -366,6 +680,16 @@ function validateBaseUrl(raw: string): string {
   }
 }
 
+// The catalog declares WHICH kinds read a param name (`needsParamName`), and until issue #488 this
+// only enforced half of that: required where declared, and accepted-then-ignored everywhere else.
+// The field is read in exactly one place (`resolveSecretInjection`, off a `needsParamName` entry),
+// so a name stored on any other kind is a name nothing will ever send — the operator configures an
+// `Authorization` header, the write answers 200, the console reads it back, and the request goes
+// out with no credential on it. Refusing is the only half that reaches them: whoever gets this
+// picked the kind, and the fix is to pick one that injects (that is what the sentence names).
+//
+// Empty stays empty: "" has always meant "no param name", and refusing it would break a client that
+// sends the field unconditionally.
 function validateParamName(raw: string, kind: string): string {
   const trimmed = raw.trim();
   if (secretTypeNeedsParamName(kind) && !trimmed) {
@@ -373,6 +697,16 @@ function validateParamName(raw: string, kind: string): string {
       "paramName is required for this credential type",
       400,
       "errors.vaultParamNameRequired",
+    );
+  }
+  if (trimmed && secretTypeRefusesParamName(kind)) {
+    const kinds = PARAM_NAME_KIND_IDS.join(", ");
+    throw new AppError(
+      `the "${kind}" credential type does not use a param name. The types that do are: ${kinds}.`,
+      400,
+      "errors.vaultParamNameNotApplicable",
+      { kind, kinds },
+      "paramName",
     );
   }
   if (trimmed && !PARAM_NAME_RE.test(trimmed)) {
@@ -501,6 +835,11 @@ export interface VaultEntryInfo {
   paramName: string | null;
   // "active" = a real secret is stored; "pending" = only the reference exists (not filled yet).
   status: string;
+  // Whether the stored value is the shape this kind declares. A VERDICT, never the value: it is
+  // computed server-side and crosses the wire as a boolean, so the console can judge a pairing the
+  // way the runtime does without the secret ever leaving the process. Always true for a `pending`
+  // entry, which has no value yet and is reported through `status` instead.
+  valueFitsKind: boolean;
 }
 
 export async function listVaultInfos(db: ScopedDb): Promise<VaultEntryInfo[]> {
@@ -512,6 +851,7 @@ export async function listVaultInfos(db: ScopedDb): Promise<VaultEntryInfo[]> {
       baseUrl: true,
       paramName: true,
       status: true,
+      secret: true,
     },
     orderBy: { name: "asc" },
   });
@@ -522,6 +862,7 @@ export async function listVaultInfos(db: ScopedDb): Promise<VaultEntryInfo[]> {
     baseUrl: r.baseUrl,
     paramName: r.paramName,
     status: r.status,
+    valueFitsKind: r.status === "pending" || vaultValueFits(r.kind, r.secret),
   }));
 }
 
@@ -532,9 +873,22 @@ export async function listVaultInfos(db: ScopedDb): Promise<VaultEntryInfo[]> {
 // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — detecting control chars
 const VAULT_NAME_CTRL_RE = /[\x00-\x1f\x7f]/;
 
-function validateVaultName(raw: string): string {
+// The name a row is STORED under, or null when it could never be stored. A caller that looks a
+// credential up BEFORE deciding to create it has to ask about the same string the write will use,
+// and the write trims: the agent import resolved a bundle's ` cred ` as missing, reached the insert,
+// and collided with the row it had just failed to find. `validateVaultName` is this function plus
+// the throw, so the rule has one spelling rather than two.
+export function storedVaultName(raw: string): string | null {
   const name = raw.trim();
   if (name.length === 0 || name.length > 128 || VAULT_NAME_CTRL_RE.test(name)) {
+    return null;
+  }
+  return name;
+}
+
+function validateVaultName(raw: string): string {
+  const name = storedVaultName(raw);
+  if (name === null) {
     throw new AppError(
       "invalid vault entry name",
       400,
@@ -566,7 +920,184 @@ export interface CreateVaultEntryInput {
   paramName?: string | null;
 }
 
+// Everything `createVaultEntry` decides about its input, before any database is involved: the name,
+// the kind against the catalog, the VALUE against that kind's declared fields (non-empty, no
+// surrounding whitespace, no unexpected key), the base URL, and the param name. Split out so a
+// caller that will eventually reach this write can ask the same question first (#490).
+//
+// Its RETURN is part of the verdict, not a convenience: `kind` defaults to "generic" and `baseUrl`
+// normalizes, and a caller that re-derives either from the raw input will disagree with what gets
+// stored.
+
+// The base URL a write would STORE, refusing both ways the kind can disagree with it: required and
+// absent, and present on a kind that has no use for one.
+//
+// It exists because the check has to sit after the normalization, and `updateVaultEntry` had it
+// before: it asked `secretTypeRequiresBaseUrl` only on the `null`/`""` branch, while the other
+// branch ran `validateBaseUrl`, which turns "   " into the empty string WITHOUT raising, and stored
+// the `null` that branch had just refused. So a langfuse entry that already existed could be
+// updated to `baseUrl: null` — a state its own create path rejects. Found by the MCP preview
+// answering the question the apply did not (#490), and it is the inverse of every other divergence
+// in that issue: the preview refused and the apply succeeded, leaving invalid configuration behind.
+//
+// The second half is issue #504, and it is the `paramName` story of #488 with a sharper ending. The
+// catalog declares which kinds carry a base URL; the console renders the input for exactly those
+// nine of the eighteen and for no other. The other nine STORED one anyway — every one of them,
+// measured — and the runtime then USED it: `prepare.ts` hands the model client `credentialBaseUrl ?? mc.baseURL`
+// straight off the resolved entry, and vision, STT, TTS, the HTTP-tool base and the MCP connection
+// URL do the same, none of them asking the kind. So an `openai` credential could carry a host the
+// console never shows, never lists and cannot edit, and the provider key went there on the next
+// turn. The kind that legitimately points an OpenAI API somewhere else is `openai_compatible`, and
+// naming it is the difference between a refusal and a dead end.
+//
+// Empty stays empty, for the reason `validateParamName` gives: the console submits the field on
+// every kind whose form has no input, and refusing that would refuse every save it makes.
+function normalizeBaseUrlForKind(
+  raw: string | null | undefined,
+  kind: string,
+): string | null {
+  const normalized =
+    raw == null || raw === "" ? null : validateBaseUrl(raw) || null;
+  if (normalized === null) {
+    if (secretTypeRequiresBaseUrl(kind)) {
+      throw new AppError(
+        "baseUrl is required for this credential type",
+        400,
+        "errors.vaultBaseUrlRequired",
+      );
+    }
+    return null;
+  }
+  if (secretTypeRefusesBaseUrl(kind)) {
+    const kinds = BASE_URL_KIND_IDS.join(", ");
+    throw new AppError(
+      `the "${kind}" credential type does not use a base URL. The types that do are: ${kinds}.`,
+      400,
+      "errors.vaultBaseUrlNotApplicable",
+      { kind, kinds },
+      "baseUrl",
+    );
+  }
+  return normalized;
+}
+
+export function assertVaultEntryCreatable(input: CreateVaultEntryInput): {
+  name: string;
+  kind: string;
+  baseUrl: string | null;
+  paramName: string | null;
+} {
+  const name = validateVaultName(input.name);
+  if (input.kind != null && !isSecretTypeId(input.kind)) {
+    throw new AppError("invalid secret type", 400, "errors.invalidSecretType");
+  }
+  const kind = input.kind ?? "generic";
+  validateVaultValue(kind, input.value);
+
+  const baseUrl = normalizeBaseUrlForKind(input.baseUrl, kind);
+
+  const paramName =
+    input.paramName != null
+      ? validateParamName(input.paramName, kind)
+      : secretTypeNeedsParamName(kind)
+        ? (() => {
+            throw new AppError(
+              "paramName is required for this credential type",
+              400,
+              "errors.vaultParamNameRequired",
+            );
+          })()
+        : null;
+
+  return { name, kind, baseUrl, paramName };
+}
+
 // INSERT-only create: 409 if both name and kind already exist in the tenant.
+// What a credential's audit row carries, and what it only compares.
+//
+// This is the family where the metadata and the thing that authenticates are adjacent columns, so
+// the two halves are drawn tightly. PROJECTED: the identity (`id`, `name`), the type, the lifecycle
+// and the two fields that say how the credential is used. `baseUrl` is an operator-typed URL and
+// reaches the row as its ORIGIN, by the same rule every such URL answers to (`redactEndpoint`): a
+// self-hosted API root is exactly the kind of destination that carries a token in its path, and this
+// row is append-only and outlives the entry.
+//
+// UNDISCLOSED, compared and never carried: the `secret` itself, and the whole `baseUrl` so a change
+// living in the path is still recorded as a change.
+type VaultAuditRow = {
+  id: bigint;
+  name: string;
+  kind: string;
+  status: string;
+  baseUrl: string | null;
+  paramName: string | null;
+  secret: string;
+};
+
+function auditProjection(r: VaultAuditRow) {
+  return {
+    id: String(r.id),
+    name: r.name,
+    kind: r.kind,
+    status: r.status,
+    baseUrl: r.baseUrl === null ? null : redactEndpoint(r.baseUrl),
+    paramName: r.paramName,
+  };
+}
+
+const VAULT_AUDIT_SELECT = {
+  id: true,
+  name: true,
+  kind: true,
+  status: true,
+  baseUrl: true,
+  paramName: true,
+  secret: true,
+} as const;
+
+const UNDISCLOSED = ["secret", "baseUrl"] as const;
+
+// Whether the credential BEHIND the reference moved, asked of the plaintext.
+//
+// The ciphertext cannot answer it: `encryptJson` randomizes, so re-submitting the value already
+// stored produces a different blob every time, and a comparison on the column would report a
+// rotation on every save of an unchanged credential. A blob that cannot be read counts as moved:
+// the write replaces it, and an unreadable secret becoming a readable one is a change.
+function secretMoved(before: string, after: string): boolean {
+  // The column UNCHANGED is the one answer the ciphertext can give: a metadata-only save leaves the
+  // blob byte-identical, and asking anything else about it (including whether it can be read) would
+  // report a rotation on every edit of a row whose key has since changed.
+  if (before === after) return false;
+  let a: unknown;
+  let b: unknown;
+  try {
+    a = decryptJson(before);
+  } catch {
+    return true;
+  }
+  try {
+    b = decryptJson(after);
+  } catch {
+    return true;
+  }
+  return stableJson(a) !== stableJson(b);
+}
+
+// Key order is not part of a credential. A multi-field secret is stored as an object and read by
+// key, so `{publicKey, secretKey}` and `{secretKey, publicKey}` are the same credential and a
+// comparison that says otherwise reports a rotation nobody performed.
+function stableJson(v: unknown): string {
+  return JSON.stringify(v, (_k, val) =>
+    val && typeof val === "object" && !Array.isArray(val)
+      ? Object.fromEntries(
+          Object.entries(val as Record<string, unknown>).sort(([x], [y]) =>
+            x < y ? -1 : x > y ? 1 : 0,
+          ),
+        )
+      : val,
+  );
+}
+
 export async function createVaultEntry(
   ctx: TenantContext,
   nameOrInput: string | CreateVaultEntryInput,
@@ -597,44 +1128,18 @@ export async function createVaultEntry(
     rawParamName = undefined;
   }
 
-  const validName = validateVaultName(rawName);
-  if (rawKind != null && !isSecretTypeId(rawKind)) {
-    throw new AppError("invalid secret type", 400, "errors.invalidSecretType");
-  }
-
-  const normalizedKind = rawKind ?? "generic";
-
-  // Validate value shape for the kind.
-  validateVaultValue(normalizedKind, rawValue);
-
-  // Validate and normalize baseUrl.
-  let normalizedBaseUrl: string | null = null;
-  if (rawBaseUrl != null && rawBaseUrl !== "") {
-    const validated = validateBaseUrl(rawBaseUrl);
-    normalizedBaseUrl = validated || null;
-  }
-
-  if (secretTypeRequiresBaseUrl(normalizedKind) && !normalizedBaseUrl) {
-    throw new AppError(
-      "baseUrl is required for this credential type",
-      400,
-      "errors.vaultBaseUrlRequired",
-    );
-  }
-
-  // Validate paramName.
-  const normalizedParamName =
-    rawParamName != null
-      ? validateParamName(rawParamName, normalizedKind)
-      : secretTypeNeedsParamName(normalizedKind)
-        ? (() => {
-            throw new AppError(
-              "paramName is required for this credential type",
-              400,
-              "errors.vaultParamNameRequired",
-            );
-          })()
-        : null;
+  const {
+    name: validName,
+    kind: normalizedKind,
+    baseUrl: normalizedBaseUrl,
+    paramName: normalizedParamName,
+  } = assertVaultEntryCreatable({
+    name: rawName,
+    value: rawValue,
+    kind: rawKind,
+    baseUrl: rawBaseUrl,
+    paramName: rawParamName,
+  });
 
   return runScopedOn(base, ctx, async (db) => {
     const existing = await db.vaultEntry.findFirst({
@@ -659,7 +1164,12 @@ export async function createVaultEntry(
           baseUrl: normalizedBaseUrl,
           paramName: normalizedParamName || null,
         },
-        select: { id: true },
+        select: VAULT_AUDIT_SELECT,
+      });
+      await auditMutation(db, ctx, {
+        action: "credential.create",
+        target: formatVaultRef(created.id),
+        after: auditProjection(created),
       });
       return { id: created.id, ref: formatVaultRef(created.id) };
     } catch (e) {
@@ -682,20 +1192,46 @@ export interface CreatePendingVaultEntryInput {
   paramName?: string | null;
 }
 
-// Creates a reference-only ("pending") vault entry: NO secret is supplied. Stores encryptJson({}) as
-// a placeholder with status="pending"; resolution treats it as missing (resolve* throw
-// errors.credentialPending, try* return null) until the operator fills it in the UI — updateVaultEntry
-// with a real value promotes it to "active". Used by the MCP `credential_create` tool, which by design
-// never receives a secret. INSERT-only: 409 if (name, kind) already exists in the tenant. baseUrl /
-// paramName are not secrets, so they are validated/required up front to keep the entry coherent.
-export async function createPendingVaultEntry(
+// Everything `createPendingVaultEntry` decides about its INPUT, before any database is involved: the
+// name, the kind against the catalog, the two kinds that can only come from a connect flow, the base
+// URL, and the param name. Split out so the MCP preview can ask the same question the apply asks
+// (#490) — the preview answers without reaching the core, so a rule that lives only inside it is a
+// rule the preview promises away. Returns the normalized fields the caller goes on to store.
+// The database half of `createPendingVaultEntry`'s verdict, ADVISORY like the others: it reads
+// outside the write's transaction, so the `(name, kind)` pair it finds free can be taken before the
+// apply gets there. The pre-read inside the write, and the unique index behind it, stay the
+// authority — this only lets the preview refuse the collision the operator actually causes, which
+// is reusing a name they already used (#490).
+//
+// It takes the NORMALIZED pair, not the raw input, because `kind` defaults to "generic" and the
+// uniqueness is on the stored value: asking with the raw `kind: null` would look up a row that
+// cannot exist and answer "free" for a name that is not.
+export async function assertVaultNameAvailable(
   ctx: TenantContext,
-  input: CreatePendingVaultEntryInput,
+  name: string,
+  kind: string,
   base: PrismaClient = basePrisma,
-): Promise<{ id: bigint; ref: string }> {
-  if (ctx.tenantId === null) throw new AppError("tenant required", 400);
-  const tenantId = ctx.tenantId;
+): Promise<void> {
+  const taken = await runScopedOn(base, ctx, (db) =>
+    db.vaultEntry.findFirst({ where: { name, kind }, select: { id: true } }),
+  );
+  if (taken) {
+    throw new ConflictError(
+      "vault entry name and type already in use",
+      "errors.vaultNameInUse",
+      "name",
+    );
+  }
+}
 
+export function assertPendingVaultEntryCreatable(
+  input: CreatePendingVaultEntryInput,
+): {
+  name: string;
+  kind: string;
+  baseUrl: string | null;
+  paramName: string | null;
+} {
   const validName = validateVaultName(input.name);
   if (input.kind != null && !isSecretTypeId(input.kind)) {
     throw new AppError("invalid secret type", 400, "errors.invalidSecretType");
@@ -716,17 +1252,13 @@ export async function createPendingVaultEntry(
     );
   }
 
-  let normalizedBaseUrl: string | null = null;
-  if (input.baseUrl != null && input.baseUrl !== "") {
-    normalizedBaseUrl = validateBaseUrl(input.baseUrl) || null;
-  }
-  if (secretTypeRequiresBaseUrl(normalizedKind) && !normalizedBaseUrl) {
-    throw new AppError(
-      "baseUrl is required for this credential type",
-      400,
-      "errors.vaultBaseUrlRequired",
-    );
-  }
+  // NOTE: the SAME helper the create path uses, not a second spelling of it. The two were written
+  // separately and the copy here already lagged once — it is where #490 found the required-baseUrl
+  // check sitting before the normalization instead of after.
+  const normalizedBaseUrl = normalizeBaseUrlForKind(
+    input.baseUrl,
+    normalizedKind,
+  );
   const normalizedParamName =
     input.paramName != null
       ? validateParamName(input.paramName, normalizedKind)
@@ -740,45 +1272,104 @@ export async function createPendingVaultEntry(
           })()
         : null;
 
+  return {
+    name: validName,
+    kind: normalizedKind,
+    baseUrl: normalizedBaseUrl,
+    paramName: normalizedParamName || null,
+  };
+}
+
+// Creates a reference-only ("pending") vault entry: NO secret is supplied. Stores encryptJson({}) as
+// a placeholder with status="pending"; resolution treats it as missing (resolve* throw
+// errors.credentialPending, try* return null) until the operator fills it in the UI — updateVaultEntry
+// with a real value promotes it to "active". Used by the MCP `credential_create` tool, which by design
+// never receives a secret. INSERT-only: 409 if (name, kind) already exists in the tenant. baseUrl /
+// paramName are not secrets, so they are validated/required up front to keep the entry coherent.
+export async function createPendingVaultEntry(
+  ctx: TenantContext,
+  input: CreatePendingVaultEntryInput,
+  base: PrismaClient = basePrisma,
+): Promise<{ id: bigint; ref: string }> {
+  if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   return runScopedOn(base, ctx, async (db) => {
-    const existing = await db.vaultEntry.findFirst({
-      where: { name: validName, kind: normalizedKind },
-      select: { id: true },
-    });
-    if (existing) {
+    const entry = await ensurePendingVaultEntryOn(db, ctx, input);
+    if (!entry.created) {
       throw new ConflictError(
         "vault entry name and type already in use",
         "errors.vaultNameInUse",
         "name",
       );
     }
-    // Placeholder blob: an empty object, never a real secret. `status` discriminates it from active.
-    const blob = encryptJson({});
-    try {
-      const created = await db.vaultEntry.create({
-        data: {
-          tenantId,
-          name: validName,
-          secret: blob,
-          kind: normalizedKind,
-          baseUrl: normalizedBaseUrl,
-          paramName: normalizedParamName || null,
-          status: "pending",
-        },
-        select: { id: true },
-      });
-      return { id: created.id, ref: formatVaultRef(created.id) };
-    } catch (e) {
-      if ((e as { code?: string }).code === "P2002") {
-        throw new ConflictError(
-          "vault entry name and type already in use",
-          "errors.vaultNameInUse",
-          "name",
-        );
-      }
-      throw e;
-    }
+    return { id: entry.id, ref: entry.ref };
   });
+}
+
+// The same write, on a transaction the caller already opened, and conflict-free.
+//
+// Two things forced both halves of that sentence, and the agent import is why. It creates one of
+// these per credential the bundle names and the tenant lacks, from INSIDE its own transaction: a
+// call that opened its own committed independently of it, so an import that unwound left the entries
+// and their audit rows behind (measured on the dry run, which is that case every time). And a plain
+// INSERT that hits `(tenantId, name, kind)` raises inside that transaction, which aborts it — so a
+// second import of the same bundle, racing this one, took the whole agent down instead of finding
+// the row. `ON CONFLICT DO NOTHING` plus a read makes a concurrent creation a fact to report rather
+// than an error to survive.
+//
+// What a pre-existing row MEANS is the caller's, which is why this reports rather than decides: the
+// MCP `credential_create` tool answers 409, and the import reuses the row and says nothing.
+export async function ensurePendingVaultEntryOn(
+  db: ScopedDb,
+  ctx: TenantContext,
+  input: CreatePendingVaultEntryInput,
+): Promise<{ id: bigint; ref: string; created: boolean }> {
+  // NOTE: not re-asked here. A `ScopedDb` only comes out of `runScopedOn`, which refuses a null
+  // tenant before it opens the transaction, so by the time this holds one the question is answered.
+  const tenantId = ctx.tenantId as bigint;
+  const {
+    name: validName,
+    kind: normalizedKind,
+    baseUrl: normalizedBaseUrl,
+    paramName: normalizedParamName,
+  } = assertPendingVaultEntryCreatable(input);
+
+  // Placeholder blob: an empty object, never a real secret. `status` discriminates it from active.
+  const blob = encryptJson({});
+  const { count } = await db.vaultEntry.createMany({
+    data: [
+      {
+        tenantId,
+        name: validName,
+        secret: blob,
+        kind: normalizedKind,
+        baseUrl: normalizedBaseUrl,
+        paramName: normalizedParamName || null,
+        status: "pending",
+      },
+    ],
+    skipDuplicates: true,
+  });
+  const row = await db.vaultEntry.findFirstOrThrow({
+    where: { name: validName, kind: normalizedKind },
+    select: VAULT_AUDIT_SELECT,
+  });
+  const created = count === 1;
+  if (created) {
+    // NOTE: The same action as a filled create, because it is the same act: a credential now
+    // exists under this name. `status` is what tells the two apart, and it is on the row.
+    //
+    // This is also where the agent import starts leaving a trail. It creates one reference-only
+    // entry per credential the bundle names and the tenant does not have, and its own `agent.import`
+    // row projects the AGENT, so six pending credentials used to appear in the vault with nothing
+    // naming where they came from. One row each, under the operator who ran the import. A row that
+    // was already there is not this operator's act and files nothing.
+    await auditMutation(db, ctx, {
+      action: "credential.create",
+      target: formatVaultRef(row.id),
+      after: auditProjection(row),
+    });
+  }
+  return { id: row.id, ref: formatVaultRef(row.id), created };
 }
 
 export interface UpdateVaultEntryPatch {
@@ -801,9 +1392,14 @@ export async function updateVaultEntry(
 ): Promise<bigint> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   return runScopedOn(base, ctx, async (db) => {
+    // NOTE: LOCKED before it is read, because this snapshot is what the row's `before` reports. Two
+    // overlapping saves both read the same entry otherwise, and the second wakes to an `after` that
+    // includes the first one's changes: its row then claims a transition, or a rotation, that its
+    // actor never performed.
+    await db.$queryRaw`SELECT id FROM vault_entries WHERE id = ${id} FOR UPDATE`;
     const entry = await db.vaultEntry.findFirst({
       where: { id },
-      select: { id: true, kind: true },
+      select: VAULT_AUDIT_SELECT,
     });
     if (!entry) throw new NotFoundError(`vault entry ${id} not found`);
 
@@ -842,19 +1438,7 @@ export async function updateVaultEntry(
     }
 
     if (patch.baseUrl !== undefined) {
-      if (patch.baseUrl === null || patch.baseUrl === "") {
-        if (secretTypeRequiresBaseUrl(entry.kind)) {
-          throw new AppError(
-            "baseUrl is required for this credential type",
-            400,
-            "errors.vaultBaseUrlRequired",
-          );
-        }
-        data.baseUrl = null;
-      } else {
-        const validated = validateBaseUrl(patch.baseUrl);
-        data.baseUrl = validated || null;
-      }
+      data.baseUrl = normalizeBaseUrlForKind(patch.baseUrl, entry.kind);
     }
 
     if (patch.paramName !== undefined) {
@@ -876,7 +1460,151 @@ export async function updateVaultEntry(
       }
       throw e;
     }
+    const after = await db.vaultEntry.findUniqueOrThrow({
+      where: { id: entry.id },
+      select: VAULT_AUDIT_SELECT,
+    });
+    const beforeProj = auditProjection(entry);
+    const afterProj = auditProjection(after);
+    // NOTE: Over the declared list, so a column added to it later is compared without anyone having
+    // to remember this line; `secret` is the one whose comparison cannot be a column comparison.
+    const undisclosed = UNDISCLOSED.some((c) =>
+      c === "secret"
+        ? secretMoved(entry.secret, after.secret)
+        : undisclosedMoved(entry, after, [c]),
+    );
+    // NOTE: The action with no name on any transport before #444: replacing the value behind a live
+    // reference. Every consumer of that reference starts authenticating with something else on the
+    // next call, and nothing said so.
+    //
+    // The marker rather than the value, on both sides, because what a reader needs is that the
+    // secret moved. `undisclosedMoved` is what the write is gated on, never the marker: two
+    // identical markers move nothing, so gating on `projectionMoved` alone would drop the one row
+    // that matters most here, the save whose ONLY change was the credential itself.
+    if (undisclosed || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, ctx, {
+        action: "credential.update",
+        target: formatVaultRef(entry.id),
+        before: undisclosed ? markUndisclosed(beforeProj) : beforeProj,
+        after: undisclosed ? markUndisclosed(afterProj) : afterProj,
+      });
+    }
     return entry.id;
+  });
+}
+
+// Replace the secret behind an existing entry, recording it like any other credential edit.
+//
+// The OAuth flows write `vaultEntry.secret` themselves — connecting merges the tokens in,
+// disconnecting strips them back out — and they are operator actions on a credential like any
+// other. Reaching the column directly is what left them off the trail: this is the same write, with
+// the seam around it, so the row says a credential moved without saying what it moved to.
+//
+// The value is never projected. `credential.update` carries the marker and the metadata, exactly as
+// the console's own edit does.
+export async function replaceVaultSecret(
+  ctx: TenantContext,
+  id: bigint,
+  value: unknown,
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  await runScopedOn(base, ctx, async (db) => {
+    await db.$queryRaw`SELECT id FROM vault_entries WHERE id = ${id} FOR UPDATE`;
+    const before = await db.vaultEntry.findFirst({
+      where: { id },
+      select: VAULT_AUDIT_SELECT,
+    });
+    if (!before) throw new NotFoundError(`vault entry ${id} not found`);
+    const blob = encryptJson(value);
+    await db.vaultEntry.updateMany({ where: { id }, data: { secret: blob } });
+    if (secretMoved(before.secret, blob)) {
+      const proj = auditProjection(before);
+      await auditMutation(db, ctx, {
+        action: "credential.update",
+        target: formatVaultRef(id),
+        before: markUndisclosed(proj),
+        after: markUndisclosed(proj),
+      });
+    }
+  });
+}
+
+// The refresh path's write, with the seam around it and a gate the other secret writes do not have.
+//
+// A token refresh IS a write to `vault_entries.secret`, so `replaceVaultSecret` above would take it
+// unchanged, and that is exactly what must not happen: an access token expires hourly and is renewed
+// by USE, not by a decision, so routing it through there puts a row into an append-only table every
+// hour per connected credential, and the operator's own edits drown in machine bookkeeping. This
+// family already answered that question once in the other direction (#395: the Channels page
+// auto-syncs on load, so an unconditional `instance.sync_inboxes` recorded a row per account per
+// visit, and the fix was to record only what actually moved).
+//
+// What moved is the line. An access token is a DERIVED, short-lived artifact of the credential; the
+// refresh token and the granted scopes ARE the credential. A refresh token rotating replaces the
+// durable secret and revokes the old one, and scopes changing under a refresh means the grant itself
+// changed upstream: both are things an operator would want to find in the trail, and neither is
+// hourly. The access token moving on its own is not, and gets no row.
+//
+// The comparison is against the value read HERE, under the row lock, and NOT against the snapshot
+// the caller decrypted: that snapshot predates a network round trip to the provider, so two
+// overlapping refreshes of the same expired credential would both compare with the same stale value
+// and both record the same rotation. It is the same defect this module's own rule names (a row only
+// when something changed), and the same shape as every other read that decided something a
+// concurrent write could move underneath it. `FOR UPDATE` and not `FOR NO KEY UPDATE`, because that
+// is the mode the rest of this module takes on this table and a mixed mode is a deadlock with no
+// green test to show it (#395).
+//
+// `system` and a null actor, for the same reason /reset's rows are (#398): the refresh is triggered
+// by a clock and a use, and the principal whose request happened to notice the expiry did not rotate
+// anything. Left on `ctx` the row would name a person who did not act.
+export async function persistRefreshedOAuthSecret<
+  T extends { refreshToken?: string | null; scopes?: string[] | null },
+>(
+  ctx: TenantContext,
+  id: bigint,
+  after: T,
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  const scopeKey = (v: string[] | null | undefined) =>
+    JSON.stringify([...(v ?? [])].sort());
+  await runScopedOn(base, ctx, async (db) => {
+    await db.$queryRaw`SELECT id FROM vault_entries WHERE id = ${id} FOR UPDATE`;
+    const row = await db.vaultEntry.findFirst({
+      where: { id },
+      select: VAULT_AUDIT_SELECT,
+    });
+    // Deleted under us: there is nothing to refresh and nothing to record. The caller already has
+    // its access token and the next use will fail on the missing reference, which is the truth.
+    if (!row) return;
+    // A blob that will not decrypt into the shape (a pending placeholder, a hand-edited row) is
+    // treated as MOVED rather than as equal: recording a rotation that may not have happened is the
+    // side that keeps the trail honest, and staying silent is the side that loses one.
+    let stored: T | null = null;
+    try {
+      stored = decryptJson<T>(row.secret);
+    } catch {
+      stored = null;
+    }
+    await db.vaultEntry.updateMany({
+      where: { id },
+      data: { secret: encryptJson(after) },
+    });
+    const durableMoved =
+      stored === null ||
+      (stored.refreshToken ?? null) !== (after.refreshToken ?? null) ||
+      scopeKey(stored.scopes) !== scopeKey(after.scopes);
+    if (!durableMoved) return;
+    const proj = auditProjection(row);
+    await auditMutation(
+      db,
+      { ...ctx, userId: null, actorType: "system" },
+      {
+        action: "credential.update",
+        target: formatVaultRef(id),
+        before: markUndisclosed(proj),
+        after: markUndisclosed(proj),
+      },
+    );
   });
 }
 
@@ -885,9 +1613,28 @@ export async function deleteVaultEntry(
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<void> {
-  await runScopedOn(base, ctx, (db) =>
-    db.vaultEntry.deleteMany({ where: { id } }),
-  );
+  await runScopedOn(base, ctx, async (db) => {
+    // NOTE: Read before the delete with the row LOCKED, so the row describes the version actually
+    // removed: an update committing between the read and the delete would otherwise leave the trail
+    // describing the credential as it was two saves ago. And only recorded when this call is the one
+    // that removed it:
+    // `deleteMany` is idempotent by design, and a row per attempt would put the same removal on the
+    // trail as many times as it was retried. Creating a credential was audited and removing one was
+    // not, which is the asymmetry #444 opened with.
+    await db.$queryRaw`SELECT id FROM vault_entries WHERE id = ${id} FOR UPDATE`;
+    const entry = await db.vaultEntry.findFirst({
+      where: { id },
+      select: VAULT_AUDIT_SELECT,
+    });
+    const { count } = await db.vaultEntry.deleteMany({ where: { id } });
+    if (entry && count > 0) {
+      await auditMutation(db, ctx, {
+        action: "credential.delete",
+        target: formatVaultRef(entry.id),
+        before: auditProjection(entry),
+      });
+    }
+  });
 }
 
 // ── credential connectivity test (test-on-save) ──

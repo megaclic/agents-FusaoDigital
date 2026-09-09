@@ -4,9 +4,12 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { getGlobalBranding } from "@/api/features/branding/branding.service";
 import config from "@/config";
+import { AUDIT_SCOPES, isAuditScope } from "@/lib/audit/scope";
 import { AppError } from "@/lib/errors";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import type { TenantContext } from "@/lib/tenancy";
+import { ACTOR_TYPES } from "@/lib/tenancy/actor";
+import { AGENT_MODES, type AgentMode } from "@/modules/agents/mode";
 import {
   BEHAVIOR_PATCH_SHAPE,
   type BehaviorPatchArgs,
@@ -19,9 +22,11 @@ import {
   runPlaygroundFileTurn,
   runPlaygroundTurn,
 } from "@/modules/playground/service";
+import { hasReservedFieldName } from "@/modules/tool-definitions/normalize";
 import { OUTBOUND_DELIVERY_STATUSES } from "@/modules/webhooks/outbound/deliveries";
 import { hasScope, type VerifiedToken } from "./oauth/tokens";
 import {
+  agentConfigHealth,
   agentGet,
   agentToolsGet,
   alertChannelList,
@@ -29,6 +34,9 @@ import {
   apiKeyList,
   auditList,
   businessHoursList,
+  codeToolGet,
+  codeToolList,
+  codeToolSchema,
   conversationGet,
   conversationMessages,
   documentStarterList,
@@ -100,13 +108,21 @@ import {
   deploymentRotateToken,
   deploymentSetAccounts,
   inboxBind,
+  inboxObserve,
   inboxReconcile,
   inboxReconnect,
   inboxRemove,
+  inboxUnobserve,
   instanceDisconnect,
   instanceListAccounts,
   instanceSyncInboxes,
 } from "./write-channels";
+import {
+  type CodeToolWriteArgs,
+  codeToolCreate,
+  codeToolDelete,
+  codeToolUpdate,
+} from "./write-code-tools";
 import {
   conversationHandoff,
   conversationReengage,
@@ -121,6 +137,28 @@ import {
   documentTemplateUpdate,
 } from "./write-documents";
 import { tenantCreate, tenantGet, tenantList } from "./write-fleet";
+
+// `input_schema`, with the one field name that cannot survive being parsed. `z.record` rebuilds the
+// map by assignment, so an own `__proto__` key hits the prototype setter and is GONE before any
+// handler runs — the write would then succeed while the argument the caller declared is missing,
+// and a body reading `input.__proto__` would find the prototype. The service refuses it by name
+// (code-tools/service.ts); this is the same refusal at the transport, which is the only place that
+// still holds the raw value.
+export const inputSchemaArg = z.preprocess((value, ctx) => {
+  // Both spellings, because the guard downstream knows both: the compact map with the key at the
+  // root, and the standard JSON Schema with it under `properties` (namespace's caller,
+  // tool-definitions/normalize.ts).
+  if (hasReservedFieldName(value)) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "input_schema field `__proto__` is reserved by JavaScript and cannot be a parameter name",
+    });
+    return z.NEVER;
+  }
+  return value;
+}, z.record(z.string(), z.unknown()).optional());
+
 import {
   knowledgeApprove,
   knowledgeCreate,
@@ -191,11 +229,22 @@ function principalCtx(principal: VerifiedToken): TenantContext {
 // unchanged). A missing/unknown `tenant` (SUPER_ADMIN only) short-circuits with an isError result,
 // never a thrown 500. See ./tenant-target.ts. Fleet/global tools (whoami, branding_*, tenant_*) are
 // NOT registered through this — they have no tenant target and stay on server.registerTool.
+// `targetless` is for the tool whose OWN arguments can name a trail that belongs to no tenant --
+// today only `audit_list` with `scope=fleet|all` (#520). It changes two things for a fleet-level
+// token, and both are needed: the selector becomes optional in the advertised schema (a required one
+// is refused by the SDK before any handler of ours runs), and a call the predicate accepts skips
+// tenant resolution entirely, reaching the handler with the tenant-less principal it was issued as.
+// Everything else on this list keeps the fence unchanged, and the tool itself still decides what a
+// targetless call may do.
 function registerTenantTool(
   server: McpServer,
   principal: VerifiedToken,
   name: string,
-  def: { description: string; inputSchema: z.ZodRawShape },
+  def: {
+    description: string;
+    inputSchema: z.ZodRawShape;
+    targetless?: (args: Record<string, unknown>) => boolean;
+  },
   handler: (
     // biome-ignore lint/suspicious/noExplicitAny: each call site narrows `args` to its own tool shape; `any` lets those narrower handler signatures bind without a per-tool generic.
     args: any,
@@ -204,12 +253,20 @@ function registerTenantTool(
 ): void {
   const inputSchema =
     principal.role === "SUPER_ADMIN"
-      ? { ...def.inputSchema, tenant: tenantSelectorField }
+      ? {
+          ...def.inputSchema,
+          tenant: def.targetless
+            ? tenantSelectorField.optional()
+            : tenantSelectorField,
+        }
       : def.inputSchema;
   server.registerTool(
     name,
     { description: def.description, inputSchema },
     async (args: Record<string, unknown>) => {
+      if (principal.role === "SUPER_ADMIN" && def.targetless?.(args)) {
+        return handler(args, principal);
+      }
       const resolved = await resolveEffectivePrincipal(principal, args);
       if (!resolved.ok) {
         return {
@@ -429,6 +486,21 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
     registerTenantTool(
       server,
       principal,
+      "agent_config_health",
+      {
+        description:
+          "Whether an agent's configuration is HEALTHY, by the checks the console's editor panel runs — a feature switched on with no credential, a credential referenced but never filled (credential_create leaves one that way), two settings that cancel out. Run it at the end of an onboarding: nothing computes these until something asks, and several are silent at runtime — guardrails with no key delivers every message unscreened while the switch reads \"on\". Per issue, `severity` is `blocking` (no answer, or an unscreened one), `degraded` (answers; a feature that is on does not run) or `advisory` (nothing is off). `healthy` = no blocking and no degraded. `unchecked` names live readings this call could not take. Returns `{ health: { agentId, agentName, healthy, counts, issues, unchecked } }`.",
+        inputSchema: {
+          agent_id: z.string(),
+        },
+      },
+      async (args: { agent_id: string }, eff) =>
+        writeContent(await agentConfigHealth(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
       "agent_playground",
       {
         description:
@@ -607,8 +679,15 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
 
     // ── expanded read coverage (mcp:read) ──
     // Each tool projects a tenant-scoped service; secret-bearing fields are redacted by the service
-    // (Chatwoot adminToken → hasAdminToken, alert URL → urlMasked, API key → prefix) and credentialRef
-    // values are returned as vault entry NAMES, never secret values.
+    // (Chatwoot adminToken → hasAdminToken, alert URL → urlMasked, API key → prefix).
+    //
+    // Ref-bearing fields come back in ONE of two vocabularies, and which one is the SERVICE's choice,
+    // not this file's: the settings reads translate to a vault entry NAME (`vaultNameByRef`), the
+    // entity reads hand back the stable `vault:<id>` the column holds. Both go through
+    // `readableVaultRef`, so a stored value that is not a reference at all reads as null rather than reaching a
+    // client — these columns took any string until #126 (issue #438). The descriptions below say
+    // which vocabulary each tool speaks; they used to promise NAMES for all of them, which was true
+    // of two.
 
     registerTenantTool(
       server,
@@ -629,7 +708,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_tools_get",
       {
         description:
-          "Get an agent's tool GRANTS (the selected set) plus the full tenant CATALOG of selectable tools (native, RAG knowledge bases, HTTP tool definitions, MCP connections, integration instances). Use this to discover ids before agent_tools_set.",
+          "Get an agent's tool GRANTS (the selected set) plus the full tenant CATALOG of selectable tools (native, RAG knowledge bases, HTTP tool definitions, code tools, MCP connections, integration instances, document templates). Use this to discover ids before agent_tools_set.",
         inputSchema: { agent_id: z.string() },
       },
       async (args: { agent_id: string }, eff) =>
@@ -642,7 +721,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "tool_list",
       {
         description:
-          "List the tenant's HTTP tool definitions (id, name, method, urlTemplate, enabled, credentialRef as a vault NAME). No secrets.",
+          "List the tenant's HTTP tool definitions (id, name, method, urlTemplate, enabled, credentialRef as a stable vault:<id> ref, null when the stored value is not a reference at all). No secrets.",
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await toolList(eff)),
@@ -654,7 +733,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "tool_get",
       {
         description:
-          "Get one HTTP tool definition in full (schemas, headers, body, allowedHosts, credentialRef as a vault NAME). No secrets.",
+          "Get one HTTP tool definition in full (schemas, headers, body, allowedHosts, credentialRef as a stable vault:<id> ref, null when the stored value is not a reference at all). No secrets.",
         inputSchema: { tool_id: z.string() },
       },
       async (args: { tool_id: string }, eff) =>
@@ -664,10 +743,35 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
     registerTenantTool(
       server,
       principal,
+      "code_tool_list",
+      {
+        description:
+          "List the tenant's operator-authored code tools (id, name, label, description, inputSchema, enabled). The body is omitted; code_tool_get returns it.",
+        inputSchema: {},
+      },
+      async (_args, eff) => writeContent(await codeToolList(eff)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "code_tool_get",
+      {
+        description:
+          "Get one code tool in full: the input schema and the body (the function the sandbox runs).",
+        inputSchema: { code_tool_id: z.string() },
+      },
+      async (args: { code_tool_id: string }, eff) =>
+        writeContent(await codeToolGet(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
       "mcp_connection_list",
       {
         description:
-          "List the tenant's outbound MCP server connections (id, name, transport, url/command, enabled, credentialRef as a vault NAME). No secrets.",
+          "List the tenant's outbound MCP server connections (id, name, transport, url/command, enabled, credentialRef as a stable vault:<id> ref, null when the stored value is not a reference at all). No secrets.",
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await mcpConnectionList(eff)),
@@ -679,7 +783,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "integration_list",
       {
         description:
-          "List the tenant's integration instances (id, catalogType, name, enabled, config, credentialRef/inboundSecretRef as vault NAMES, inboundAuthStrategy). No secrets, no route tokens.",
+          "List the tenant's integration instances (id, catalogType, name, enabled, config, credentialRef/inboundSecretRef as stable vault:<id> refs, null when the stored value is not a reference at all). No secrets, no route tokens.",
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await integrationList(eff)),
@@ -886,7 +990,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "alert_channel_list",
       {
         description:
-          "List the tenant's flow-log alert channels (id, name, type, urlMasked, minLevel, stages, enabled, hasSecret). The full URL/token is never returned (urlMasked only).",
+          "List the tenant's flow-log alert channels (id, name, type, urlMasked, minLevel, stages, enabled, hasSecret, secretRef as a vault ref). The full URL/token is never returned (urlMasked only), and the signing secret itself never leaves the vault.",
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await alertChannelList(eff)),
@@ -1008,14 +1112,45 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "audit_list",
       {
         description:
-          "Read the tenant's audit log (most recent first). before/after were allowlist-sanitized at write time (never secrets). Optionally filter by action; limit defaults to 100 (max 500).",
+          "Audit log, newest first. before/after are sanitized at write time, never secrets. Keyset cursor; limit 100 (max 500). `scope`: tenant (default), fleet (rows keyed to no tenant) or all; fleet/all need SUPER_ADMIN. `latestAt` is that trail's newest row, past any filter.",
         inputSchema: {
           action: z.string().optional(),
+          // NOTE: derived from the vocabulary and never hand-listed, for the reason `logs_query`
+          // carries one line below: a copy drifts, and the server then refuses a value it had just
+          // advertised.
+          actor_type: z.enum(ACTOR_TYPES).optional(),
+          actor_id: z.string().optional(),
+          since: z.string().optional(),
+          until: z.string().optional(),
           limit: z.number().int().optional(),
+          cursor: z.string().optional(),
+          // Derived, for the same reason `actor_type` above is: a hand-listed copy drifts, and the
+          // server then refuses a value it had just advertised.
+          scope: z.enum(AUDIT_SCOPES).optional(),
         },
+        // The only tool on this list that can name its own trail. `fleet` and `all` read the rows
+        // keyed to no tenant, so a fleet-level token reaches them WITHOUT selecting one -- which is
+        // the shape a fleet-scoped API key has, and the only shape a deployment with no tenants at
+        // all can offer. A value that is not a scope falls through to the ordinary path and is
+        // rejected by `auditList`, which owns that message.
+        targetless: (args) =>
+          typeof args.scope === "string" &&
+          isAuditScope(args.scope) &&
+          args.scope !== "tenant",
       },
-      async (args: { action?: string; limit?: number }, eff) =>
-        writeContent(await auditList(eff, args)),
+      async (
+        args: {
+          action?: string;
+          actor_type?: string;
+          actor_id?: string;
+          since?: string;
+          until?: string;
+          limit?: number;
+          cursor?: string;
+          scope?: string;
+        },
+        eff,
+      ) => writeContent(await auditList(eff, args)),
     );
 
     registerTenantTool(
@@ -1202,25 +1337,6 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
         writeContent(await documentTemplateGet(eff, args)),
     );
 
-    // NOTE: the block vocabulary is served HERE, on demand, instead of being published in every
-    // tools/list as the input schema of the two write tools. A document block is a six-variant
-    // discriminated union, and JSON Schema publishes a union by inlining every variant — measured at
-    // ~3.2k characters per tool, paid by every client on every session, for a contract only a caller
-    // actually authoring a template needs. Nothing on the client side renders a form for a six-way
-    // oneOf, so the cost buys nothing. The enforcement is not weakened: the service validates
-    // strictly, and its refusal names the block and the rule.
-    registerTenantTool(
-      server,
-      principal,
-      "document_template_schema",
-      {
-        description:
-          "The authoring contract for document templates: JSON Schema for every block type, for a declared field and for the style, plus the full {{token}} list. Generated from the validator itself, so it is exactly what document_template_create accepts. Call it once before authoring blocks.",
-        inputSchema: {},
-      },
-      async (_args, eff) => writeContent(await documentTemplateSchema(eff)),
-    );
-
     registerTenantTool(
       server,
       principal,
@@ -1251,6 +1367,48 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
         args: { template_id?: string; thread_id?: string; limit?: number },
         eff,
       ) => writeContent(await issuedDocumentList(eff, args)),
+    );
+  }
+
+  // The two AUTHORING CONTRACTS, outside both blocks because they belong to both. Each is a
+  // constant that a write tool's description names as the place its contract lives, and
+  // `filterScopes` grants exactly the scopes a client asked for, so `mcp:write` without
+  // `mcp:read` is a real token; registering these in the read block alone pointed that client at
+  // a tool it could neither list nor call. They stay visible to a read-only token too, which is
+  // what the `*_schema` sweep in tests/modules/mcp-tool-descriptions.test.ts asserts.
+  if (hasScope(principal, "mcp:read") || hasScope(principal, "mcp:write")) {
+    // The authoring contract, served on demand for the reason document_template_schema is: a
+    // vocabulary inlined into code_tool_create's description is paid by every caller on every
+    // session, and only a caller actually writing a body needs it (issue #538).
+    registerTenantTool(
+      server,
+      principal,
+      "code_tool_schema",
+      {
+        description:
+          "The authoring contract for a code tool body: every `context` key with its type and whether it can be ABSENT, what a return and a throw mean, and the sandbox limits. Generated from the modules that enforce them. Call it once before writing `code`.",
+        inputSchema: {},
+      },
+      async (_args, eff) => writeContent(codeToolSchema(eff)),
+    );
+
+    // NOTE: the block vocabulary is served HERE, on demand, instead of being published in every
+    // tools/list as the input schema of the two write tools. A document block is a six-variant
+    // discriminated union, and JSON Schema publishes a union by inlining every variant — measured at
+    // ~3.2k characters per tool, paid by every client on every session, for a contract only a caller
+    // actually authoring a template needs. Nothing on the client side renders a form for a six-way
+    // oneOf, so the cost buys nothing. The enforcement is not weakened: the service validates
+    // strictly, and its refusal names the block and the rule.
+    registerTenantTool(
+      server,
+      principal,
+      "document_template_schema",
+      {
+        description:
+          "The authoring contract for document templates: JSON Schema for every block type, for a declared field and for the style, plus the full {{token}} list. Generated from the validator itself, so it is exactly what document_template_create accepts. Call it once before authoring blocks.",
+        inputSchema: {},
+      },
+      async (_args, eff) => writeContent(await documentTemplateSchema(eff)),
     );
   }
 
@@ -1353,7 +1511,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           name: z.string(),
           system_prompt: z.string().optional(),
           enabled: z.boolean().optional(),
-          mode: z.enum(["test", "production"]).optional(),
+          mode: z.enum(AGENT_MODES).optional(),
           transfer_with_summary: z.boolean().optional(),
           model_config: z.record(z.string(), z.unknown()).optional(),
           business_hours_id: z.string().nullable().optional(),
@@ -1366,7 +1524,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           name: string;
           system_prompt?: string;
           enabled?: boolean;
-          mode?: "test" | "production";
+          mode?: AgentMode;
           transfer_with_summary?: boolean;
           model_config?: Record<string, unknown>;
           business_hours_id?: string | null;
@@ -1383,12 +1541,12 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_update",
       {
         description:
-          "Update an agent's name/enabled/mode/transfer_with_summary/model_config/business_hours_id/follow_up_hours_id. mode is 'test' (silent until the customer sends /teste) or 'production' (answers normally). Previews a diff and applies NOTHING unless dry_run is false. (System prompt → prompt_set; behavior → agent_settings_set.) model_config credentialRef accepts a vault NAME.",
+          "Update an agent's name/enabled/mode/transfer_with_summary/model_config/business_hours_id/follow_up_hours_id. mode is 'test' (silent until /teste), 'production' (answers) or 'monitoring' (reads, never answers). Previews a diff and applies NOTHING unless dry_run is false. (System prompt → prompt_set; behavior → agent_settings_set.) model_config credentialRef accepts a vault NAME.",
         inputSchema: {
           agent_id: z.string(),
           name: z.string().optional(),
           enabled: z.boolean().optional(),
-          mode: z.enum(["test", "production"]).optional(),
+          mode: z.enum(AGENT_MODES).optional(),
           transfer_with_summary: z.boolean().optional(),
           model_config: z.record(z.string(), z.unknown()).optional(),
           business_hours_id: z.string().nullable().optional(),
@@ -1401,7 +1559,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           agent_id: string;
           name?: string;
           enabled?: boolean;
-          mode?: "test" | "production";
+          mode?: AgentMode;
           transfer_with_summary?: boolean;
           model_config?: Record<string, unknown>;
           business_hours_id?: string | null;
@@ -1471,7 +1629,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_tools_set",
       {
         description:
-          "REPLACE an agent's entire set of tool grants (it is not additive — pass the full desired set). Discover ids via agent_tools_get. Each grant has a source (NATIVE/RAG/HTTP/MCP/INTEGRATION/DOCUMENT) and the matching id(s): toolDefinitionId (HTTP), mcpServerConnectionId (MCP), integrationInstanceId (INTEGRATION), documentTemplateId (DOCUMENT), knowledgeBaseIds (RAG), enabledTools (names to enable within the source). For a RAG grant, omitting enabledTools defaults to search_knowledge (the knowledge base would otherwise be granted but unreachable). Previews current vs next and applies NOTHING unless dry_run is false.",
+          "REPLACE an agent's entire set of tool grants (it is not additive — pass the full desired set). Discover ids via agent_tools_get. Each grant has a source (NATIVE/RAG/HTTP/MCP/INTEGRATION/DOCUMENT/CODE) and the matching id(s): toolDefinitionId (HTTP), mcpServerConnectionId (MCP), integrationInstanceId (INTEGRATION), documentTemplateId (DOCUMENT), codeToolDefinitionId (CODE, from code_tool_list), knowledgeBaseIds (RAG), enabledTools (names to enable within the source). For a RAG grant, omitting enabledTools defaults to search_knowledge (the knowledge base would otherwise be granted but unreachable). Previews current vs next and applies NOTHING unless dry_run is false.",
         inputSchema: {
           agent_id: z.string(),
           grants: z.array(
@@ -1483,11 +1641,13 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
                 "MCP",
                 "INTEGRATION",
                 "DOCUMENT",
+                "CODE",
               ]),
               toolDefinitionId: z.string().nullable().optional(),
               mcpServerConnectionId: z.string().nullable().optional(),
               integrationInstanceId: z.string().nullable().optional(),
               documentTemplateId: z.string().nullable().optional(),
+              codeToolDefinitionId: z.string().nullable().optional(),
               knowledgeBaseIds: z.array(z.string()).optional(),
               enabledTools: z.array(z.string()).optional(),
             }),
@@ -1504,6 +1664,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
             mcpServerConnectionId?: string | null;
             integrationInstanceId?: string | null;
             documentTemplateId?: string | null;
+            codeToolDefinitionId?: string | null;
             knowledgeBaseIds?: string[];
             enabledTools?: string[];
           }>;
@@ -1528,8 +1689,13 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional(),
           description: z.string().nullable().optional(),
           headers: z.record(z.string(), z.unknown()).optional(),
-          input_schema: z.record(z.string(), z.unknown()).optional(),
-          output_schema: z.record(z.string(), z.unknown()).optional(),
+          input_schema: inputSchemaArg,
+          output_schema: z
+            .record(z.string(), z.unknown())
+            .optional()
+            .describe(
+              'How the response reaches the model: {"mode":"template","template":"**{{razao_social}}**\nStatus: {{situacao}}"}. A token is a dotted path into the response body, a number for a list position (data.items.0.name); one that does not resolve renders "(not returned)". A list: {{#each items}}- {{name}}\n{{/each}} repeats per item, paths inside are relative to the item and {{.}} is the item; 50 items at most, the rest counted. Rendered BEFORE the 4000-char clip. Omitted, or any other shape: the raw body, clipped.',
+            ),
           query: z.record(z.string(), z.unknown()).optional(),
           body: z.record(z.string(), z.unknown()).optional(),
           credential_ref: z.string().nullable().optional(),
@@ -1585,8 +1751,13 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).optional(),
           description: z.string().nullable().optional(),
           headers: z.record(z.string(), z.unknown()).optional(),
-          input_schema: z.record(z.string(), z.unknown()).optional(),
-          output_schema: z.record(z.string(), z.unknown()).optional(),
+          input_schema: inputSchemaArg,
+          output_schema: z
+            .record(z.string(), z.unknown())
+            .optional()
+            .describe(
+              'How the response reaches the model: {"mode":"template","template":"**{{razao_social}}**\nStatus: {{situacao}}"}. A token is a dotted path into the response body, a number for a list position (data.items.0.name); one that does not resolve renders "(not returned)". A list: {{#each items}}- {{name}}\n{{/each}} repeats per item, paths inside are relative to the item and {{.}} is the item; 50 items at most, the rest counted. Rendered BEFORE the 4000-char clip. Omitted, or any other shape: the raw body, clipped.',
+            ),
           query: z.record(z.string(), z.unknown()).optional(),
           body: z.record(z.string(), z.unknown()).optional(),
           credential_ref: z.string().nullable().optional(),
@@ -1638,6 +1809,67 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       },
       async (args: { tool_id: string; dry_run?: boolean }, eff) =>
         writeContent(await toolDelete(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "code_tool_create",
+      {
+        description:
+          'Create a code tool: a JavaScript function the operator writes, which an agent calls with typed arguments and whose return value it reads. Previews the normalized input plus the body\'s static warnings and creates NOTHING unless dry_run is false. code is the body of `function (input, context) { … }` and answers with `return` (the value reaches the agent as JSON). input is the arguments declared in input_schema, the compact field map tool_create takes (standard JSON Schema is accepted and converted). Call code_tool_schema for what `context` carries, what is available inside the body, the limits, and which of them mark the call failed. Code that does not parse is SAVED and reported in `warnings`; it fails at call time. name shares one namespace with HTTP tools and the built-in tools. Grant it with agent_tools_set: source "CODE", codeToolDefinitionId.',
+        inputSchema: {
+          name: z.string(),
+          label: z.string().optional(),
+          description: z.string(),
+          input_schema: inputSchemaArg,
+          code: z.string(),
+          enabled: z.boolean().optional(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: CodeToolWriteArgs & { dry_run?: boolean }, eff) =>
+        writeContent(await codeToolCreate(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "code_tool_update",
+      {
+        description:
+          "Update a code tool. Previews a diff and applies NOTHING unless dry_run is false. Same authoring contract as code_tool_create: code is the body of `function (input, context) { … }`, input_schema is the compact field map (standard JSON Schema is accepted and converted, and the diff shows the canonical form). A new body that does not parse is SAVED and reported in `warnings`; it fails at call time.",
+        inputSchema: {
+          code_tool_id: z.string(),
+          name: z.string().optional(),
+          label: z.string().optional(),
+          description: z.string().optional(),
+          input_schema: inputSchemaArg,
+          code: z.string().optional(),
+          enabled: z.boolean().optional(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (
+        args: CodeToolWriteArgs & { code_tool_id: string; dry_run?: boolean },
+        eff,
+      ) => writeContent(await codeToolUpdate(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "code_tool_delete",
+      {
+        description:
+          "Delete a code tool. Previews the target and deletes NOTHING unless dry_run is false; an agent that had it granted loses the grant.",
+        inputSchema: {
+          code_tool_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: { code_tool_id: string; dry_run?: boolean }, eff) =>
+        writeContent(await codeToolDelete(eff, args)),
     );
 
     registerTenantTool(
@@ -1847,6 +2079,44 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
     registerTenantTool(
       server,
       principal,
+      "inbox_observe",
+      {
+        description:
+          "Attach a MONITORING agent to an inbox as an observer: it receives every event and never answers, and the inbox keeps starting conversations open for whoever answers it. Provisions the agent's bot and attaches it on Chatwoot (needs the fazer.ai Chatwoot with agent bot observers). Previews and applies NOTHING unless dry_run is false.",
+        inputSchema: {
+          inbox_id: z.string(),
+          agent_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (
+        args: { inbox_id: string; agent_id: string; dry_run?: boolean },
+        eff,
+      ) => writeContent(await inboxObserve(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "inbox_unobserve",
+      {
+        description:
+          "Detach an agent as an observer of an inbox (calls Chatwoot). Previews and applies NOTHING unless dry_run is false.",
+        inputSchema: {
+          inbox_id: z.string(),
+          agent_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (
+        args: { inbox_id: string; agent_id: string; dry_run?: boolean },
+        eff,
+      ) => writeContent(await inboxUnobserve(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
       "inbox_remove",
       {
         description:
@@ -1882,7 +2152,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "inbox_reconcile",
       {
         description:
-          "Check every bound inbox's bot against Chatwoot and re-provision missing ones. Calls Chatwoot. Previews a note and acts ONLY when dry_run is false.",
+          "Report which bound inboxes have a live bot in Chatwoot and which do not, ONLY when dry_run is false. Calls Chatwoot; changes nothing. Repair one with inbox_reconnect.",
         inputSchema: { dry_run: z.boolean().optional() },
       },
       async (args: { dry_run?: boolean }, eff) =>
@@ -2381,10 +2651,10 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "experiment_create",
       {
         description:
-          "Create an A/B prompt experiment. variants is an array of { key, weight?, system_prompt? }. agent_id optionally scopes it. Previews and creates NOTHING unless dry_run is false.",
+          "Create an A/B prompt experiment. variants is an array of { key, weight?, system_prompt? }. agent_id is required: a variant resolves for one agent. Previews and creates NOTHING unless dry_run is false.",
         inputSchema: {
           name: z.string(),
-          agent_id: z.string().nullable().optional(),
+          agent_id: z.string(),
           variants: z.array(
             z.object({
               key: z.string(),
@@ -2422,7 +2692,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
         inputSchema: {
           experiment_id: z.string(),
           name: z.string().optional(),
-          agent_id: z.string().nullable().optional(),
+          agent_id: z.string().optional(),
           variants: z
             .array(
               z.object({

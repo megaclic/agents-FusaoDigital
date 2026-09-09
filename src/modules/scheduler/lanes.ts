@@ -59,12 +59,28 @@ export const JOB_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // per tenant — the arming it may do costs nothing, and the flush that follows is a DEBOUNCE job
   // that gets claimed on its own lane with its own budget.
   DELIVERY_SWEEP: "shared",
+  // Shared, and neither reason applies: one HTTP round trip to Langfuse per tenant per period, at
+  // a cadence of minutes by design (issue #426). The ceiling's gate reads the row it writes, so a
+  // late poll costs staleness, which the row reports, and never a customer's turn.
+  SPEND_CEILING_POLL: "shared",
   // Shared, and neither reason applies. Cadence: the message it answers has been unanswered for at
   // least the sweep's staleness window, so a wait of one shared tick is not what the customer feels.
   // Budget: it does spend the model, but the cap that needs is the shared lane's own provider
   // concurrency (below), not a tick of its own — a lane would give it a budget INDEPENDENT of the
   // turns a live customer is queueing for, which is the opposite of what a recovery should get.
   DELIVERY_RECOVERY: "shared",
+  // Shared, and neither reason applies — for the opposite mix of reasons to its neighbour above.
+  // Cadence: what it recovers is a status, and the conversation has already been sitting in the
+  // wrong one for the sweep's whole staleness window, so a shared tick changes nothing a person
+  // notices. Budget: it spends no model at all, only two or three Chatwoot calls, and the shared
+  // lane's provider concurrency is not the resource that bounds those.
+  TAKEOVER_RECOVERY: "shared",
+  // Shared, and neither reason applies. Cadence: what it writes is a label on a conversation a person
+  // is answering, and a label that lands one shared tick after the burst it describes is not a
+  // delay anyone feels. Budget: it spends the model, and the shared lane's provider concurrency is
+  // the cap it wants — the same pool a customer's turn queues on, so a busy inbox's observers cannot
+  // starve the replies on it.
+  OBSERVE: "shared",
 };
 
 // Whether ONE job of this kind spends capacity at an external provider that the rest of the product
@@ -107,10 +123,19 @@ export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   // true, and that is exactly why answering is not done here (issue #295): the sweep arms a
   // DELIVERY_RECOVERY per row it declares lost, and that kind carries the spend.
   DELIVERY_SWEEP: false,
+  // It asks Langfuse, not a model provider: no tokens, no embeddings.
+  SPEND_CEILING_POLL: false,
   // It runs the delivery path, which runs a real agent turn: a model call, and whatever tools the
   // turn decides to use. The whole reason it is a kind of its own rather than work the sweep does
   // inline.
   DELIVERY_RECOVERY: true,
+  // The other half of why it is not the same kind as the one above (issue #439): it re-runs the
+  // TAKEOVER and nothing else — a fence, a claim, a toggle and a reconcile — and never reaches a
+  // model. Folded into DELIVERY_RECOVERY it would take a permit from the semaphore a customer's turn
+  // queues on, to make two HTTP calls.
+  TAKEOVER_RECOVERY: false,
+  // One model call per tick, on the agent's own model.
+  OBSERVE: true,
 };
 
 // How many provider-spending jobs the shared lane may run at once, out of the model budget. NEVER
@@ -146,11 +171,18 @@ export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   MEMORY_COMPACT: false,
   INGEST_MESSAGE: true,
   DELIVERY_SWEEP: false,
+  SPEND_CEILING_POLL: false,
   // Same reason as INGEST_MESSAGE, and the same shape: the key names ONE ledger row — it has to, or
   // a second stranded delivery would overwrite the first — so nothing ever reuses the row and the
   // count is bounded by how many deliveries have ever been stranded. What the record of the work is
   // here is the ledger row itself, which is terminal either way.
   DELIVERY_RECOVERY: true,
+  // Same key, same shape, same answer: it names ONE ledger row, nothing reuses it, and the row that
+  // records the work is the ledger row.
+  TAKEOVER_RECOVERY: true,
+  // The key names ONE CONVERSATION (`observe:<thread>`), like DEBOUNCE's, and the row is re-armed by
+  // every burst on it; a DONE row is the record of the last verdict.
+  OBSERVE: false,
 };
 
 // Whether the NUMBER of rows of this kind follows inbound traffic, rather than a population the
@@ -185,6 +217,9 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   INGEST_MESSAGE: true,
   // One row per tenant, re-armed forever. Bounded by the install's tenant count, not by traffic.
   DELIVERY_SWEEP: false,
+  // One row per tenant with the ceiling on, re-armed forever. Bounded by the install's tenant
+  // count, not by traffic.
+  SPEND_CEILING_POLL: false,
   // One row per DELIVERY the sweep declared lost, and a single sweep pass can declare a whole batch
   // of them at once — the deploy that stranded them stranded every delivery that was in flight. They
   // are armed for `now`, so they are also the oldest rows, which is the exact shape that fills every
@@ -198,6 +233,26 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   // right answer for a different reason: a reply that late is stale whatever delayed it. Reserving
   // capacity here would be mechanism for a backlog nobody has measured.
   DELIVERY_RECOVERY: true,
+  // Armed by the same pass, from the same deploy, off the same traffic: one row per delivery that
+  // was carrying a colleague's reply when the process died. Fewer than of the kind above — most
+  // stranded deliveries carry a customer message, not a reply — but what decides this answer is that
+  // the number follows inbound traffic rather than a population the install controls.
+  //
+  // The cost paragraph above does NOT carry over, and the difference is worth naming: this kind has
+  // no age ceiling to discard it, because what it recovers does not go stale (recover-takeover.ts).
+  // A conversation the agent is wrongly holding stays wrong however long the queue was.
+  TAKEOVER_RECOVERY: true,
+  // TRUE, and DEBOUNCE being false is not the precedent it looks like (issue #477 review, round 8).
+  // The shape is the same — one row per conversation, re-armed by every burst — but DEBOUNCE has a
+  // LANE of its own, so however many of its rows a busy inbox arms, none of them is ever claimed in
+  // the same batch as an appointment reminder. OBSERVE is on `shared`, and there it is the only kind
+  // whose row count follows how much contacts write: every other one is per agent, per appointment,
+  // per closed attendance, per tenant, per retry. A resolve arms for `now` and a burst for `now`
+  // plus a window measured in seconds, so within a tick or two they are as old as anything else in
+  // the lane, and a claim ordered by `run_at` fills the batch with them. On an inbox under
+  // observation and under load that is exactly the starvation the separate traffic claim exists to
+  // prevent, and the kind it would starve is the one that has to arrive BEFORE something.
+  OBSERVE: true,
 };
 
 // WHAT ONE KIND'S DEATH MEANS TO THE OPERATOR, at the only moment the scheduler can state it
@@ -266,6 +321,10 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // (see status-reconcile.ts's header comment) — the panel itself still shows the true, current
   // state. Its death leaves our UI stale, not the ticket unhandled.
   ZPRO_STATUS_CHECK: "warn",
+  // Self-rescheduling, and the handler never throws (a failing Langfuse is written on the row),
+  // so a death here is the loop itself gone: the ceiling keeps deciding on a figure frozen at the
+  // last poll, under-refusing by everything spent since, and nothing on the console moves.
+  SPEND_CEILING_POLL: "error",
   // The one `warn` here, and it is the rule above applied rather than an exception to it: the
   // operator has their own way back to this work, twice over. The sweep already announced this exact
   // delivery at `error` when it declared the row DEAD, and the row is still in the
@@ -274,6 +333,17 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // second `error` would be the same customer message waking somebody twice, which is how a channel
   // stops being read.
   DELIVERY_RECOVERY: "warn",
+  // `warn`, and by the same rule read the other way round: nothing paged anybody about this row in
+  // the first place, because nothing was lost to page about — the sweep closed it PROCESSED and
+  // wrote no loss line. What dies with the job is a conversation left `pending` on the bot after a
+  // person answered on it: the state every install had for the whole life of issue #430, and one the
+  // NEXT reply from that person takes over on its own. An `error` here would announce, at the level
+  // of a customer's lost message, something that self-heals.
+  TAKEOVER_RECOVERY: "warn",
+  // `warn`, by the rule above: what dies is a label that was not refreshed, on a conversation a person
+  // is already reading and can label by hand, and the next burst on it arms the same row again. No
+  // customer message was lost and nothing they wait on stopped.
+  OBSERVE: "warn",
 };
 
 export function kindsInLane(

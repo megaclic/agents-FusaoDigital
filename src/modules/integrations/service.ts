@@ -8,7 +8,13 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { requireVaultRef } from "@/modules/vault/service";
+import {
+  markUndisclosed,
+  refForAudit,
+  undisclosedMoved,
+} from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
+import { readableVaultRef, requireVaultRef } from "@/modules/vault/service";
 import { isUsableHeaderName } from "@/modules/webhooks/inbound/auth";
 import {
   generateRouteToken,
@@ -99,6 +105,59 @@ export function assertUsableHeaderNames(config: Record<string, unknown>): void {
   }
 }
 
+// What the audit row carries.
+//
+// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
+// else is listed in `UNDISCLOSED` below and compared without being carried.
+//
+// `config` is where that matters most here, and it contributes NEITHER its values nor its key
+// names. It is a free-form bag on both writers (`z.record(z.string(), z.unknown())`, no allowlist),
+// so nothing about it was vouched for by a schema: the values are whatever an operator typed, two
+// of its keys are read back as HTTP header names, and #394 already settled that an unknown,
+// caller-controlled key can itself be secret material (`docs/mcp.md`). Listing the keys would also
+// have missed the ordinary edit — a value changed under an existing key moves no key at all.
+//
+// `routeToken` and `routeTokenHash` are in NEITHER half, deliberately. The token IS the credential
+// the inbound route authenticates by, and the hash is its verifier; the change that matters to them
+// has an action of its own (`integration.rotate_token`), so nothing is lost by leaving both out and
+// a great deal would be lost by folding them in.
+//
+// The RAW `credentialRef` is compared as well as projected, and that is not belt-and-braces: two
+// different opaque values both project as `{ref: null, opaque: true}`, so swapping one for the
+// other would move nothing. `requireVaultRef` has refused that spelling on the way in since #126,
+// which makes it a legacy row rather than a reachable write — but the fence answers for columns and
+// not for what today's writer happens to allow, and listing it costs one line.
+// `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
+function auditProjection(r: {
+  catalogType: string;
+  name: string;
+  enabled: boolean;
+  config: unknown;
+  credentialRef: string | null;
+  inboundAuthStrategy: string;
+  inboundSecretRef: string | null;
+}) {
+  const cred = refForAudit(r.credentialRef);
+  const inbound = refForAudit(r.inboundSecretRef);
+  return {
+    catalogType: r.catalogType,
+    name: r.name,
+    enabled: r.enabled,
+    credentialRef: cred.ref,
+    credentialRefOpaque: cred.opaque,
+    inboundAuthStrategy: r.inboundAuthStrategy,
+    inboundSecretRef: inbound.ref,
+    inboundSecretRefOpaque: inbound.opaque,
+  };
+}
+
+// The columns the projection above may not publish, compared and never carried
+// (`@/modules/audit/projection`). `config` is the reason this family needs the rule at all: it is
+// `z.record(z.string(), z.unknown())` on both writers, so neither its values NOR ITS KEY NAMES are
+// anything the schema vouched for, and #394 already settled that an unknown, caller-controlled key
+// can itself be secret material — which is why the row no longer lists them.
+const UNDISCLOSED = ["config", "credentialRef", "inboundSecretRef"] as const;
+
 export interface CreateIntegrationParams {
   catalogType: string;
   name: string;
@@ -133,7 +192,7 @@ export async function createIntegrationInstance(
       minted && params.inboundSecretRef
         ? await requireVaultRef(db, params.inboundSecretRef, "inboundSecretRef")
         : null;
-    return db.integrationInstance.create({
+    const row = await db.integrationInstance.create({
       data: {
         tenantId,
         catalogType: params.catalogType,
@@ -148,8 +207,14 @@ export async function createIntegrationInstance(
         routeTokenHash: minted?.hash ?? null,
         routeToken: minted ? encryptJson(minted.token) : null,
       },
-      select: { id: true },
+      select: INSTANCE_SELECT,
     });
+    await auditMutation(db, ctx, {
+      action: "integration.create",
+      target: `integration:${row.id}`,
+      after: auditProjection(row),
+    });
+    return row;
   });
   return { id: created.id, routeToken: minted?.token ?? null };
 }
@@ -233,9 +298,12 @@ function toInstanceDto(r: {
     name: r.name,
     enabled: r.enabled,
     config: (r.config ?? {}) as Record<string, unknown>,
-    credentialRef: r.credentialRef,
+    // Both refs only where they NAME an entry — see the note on `readableVaultRef`. This module
+    // predates `requireVaultRef` by two months (#126, dc6c467a), so either column can hold a value
+    // no resolver ever matched, and this DTO is what `integration_list` returns over `mcp:read`.
+    credentialRef: readableVaultRef(r.credentialRef),
     inboundAuthStrategy: r.inboundAuthStrategy,
-    inboundSecretRef: r.inboundSecretRef,
+    inboundSecretRef: readableVaultRef(r.inboundSecretRef),
     ...(() => {
       const { token, status } = readRouteToken(r.routeToken);
       return { routeToken: token, routeTokenStatus: status };
@@ -297,9 +365,13 @@ export async function updateIntegrationInstance(
 ): Promise<IntegrationInstanceDto> {
   if (params.config) assertUsableHeaderNames(params.config);
   return runScopedOn(base, ctx, async (db) => {
+    // LOCKED before the snapshot the trail compares against: at READ COMMITTED two concurrent
+    // PATCHes both read state A, the first commits B, and the second's `update` blocks, wakes and
+    // writes C — filing a row that says A became C and attributing B's change to whoever wrote C.
+    await db.$queryRaw`SELECT 1 FROM "integration_instances" WHERE "id" = ${id} FOR UPDATE`;
     const current = await db.integrationInstance.findUnique({
       where: { id },
-      select: { id: true },
+      select: INSTANCE_SELECT,
     });
     if (!current) {
       throw new NotFoundError(
@@ -332,6 +404,17 @@ export async function updateIntegrationInstance(
       where: { id },
       select: INSTANCE_SELECT,
     });
+    const beforeProj = auditProjection(current);
+    const afterProj = auditProjection(row);
+    const undisclosed = undisclosedMoved(current, row, UNDISCLOSED);
+    if (undisclosed || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, ctx, {
+        action: "integration.update",
+        target: `integration:${id}`,
+        before: undisclosed ? markUndisclosed(beforeProj) : beforeProj,
+        after: undisclosed ? markUndisclosed(afterProj) : afterProj,
+      });
+    }
     return toInstanceDto(row);
   });
 }
@@ -346,9 +429,14 @@ export async function rotateIntegrationRouteToken(
   base: PrismaClient = basePrisma,
 ): Promise<{ routeToken: string }> {
   return runScopedOn(base, ctx, async (db) => {
+    // Locked BEFORE the snapshot, like every other audited write in this family. At READ COMMITTED
+    // a rename committing between this read and the update below is invisible to it, and the row
+    // then files a rotation against a name the instance no longer has — the one identifying detail
+    // it carries, since neither token is on it.
+    await db.$queryRaw`SELECT 1 FROM "integration_instances" WHERE "id" = ${id} FOR UPDATE`;
     const current = await db.integrationInstance.findUnique({
       where: { id },
-      select: { catalogType: true },
+      select: { catalogType: true, name: true },
     });
     if (!current) {
       throw new NotFoundError(
@@ -373,6 +461,19 @@ export async function rotateIntegrationRouteToken(
         routeToken: encryptJson(minted.token),
       },
     });
+    // A name this issue invents (#399): rotating has no MCP twin, so there was no action to move
+    // down. It is recorded rather than left out because the old URL stops answering the instant
+    // this commits — the provider keeps posting to an address nothing serves, and until now
+    // nothing said who did that or when.
+    //
+    // NEITHER token is in the projection, old or new. The row is readable by every tenant admin
+    // and outlives the instance, and the token IS the credential: the inbound route authenticates
+    // by nothing else. What identifies the rotation is the target.
+    await auditMutation(db, ctx, {
+      action: "integration.rotate_token",
+      target: `integration:${id}`,
+      after: { catalogType: current.catalogType, name: current.name },
+    });
     return { routeToken: minted.token };
   });
 }
@@ -383,12 +484,24 @@ export async function deleteIntegrationInstance(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Locked, then read before the delete: after `deleteMany` there is nothing left to name what
+    // was removed.
+    await db.$queryRaw`SELECT 1 FROM "integration_instances" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.integrationInstance.findUnique({
+      where: { id },
+      select: INSTANCE_SELECT,
+    });
     const res = await db.integrationInstance.deleteMany({ where: { id } });
-    if (res.count === 0) {
+    if (res.count === 0 || !current) {
       throw new NotFoundError(
         "integration instance not found",
         "errors.integrationInstanceNotFound",
       );
     }
+    await auditMutation(db, ctx, {
+      action: "integration.delete",
+      target: `integration:${id}`,
+      before: auditProjection(current),
+    });
   });
 }

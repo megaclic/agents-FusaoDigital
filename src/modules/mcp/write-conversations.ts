@@ -1,8 +1,11 @@
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
-import { truncForAudit } from "@/modules/audit/projection";
-import { reengageConversation } from "@/modules/conversations/reengage";
 import {
+  assertConversationReengageable,
+  reengageConversation,
+} from "@/modules/conversations/reengage";
+import {
+  assertConversationReturnable,
   getConversationDetail,
   handoffConversation,
   replyToConversation,
@@ -15,7 +18,6 @@ import {
   gate,
   ok,
   parseMcpId,
-  recordMcpAudit,
   type WriteDeps,
   type WriteResult,
 } from "./write";
@@ -24,6 +26,10 @@ import {
 // to / change the state of a live customer conversation in Chatwoot. dry-run by default previews the
 // action (conversation_reply shows the exact text that would be sent); applying is NOT reversible —
 // the trade-off is the MCP client's per-call approval plus an audit row on every apply.
+//
+// The row is no longer written HERE (#398). Each service records its own, so the same guard covers
+// the console and the REST API, which had none: this file only reads the conversation for the
+// dry-run preview and hands the apply down.
 
 function failOf(e: unknown): WriteResult {
   if (e instanceof AppError) return err(e.message);
@@ -63,14 +69,6 @@ export async function conversationReply(
       });
     }
     await replyToConversation(ctx, id, args.content, isPrivate, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "conversation.reply",
-      target,
-      before: null,
-      after: truncForAudit({ private: isPrivate, content: args.content }),
-    });
     return ok({ dryRun: false, applied: true, target, private: isPrivate });
   } catch (e) {
     return failOf(e);
@@ -107,17 +105,6 @@ export async function conversationHandoff(
       });
     }
     await handoffConversation(ctx, id, assigneeId, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "conversation.handoff",
-      target,
-      before: truncForAudit({
-        status: current.status,
-        assigneeId: current.assigneeId,
-      }),
-      after: truncForAudit({ status: "open", assigneeId }),
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -138,6 +125,19 @@ export async function conversationReturn(
   try {
     const current = await getConversationDetail(ctx, id, base);
     if (args.dry_run !== false) {
+      // THE PREVIEW REFUSES WHAT THE APPLY REFUSES (issue #495 review, round 1). Without this the
+      // dry run answered "this returns the conversation" for an inbox with no responder — unbound,
+      // switched off, only observing, or with no bot on this Chatwoot — and the approved apply then
+      // failed with a 409, which is the incoherence docs/mcp.md rules out.
+      // The INJECTED factory, not a fresh one (issue #495 review, round 5): this preview now makes a
+      // Chatwoot call, so discarding `deps.makeClient` would send a test or an embedded caller at the
+      // real instance behind the operator's back.
+      await assertConversationReturnable(
+        ctx,
+        id,
+        { makeClient: deps.makeClient },
+        base,
+      );
       return ok({
         dryRun: true,
         action: "return",
@@ -146,15 +146,17 @@ export async function conversationReturn(
         note: "Returns the conversation to the bot (unassigns human, status pending). Calls Chatwoot.",
       });
     }
-    const outcome = await returnConversationToAgent(ctx, id, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "conversation.return",
-      target,
-      before: truncForAudit({ status: current.status }),
-      after: truncForAudit({ status: "pending", outcome }),
-    });
+    // The INJECTED factory here too (issue #495 review, round 7). The preview was given it in round
+    // 5 and the apply beside it kept `{}`, which went unnoticed only because the refusal it is
+    // usually asked for happened before any client was built; now that both halves read the
+    // conversation from Chatwoot first, a caller that passes a factory had it honoured on the
+    // preview and discarded on the apply — the two halves talking to different Chatwoots.
+    const outcome = await returnConversationToAgent(
+      ctx,
+      id,
+      { makeClient: deps.makeClient },
+      base,
+    );
     // Reported, not swallowed: a takeover during the call leaves the conversation with the human who
     // claimed it, and an `applied: true` alone would tell the caller the agent has it back.
     return ok({ dryRun: false, applied: true, target, outcome });
@@ -191,14 +193,6 @@ export async function conversationStatus(
       });
     }
     await setConversationStatus(ctx, id, args.status, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "conversation.status",
-      target,
-      before: truncForAudit({ status: current.status }),
-      after: truncForAudit({ status: args.status }),
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -219,6 +213,10 @@ export async function conversationReengage(
   try {
     const current = await getConversationDetail(ctx, id, base);
     if (args.dry_run !== false) {
+      // NOTE: the core's own second refusal, past the existence check this `getConversationDetail`
+      // already made. An inbox with no agent bound has nothing to run the turn, and the preview
+      // promised a proactive message that could never be sent (#510).
+      await assertConversationReengageable(ctx, id, base);
       return ok({
         dryRun: true,
         action: "reengage",
@@ -228,14 +226,6 @@ export async function conversationReengage(
       });
     }
     const result = await reengageConversation(ctx, id, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "conversation.reengage",
-      target,
-      before: null,
-      after: truncForAudit({ outcome: result.outcome }),
-    });
     return ok({
       dryRun: false,
       applied: true,

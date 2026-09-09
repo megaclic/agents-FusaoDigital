@@ -70,7 +70,10 @@ export type SchedulerJobKind =
   | "MEMORY_COMPACT"
   | "INGEST_MESSAGE"
   | "DELIVERY_SWEEP"
-  | "DELIVERY_RECOVERY";
+  | "DELIVERY_RECOVERY"
+  | "TAKEOVER_RECOVERY"
+  | "SPEND_CEILING_POLL"
+  | "OBSERVE";
 
 export interface ClaimedJob {
   id: bigint;
@@ -190,6 +193,72 @@ export async function upsertJobRow(
   return row.id;
 }
 
+// The SET-BASED sibling of `upsertJobRow`, for a caller arming many rows inside one transaction.
+//
+// Same row and the same `rearm` question, in one round trip. `reindexKnowledgeBase` commits the
+// status transition, the jobs and the audit row together, and a per-row loop there is N round trips
+// against a transaction with a five-second budget: an imported base with a few thousand documents
+// would blow the deadline and roll the whole reindex back.
+//
+// Deliberately narrower than the single-row version, because a bulk arming is a bulk arming: every
+// row shares one `kind`, one `rearm` and one `runAt`, and carries its own dedupe key and payload.
+// Anything that does not fit that shape stays on `upsertJobRow`.
+//
+// The payload is REQUIRED here, and that is the narrowing doing its job rather than an oversight.
+// `upsertJobRow` treats an omitted payload as "keep the one already stored", and that meaning cannot
+// survive the trip through an array: the rows travel as `text[]`, so an omission would have to be
+// spelled as a JSON value, and every spelling of it (`{}`, `null`) is also a payload a caller might
+// legitimately mean. Making it optional and coercing to `{}` is what the type USED to allow, and it
+// silently replaced the stored payload and cleared its secret half on a re-arm that never asked to.
+// Requiring it moves that from a runtime surprise to a compile error at the call site.
+//
+// It lives HERE, beside it, because `tests/modules/scheduler-row-writers.test.ts` fences row
+// creation to this module.
+export async function upsertJobRows(
+  db: ScopedDb,
+  params: {
+    tenantId: bigint;
+    kind: SchedulerJobKind;
+    rearm: Rearm;
+    runAt: Date;
+    rows: { dedupeKey: string; payload: Record<string, unknown> }[];
+  },
+): Promise<number> {
+  if (params.rows.length === 0) return 0;
+  // NOTE: The rows travel as TWO ARRAYS and not as N tuples, because a tuple list carries one bind
+  // parameter per column per row and Postgres refuses a statement with more than 65535 of them: at
+  // five per row this breaks at 13108 documents, and nothing upstream caps how many a base may hold
+  // (an import creates them in bulk). The whole reindex would fail on the statement that arms it,
+  // rolling back a transition the operator asked for, and the size that trips it is a customer's
+  // catalogue rather than anything we choose. Unnesting keeps the count at one parameter per COLUMN,
+  // whatever the row count, and the shared halves bind once each instead of once per row.
+  const keys = params.rows.map((r) => r.dedupeKey);
+  const payloads = params.rows.map((r) => JSON.stringify(r.payload));
+  return db.$executeRaw`
+    INSERT INTO scheduler_jobs
+      (tenant_id, kind, dedupe_key, run_at, payload, status, created_at, updated_at)
+    SELECT ${params.tenantId}::bigint,
+           ${params.kind}::"SchedulerJobKind",
+           t.dedupe_key,
+           ${params.runAt}::timestamptz,
+           t.payload::jsonb,
+           'PENDING'::"SchedulerJobStatus",
+           now(),
+           now()
+      FROM unnest(${keys}::text[], ${payloads}::text[]) AS t(dedupe_key, payload)
+    ON CONFLICT (tenant_id, kind, dedupe_key) DO UPDATE
+       SET run_at = EXCLUDED.run_at,
+           status = 'PENDING'::"SchedulerJobStatus",
+           last_error = NULL,
+           payload = EXCLUDED.payload,
+           -- The payload is authoritative on a re-arm and its secret half travels with it, exactly
+           -- as the single-row version does; this shape never carries one, so it is cleared rather
+           -- than left behind from a previous arming.
+           payload_secret = NULL,
+           attempts = ${params.rearm === "new-work" ? Prisma.sql`0` : Prisma.sql`scheduler_jobs.attempts`},
+           updated_at = now()`;
+}
+
 // One live row per (tenant, kind, dedupeKey): a re-enqueue re-arms run_at and resets to PENDING.
 export async function enqueueJob(params: EnqueueParams): Promise<bigint> {
   const base = params.base ?? basePrisma;
@@ -231,6 +300,44 @@ export async function cancelPendingJobsByPrefix(
   return runScopedOn(base, sysCtx(tenantId), async (db) => {
     const res = await db.schedulerJob.updateMany({
       where: { kind, status: "PENDING", dedupeKey: { startsWith: prefix } },
+      data: { status: "DONE" },
+    });
+    return res.count;
+  });
+}
+
+// The same cancel, FENCED ON THE EPISODE the rows belong to (issue #477 review, round 21).
+//
+// `/reset` retires the verdicts armed before it, and the plain prefix cancel above cannot tell them
+// from the ones armed after: the command's own work takes seconds — a live refresh, the memory
+// clear, a dozen Chatwoot calls — and a customer message landing in that stretch arrives AFTER the
+// reset, arms a burst the operator wants classified, and was then marked DONE by a cancel that ran
+// later and asked nothing. Moving the cancel earlier only narrows the window; the boundary closes
+// it, and the boundary is the one the whole command is already written in — the command's own
+// message id in Chatwoot's sequence (../../graph/reset-episode.ts).
+//
+// AT OR BELOW, and only for a row that NAMES a message, exactly as `resetLandedAfter` reads it: a
+// row with no `atMessageId` is a resolve verdict, which orders against nothing here and is stood
+// down by the tick's own reopen fence instead — the command is an incoming message, so a
+// conversation that was resolved no longer is.
+//
+// One statement, not read-then-update: a burst joining the row between a read and a write would
+// raise its `atMessageId` past the boundary, and the cancel would retire the episode it just became.
+export async function cancelPendingJobsByPrefixUpToMessage(
+  tenantId: bigint,
+  kind: SchedulerJobKind,
+  prefix: string,
+  atOrBelowMessageId: number,
+  base: PrismaClient = basePrisma,
+): Promise<number> {
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const res = await db.schedulerJob.updateMany({
+      where: {
+        kind,
+        status: "PENDING",
+        dedupeKey: { startsWith: prefix },
+        payload: { path: ["atMessageId"], lte: atOrBelowMessageId },
+      },
       data: { status: "DONE" },
     });
     return res.count;

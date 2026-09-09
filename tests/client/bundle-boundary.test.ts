@@ -19,8 +19,23 @@ const FORBIDDEN = [
   // The synthesis path itself (fetch + audio encoding), reachable the same way.
   "src/modules/tts/normalize.ts",
   "src/config.ts",
+  // `new AsyncLocalStorage()` at module scope, and its browser shim is empty: importing ANYTHING
+  // from here (the audit page wanted `ACTOR_TYPES`) throws before the console renders, on every
+  // screen and not only the one that imported it. The value half lives in `tenancy/actor.ts`, which
+  // has no imports at all.
+  "src/lib/tenancy/context.ts",
 ];
-const FORBIDDEN_PACKAGES = ["@langchain/", "langchain", "@prisma/client"];
+const FORBIDDEN_PACKAGES = [
+  "@langchain/",
+  "langchain",
+  "@prisma/client",
+  "node:async_hooks",
+  // The code-tool sandbox interpreter (QuickJS over WebAssembly) cannot load under the console's
+  // CSP and must never reach the browser bundle: the client reads only the import-free limits module
+  // and the isomorphic acorn check, never `graph/tools/code-sandbox` or its worker.
+  "quickjs-emscripten-core",
+  "@jitl/quickjs",
+];
 
 const EXTENSIONS = [".ts", ".tsx", ".js", ".jsx"];
 

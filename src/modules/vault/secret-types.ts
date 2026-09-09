@@ -58,8 +58,16 @@ export interface SecretType {
   service?: string;
   // Optional connectivity test (test-on-save). Absent ⇒ the type is not testable.
   test?: SecretTestSpec;
-  // When true, a non-empty baseUrl is required to create or update this credential kind.
-  requiresBaseUrl?: boolean;
+  // Whether this kind carries a persistent base URL (VaultEntry.baseUrl), and whether it can be
+  // created without one. ONE declaration rather than a supports/requires pair, because "required
+  // but not supported" is not a state any kind can be in and a pair lets it be written: the
+  // console's own mirror kept the two as separate booleans and the server declared only half of
+  // them, which is how every kind ended up storing a base URL nine of them never show (#504).
+  // Absent ⇒ the kind has no use for one, and a non-empty baseUrl on it is REFUSED at the write
+  // boundary — the field is read straight off the entry by the model, vision, STT, TTS and MCP
+  // paths (`credentialBaseUrl ?? cfg.baseURL`), so a value stored on a kind whose form never shows
+  // it silently redirects where the credential is sent.
+  baseUrl?: "required" | "optional";
   // When true, the VALUE is a server-managed JSON blob (created empty, populated by a connect flow
   // like OAuth DCR + consent). Exempt from validateVaultValue's field/string shape check — only
   // "must be an object" is enforced. The operator never types the secret value directly.
@@ -69,13 +77,23 @@ export interface SecretType {
 // Order is the UI display order. Keep `generic` first (the default); generic mechanisms, then the
 // service-specific types (which carry a logo + a connectivity test).
 export const SECRET_TYPES: SecretType[] = [
-  { id: "generic", injection: "none" },
-  { id: "bearer_token", injection: "bearer" },
+  { id: "generic", injection: "none", baseUrl: "optional" },
+  { id: "bearer_token", injection: "bearer", baseUrl: "optional" },
   // Generic header injection — the operator names the header in VaultEntry.paramName.
-  { id: "header", injection: "header", needsParamName: true },
-  { id: "basic_auth", injection: "basic" },
+  {
+    id: "header",
+    injection: "header",
+    needsParamName: true,
+    baseUrl: "optional",
+  },
+  { id: "basic_auth", injection: "basic", baseUrl: "optional" },
   // Generic query injection — the operator names the query parameter in VaultEntry.paramName.
-  { id: "query", injection: "query", needsParamName: true },
+  {
+    id: "query",
+    injection: "query",
+    needsParamName: true,
+    baseUrl: "optional",
+  },
   {
     id: "openai",
     injection: "bearer",
@@ -119,7 +137,7 @@ export const SECRET_TYPES: SecretType[] = [
     id: "openai_compatible",
     injection: "bearer",
     service: "openai_compatible",
-    requiresBaseUrl: true,
+    baseUrl: "required",
     // Base is the operator's API root (typically ending in /v1); the probe hits {base}/models.
     test: { needsBase: true, path: "/models" },
   },
@@ -158,7 +176,7 @@ export const SECRET_TYPES: SecretType[] = [
     // with the SAME header; hyphenated to survive proxies that drop underscores (chatwoot/constants.ts).
     name: CHATWOOT_AUTH_HEADER,
     service: "chatwoot",
-    requiresBaseUrl: true,
+    baseUrl: "required",
     // Self-hosted: the operator's Chatwoot base. Probes the user-scoped profile endpoint.
     test: { needsBase: true, path: "/api/v1/profile" },
   },
@@ -183,7 +201,7 @@ export const SECRET_TYPES: SecretType[] = [
     id: "mcp_oauth",
     injection: "bearer",
     service: "mcp",
-    requiresBaseUrl: true,
+    baseUrl: "required",
     managedBlob: true,
   },
   // Environment variable for a stdio MCP server (many stdio servers read their token from an env var,
@@ -206,7 +224,7 @@ export const SECRET_TYPES: SecretType[] = [
     injection: "none",
     neverOutbound: true,
     service: "langfuse",
-    requiresBaseUrl: true,
+    baseUrl: "required",
     fields: [{ key: "publicKey" }, { key: "secretKey", masked: true }],
   },
 ];
@@ -236,10 +254,82 @@ export function secretTypeNeedsParamName(
   return !!getSecretType(id)?.needsParamName;
 }
 
+// The kinds that read `paramName`, in catalog order. Both halves of the applicability rule are
+// derived from the same declaration, so a kind added to `SECRET_TYPES` lands on whichever side its
+// own entry puts it, and the refusal below can NAME the alternatives instead of only saying no.
+export const PARAM_NAME_KIND_IDS: string[] = SECRET_TYPES.filter(
+  (s) => s.needsParamName,
+).map((s) => s.id);
+
+// Whether a non-empty `paramName` on this kind must be REFUSED at the write boundary. Not the
+// negation of `secretTypeNeedsParamName`, and the difference is the whole reason this is a function:
+// that one answers false for a kind the catalog does not know, and refusing those would strand every
+// row an older build wrote with a kind this one has since dropped — the same carve-out
+// `secretTypeFits` makes, for the same reason.
+//
+// The field is only ever read through `resolveSecretInjection`, which takes the name from a
+// `needsParamName` entry and from nowhere else. Storing it on any other kind is storing something
+// the runtime discards: the write answered 200, the console read the name back, and the outbound
+// request carried no credential at all (issue #488).
+export function secretTypeRefusesParamName(
+  id: string | null | undefined,
+): boolean {
+  const type = getSecretType(id);
+  return type != null && !type.needsParamName;
+}
+
+// Whether the kind puts the credential on the outbound request BY ITSELF. False for `generic` — the
+// escape hatch whose whole contract is that the operator writes `{{secret}}` where the API wants it —
+// and for a kind this build does not know, which is treated as `generic` everywhere else.
+export function secretTypeAutoInjects(id: string | null | undefined): boolean {
+  const type = getSecretType(id);
+  return type != null && type.injection !== "none";
+}
+
+// The kinds that inject a credential without naming a service: bearer/header/basic/query. Derived
+// rather than listed, and the two conditions are both load-bearing — a kind that injects but names a
+// service (`openai`, `asaas`, …) is not an alternative for an arbitrary HTTP tool, it is a different
+// API. This is what the unused-credential warning offers instead of only saying the credential is dead.
+export const INJECTING_MECHANISM_KIND_IDS: string[] = SECRET_TYPES.filter(
+  (s) => s.injection !== "none" && !s.service,
+).map((s) => s.id);
+
 export function secretTypeRequiresBaseUrl(
   id: string | null | undefined,
 ): boolean {
-  return !!getSecretType(id)?.requiresBaseUrl;
+  return getSecretType(id)?.baseUrl === "required";
+}
+
+// Whether the kind has any use for a base URL at all. Required implies supported by construction —
+// that is the whole reason the catalog declares one field and not two.
+export function secretTypeSupportsBaseUrl(
+  id: string | null | undefined,
+): boolean {
+  return getSecretType(id)?.baseUrl != null;
+}
+
+// The kinds that carry a base URL, in catalog order — the same shape `PARAM_NAME_KIND_IDS` has, and
+// for the same reason: the refusal below can NAME the alternatives instead of only saying no.
+export const BASE_URL_KIND_IDS: string[] = SECRET_TYPES.filter(
+  (s) => s.baseUrl != null,
+).map((s) => s.id);
+
+// Whether a non-empty `baseUrl` on this kind must be REFUSED at the write boundary. Not the negation
+// of `secretTypeSupportsBaseUrl`, and the difference is the same carve-out `secretTypeRefusesParamName`
+// makes: a kind this build does not know answers false, so an entry written by a build whose catalog
+// had a kind this one dropped stays editable.
+//
+// The field is read straight off the resolved entry by the model path (`credentialBaseUrl ?? mc.baseURL`
+// in prepare.ts), vision, STT, TTS, the HTTP-tool base and the MCP connection URL — none of them
+// asking the kind. So a base URL stored on a kind whose console form never renders the input is a
+// redirect nobody can see: the operator's provider key goes to that host on the next turn, and the
+// only surface that already asks the question is the embedding path, which honours the entry's
+// baseUrl for `openai_compatible` and nothing else (rag/documents.ts, and it says why).
+export function secretTypeRefusesBaseUrl(
+  id: string | null | undefined,
+): boolean {
+  const type = getSecretType(id);
+  return type != null && type.baseUrl == null;
 }
 
 // True for kinds whose VALUE is a server-managed JSON blob (created empty; see SecretType.managedBlob).
@@ -258,6 +348,120 @@ const MANAGED_OAUTH_KINDS = new Set<string>(["google_oauth", "mcp_oauth"]);
 
 export function isManagedOAuthKind(kind: string | null | undefined): boolean {
   return kind != null && MANAGED_OAUTH_KINDS.has(kind);
+}
+
+// What a field that names a credential DOES with it, and therefore what it needs the entry to be
+// able to give. The catalog knows the shapes; only the reading field knows which one it can use, and
+// until this existed nobody asked: every write boundary stopped at "does this ref resolve".
+//
+//   apiKey       The stored value IS the credential the request carries — an API key handed to a
+//                provider SDK (the agent's model and its four model overrides, STT, TTS, vision) or
+//                to a REST client. It needs the plain string itself.
+//   injectable   The value is resolved through `resolveInjectableCredentialEntry`, which hands back
+//                a FRESH access token for the managed-OAuth kinds and the stored string for the
+//                rest. It can therefore use a JSON blob it never sees (HTTP tools, MCP connections,
+//                the contact authorization gate).
+//   embeddingKey The tenant's embedding key, and the one field whose reader takes a SECOND value
+//                form the catalog does not declare: `resolveEmbeddingStatus` accepts the plain
+//                string or `{ apiKey, baseURL }`, destructuring the object and using its `baseURL`
+//                as the last fallback. Same KIND rule as `apiKey` — a `google_oauth` or `mcp_env`
+//                entry is refused there exactly the same way — and exempt from the VALUE rule,
+//                because enforcing "a generic kind holds a string" would refuse a form that reader
+//                has always supported. The debt is the undeclared form, not this exemption:
+//                declaring it in the catalog is what would remove the third value, and that is a
+//                change to how embedding credentials are stored, not to this one.
+//
+// Both send the result to somebody else's endpoint, which is why `neverOutbound` fails for both:
+// mcp_env holds a perfectly good string that the stdio loader reads, and putting it in an API-key
+// field mails the operator's stdio token to a model vendor.
+export type CredentialUse = "apiKey" | "injectable" | "embeddingKey";
+
+// Whether an entry of this KIND can supply what a field of this USE reads. The one question the
+// three surfaces ask — the write boundary refusing a pairing, config-health reporting a stored one,
+// the runtime declining to use it — so that they cannot answer it differently. Issue #471.
+//
+// A kind this build does not know (and a null kind, which is every entry created before the catalog)
+// is the legacy `generic` escape hatch: a plain string with no injection rule. Refusing those would
+// invalidate working installs over a catalog entry we removed.
+export function secretTypeFits(
+  kind: string | null | undefined,
+  use: CredentialUse,
+): boolean {
+  const type = getSecretType(kind);
+  if (!type) return true;
+  if (type.neverOutbound) return false;
+  if (use === "injectable") {
+    // Mirrors resolveInjectableCredentialEntry: managed OAuth resolves to a token, everything else
+    // has to already be the string.
+    return isManagedOAuthKind(type.id) || yieldsPlainString(type);
+  }
+  // `apiKey` and `embeddingKey` are the same question about the KIND; they differ only in whether
+  // the stored VALUE is also held to it (see `valueRuleApplies`).
+  return yieldsPlainString(type);
+}
+
+// Whether this use reads a PLAIN KEY out of the entry, as opposed to resolving it through the
+// injectable path. Two of the three do, and the difference matters twice: it is the kind rule below,
+// and it is which of the two refusal sentences the write boundary throws. Those two were derived
+// separately once — `use === "apiKey"` — and the day a third use appeared it silently told an
+// operator that their `google_oauth` embedding key "is never sent outbound", which is false about
+// that kind and about that field.
+export function readsPlainKey(use: CredentialUse): boolean {
+  return use !== "injectable";
+}
+
+// Whether a field of this use holds its credential's stored VALUE to the kind's declared shape, as
+// opposed to only holding its KIND to the field's needs. Exactly one use says no, and the comment on
+// `CredentialUse` says why.
+export function valueRuleApplies(use: CredentialUse): boolean {
+  return use !== "embeddingKey";
+}
+
+// CAN THIS ENTRY SERVE THIS FIELD — the whole question, in one place, because it is the question the
+// write boundary, the import warning and config-health all ask and the defect this change exists to
+// fix was those three answering it differently. Three call sites spelling out `secretTypeFits(...) &&
+// (!valueRuleApplies(...) || ...)` is three chances to drift, and it drifted twice inside one review
+// round: config-health applied the value rule to a use that is exempt from it, and the import did the
+// same in a place no test could reach yet.
+//
+// `facts` is what the vault answers about one entry beyond its existence — read through
+// `readVaultRefFacts`, or off `listVaultInfos` for the console — never the secret itself.
+export function credentialServes(
+  facts: { kind: string | null; valueFitsKind: boolean },
+  use: CredentialUse,
+): boolean {
+  return (
+    secretTypeFits(facts.kind, use) &&
+    (!valueRuleApplies(use) || facts.valueFitsKind)
+  );
+}
+
+// Whether the stored VALUE is the shape its own KIND declares. The predicate above reads the catalog;
+// this one reads what is actually in the row, and the two can disagree — an entry created before its
+// kind existed, or one written by a path that does not go through `validateVaultValue`.
+//
+// Deliberately asymmetric, and the asymmetry is the whole content. A string-valued kind is checked
+// strictly, because that is the case a reader breaks on. A multi-field or managed-blob kind is only
+// checked for being an object, NOT for its declared field list: the OAuth consent flows MERGE tokens
+// into `google_oauth` and `mcp_oauth` values outside `validateVaultValue` (the catalog says so at both
+// entries), so demanding exactly `{ clientId, clientSecret }` would report every CONNECTED Google
+// account as malformed.
+export function secretValueFitsKind(
+  kind: string | null | undefined,
+  value: unknown,
+): boolean {
+  const type = getSecretType(kind);
+  if (type && !yieldsPlainString(type)) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  return typeof value === "string" && value.length > 0;
+}
+
+// The two declarations that say the stored VALUE is not a string: a declared field list (the value
+// is a multi-field object) and a server-managed blob. Kept as one predicate so a third declaration
+// of the same idea has one place to be added.
+function yieldsPlainString(type: SecretType): boolean {
+  return !type.fields && !type.managedBlob;
 }
 
 export function getSecretTypeFields(

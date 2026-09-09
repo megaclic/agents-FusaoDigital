@@ -99,16 +99,17 @@ async function advanceZproWatermarkFromArm(
 ): Promise<void> {
   const last = readLastMessageId(job.payload);
   if (last === null) return;
+  const lastId = BigInt(last);
   await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.zproConversation.updateMany({
       where: {
         id: convDbId,
         OR: [
           { lastHandledMessageId: null },
-          { lastHandledMessageId: { lt: BigInt(last) } },
+          { lastHandledMessageId: { lt: lastId } },
         ],
       },
-      data: { lastHandledMessageId: BigInt(last) },
+      data: { lastHandledMessageId: lastId },
     }),
   );
 }

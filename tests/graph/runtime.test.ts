@@ -1,14 +1,19 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage, type BaseMessage } from "@langchain/core/messages";
+import {
+  AIMessage,
+  type BaseMessage,
+  HumanMessage,
+  ToolMessage,
+} from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
 import { encryptJson } from "@/api/lib/crypto";
-import { computeConfigIssues } from "@/client/lib/configHealth";
+import logger from "@/api/lib/logger";
 import { contactInboxThreadId } from "@/graph/checkpointer";
 import {
   clearTurnInFlight,
@@ -17,13 +22,24 @@ import {
 } from "@/graph/inflight";
 import { ingestMessageIntoThread } from "@/graph/ingest";
 import { armIngest } from "@/graph/ingest-job";
-import { isConversationDivider, stampedConversationId } from "@/graph/markers";
+import {
+  HUMAN_HANDBACK_NOTE,
+  humanAgentMessage,
+  humanHandbackMessage,
+  isConversationDivider,
+  stampedConversationId,
+} from "@/graph/markers";
 import type { ResolvedModelConfig } from "@/graph/models";
+import { FOLLOWUP_SKIP_SENTINEL } from "@/graph/nudge";
 import { runAgentTurn } from "@/graph/runtime";
-import { buildThreadStateGraph } from "@/graph/thread-state";
+import { clearTurnOwning, markTurnOwning } from "@/graph/thread-claim";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
+import { HANDOFF_DONE_PREFIX } from "@/graph/tools/catalog";
 import type { TenantContext } from "@/lib/tenancy";
+import { computeConfigIssues } from "@/modules/agents/config-health";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import { reengageConversation } from "@/modules/conversations/reengage";
 import { storageKey } from "@/modules/documents/issue";
 import { documentStarter } from "@/modules/documents/starters";
 import { createDocumentTemplate } from "@/modules/documents/templates";
@@ -252,6 +268,23 @@ async function threadChannel(
   ]);
 }
 
+// The same read as `threadChannel`, by explicit thread key: the per-contact-inbox thread has a
+// different one, and the tests that care about continuity across conversations address it directly.
+async function threadOf(
+  checkpointer: MemorySaver,
+  threadId: string,
+): Promise<Array<[string, string]>> {
+  const state = await buildThreadStateGraph(checkpointer).getState({
+    configurable: { thread_id: threadId },
+  });
+  const messages = ((state.values as { messages?: BaseMessage[] })?.messages ??
+    []) as BaseMessage[];
+  return messages.map((m) => [
+    m.getType(),
+    typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+  ]);
+}
+
 async function seedConversation(
   convId: number,
   assigneeType: string | null,
@@ -369,6 +402,336 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(outcome).toBe("posted");
     expect(sent).toEqual([[900, REPLY]]);
+  });
+
+  // NOTE: Issue #454. `[[SKIP]]` is the FOLLOW-UP's way of saying "stay silent", and it is stripped
+  // on both proactive paths. The reactive path had no equivalent, so a model that reproduced the
+  // token — it is in the shared per-contact-inbox transcript every silent follow-up leaves behind —
+  // had it delivered verbatim. On an email inbox that is a real email, to whoever wrote in.
+  test("a reply that is only the follow-up's skip sentinel is silence, not text", async () => {
+    await seedConversation(9454, null);
+    const saver9454 = new MemorySaver();
+    const sent: Array<[number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9454 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
+        makeClient: makeStubClient(sent),
+        checkpointer: saver9454,
+      },
+    });
+    expect(sent).toEqual([]);
+    expect(outcome).toBe("empty");
+
+    // And the operator can tell this apart from the agent ignoring a customer: `skip_reply` records
+    // itself in the timeline, so a turn silenced by the token owes a line of its own.
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 9454 },
+    });
+    // Searched rather than taken by order: a turn writes several `generate` lines, and "the last
+    // one" is whichever the stage happened to end on.
+    const rows = await flowLogRows(suDb, {
+      where: { tenantId, conversationId: conv.id, stage: "generate" },
+      select: { level: true, detail: true },
+    });
+    const suppressed = rows.filter((r) =>
+      JSON.stringify(r.detail ?? {}).includes("silenceTokenSuppressed"),
+    );
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]?.level).toBe("warn");
+
+    // Review round 5: and the token is not left in the thread to feed itself. The raw message was
+    // already checkpointed, the thread is shared per contact-inbox, and the next turn reading one
+    // more sentinel answer is what reinforces the condition that produced this one.
+    const held = await threadChannel(saver9454, 9454);
+    expect(held.filter(([, c]) => c.includes(FOLLOWUP_SKIP_SENTINEL))).toEqual(
+      [],
+    );
+  });
+
+  // Review round 6. The rollback stands down while the GRAPH thread is in flight, and a conversation
+  // WITH a contact-inbox — the normal production shape — carries TWO claims on two different keys:
+  // the conversation one, and the durable `markTurnOwning` one on the contact-inbox thread. Placed
+  // between them, the rollback read this turn's own claim and did nothing, silently. The case above
+  // could not catch it: with no contact-inbox the two keys collapse into one.
+  test("the token is rolled back on a contact-inbox thread too", async () => {
+    const contactInboxId = 7454;
+    const contact = await suDb.contact.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootContactId: 88454,
+        name: "C",
+      },
+      select: { id: true },
+    });
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 9460,
+        contactInboxId,
+        contactId: contact.id,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:9460`,
+        lastEventAt: new Date(),
+      },
+    });
+    const saver = new MemorySaver();
+    const sent: Array<[number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9460, contactInboxId }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
+        makeClient: makeStubClient(sent),
+        checkpointer: saver,
+      },
+    });
+    expect(sent).toEqual([]);
+    expect(outcome).toBe("empty");
+
+    // Read on the key the NUDGE and the next reactive turn actually load: the contact-inbox thread.
+    const state = await buildThreadStateGraph(saver).getState({
+      configurable: {
+        thread_id: contactInboxThreadId(tenantId, instanceId, contactInboxId),
+      },
+    });
+    const messages = ((state.values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    // Positive control: a probe that found no messages measured nothing. The customer's own turn
+    // stands (the reactive rollback plan leaves it), and the sentinel answer is gone.
+    expect(messages.length).toBeGreaterThan(0);
+    expect(
+      messages.filter((m) =>
+        JSON.stringify(m.content).includes(FOLLOWUP_SKIP_SENTINEL),
+      ),
+    ).toEqual([]);
+  });
+
+  // Review round 11, and the twin of the case above one layer out. The rollback runs just after this
+  // turn released its durable claim, which is exactly when a turn on ANOTHER replica may start —
+  // and that one holds nothing in this process's Map. So the rollback takes the claim every write to
+  // the channel from outside an invoke takes, and stands down when the row says the thread is busy.
+  // Here to prove the WIRING: `runAgentTurn` handing its owner down is what the deferral depends on,
+  // and `tests/graph/nudge-refused-rollback.test.ts` proves the rule itself.
+  test("another replica's turn defers the token rollback instead of racing it", async () => {
+    const contactInboxId = 7455;
+    const contact = await suDb.contact.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootContactId: 88455,
+        name: "C",
+      },
+      select: { id: true },
+    });
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 9461,
+        contactInboxId,
+        contactId: contact.id,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:9461`,
+        lastEventAt: new Date(),
+      },
+    });
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+    const saver = new MemorySaver();
+    const sent: Array<[number, string]> = [];
+    // The other replica JOINS while this turn runs — turn claims are counted, so that is ordinary —
+    // and is still there when this one releases. Its Map entry is dropped at once: another replica
+    // holds none here, and leaving one would let the Map check answer instead of the row.
+    const otherReplica = await markTurnOwning(owner, appDb);
+    clearTurnInFlight(graphThreadId);
+    let outcome: string;
+    try {
+      outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9461, contactInboxId }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
+          makeClient: makeStubClient(sent),
+          checkpointer: saver,
+        },
+      });
+    } finally {
+      markTurnInFlight(graphThreadId);
+      await clearTurnOwning(owner, appDb, otherReplica);
+    }
+    expect(sent).toEqual([]);
+    expect(outcome).toBe("empty");
+    // Deferred, not removed: the honest outcome, and the one the log names. Writing a removal an
+    // invoke on another host is about to undo leaves the same history and a checkpoint that lies.
+    const state = await buildThreadStateGraph(saver).getState({
+      configurable: { thread_id: graphThreadId },
+    });
+    const messages = ((state.values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(
+      messages.filter((m) =>
+        JSON.stringify(m.content).includes(FOLLOWUP_SKIP_SENTINEL),
+      ),
+    ).not.toEqual([]);
+  });
+
+  // The control for the line above, and the reason it is not just "log on every empty turn": a model
+  // that genuinely wrote nothing is an ordinary silent turn, and a warn there would cry wolf on the
+  // shape `skip_reply` produces on purpose.
+  test("an ordinary empty reply logs no suppression line", async () => {
+    await seedConversation(9456, null);
+    const sent: Array<[number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9456 }),
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeClient: makeStubClient(sent),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(sent).toEqual([]);
+    expect(outcome).toBe("empty");
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 9456 },
+    });
+    const rows = await flowLogRows(suDb, {
+      where: { tenantId, conversationId: conv.id, stage: "generate" },
+      select: { detail: true },
+    });
+    expect(
+      rows.filter((r) =>
+        JSON.stringify(r.detail ?? {}).includes("silenceTokenSuppressed"),
+      ),
+    ).toEqual([]);
+  });
+
+  // The other half, and the one that says this is a strip and not a refusal: a real answer that
+  // happens to carry the token still reaches the customer, minus the token. Suppressing the whole
+  // reply here would trade a leaked marker for an ignored customer.
+  test("a real reply carrying a stray sentinel keeps its text and loses the token", async () => {
+    await seedConversation(9455, null);
+    const sent: Array<[number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9455 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FakeListChatModel({
+            responses: [`${FOLLOWUP_SKIP_SENTINEL} Claro, posso ajudar.`],
+          }),
+        makeClient: makeStubClient(sent),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    // Review round 4: the token is NOT edited out of a real answer — that is the silent data loss
+    // docs/graph.md rejects. It rides along, and the operator gets a line saying so.
+    expect(outcome).toBe("posted");
+    expect(sent).toEqual([
+      [9455, `${FOLLOWUP_SKIP_SENTINEL} Claro, posso ajudar.`],
+    ]);
+    const conv455 = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 9455 },
+    });
+    const rows455 = await flowLogRows(suDb, {
+      where: { tenantId, conversationId: conv455.id, stage: "generate" },
+      select: { detail: true },
+    });
+    expect(
+      rows455.filter((r) =>
+        JSON.stringify(r.detail ?? {}).includes("silenceTokenInReply"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  // Review round 1, P2. The proactive path also reads a bare "SKIP" and a parenthetical-only reply
+  // as silence, because ITS prompt asked the model to produce nothing. Nothing asks that here, a
+  // customer is waiting, and these are ordinary short answers — importing that heuristic would trade
+  // a leaked marker for an ignored customer, which is the defect this PR exists to avoid.
+  test("a short reply the follow-up would read as silence is still delivered", async () => {
+    for (const [conv, reply] of [
+      [9457, "SKIP"],
+      [9458, "(nada consta)"],
+    ] as Array<[number, string]>) {
+      await seedConversation(conv, null);
+      const sent: Array<[number, string]> = [];
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: conv }),
+        base: appDb,
+        deps: {
+          makeModel: () => new FakeListChatModel({ responses: [reply] }),
+          makeClient: makeStubClient(sent),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(outcome).toBe("posted");
+      expect(sent).toEqual([[conv, reply]]);
+    }
+  });
+
+  // Review round 1, P3. `[[SKIP]][[SKIP]]` used to fall between the two answers: not equal to the
+  // sentinel, so "not silent", yet empty once stripped — silenced with no line explaining it.
+  test("a reply of repeated sentinels is silence, and says so", async () => {
+    await seedConversation(9459, null);
+    const sent: Array<[number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9459 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FakeListChatModel({
+            responses: [`${FOLLOWUP_SKIP_SENTINEL} ${FOLLOWUP_SKIP_SENTINEL}`],
+          }),
+        makeClient: makeStubClient(sent),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(sent).toEqual([]);
+    expect(outcome).toBe("empty");
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 9459 },
+    });
+    const rows = await flowLogRows(suDb, {
+      where: { tenantId, conversationId: conv.id, stage: "generate" },
+      select: { detail: true },
+    });
+    expect(
+      rows.filter((r) =>
+        JSON.stringify(r.detail ?? {}).includes("silenceTokenSuppressed"),
+      ),
+    ).toHaveLength(1);
   });
 
   // NOTE: Issue #63 end-to-end. A provider answering 200 with an empty completion used to end the
@@ -1137,6 +1500,71 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(sent).toEqual([]);
   });
 
+  // Round 25. A turn silenced by the TOKEN arms a rollback for the `finally`, and it can still be
+  // refused afterwards — a takeover, a supersede, a `/reset`. `refuse` then removes the same
+  // messages, and the armed rollback ran a second time: it took the ingest claim, read the channel,
+  // found nothing left and logged "could not roll back" — a warning about a removal that succeeded.
+  test("a token-silenced turn that is then refused is not rolled back twice", async () => {
+    await seedConversation(9462, null);
+    const warn = spyOn(logger, "warn");
+    const sent: Array<[number, string]> = [];
+    try {
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9462 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
+          makeClient: makeStubClient(sent),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      // The takeover fixture above: `seedConversation(_, "User")` is what makes the recheck lose, so
+      // this one is only silenced. Kept as the control that the warning is absent because nothing
+      // failed, not because the branch never ran.
+      expect(outcome).toBe("empty");
+      expect(sent).toEqual([]);
+      const said = warn.mock.calls.map((c) => JSON.stringify(c));
+      expect(
+        said.filter((c) => c.includes("could not roll back a token-silenced")),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("a token-silenced turn refused by a takeover logs no failed rollback", async () => {
+    await seedConversation(9463, "User");
+    const warn = spyOn(logger, "warn");
+    const sent: Array<[number, string]> = [];
+    try {
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9463 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
+          makeClient: makeStubClient(sent),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(outcome).toBe("taken-over");
+      expect(sent).toEqual([]);
+      const said = warn.mock.calls.map((c) => JSON.stringify(c));
+      expect(
+        said.filter((c) => c.includes("could not roll back a token-silenced")),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   // NOTE: Both of these lose the ownership recheck and return the same "taken-over". What they must
   // NOT share is the flow-log detail. A human assignee is a real handoff; a conversation that merely
   // left `pending` with nobody assigned is Chatwoot auto-escalating (most often because our webhook
@@ -1814,7 +2242,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         imageDeps,
       },
     });
-    expect(outcome).toBe("posted");
+    // `posted-partial`, not plain `posted` (issue #429): the handoff line answered, so this is not a
+    // failed turn — but the customer was promised a photo that never arrived, and the word that
+    // clears the operator's badge is reserved for a delivery that arrived whole. Same two bits as
+    // the resolve decision, which this branch already refused for the same reason.
+    expect(outcome).toBe("posted-partial");
   });
 
   test("taken over mid-turn discards the resolve intent", async () => {
@@ -2705,7 +3137,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
           documentsStorageDir: dir,
         },
       });
-      expect(outcome).toBe("posted");
+      // `posted-partial` (issue #429), and the same reasoning the flow line below states: a lookup
+      // that could not be made is not the operator withdrawing the file. The customer holds the text
+      // and not the document they were promised, so the turn does not get the word that clears the
+      // badge — the badge is the second place they can find out why the file never arrived.
+      expect(outcome).toBe("posted-partial");
       expect(calls).toEqual([["sendMessage", 945, "Segue o orçamento!"]]);
       // And the trail says so. A lookup that could not be made is not the operator revoking
       // anything: logging it as an intentional skip makes the one place they would look to find out
@@ -3014,6 +3450,561 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ["toggleStatus", 9701, "open"],
       ["sendMessage", 9701, "Um humano já te atende."],
     ]);
+  });
+
+  // THE END OF THE HUMAN STRETCH GETS WRITTEN DOWN, and until this it never was (issue #457). The
+  // agent's own transfer turn and every message the person sent stay in the thread; the return
+  // leaves no trace at all, so an operator prompt like "após transferir, não responda mais" goes on
+  // applying to a condition that ended. Measured live: one model went silent (`outcome=empty`, the
+  // reported symptom) and another sent the silence to the customer as text.
+  //
+  // The note has to land BEFORE the customer's message, which is why it is written here and not
+  // when ownership changed: the model reads the thread in order, and a hand-back announced after
+  // the question it is meant to unblock announces nothing.
+  test("issue #457: the turn after a hand-back writes the note, before the customer's message", async () => {
+    // ON A CONTACT-INBOX THREAD, which is the shape this situation has: the message that OPENS the
+    // human stretch is folded in by continuous ingestion, and that path is keyed by contact inbox.
+    const contactInboxId = 7457;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 982,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${982}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const checkpointer = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    // The thread as a handed-off conversation leaves it: the agent's own transfer call, and the
+    // person's reply folded in beside it. Nothing here says that stretch ended, which is the defect.
+    await buildThreadStateGraph(checkpointer).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new HumanMessage("quero falar com uma pessoa"),
+          new AIMessage({
+            content: "",
+            tool_calls: [{ name: "handoff_to_human", args: {}, id: "h1" }],
+          }),
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+          humanAgentMessage(982, "Oi, aqui é a Ana. Já estou vendo."),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+
+    const sent: Array<[number, string]> = [];
+    const client = {
+      getMessages: async () => ({
+        payload: [
+          {
+            id: 1,
+            content: "e aí, conseguiram ver?",
+            message_type: 0,
+            private: false,
+          },
+        ],
+      }),
+      sendMessage: async (conversationId: number, content: string) => {
+        sent.push([conversationId, content]);
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({
+        conversationId: 982,
+        contactInboxId,
+        message: {
+          id: 1,
+          content: "e aí, conseguiram ver?",
+          messageType: "incoming",
+          private: false,
+        },
+      }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer,
+      },
+    });
+    expect(outcome).toBe("posted");
+
+    const channel = await threadOf(checkpointer, threadId);
+    const note = channel.findIndex(([, text]) => text === HUMAN_HANDBACK_NOTE);
+    const question = channel.findIndex(([, text]) =>
+      text.includes("conseguiram ver?"),
+    );
+    expect(note).toBeGreaterThanOrEqual(0);
+    expect(note).toBeLessThan(question);
+    // ONE note, not one per turn: the note itself is what says the announcement already happened.
+    expect(
+      channel.filter(([, text]) => text === HUMAN_HANDBACK_NOTE).length,
+    ).toBe(1);
+  });
+
+  // DEFERRED WHILE AN OLDER INVOKE IS READING, the same rule the divider follows: that invoke saves
+  // the channel it LOADED, so a note appended beside it is erased — and an erased note is the bug
+  // back, silently. Deferring costs nothing because the decision is derived: the next turn asks the
+  // same question of the same thread.
+  test("issue #457: while another invoke is reading, the note rides in this turn's own invoke", async () => {
+    const contactInboxId = 7459;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 984,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${984}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const checkpointer = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(checkpointer).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    // Another invoke is already reading this channel.
+    const owner = {
+      tenantId,
+      instanceId,
+      contactInboxId,
+      graphThreadId: threadId,
+    };
+    await markTurnOwning(owner, appDb);
+
+    const client = {
+      getMessages: async () => ({
+        payload: [{ id: 1, content: "e aí?", message_type: 0, private: false }],
+      }),
+      sendMessage: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    const model = new CaptureReplyModel(REPLY);
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 984, contactInboxId }),
+      base: appDb,
+      deps: {
+        makeModel: () => model as never,
+        makeClient: async () => client,
+        checkpointer,
+      },
+    });
+
+    // THE CORRECTION IS NOT WHAT WAS DEFERRED, the durable append is. This turn is the one that
+    // would otherwise read a transfer with no ending, and the customer waiting for it is the one the
+    // issue is about — so the note goes into the invoke's own input instead of beside an older
+    // invoke that would erase it.
+    const seen = (model.seen.at(-1) ?? []) as Array<{ content?: unknown }>;
+    expect(seen.some((m) => String(m.content) === HUMAN_HANDBACK_NOTE)).toBe(
+      true,
+    );
+    // Once, and BEFORE the customer's message: the order is what the model has to read it in.
+    const channel = await threadOf(checkpointer, threadId);
+    const noteAt = channel.findIndex(([, t]) => t === HUMAN_HANDBACK_NOTE);
+    const customerAt = channel.findIndex(([, t]) => t.includes("oi"));
+    expect(noteAt).toBeGreaterThanOrEqual(0);
+    expect(customerAt).toBeGreaterThanOrEqual(0);
+    expect(noteAt).toBeLessThan(customerAt);
+    expect(channel.filter(([, t]) => t === HUMAN_HANDBACK_NOTE)).toHaveLength(
+      1,
+    );
+    // AND IT WAS NOT APPENDED BESIDE THE OLDER INVOKE: a durable `updateState` writes the note in a
+    // checkpoint of its own, before the customer's message exists. Carried by the invoke, the two
+    // enter together — so the first checkpoint that has the note has the customer's message too.
+    const withNote: string[][] = [];
+    for await (const cp of checkpointer.list({
+      configurable: { thread_id: threadId },
+    })) {
+      const texts = (
+        ((cp.checkpoint.channel_values as { messages?: BaseMessage[] })
+          ?.messages ?? []) as BaseMessage[]
+      ).map((m) => String(m.content));
+      if (texts.includes(HUMAN_HANDBACK_NOTE)) withNote.push(texts);
+    }
+    // `list` reads newest-first, so the oldest checkpoint carrying the note is the last one.
+    expect(withNote.at(-1)?.some((t) => t.includes("oi"))).toBe(true);
+  });
+
+  // TWO TURNS, ONE NOTE (issue #457, review round 10). The turn that defers can be beaten to the
+  // append by the very invoke it deferred to: that one finishes, writes the note, and this turn would
+  // then carry a second copy into its own invoke. The question is re-asked of the thread as it is
+  // immediately before the invoke, so a note already there is a note not carried.
+  test("issue #457: a note appended while we deferred is not carried a second time", async () => {
+    const contactInboxId = 7462;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 988,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${988}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const checkpointer = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(checkpointer).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const owner = {
+      tenantId,
+      instanceId,
+      contactInboxId,
+      graphThreadId: threadId,
+    };
+    await markTurnOwning(owner, appDb);
+
+    // THE OTHER INVOKE, landing between this turn's decision and its invoke: the first read that
+    // sees the handoff with no note is the decision's own, and the append follows it.
+    let injected = false;
+    const original = checkpointer.getTuple.bind(checkpointer);
+    checkpointer.getTuple = async (config) => {
+      const tuple = await original(config);
+      if (!injected) {
+        const texts = (
+          ((tuple?.checkpoint.channel_values as { messages?: BaseMessage[] })
+            ?.messages ?? []) as BaseMessage[]
+        ).map((m) => String(m.content));
+        if (
+          texts.some((t) => t.includes(HANDOFF_DONE_PREFIX)) &&
+          !texts.includes(HUMAN_HANDBACK_NOTE)
+        ) {
+          injected = true;
+          await buildThreadStateGraph(checkpointer).updateState(
+            { configurable: { thread_id: threadId } },
+            { messages: [humanHandbackMessage(988)] },
+            THREAD_STATE_NODE,
+          );
+        }
+      }
+      return tuple;
+    };
+
+    const client = {
+      getMessages: async () => ({
+        payload: [{ id: 1, content: "e aí?", message_type: 0, private: false }],
+      }),
+      sendMessage: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 988, contactInboxId }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer,
+      },
+    });
+    expect(injected).toBe(true);
+    const channel = await threadOf(checkpointer, threadId);
+    expect(channel.filter(([, t]) => t === HUMAN_HANDBACK_NOTE)).toHaveLength(
+      1,
+    );
+  });
+
+  // THE CONVERSATION-KEYED FALLBACK THREAD is a path the runtime supports, and a successful handoff
+  // is written there by the turn's own invoke like anywhere else — so leaving it out would leave
+  // this issue unfixed on it.
+  test("issue #457: a conversation-keyed thread gets the note too", async () => {
+    await seedConversation(985, null);
+    const checkpointer = new MemorySaver();
+    const threadId = `${tenantId}:${instanceId}:985`;
+    await buildThreadStateGraph(checkpointer).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    const client = {
+      getMessages: async () => ({
+        payload: [{ id: 1, content: "e aí?", message_type: 0, private: false }],
+      }),
+      sendMessage: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 985 }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer,
+      },
+    });
+    const channel = await threadOf(checkpointer, threadId);
+    expect(channel.some(([, text]) => text === HUMAN_HANDBACK_NOTE)).toBe(true);
+  });
+
+  // A TAKEOVER INSIDE THE WINDOW (issue #457, review round 7), on the reactive turn this time. The
+  // receiver's gate proved bot ownership before this turn was queued, and the note is written after
+  // the toolset is built, after the ingestion drain, and after a claim that WAITS. A person taking
+  // the conversation over in there leaves the gate's answer stale, and the note would announce that
+  // a human attendance ended while the human is in it — which the post-generation recheck can
+  // suppress the SEND for and never unwrite.
+  test("issue #457: a takeover after the gate stops the note", async () => {
+    const contactInboxId = 7461;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 987,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${987}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const checkpointer = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await buildThreadStateGraph(checkpointer).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new ToolMessage({
+            content: `${HANDOFF_DONE_PREFIX} (status set to open).`,
+            tool_call_id: "h1",
+            name: "handoff_to_human",
+          }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    // The person takes it over between the gate and the write: every ownership-shaped read from here
+    // on answers "a human has it".
+    const brittle = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            const isOwnershipRead =
+              !!sel &&
+              sel.assigneeType === true &&
+              sel.assigneeId === true &&
+              sel.status === true;
+            const row = await query(args);
+            if (!isOwnershipRead || row === null) return row;
+            return { ...(row as object), assigneeType: "User", status: "open" };
+          },
+        },
+      },
+    }) as unknown as typeof appDb;
+    const client = {
+      getMessages: async () => ({
+        payload: [{ id: 1, content: "e aí?", message_type: 0, private: false }],
+      }),
+      sendMessage: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 987, contactInboxId }),
+      base: brittle,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer,
+      },
+    });
+    const channel = await threadOf(checkpointer, threadId);
+    expect(channel.some(([, text]) => text === HUMAN_HANDBACK_NOTE)).toBe(
+      false,
+    );
+  });
+
+  // The control, and it is what makes the test above about the human stretch rather than about every
+  // turn: an ordinary conversation nobody handed over says nothing about a human attendance.
+  test("issue #457: a turn on a conversation nobody handed over writes no note", async () => {
+    const contactInboxId = 7458;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 983,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${983}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const sent: Array<[number, string]> = [];
+    const client = {
+      getMessages: async () => ({
+        payload: [{ id: 1, content: "oi", message_type: 0, private: false }],
+      }),
+      sendMessage: async (conversationId: number, content: string) => {
+        sent.push([conversationId, content]);
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    const checkpointer = new MemorySaver();
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 983, contactInboxId }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer,
+      },
+    });
+    const channel = await threadOf(
+      checkpointer,
+      contactInboxThreadId(tenantId, instanceId, contactInboxId),
+    );
+    expect(channel.some(([, text]) => text === HUMAN_HANDBACK_NOTE)).toBe(
+      false,
+    );
+  });
+
+  // ONE CLAIM FOR EVERY POSTING PATH (issue #452). This direct turn and a manual re-engage of the
+  // same message are two paths to one reply, and the only thing that stops them both sending is
+  // that they claim the same column. While the claim was per caller — this one on the watermark,
+  // the button on a column of its own — an operator clicking during a delivery got the customer two
+  // answers.
+  //
+  // Ordered rather than raced, and stopped at the ONE instant where the claim is the only thing that
+  // can answer: the direct turn runs to completion inside the click's burst selection, and then its
+  // watermark write is undone. That is a real state — the claim is written before the send and the
+  // watermark only after the turn returns, so every reply passes through it. Letting the watermark
+  // stand instead makes this pass with the claim GONE, because the click's handled ceiling refuses
+  // it on the mark alone. (The other order proves nothing either: the click advances the watermark
+  // on its way out, and the direct turn's own ceiling would stop it whatever the claim did.)
+  test("issue #452: a direct turn completing inside an operator's click leaves one reply", async () => {
+    await seedConversation(978, null);
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: 7 },
+      select: { id: true },
+    });
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 978 },
+      select: { id: true },
+    });
+    await suDb.conversation.update({
+      where: { id: conv.id },
+      data: { inboxId: inbox.id },
+    });
+    const sent: Array<[number, string]> = [];
+    const inner: { direct: string | null } = { direct: null };
+    let running = false;
+    let fetches = 0;
+    const client = {
+      getMessages: async () => {
+        fetches += 1;
+        // The click's burst selection (its pre-fetch was #1). Guarded before the call, not by its
+        // result: the direct turn reads the thread through this same stub.
+        if (fetches === 2 && !running) {
+          running = true;
+          const before = (
+            await suDb.conversation.findUniqueOrThrow({
+              where: { id: conv.id },
+              select: { lastHandledMessageId: true },
+            })
+          ).lastHandledMessageId;
+          inner.direct = await runAgentTurn({
+            tenantId,
+            instanceId,
+            agentBotId: 9,
+            event: incoming({ conversationId: 978 }),
+            base: appDb,
+            deps: {
+              makeModel: fakeModel,
+              makeClient: async () => client,
+              checkpointer: new MemorySaver(),
+            },
+          });
+          // Back to the instant between the direct turn's claim and its watermark write.
+          await suDb.conversation.update({
+            where: { id: conv.id },
+            data: { lastHandledMessageId: before },
+          });
+        }
+        return {
+          payload: [{ id: 1, content: "oi", message_type: 0, private: false }],
+        };
+      },
+      sendMessage: async (conversationId: number, content: string) => {
+        sent.push([conversationId, content]);
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+
+    const clicked = await reengageConversation(
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      conv.id,
+      {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+      appDb,
+    );
+
+    expect(inner.direct).toBe("posted");
+    expect(clicked.outcome).toBe("superseded");
+    expect(sent.length).toBe(1);
+    const after = await suDb.conversation.findUniqueOrThrow({
+      where: { id: conv.id },
+      select: { lastHandledMessageId: true },
+    });
+    expect(after.lastHandledMessageId).toBeNull();
   });
 
   test("issue #49: a stale trigger loses the watermark CAS and does not double-post", async () => {
@@ -4505,6 +5496,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         computeConfigIssues({
           agentEnabled: true,
           modelProvider: "openai",
+          modelConfig: { provider: "openai", model: "gpt-4o-mini" },
           modelCredentialRef: "vault:1",
           savedModelProvider: "openai",
           sttEnabled: false,

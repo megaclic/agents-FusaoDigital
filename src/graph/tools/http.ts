@@ -7,8 +7,8 @@ import {
   normalizeExpectedStatuses,
 } from "@/graph/tools/http-status";
 import { AppError } from "@/lib/errors";
+import { fetchBounded } from "@/lib/outbound";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
-import { clipText } from "@/lib/text";
 import { zonedWallClock } from "@/modules/integrations/toolpacks/calendar-slots";
 import {
   type ExtractedAppointment,
@@ -16,6 +16,12 @@ import {
   readAppointmentDeclaration,
 } from "@/modules/tool-definitions/appointment";
 import { normalizeToolShapes } from "@/modules/tool-definitions/normalize";
+import {
+  clipToModelLimit,
+  MODEL_RESPONSE_CHAR_LIMIT,
+  type ProjectedResponse,
+  projectToolResponse,
+} from "@/modules/tool-definitions/response-template";
 import { resolveSecretInjection } from "@/modules/vault/secret-types";
 import { normalizeToolName } from "./toolName";
 
@@ -66,7 +72,16 @@ export interface HttpToolDef {
   // What this tool's RESPONSE says about an appointment, when it says anything (issue #352). Read by
   // readAppointmentDeclaration; anything it cannot make sense of declares nothing.
   appointment?: unknown;
+  // What this tool's RESPONSE should look like by the time it reaches the model (issue #456). Read
+  // by readResponseTemplate; anything it cannot make sense of declares nothing, which is the raw
+  // body and the clip this file has always handed over.
+  outputSchema?: unknown;
 }
+
+// How long a tool call waits before it is aborted, when the caller names nothing. EXPORTED
+// because a caller that is MORE patient than this reports a success the runtime would never
+// have: an endpoint answering in 12s reads as fine and then aborts on every turn.
+export const DEFAULT_HTTP_TOOL_TIMEOUT_MS = 10_000;
 
 export interface HttpToolDeps {
   // Resolves a vault secret by reference (a short scoped DB read; no network). Returns null when
@@ -77,8 +92,9 @@ export interface HttpToolDeps {
   timeoutMs?: number;
   maxResponseChars?: number;
   // Posts a "I'll look into that…" ack to the customer before a slow tool runs (best-effort). Wired
-  // only on a real conversation; absent in the playground (no client / no conversation).
-  emitAck?: (message: string) => Promise<void>;
+  // only on a real conversation; absent in the playground (no client / no conversation). An
+  // explicit `false` says the run was called off after the ack, and the tool does not run.
+  emitAck?: (message: string) => Promise<boolean | undefined>;
   // Conversation/contact context for {{placeholder}} interpolation in fixed fields, headers, the URL
   // and a raw body (e.g. {{conversation_id}}, {{contact_name}}). NEVER a secret.
   context?: Record<string, string>;
@@ -112,9 +128,13 @@ export interface HttpToolDeps {
     eventId: string,
     opts?: { provider?: string; tool?: string },
   ) => Promise<void>;
-  // Reports a side effect that failed INSIDE a tool that still returns success to the model. A
-  // declared path that does not resolve is exactly that: the booking is real and already made, so
-  // the tool succeeded, and the only thing to do with the miss is put it where the operator reads it.
+  // Reports what went wrong INSIDE a tool that still returns success to the model. Two kinds reach
+  // it, and they share this channel because they share the property that makes them dangerous: the
+  // call succeeded, so nothing else anywhere says a word. A declared appointment path that does not
+  // resolve is one (the booking is real and already made). A response the operator's template could
+  // not render, or a response that was clipped with no template to render, is the other — there the
+  // model got an answer with a hole in it, and #456 is the measurement of what a model does with a
+  // hole. The only thing to do with either is put it where the operator reads it.
   onSideEffectError?: (e: {
     tool: string;
     phase: string;
@@ -440,6 +460,65 @@ async function applyExtractedAppointment(
   });
 }
 
+// The operator's response template, applied to one response. Returns the text the model should be
+// given, or null for "hand over the raw body" — which is what every tool written before #456 says,
+// and what every response this cannot render says.
+//
+// ONLY 2xx, the same gate `registerDeclaredAppointment` uses and for a related reason. A non-2xx
+// body is the provider's own error message and the model needs it verbatim; a template pointed at
+// success fields would paper it over with a block of absent markers. `expectedStatuses` does not
+// change this: it says a status is a RESULT rather than an integration failure, which is how a
+// lookup declares that its 404 means "no record" (issue #59) — it does not say the 404 body carries
+// the success fields.
+function projectResponse(
+  def: HttpToolDef,
+  deps: HttpToolDeps,
+  status: number,
+  rawBody: string,
+): ProjectedResponse {
+  // The decision is `projectToolResponse`'s, in `modules/tool-definitions/response-template.ts`,
+  // because the editor's preview has to make the identical one and a second copy of the rules is
+  // how a preview stops being one. What is left here is the REPORTING, which is the runtime's
+  // alone: there is no operator standing in front of a turn.
+  const { text, missing, skipped } = projectToolResponse(
+    def.outputSchema,
+    status,
+    rawBody,
+    // The clip this text will meet, so a block renders under it with its count intact.
+    { maxChars: deps.maxResponseChars ?? MODEL_RESPONSE_CHAR_LIMIT },
+  );
+  const report = (err: Error, detail?: Record<string, unknown>) =>
+    deps.onSideEffectError?.({
+      tool: def.name,
+      phase: "response_template",
+      detail,
+      err,
+    });
+  if (skipped === "not-json") {
+    // The raw body still goes to the model: the request succeeded and refusing the call would be
+    // wrong, and an empty render would be worse than the body it replaced.
+    report(
+      new Error(
+        "the response is not JSON, so the response template could not be applied and the raw body was sent to the model",
+      ),
+    );
+  }
+  if (missing.length > 0) {
+    // The model was handed an explicit marker rather than a blank, so this is not a silent hole for
+    // it. It IS a silent hole for the operator, whose template promises a field the API is not
+    // answering with — and naming the path is the only channel that exists for it.
+    report(
+      new Error(
+        `response template path(s) did not resolve: ${missing.join(", ")}`,
+      ),
+      { missing },
+    );
+  }
+  // The reason travels with the text, because the clip notice below has to give DIFFERENT advice
+  // depending on it: "declare a template" is wrong for a tool that has one.
+  return { text, missing, skipped };
+}
+
 export function buildHttpTool(
   def: HttpToolDef,
   deps: HttpToolDeps,
@@ -467,8 +546,8 @@ export function buildHttpTool(
   const isBodyMethod =
     method === "POST" || method === "PUT" || method === "PATCH";
   const doFetch = deps.fetchImpl ?? fetch;
-  const timeoutMs = deps.timeoutMs ?? 10_000;
-  const maxChars = deps.maxResponseChars ?? 4000;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_HTTP_TOOL_TIMEOUT_MS;
+  const maxChars = deps.maxResponseChars ?? MODEL_RESPONSE_CHAR_LIMIT;
   const expectedStatuses = normalizeExpectedStatuses(def.expectedStatuses);
 
   // Schema = the AI-filled fields. When an ack is configured, the model MUST write the holding message
@@ -516,7 +595,9 @@ export function buildHttpTool(
         if (!msg) {
           return "Error: a wait message is required. Call this tool again with a short __wait_message to send to the user before it runs.";
         }
-        if (deps.emitAck) await deps.emitAck(msg);
+        if (deps.emitAck && (await deps.emitAck(msg)) === false) {
+          return "The run was called off after the acknowledgement; the tool did not run.";
+        }
       }
 
       // Resolve the credential up front. It flows ONLY via {{secret}} into the request the operator
@@ -758,27 +839,72 @@ export function buildHttpTool(
         allowHttp: deps.allowHttp,
       });
 
-      // 5. Fetch — no redirects, bounded timeout.
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-      let res: Response;
-      try {
-        res = await doFetch(url.toString(), {
-          method,
-          headers,
-          body,
-          redirect: "error",
-          signal: ctrl.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      // 5. Fetch — no redirects, and one bound over the WHOLE exchange. Not a bound on the
+      // headers: `fetchBounded` reads the body under the same armed timer, because a provider that
+      // answers at once and then stalls mid-body used to leave this line pending forever (#464).
+      // It also caps what the read retains, which is the other half of the same defect.
+      const { res, body: responseBody } = await fetchBounded(
+        url.toString(),
+        { method, headers, body, redirect: "error" },
+        { timeoutMs, fetchImpl: doFetch },
+      );
 
-      const text = await res.text();
-      const trimmed =
-        text.length > maxChars
-          ? `${clipText(text, maxChars)}…[truncated]`
-          : text;
+      const text = responseBody.text;
+      // THE PROJECTION, and it runs BEFORE the clip because that ordering is the feature. In the
+      // response #456 measured, every status-bearing field sat past char 4000: rendering after the
+      // cut could never have reached one. The clip below still applies to whatever comes out, as a
+      // backstop — a template with many tokens, or one long value, can still overrun.
+      const rendered = projectResponse(def, deps, res.status, text);
+      const modelBody = rendered.text ?? text;
+      const trimmed = clipToModelLimit(modelBody, maxChars).text;
+      // The clip is otherwise invisible from both ends: the model reads `…[truncated]` as an end,
+      // and the operator reads a plausible answer. Reported for a TEMPLATED response too — the
+      // first draft guarded this on "did it render", reasoning that an operator whose own text
+      // overran already knows about it, and the mutation battery kept that condition alive with no
+      // test able to tell either way. It is the same silent hole (the model loses the tail), so
+      // what differs is only the ADVICE.
+      //
+      // And the advice needs three branches, not two, because "it did not render" covers a tool
+      // that has no template AND a tool whose template deliberately does not apply here. Telling
+      // the second one to declare a template names something it already did, for a case where a
+      // template is not the remedy.
+      if (modelBody.length > maxChars) {
+        const templated = rendered.text !== null;
+        // A SECOND CUT, upstream of this one and reported separately: past the read cap the body
+        // arrives truncated, so a JSON response stops parsing and a template that would have
+        // applied reports itself as "not JSON". Without this branch the advice sends the operator
+        // to fix a template that was never the problem — and the count would be the cap rather
+        // than the size their provider actually answered with.
+        const capped = responseBody.chars > text.length;
+        const advice =
+          rendered.skipped === null
+            ? "shorten it or point it at fewer fields"
+            : rendered.skipped === "no-template"
+              ? "declare a response template so it gets the fields you want instead of the beginning of the body"
+              : rendered.skipped === "not-2xx"
+                ? "this tool's response template does not apply outside 2xx, where the body is the error the model has to read"
+                : capped
+                  ? `only the first ${text.length} characters of the body were read, so it could not be parsed as JSON and this tool's response template was not applied`
+                  : "this tool's response template could not be applied because the body is not JSON";
+        deps.onSideEffectError?.({
+          tool: def.name,
+          phase: "response_clipped",
+          detail: {
+            chars: templated ? modelBody.length : responseBody.chars,
+            limit: maxChars,
+            templated,
+            ...(capped ? { readCap: text.length } : {}),
+            ...(rendered.skipped ? { skipped: rendered.skipped } : {}),
+          },
+          err: new Error(
+            `${
+              templated
+                ? `the response template rendered ${modelBody.length} characters`
+                : `the response was ${responseBody.chars} characters`
+            } and the model was given the first ${maxChars}; ${advice}`,
+          ),
+        });
+      }
       // NOTE: By default every non-2xx is an integration failure worth alerting on — a broken
       // credential, a provider outage, a rejected payload (issue #40) — unless the operator declared
       // this status a result for this tool (issue #59). The model sees the same "HTTP <status>" body

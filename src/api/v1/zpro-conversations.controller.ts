@@ -17,6 +17,7 @@ import logger from "@/api/lib/logger";
 import { doc, errors } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { requireDbId } from "@/lib/db-id";
 import {
   ForbiddenError,
   NotFoundError,
@@ -198,7 +199,7 @@ export const zproConversationsController = new Elysia({
               ? { agentActive: query.agentActive === "true" }
               : {}),
             ...(query.instanceId
-              ? { zproInstanceId: BigInt(query.instanceId) }
+              ? { zproInstanceId: requireDbId(query.instanceId, "instanceId") }
               : {}),
             ...buildZproSearchWhere(query.q),
           },
@@ -256,7 +257,7 @@ export const zproConversationsController = new Elysia({
         "List Z-PRO conversations",
         "Lists mirrored Z-PRO conversations (newest first) for the tenant, optionally filtered by status, agent state or instance.",
       ),
-      response: errors(400, 401),
+      response: errors(400, 401, 404),
     },
   )
   // Registered BEFORE /conversations/:id so the literal "analytics" segment can never be swallowed
@@ -287,14 +288,14 @@ export const zproConversationsController = new Elysia({
         "Z-PRO funnel metrics",
         "Returns FusaoChatBot CRM (Z-PRO) funnel counts for the tenant since the given date: total conversations, agent-handled, escalated to human, and resolved.",
       ),
-      response: errors(400, 401),
+      response: errors(400, 401, 404),
     },
   )
   .get(
     "/conversations/:id",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const row = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproConversation.findUnique({
           where: { id },
@@ -370,7 +371,7 @@ export const zproConversationsController = new Elysia({
       const ctx = ctxOrThrow(tenantContext);
       const row = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproConversation.findUnique({
-          where: { id: BigInt(params.id) },
+          where: { id: requireDbId(params.id) },
           select: { avatarUrl: true },
         }),
       );
@@ -409,7 +410,7 @@ export const zproConversationsController = new Elysia({
     "/conversations/:id/messages",
     async ({ tenantContext, params }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const conversation = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproConversation.findUnique({
           where: { id },
@@ -460,8 +461,8 @@ export const zproConversationsController = new Elysia({
       const row = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproMessage.findFirst({
           where: {
-            id: BigInt(params.messageId),
-            conversationId: BigInt(params.id),
+            id: requireDbId(params.messageId, "messageId"),
+            conversationId: requireDbId(params.id),
           },
           select: {
             mediaUrl: true,
@@ -531,11 +532,12 @@ export const zproConversationsController = new Elysia({
     "/conversations/:id/toggle-agent",
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const id = BigInt(params.id);
+      const id = requireDbId(params.id);
       const conv = await runScopedOn(basePrisma, ctx, (db) =>
         db.zproConversation.findUnique({
           where: { id },
           select: {
+            tenantId: true,
             ticketId: true,
             zproInstance: {
               select: { baseUrl: true, apiId: true, bearerToken: true },
@@ -569,7 +571,7 @@ export const zproConversationsController = new Elysia({
         }),
       );
 
-      broadcastZproAgentToggled(ctx.tenantId as bigint, {
+      broadcastZproAgentToggled(conv.tenantId, {
         conversationId: String(id),
         ticketId: conv.ticketId,
         agentActive: body.agentActive,
@@ -592,6 +594,6 @@ export const zproConversationsController = new Elysia({
         "Toggle Z-PRO agent",
         "Activates or deactivates the AI agent (n8nStatus) for a Z-PRO conversation.",
       ),
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   );

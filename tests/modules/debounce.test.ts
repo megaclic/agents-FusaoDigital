@@ -16,13 +16,17 @@ import {
   type ChatwootClient,
   ChatwootMissingTokenError,
 } from "@/modules/chatwoot/client";
+import { reengageConversation } from "@/modules/conversations/reengage";
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import {
   armDebounce,
   debounceDedupeKey,
   resolveDebounceConfig,
 } from "@/modules/debounce/service";
-import { advanceHandledWatermark } from "@/modules/debounce/watermark";
+import {
+  advanceHandledWatermark,
+  claimReplyBurst,
+} from "@/modules/debounce/watermark";
 import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import {
@@ -37,7 +41,9 @@ import {
   flowLogRow,
   flowLogRows,
 } from "@/tests/utils/flowlog";
+import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { burnSchedulerJobId } from "../utils/scheduler";
 import {
   EmptyThenReplyModel,
   guardrailModel,
@@ -69,6 +75,9 @@ if (appUrl && suUrl) {
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
+
+// Burned from `scheduler_jobs_id_seq`, never a literal: tests/utils/scheduler.ts says why.
+let phantomJobId = 0n;
 
 let tenantId = 0n;
 let agentDbId = 0n;
@@ -235,7 +244,7 @@ function jobFor(
   extra: { lastMessageId?: number } = {},
 ): ClaimedJob {
   return {
-    id: 1n,
+    id: phantomJobId,
     tenantId,
     kind: "DEBOUNCE",
     payload: {
@@ -249,6 +258,14 @@ function jobFor(
     attempts: 0,
     claimSeq: 0,
   };
+}
+
+async function replyClaimOf(convId: number): Promise<number | null> {
+  const row = await suDb.conversation.findFirstOrThrow({
+    where: { tenantId, chatwootConversationId: convId },
+    select: { lastRepliedMessageId: true },
+  });
+  return row.lastRepliedMessageId;
 }
 
 async function watermarkOf(convId: number): Promise<number | null> {
@@ -276,7 +293,7 @@ async function convRowId(convId: number) {
 
 async function correctionLine(convId: number) {
   const conversationId = await convRowId(convId);
-  const deadline = Date.now() + 2000;
+  const deadline = Date.now() + POLL_DEADLINE_MS;
   let lines: Array<{ level: string; detail: unknown }> = [];
   while (Date.now() < deadline) {
     lines = await flowLogRows(suDb, {
@@ -294,6 +311,7 @@ async function correctionLine(convId: number) {
 
 describe.skipIf(!dbUp)("debounce", () => {
   beforeAll(async () => {
+    phantomJobId = await burnSchedulerJobId(suDb);
     const t = await suDb.tenant.create({
       data: { name: "DBC", slug: `dbc-${process.pid}` },
     });
@@ -699,6 +717,247 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(800)).toBe(2);
   });
 
+  // The claim's own table, decided in one place and asked here directly: the paths above prove the
+  // gate consults it, this proves what it answers (issue #452).
+  test("the reply claim is monotonic and honours its handled ceiling", async () => {
+    const convId = 892;
+    await seedConversation(convId);
+    const { id } = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    const claim = (
+      toMessageId: number,
+      maxHandledAllowed: number | null = null,
+    ) =>
+      claimReplyBurst({
+        tenantId,
+        conversationDbId: id,
+        toMessageId,
+        maxHandledAllowed,
+        base: appDb,
+      });
+    const stored = async () =>
+      (
+        await suDb.conversation.findUniqueOrThrow({
+          where: { id },
+          select: { lastRepliedMessageId: true },
+        })
+      ).lastRepliedMessageId;
+
+    // Nothing claimed yet, then a burst ahead of it, then the same burst twice, then one behind —
+    // the shape a flush retry and a second click both take.
+    expect(await claim(10)).toEqual({ won: true });
+    expect(await claim(20)).toEqual({ won: true });
+    expect(await claim(20)).toEqual({ won: false, reason: "claimed" });
+    expect(await claim(15)).toEqual({ won: false, reason: "claimed" });
+    expect(await stored()).toBe(20);
+
+    // AND THE WATERMARK IS THE SECOND QUESTION, settled under the same lock. The ceiling is what
+    // separates the callers: a flush answering above the mark passes `target - 1` and loses to a
+    // skip; a re-engage passes the mark it read on the way IN, so what was already settled when the
+    // operator clicked does not refuse it, and what lands afterwards does.
+    await advanceHandledWatermark({
+      tenantId,
+      conversationDbId: id,
+      toMessageId: 40,
+      base: appDb,
+    });
+    expect(await claim(30, 29)).toEqual({ won: false, reason: "handled" });
+    expect(await claim(30, 40)).toEqual({ won: true });
+    // A click that read the mark at 30 and found it at 40 by claim time: somebody settled this tail
+    // while the model was running.
+    expect(await claim(50, 30)).toEqual({ won: false, reason: "handled" });
+    // A caller that read NO mark on the way in. Null is that reading, not "no ceiling": a mark
+    // stands here now, so it was written after that read and this claim is not entitled to it.
+    expect(await claim(50, null)).toEqual({ won: false, reason: "handled" });
+  });
+
+  // A LOST WATERMARK WRITE MUST NOT COST A SECOND REPLY (issue #452). The claim is written
+  // immediately before the send and the watermark only after the turn returns, so a reply that
+  // lands and then loses its watermark write leaves the message answered with the mark behind it —
+  // the direct path catches that failure and logs it, and a process exit does the same. Selecting
+  // from the mark alone, this flush would coalesce the answered message with the newer one and, the
+  // target being higher, win the claim and answer it again. The floor is the max of the two.
+  test("a message the claim records is not re-answered when the watermark lags", async () => {
+    const convId = 895;
+    await seedConversation(convId);
+    const { id } = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    // The state a lost watermark write leaves: message 1 answered (the claim says so), mark behind.
+    await suDb.conversation.update({
+      where: { id },
+      data: { lastRepliedMessageId: 1, lastHandledMessageId: null },
+    });
+    const sent: Array<[number, string]> = [];
+
+    const out = await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [
+            page([
+              { id: 1, content: "já respondida" },
+              { id: 2, content: "a nova" },
+            ]),
+          ],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([[convId, REPLY]]);
+    // THE BURST'S SIZE IS THE ASSERTION, read off the line the coalescing writes: one message, not
+    // two. Selecting from the watermark alone this is 2, and the answered message goes to the model
+    // a second time.
+    await settleFlowEvents();
+    const row = await flowLogRow(suDb, {
+      where: { tenantId, threadId: threadOf(convId), stage: "debounce" },
+      select: { detail: true },
+    });
+    expect((row?.detail as { coalesced?: number } | null)?.coalesced).toBe(1);
+  });
+
+  // THE SECOND QUESTION THE CLAIM ANSWERS, and the flush needs it too: a burst is selected from
+  // ABOVE the watermark, but the mark can move between that selection and the post — a deliberate
+  // skip by another delivery (a handoff, an out-of-hours silence) settles those messages without
+  // ever writing a reply of ours to claim against. The losing CAS used to say so for free; now it
+  // is `requireUnhandled`, asked under the claim's own row lock (issue #452).
+  test("a burst handled while the turn ran is not answered", async () => {
+    const convId = 893;
+    await seedConversation(convId);
+    const sent: Array<[number, string]> = [];
+    let fetches = 0;
+    const client = {
+      getMessages: async () => {
+        fetches += 1;
+        // The supersede re-fetch: the burst is chosen and the claim has not been taken yet.
+        if (fetches === 2) {
+          const { id } = await suDb.conversation.findFirstOrThrow({
+            where: { tenantId, chatwootConversationId: convId },
+            select: { id: true },
+          });
+          await advanceHandledWatermark({
+            tenantId,
+            conversationDbId: id,
+            toMessageId: 1,
+            base: appDb,
+          });
+        }
+        return page([{ id: 1, content: "oi" }]);
+      },
+      sendMessage: async (conversationId: number, content: string) => {
+        sent.push([conversationId, content]);
+        return {};
+      },
+      sendPrivateNote: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+
+    const out = await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(out).toEqual({ outcome: "done" });
+    expect(fetches).toBe(2);
+    expect(sent).toEqual([]);
+    // Nothing claimed it either: the burst was settled by whoever moved the mark.
+    expect(await replyClaimOf(convId)).toBeNull();
+  });
+
+  // ONE CLAIM FOR EVERY POSTING PATH (issue #452). The re-engage button and a flush answer the same
+  // burst through different entry points, and the only thing that stops them both sending is that
+  // they claim the SAME column. Split the claim per caller — the flush on the watermark, the button
+  // on a column of its own — and the two stop contending: an operator clicking while a retry of the
+  // same failed burst is in flight gets the customer two replies.
+  //
+  // Ordered deterministically instead of raced, and stopped at the ONE instant where the claim is
+  // the only thing that can answer: the flush runs to completion inside the click's burst selection,
+  // and then its watermark write is undone. That is a real state, not a contrivance — the claim is
+  // written before the send and the watermark only after the turn returns, so every reply passes
+  // through it, and a lost watermark write leaves the conversation there for good. Letting the
+  // flush's watermark stand instead makes the test pass with the claim GONE: the click's handled
+  // ceiling refuses it on the mark alone, and the mutation that drops the claim's CAS survives.
+  test("a flush completing inside an operator's click leaves one reply", async () => {
+    const convId = 891;
+    await seedConversation(convId);
+    const convRow = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    const sent: Array<[number, string]> = [];
+    const thread = page([{ id: 1, content: "alguém aí?" }]);
+    let flushed: unknown = null;
+    let fetches = 0;
+    const client = {
+      getMessages: async () => {
+        fetches += 1;
+        // The click's burst selection (its pre-fetch was #1): the tail is about to be chosen, and
+        // the flush answers it and claims it before the click's own post gate is reached.
+        if (fetches === 2) {
+          const before = (
+            await suDb.conversation.findUniqueOrThrow({
+              where: { id: convRow.id },
+              select: { lastHandledMessageId: true },
+            })
+          ).lastHandledMessageId;
+          flushed = await flushDebounceJob({
+            job: jobFor(convId),
+            base: appDb,
+            deps: {
+              makeModel: fakeModel,
+              makeClient: async () => client,
+              checkpointer: new MemorySaver(),
+            },
+          });
+          // Back to the instant between the flush's claim and its watermark write.
+          await suDb.conversation.update({
+            where: { id: convRow.id },
+            data: { lastHandledMessageId: before },
+          });
+        }
+        return thread;
+      },
+      sendMessage: async (conversationId: number, content: string) => {
+        sent.push([conversationId, content]);
+        return {};
+      },
+      sendPrivateNote: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+
+    const clicked = await reengageConversation(
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      convRow.id,
+      {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+      appDb,
+    );
+
+    expect(flushed).toEqual({ outcome: "done" });
+    // The flush took the claim; the click found the burst already claimed and stood down, with no
+    // watermark standing to refuse it on the flush's behalf.
+    expect(clicked.outcome).toBe("superseded");
+    expect(sent).toEqual([[convId, REPLY]]);
+    expect(await watermarkOf(convId)).toBeNull();
+  });
+
   test("a flush retires the ledger row of a message it rescued", async () => {
     // The half of issue #228 that makes the sweep's question answerable, and the reason there is no
     // watermark arithmetic left in the classifier.
@@ -717,6 +976,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-rescue-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
         inboundMessageId: 1,
@@ -881,6 +1141,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-gate-before-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
@@ -896,6 +1157,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-gate-level-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
@@ -911,6 +1173,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-gate-exit-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
@@ -925,6 +1188,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-gate-top-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
@@ -941,6 +1205,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-gate-beyond-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
@@ -1042,6 +1307,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-gate-sibling-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         claimedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
@@ -1244,6 +1510,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-other-instance-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
         inboundMessageId: 1,
@@ -1304,6 +1571,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-excluded-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         conversationId: convId,
         inboundMessageId: 1,
@@ -1419,6 +1687,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         deliveryId: `flush-neighbour-${process.pid}`,
         event: "message_created",
         status: "PROCESSING",
+        routeObserved: false,
         receivedAt: new Date(Date.now() - 60_000),
         // A DIFFERENT conversation, carrying a message id the burst below also contains.
         conversationId: 9_999,
@@ -1507,6 +1776,59 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(out).toEqual({ outcome: "done" });
     expect(sent).toEqual([]);
     expect(await watermarkOf(801)).toBeNull();
+  });
+
+  // A PARTIAL REPLY MUST NOT CLOSE THE CONVERSATION (issue #429). The old code kept this rule by
+  // accident — a send that failed mid-reply threw, and a throw discards the deferred intent — so
+  // reporting instead of throwing is what woke the path up. The cost of getting it wrong: the model
+  // called `resolve_conversation` believing it had answered, the customer holds the first balloon
+  // and not the rest, and `resolved` is what tells the operator there is nothing left to do.
+  //
+  // The turn still reports `posted`: the customer HAS part of it, and re-running would send that
+  // part twice. The two questions differ and cannot share one answer.
+  test("a reply that failed halfway does not resolve the conversation", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(924);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      let n = 0;
+      const client = {
+        getMessages: async () =>
+          page([{ id: 7, content: "pode encerrar depois de responder" }]),
+        sendMessage: async (conversationId: number, content: string) => {
+          n += 1;
+          // Balloon 1 lands; balloon 2 and the consolidated retry do not.
+          if (n >= 2) throw new Error("chatwoot 502");
+          sent.push([conversationId, content]);
+          return { id: 500 + n };
+        },
+        toggleStatus: async (conversationId: number, status: string) => {
+          toggles.push([conversationId, status]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const out = await flushDebounceJob({
+        job: jobFor(924, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new ResolveThenReplyModel(
+              "Certo!\n\nJá encerro por aqui.",
+            ) as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The customer got the first balloon and nothing else...
+      expect(sent).toEqual([[924, "Certo!"]]);
+      // ...so the conversation stays open. This is the assertion the throw used to make for us.
+      expect(toggles).toEqual([]);
+    });
   });
 
   test("superseded mid-turn discards the resolve intent (no toggle, watermark untouched)", async () => {
@@ -1730,6 +2052,253 @@ describe.skipIf(!dbUp)("debounce", () => {
         data: { settings: before.settings as object },
       });
     }
+  });
+
+  // ── A balloon that fails mid-reply (issue #429) ────────────────────────────
+  //
+  // The flush is where the duplication the split can cause is actually reachable, and it is not the
+  // path the issue named: there IS no Chatwoot webhook retry (the receiver acks <5s and processes
+  // detached, so Chatwoot is handed a 200 and never re-sends). What retries is the WORKER — a throw
+  // here bubbles out of `flushDebounceJob` with the watermark unadvanced, so the next attempt
+  // coalesces the same burst and answers it again. A reply that threw on its second balloon would
+  // therefore put the first balloon in the conversation twice, and run every side-effecting tool the
+  // turn chose a second time.
+  //
+  // Which is why what already landed decides: the turn reports, the watermark moves, and no retry is
+  // armed. Written against the flush rather than as a unit test because the unit cannot see the
+  // watermark, and the watermark is the whole mechanism.
+  // Personifies the fork on the three properties the reconciliation depends on (issue #499): it
+  // ASSIGNS an id to what it accepts, it STORES the `content_attributes` the create carried, and it
+  // honours `before` when paging. A stub missing any of them sends every reply here down the
+  // "cannot prove delivery" road, which is green for the wrong reason.
+  function makeFailingStub(opts: {
+    // The conversation as it stands before the reply: the customer's own messages, INCOMING like
+    // the `page` helper writes them, because this same read is what the flush coalesces from.
+    history: Array<{ id: number; content: string }>;
+    sent: Array<[number, string]>;
+    calls: { getMessages: number };
+    failOn: (n: number) => boolean;
+  }) {
+    let n = 0;
+    let nextId = 900;
+    const stored: Array<{
+      id: number;
+      content: string;
+      type: number;
+      sendId: string | null;
+    }> = opts.history.map((m) => ({ ...m, type: 0, sendId: null }));
+    const client = {
+      getMessages: async (_c: number, q?: { before?: number }) => {
+        opts.calls.getMessages += 1;
+        const upTo =
+          q?.before === undefined
+            ? stored
+            : stored.filter((m) => m.id < (q.before as number));
+        return {
+          payload: upTo.map((m) => ({
+            id: m.id,
+            content: m.content,
+            message_type: m.type,
+            private: false,
+            content_attributes:
+              m.sendId === null ? {} : { fazer_ai_send_id: m.sendId },
+          })),
+        };
+      },
+      sendMessage: async (
+        conversationId: number,
+        content: string,
+        o?: { sendId?: string },
+      ) => {
+        n += 1;
+        const id = nextId++;
+        if (opts.failOn(n)) throw new Error("chatwoot 502");
+        opts.sent.push([conversationId, content]);
+        stored.push({ id, content, type: 1, sendId: o?.sendId ?? null });
+        return { id };
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    return async () => client;
+  }
+
+  async function withSplitEnabled<T>(fn: () => Promise<T>): Promise<T> {
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentDbId },
+      select: { settings: true },
+    });
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: {
+        settings: { ...(before.settings as object), split: { enabled: true } },
+      },
+    });
+    try {
+      return await fn();
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: before.settings as object },
+      });
+    }
+  }
+
+  test("a balloon that fails mid-reply does not re-answer the burst", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(920);
+      const sent: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(920, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?\n\nPosso ajudar?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeFailingStub({
+            history: [{ id: 7, content: "oi" }],
+            sent,
+            calls: { getMessages: 0 },
+            // The SECOND balloon, with the first already in the conversation.
+            failOn: (n) => n === 2,
+          }),
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+
+      // Did not throw: the worker arms no retry, so nothing re-sends what landed.
+      expect(out).toEqual({ outcome: "done" });
+      // And the customer has the whole answer, the remainder consolidated into one send. The first
+      // balloon appears exactly once — the assertion the duplication would break.
+      expect(sent).toEqual([
+        [920, "Olá!"],
+        [920, "Como vai?\n\nPosso ajudar?"],
+      ]);
+      // The watermark moved, which is the mechanical half of "no retry re-answers this burst": left
+      // where it was, the next attempt would coalesce the same message again.
+      expect(await watermarkOf(920)).toBe(7);
+    });
+  });
+
+  // THE CASE THE WHOLE DECISION TURNS ON, and the one a passing consolidated retry hides: a balloon
+  // landed AND the remainder's retry failed too, so the customer holds a truncated answer that
+  // nothing is going to complete.
+  //
+  // "Nothing is going to complete it" is MEASURED, and it is the opposite of what this file claimed
+  // first. A throw here buys no re-answer to fear: `shouldPost` claims the burst with a monotonic
+  // CAS (`lastHandledMessageId < toMessageId`) immediately before the first balloon, so the
+  // watermark is already 7 when the second send fails, and a worker retry coalesces nothing and
+  // posts nothing. Measured against a real Chatwoot on BOTH retry paths — the flush here, and the
+  // delivery recovery, whose second pass ran the whole turn and came back "superseded".
+  //
+  // What the throw did buy was the OPERATOR: `lastError` is written on a throw and on nothing else,
+  // and the flush clears it on "posted". So reporting this as plain "posted" erases the only
+  // conversation-level sign that a customer is sitting on one of three balloons — measured live,
+  // where the fixed code came back `lastError: (none)` on exactly this input while the unfixed code
+  // showed the 502. Hence the separate word and the badge the turn writes itself.
+  test("a balloon landed and the remainder failed: reported, and the operator is told", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(922);
+      // The burst's own delivery died mid-processing and the sweep already reported it, which is
+      // what makes the settlement WORD observable (same device as the capped-message test above).
+      // Half an answer IS an answer for this question: the customer heard back on this message, so
+      // calling it merely `consumed` would tell the loss list nothing ever replied here.
+      const strand = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `flush-partial-${process.pid}`,
+          event: "message_created",
+          status: "DEAD",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: 922,
+          inboundMessageId: 7,
+        },
+        select: { id: true },
+      });
+      const sent: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(922, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?\n\nPosso ajudar?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeFailingStub({
+            history: [{ id: 7, content: "oi" }],
+            sent,
+            calls: { getMessages: 0 },
+            // The second balloon AND the consolidated retry of the remainder.
+            failOn: (n) => n >= 2,
+          }),
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // Half an answer, delivered once — the consolidated retry does not re-send what landed.
+      expect(sent).toEqual([[922, "Olá!"]]);
+      // Already claimed before the first balloon, which is why no throw could have re-answered it.
+      expect(await watermarkOf(922)).toBe(7);
+      // THE ASSERTION THE DECISION RESTS ON. The flush clears `lastError` on "posted"; a partial
+      // delivery must leave the conversation carrying one instead, or the customer's missing half is
+      // invisible everywhere an operator looks.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 922 },
+        select: { lastError: true, lastErrorAt: true },
+      });
+      expect(conv.lastError).not.toBeNull();
+      expect(conv.lastError).toContain("incompleta");
+      expect(conv.lastErrorAt).not.toBeNull();
+      expect((await correctionLine(922)).detail).toMatchObject({
+        outcome: "answered_late",
+      });
+      await suDb.chatwootWebhookDelivery.delete({ where: { id: strand.id } });
+      await clearFlowLog(suDb, { tenantId });
+    });
+  });
+
+  // The other side of the asymmetry, and the reason the first test is not simply "never throw".
+  // Nothing reached the customer, so there is nothing a retry could duplicate — and the throw is the
+  // only way the operator hears about it at all: `lastError` is written on a throw and on nothing
+  // else. Swallowed, this would be a customer waiting on an agent that reported success.
+  test("a reply where NO balloon landed is a failed turn, and says so", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(921);
+      const sent: Array<[number, string]> = [];
+      const run = flushDebounceJob({
+        job: jobFor(921, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeFailingStub({
+            history: [{ id: 7, content: "oi" }],
+            sent,
+            calls: { getMessages: 0 },
+            failOn: () => true,
+          }),
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+      // Awaited: `expect(...).rejects` returns a promise, and an un-awaited one passes whatever the
+      // call actually did — the exact shape of green that proves nothing.
+      await expect(run).rejects.toThrow();
+
+      expect(sent).toEqual([]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 921 },
+        select: { lastError: true },
+      });
+      expect(conv.lastError).not.toBeNull();
+    });
   });
 
   test("a human assignee closes the gate before any Chatwoot fetch", async () => {
@@ -2160,6 +2729,7 @@ describe.skipIf(!dbUp)("debounce", () => {
           deliveryId: `auth-refused-strand-${process.pid}`,
           event: "message_created",
           status: "PROCESSING",
+          routeObserved: false,
           receivedAt: new Date(Date.now() - 60_000),
           claimedAt: new Date(Date.now() - 60_000),
           conversationId: 846,
@@ -2287,6 +2857,7 @@ describe.skipIf(!dbUp)("debounce", () => {
           deliveryId: `auth-human-strand-${process.pid}`,
           event: "message_created",
           status: "PROCESSING",
+          routeObserved: false,
           receivedAt: new Date(Date.now() - 60_000),
           claimedAt: new Date(Date.now() - 60_000),
           conversationId: 843,
@@ -2360,6 +2931,7 @@ describe.skipIf(!dbUp)("debounce", () => {
           deliveryId: `auth-recheck-sibling-${process.pid}`,
           event: "message_created",
           status: "PROCESSING",
+          routeObserved: false,
           receivedAt: new Date(Date.now() - 60_000),
           claimedAt: new Date(Date.now() - 60_000),
           conversationId: 845,
@@ -2464,6 +3036,93 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(out).toEqual({ outcome: "done" });
     expect(sent).toEqual([]);
     expect(await watermarkOf(804)).toBe(2);
+  });
+
+  // AND IT CLAIMS NOTHING, which is the other half and the one the issue is about (#452). The
+  // watermark advances because the burst was CONSUMED — nothing will answer it again on its own —
+  // but no reply left this turn, so the tail is still unanswered and the operator's re-engage is
+  // exactly the thing that should be able to answer it. A claim taken before the turn knows whether
+  // it will send would mark the burst answered and refuse that click forever, which is the reported
+  // bug wearing a different cause.
+  test("an empty reply claims nothing, so the tail stays answerable", async () => {
+    await seedConversation(808);
+    const sent: Array<[number, string]> = [];
+    const out = await flushDebounceJob({
+      job: jobFor(808),
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeClient: makeStub({
+          pages: [
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "?" },
+            ]),
+          ],
+          sent,
+          calls: { getMessages: 0 },
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    expect(await watermarkOf(808)).toBe(2);
+    expect(await replyClaimOf(808)).toBeNull();
+  });
+
+  // THE REPORTED SEQUENCE, END TO END (#452): the flush runs, the turn ends without a reply, and the
+  // operator clicks re-engage on a tail nobody answered. Both halves of the fix have to hold at once
+  // — the watermark must not refuse the click (it covers the tail), and neither must the claim (the
+  // empty turn sent nothing, so it holds no claim).
+  test("the tail an empty flush left is answered by the operator's click", async () => {
+    const convId = 809;
+    await seedConversation(convId);
+    const convRow = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    const sent: Array<[number, string]> = [];
+    const thread = page([
+      { id: 1, content: "oi" },
+      { id: 2, content: "alguém aí?" },
+    ]);
+    const client = {
+      getMessages: async () => thread,
+      sendMessage: async (conversationId: number, content: string) => {
+        sent.push([conversationId, content]);
+        return {};
+      },
+      sendPrivateNote: async () => ({}),
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+
+    const flushed = await flushDebounceJob({
+      job: jobFor(convId),
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(flushed).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    // The mark covers the whole tail, which is what made the button report `superseded` forever.
+    expect(await watermarkOf(convId)).toBe(2);
+
+    const clicked = await reengageConversation(
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      convRow.id,
+      {
+        makeModel: fakeModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+      appDb,
+    );
+    expect(clicked.outcome).toBe("posted");
+    expect(sent).toEqual([[convId, REPLY]]);
   });
 
   test("a human takeover mid-turn advances the watermark (no re-answer after the return)", async () => {
@@ -2919,6 +3578,51 @@ describe.skipIf(!dbUp)("debounce", () => {
       });
     });
 
+    // A FAILED SEND KEEPS THE CLAIM (issue #452). The template goes out through a raw `sendMessage`
+    // with no reconciliation, so a rejection here does not even say whether Chatwoot accepted it
+    // first — and the claim is taken before the send precisely so that the scheduler's retry cannot
+    // send it a second time to a customer who may already have it. The claim is never given back.
+    test("a send that fails keeps the claim, so the retry cannot duplicate it", async () => {
+      const convId = 894;
+      await seedConversation(convId);
+      const verdict = JSON.stringify({
+        violated: true,
+        categories: ["toxicity"],
+        rationale: "abuse",
+      });
+      const client = {
+        getMessages: async () =>
+          page([{ id: 1, content: "vocês são uns inúteis" }]),
+        sendMessage: async () => {
+          throw new Error("chatwoot: 504 gateway timeout");
+        },
+        sendPrivateNote: async () => ({}),
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      await expect(
+        flushDebounceJob({
+          job: jobFor(convId),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig) =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => ({ content: verdict }))
+                : fakeModel(),
+            makeClient: async () => client,
+            checkpointer: new MemorySaver(),
+          },
+        }),
+      ).rejects.toThrow();
+
+      // Held: nothing here can say the customer did not get the template.
+      expect(await replyClaimOf(convId)).toBe(1);
+      // And the watermark stays put, so the retry would have had a burst to re-answer had the claim
+      // been released — which is what makes this assertion about the claim and not about the burst
+      // being gone.
+      expect(await watermarkOf(convId)).toBeNull();
+    });
+
     test("a burst retired inside the post gate is not answered", async () => {
       await seedConversation(862);
       const thread = threadOf(862);
@@ -2982,10 +3686,18 @@ describe.skipIf(!dbUp)("debounce", () => {
       expect(fetches).toBe(2);
       // And the customer got nothing after their reset, template included.
       expect(sent).toEqual([]);
-      // The residual, asserted rather than left to be discovered: the only ask that can catch this
-      // window answers after the CAS, so the burst is marked handled without having been answered.
-      // The alternative is the send above.
-      expect(await watermarkOf(862)).toBe(1);
+      // The residual this used to assert is GONE, and the change is what closed it (issue #452). The
+      // post gate no longer claims by advancing the watermark — it claims in `lastRepliedMessageId`
+      // — so a retirement caught by the ask after the claim leaves the watermark exactly where
+      // "stale" says it should be: on a burst nothing answered, which the next flush re-coalesces.
+      // That is the rule the outcome was written for; the old value was the CAS leaking through it.
+      expect(await watermarkOf(862)).toBeNull();
+      // And NOTHING WAS CLAIMED either, because the claim is asked one statement before the send and
+      // this turn never got there. The trade the claim makes — a lost reply rather than a risked
+      // duplicate — is about a send that FAILED, which is a burst the customer may already hold. A
+      // run retired before any send is the opposite case: nothing left, so nothing is owed, and the
+      // burst stays answerable by the re-armed flush and by the operator's click.
+      expect(await replyClaimOf(862)).toBeNull();
     });
   });
   // A turn that answers with BOTH an attachment and text, retired between the two. The image is with
@@ -2994,6 +3706,7 @@ describe.skipIf(!dbUp)("debounce", () => {
   // that already read `images.sent`, and the third place it has to hold.
   describe("with a turn that sends an image before its reply", () => {
     const IMG_URL = "https://cdn.loja.com.br/produtos/camiseta.png";
+    const IMG_URL2 = "https://cdn.loja.com.br/produtos/calca.png";
     const imageDeps = {
       fetchImpl: (async () =>
         new Response(
@@ -3033,6 +3746,215 @@ describe.skipIf(!dbUp)("debounce", () => {
         where: { id: agentDbId },
         data: { settings: previousSettings as object },
       });
+    });
+
+    // The image is delivered BEFORE the text (a reply must not swallow the attachment), so a text
+    // send that fails after it leaves the customer holding part of the answer even though no balloon
+    // landed — which is what makes `delivered: 0` alone the wrong thing to throw on (issue #429).
+    // A throw here re-runs the turn and posts that picture a second time. Same rule the attachment-
+    // only branch above already keeps, and this is the third site it has to be written at.
+    // THE THIRD LEG, and the one the table exists for: the text lands but a promised file does not.
+    // Asking only about the reply here is how a conversation closed with the customer holding the
+    // words and not the photo they were about. The decision is `mayCloseConversation`, which this
+    // proves the call site actually consults (the table proves the rule; adoption is a second test).
+    test("an attachment that failed keeps the conversation open even when the text lands", async () => {
+      await seedConversation(926);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () =>
+          page([{ id: 7, content: "manda a foto e encerra" }]),
+        sendFileAttachment: async () => {
+          throw new Error("chatwoot 502");
+        },
+        sendMessage: async (conversationId: number, content: string) => {
+          sent.push([conversationId, content]);
+          return { id: 900 };
+        },
+        toggleStatus: async (conversationId: number, status: string) => {
+          toggles.push([conversationId, status]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const model = {
+        invoke: async () => new AIMessage("Aqui está!"),
+        bindTools: (_t: unknown) => {
+          let n = 0;
+          return {
+            invoke: async () => {
+              n += 1;
+              return n === 1
+                ? new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "send_image",
+                        args: { url: IMG_URL },
+                        id: "call_img",
+                      },
+                      {
+                        name: "resolve_conversation",
+                        args: {},
+                        id: "call_resolve",
+                      },
+                    ],
+                  })
+                : new AIMessage("Aqui está!");
+            },
+          };
+        },
+      };
+
+      const out = await flushDebounceJob({
+        job: jobFor(926, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The words arrived...
+      expect(sent).toEqual([[926, "Aqui está!"]]);
+      // ...the picture they are about did not, so the attendance is not finished.
+      expect(toggles).toEqual([]);
+    });
+
+    // THE SAME RULE ON THE ATTACHMENT-ONLY BRANCH, and this half predates #429: a batch where one
+    // file lands and another fails already reached `applyDeferredResolve`, because `failed` was read
+    // for the throw and not for the close. The customer holds one of the two pictures the agent
+    // promised, and `resolved` says the attendance is finished.
+    test("a batch where one attachment failed does not resolve the conversation", async () => {
+      await seedConversation(925);
+      const attachments: string[] = [];
+      const toggles: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () => page([{ id: 7, content: "manda as fotos" }]),
+        sendFileAttachment: async (
+          _c: number,
+          _b: ArrayBuffer,
+          name: string,
+        ) => {
+          // The first picture lands, the second does not.
+          if (attachments.length >= 1) throw new Error("chatwoot 502");
+          attachments.push(name);
+          return {};
+        },
+        sendMessage: async () => ({}),
+        toggleStatus: async (conversationId: number, status: string) => {
+          toggles.push([conversationId, status]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      // Two pictures and a close, in one response, with no final text: the attachment-only branch.
+      const model = {
+        invoke: async () => new AIMessage(""),
+        bindTools: (_t: unknown) => {
+          let n = 0;
+          return {
+            invoke: async () => {
+              n += 1;
+              return n === 1
+                ? new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "send_image",
+                        args: { url: IMG_URL },
+                        id: "call_img_1",
+                      },
+                      {
+                        name: "send_image",
+                        args: { url: IMG_URL2 },
+                        id: "call_img_2",
+                      },
+                      {
+                        name: "resolve_conversation",
+                        args: {},
+                        id: "call_resolve",
+                      },
+                    ],
+                  })
+                : new AIMessage("");
+            },
+          };
+        },
+      };
+
+      const out = await flushDebounceJob({
+        job: jobFor(925, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // One picture reached the customer, so the turn is not a failure...
+      expect(attachments).toHaveLength(1);
+      // ...and the conversation stays open, because the other one did not.
+      expect(toggles).toEqual([]);
+    });
+
+    test("a text send that fails after an image is not a failed turn", async () => {
+      await seedConversation(923);
+      const sent: Array<[number, string]> = [];
+      const attachments: string[] = [];
+      const client = {
+        getMessages: async () => page([{ id: 7, content: "manda a foto" }]),
+        sendFileAttachment: async (
+          _c: number,
+          _b: ArrayBuffer,
+          name: string,
+        ) => {
+          attachments.push(name);
+          return {};
+        },
+        sendMessage: async () => {
+          throw new Error("chatwoot 502");
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const out = await flushDebounceJob({
+        job: jobFor(923, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new SendImageThenReplyModel(
+              "É essa aqui!",
+              IMG_URL,
+            ) as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(attachments).toHaveLength(1);
+      expect(sent).toEqual([]);
+      // The retry that a throw would arm is what would send that picture again.
+      expect(await watermarkOf(923)).toBe(7);
+      // AND THE THIRD SHAPE OF A PARTIAL DELIVERY (issue #429), which this branch used to report as
+      // plain `posted`: the customer holds the picture and none of the words. "Not a failed turn"
+      // and "nothing to tell the operator" are different facts, and reporting it as a clean post
+      // makes the flush CLEAR whatever badge the conversation was carrying.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 923 },
+        select: { lastError: true },
+      });
+      expect(conv.lastError).toContain("incompleta");
     });
 
     test("a burst retired after the image still counts as answered", async () => {
@@ -3212,25 +4134,28 @@ describe.skipIf(!dbUp)("debounce", () => {
             ...(before.settings as object),
             spendCeiling: {
               enabled: true,
-              monthlyInboxTokens: 1000,
+              monthlyInboxUsd: 1000,
               overCeilingMessage: CEILING_COPY,
             },
           },
         },
       });
-      await suDb.llmUsage.create({
+      // The month's figure as the poll would have written it: over the ceiling below (#426).
+      await suDb.spendCostSnapshot.create({
         data: {
           tenantId,
-          model: "gpt-4o-mini",
           source: "inbox",
-          promptTokens: 1200,
-          completionTokens: 0,
+          monthStart: new Date(
+            Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1),
+          ),
+          costUsd: 1200,
+          polledAt: new Date(),
         },
       });
     });
 
     afterAll(async () => {
-      await suDb.llmUsage.deleteMany({ where: { tenantId } });
+      await suDb.spendCostSnapshot.deleteMany({ where: { tenantId } });
       await suDb.tenant.update({
         where: { id: tenantId },
         data: { settings: previousTenantSettings as object },
@@ -3276,7 +4201,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       // digits go through `toLocaleString`, and pinning them here would pin the runner's ICU too.
       expect(notes.length).toBe(1);
       expect(notes[0]?.[0]).toBe(910);
-      expect(notes[0]?.[1]).toContain("limite de tokens do mês foi atingido");
+      expect(notes[0]?.[1]).toContain("limite de gasto do mês foi atingido");
       expect(notes[0]?.[1]).toContain("aberta para atendimento humano");
       // The ORDER, which is load-bearing in both directions: the copy leaves before the open,
       // because after it the conversation is no longer the bot's and the fence would rightly
@@ -3293,30 +4218,29 @@ describe.skipIf(!dbUp)("debounce", () => {
     // bot's attribution and puts the conversation back in the routing queue, so applying it to a
     // conversation an agent just took pulls it out of their hands.
     //
-    // The window is opened where it really is — inside the ledger read — by an extended client that
-    // flips the assignee the first time the ceiling's own query runs. That is the same seam the
+    // The window is opened where it really is — inside the snapshot read — by an extended client
+    // that flips the assignee the first time the ceiling's own query runs. That is the same seam the
     // fail-open test uses, and it is the only one that reproduces the ordering without a sleep.
     test("a human who claims the conversation during the read keeps it", async () => {
       await seedConversation(912);
       let flipped = 0;
       const raced = appDb.$extends({
         query: {
-          async $allOperations({ operation, args, query }) {
-            if (operation === "$queryRaw" && flipped === 0) {
-              const sql = ((args as { strings?: string[] }).strings ?? []).join(
-                " ",
-              );
-              if (sql.includes("FROM llm_usage")) {
-                flipped += 1;
-                await suDb.conversation.updateMany({
-                  where: {
-                    tenantId,
-                    chatwootInstanceId: instanceId,
-                    chatwootConversationId: 912,
-                  },
-                  data: { assigneeType: "User", assigneeId: 4242 },
-                });
-              }
+          async $allOperations({ model, operation, args, query }) {
+            if (
+              model === "SpendCostSnapshot" &&
+              operation === "findUnique" &&
+              flipped === 0
+            ) {
+              flipped += 1;
+              await suDb.conversation.updateMany({
+                where: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  chatwootConversationId: 912,
+                },
+                data: { assigneeType: "User", assigneeId: 4242 },
+              });
             }
             return query(args);
           },
@@ -3356,7 +4280,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       // exactly where the reason for the silence still needs saying. It reports NO handoff, because
       // none happened.
       expect(notes.length).toBe(1);
-      expect(notes[0]?.[1]).toContain("limite de tokens do mês foi atingido");
+      expect(notes[0]?.[1]).toContain("limite de gasto do mês foi atingido");
       expect(notes[0]?.[1]).not.toContain("aberta para atendimento humano");
       // ...and the burst still counts as handled, exactly as it does when the gate was already
       // closed on the way in: the ceiling decided about the TENANT, and that holds either way.
@@ -3610,7 +4534,7 @@ describe.skipIf(!dbUp)("debounce", () => {
             ...(previousTenantSettings as object),
             spendCeiling: {
               enabled: true,
-              monthlyInboxTokens: 1000,
+              monthlyInboxUsd: 1000,
               overCeilingMessage: CEILING_COPY,
               handoffEnabled: false,
             },

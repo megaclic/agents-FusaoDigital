@@ -1,5 +1,6 @@
 import {
   Bot,
+  ClipboardList,
   Gauge,
   Globe,
   KeyRound,
@@ -46,6 +47,7 @@ export interface NavItem {
 // t('nav.webhooks', 'Webhooks')
 // t('nav.apiKeys', 'API keys')
 // t('nav.logs', 'Logs')
+// t('nav.audit', 'Audit')
 // t('nav.admin', 'Admin')
 // t('nav.settings', 'Settings')
 export const NAV_ITEMS: NavItem[] = [
@@ -109,6 +111,13 @@ export const NAV_ITEMS: NavItem[] = [
     labelKey: "nav.logs",
     defaultLabel: "Logs",
     icon: ScrollText,
+    requireAdmin: true,
+  },
+  {
+    to: "/audit",
+    labelKey: "nav.audit",
+    defaultLabel: "Audit",
+    icon: ClipboardList,
     requireAdmin: true,
   },
   {

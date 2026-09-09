@@ -11,6 +11,7 @@ import {
 } from "@/modules/webhooks/outbound/deliveries";
 import { processOutboundBatch } from "@/modules/webhooks/outbound/worker";
 import { clearFlowLog, flowLogRows } from "@/tests/utils/flowlog";
+import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 
 // ── THE DELIVERY LEDGER AS A SUPPORTED SURFACE (issue #305) ──
 // Integration, real DB, real RLS: every call goes through `runScopedOn` exactly as the controller
@@ -84,6 +85,20 @@ async function seed(
   return row.id;
 }
 
+// The state the requeue undid, as the trail recorded it from inside the lock. It used to travel
+// back on the return value, for the MCP tool to record one layer up; the row is the same evidence
+// read where it now lives.
+async function requeueAudit(id: bigint) {
+  return suDb.auditLog.findFirst({
+    where: {
+      tenantId,
+      action: "webhook_delivery.requeue",
+      target: `webhook_delivery:${id}`,
+    },
+    orderBy: { id: "desc" },
+  });
+}
+
 async function clearDeliveries() {
   await suDb.$executeRawUnsafe(
     `DELETE FROM outbound_webhook_deliveries WHERE tenant_id IN (${tenantId}, ${otherTenantId})`,
@@ -92,7 +107,7 @@ async function clearDeliveries() {
 
 // The emit is fire-and-forget, so the line lands after the call returned. Poll for it rather than
 // sleeping a fixed amount: a fixed sleep is either flaky or slow and never says which.
-async function webhookLines(expected: number, waitMs = 3000) {
+async function webhookLines(expected: number, waitMs = POLL_DEADLINE_MS) {
   const deadline = Date.now() + waitMs;
   for (;;) {
     // flowlog-scope: tenant-wide — the subject is HOW MANY lines a requeue writes, so scoping the
@@ -309,13 +324,12 @@ describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
     test("a dead delivery goes back to PENDING with its attempt count reset", async () => {
       await clearDeliveries();
       const id = await seed({ status: "DEAD", attempts: 8 });
-      const { delivery: d, before } = await requeueWebhookDelivery(
-        ctx(),
-        id,
-        appDb,
-      );
-      // What the requeue undid, read under the lock — the audit trail's `before` comes from here.
-      expect(before).toEqual({ status: "DEAD", attempts: 8 });
+      const d = await requeueWebhookDelivery(ctx(), id, appDb);
+      // What the requeue undid, read under the lock — the audit row is written from that read.
+      expect((await requeueAudit(id))?.before).toEqual({
+        status: "DEAD",
+        attempts: 8,
+      });
       expect(d).toMatchObject({
         status: "PENDING",
         attempts: 0,
@@ -407,9 +421,12 @@ describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
         holder,
         requeueWebhookDelivery(ctx(), id, appDb),
       ]);
-      expect(requeued.delivery.status).toBe("PENDING");
-      expect(requeued.delivery.attempts).toBe(0);
-      expect(requeued.before).toEqual({ status: "DEAD", attempts: 8 });
+      expect(requeued.status).toBe("PENDING");
+      expect(requeued.attempts).toBe(0);
+      expect((await requeueAudit(id))?.before).toEqual({
+        status: "DEAD",
+        attempts: 8,
+      });
       const [line] = await webhookLines(1);
       expect(line?.detail).toMatchObject({
         action: "requeued",
@@ -513,7 +530,7 @@ describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
     test("a requeue into a disabled subscription succeeds and says the queue is holding it", async () => {
       await clearDeliveries();
       const id = await seed({ sub: disabledSub, status: "DEAD", attempts: 8 });
-      const { delivery: d } = await requeueWebhookDelivery(ctx(), id, appDb);
+      const d = await requeueWebhookDelivery(ctx(), id, appDb);
       expect(d.status).toBe("PENDING");
       expect(d.subscriptionEnabled).toBe(false);
       const summary = await processOutboundBatch({

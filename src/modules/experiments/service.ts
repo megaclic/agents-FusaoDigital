@@ -2,9 +2,11 @@ import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
-import { NotFoundError } from "@/lib/errors";
+import { AppError, NotFoundError } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { markUndisclosed, undisclosedMoved } from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 
 // Prompt A/B experiments. A thread is bucketed to a variant DETERMINISTICALLY (so re-resolution is
 // stable), and the assignment is persisted race-safely via createMany({skipDuplicates}) — an
@@ -109,6 +111,139 @@ export async function resolveVariantOverride(
   return variants.find((v) => v.key === key)?.systemPrompt ?? null;
 }
 
+// What the audit row carries.
+//
+// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
+// else is listed in `UNDISCLOSED` below and compared without being carried.
+//
+// The variants contribute their KEYS and WEIGHTS and never their `systemPrompt`. A prompt is the
+// largest field an experiment holds, and what a reader needs from a variant change is that the
+// split moved and which arm it moved for; the prompt is readable on the experiment for as long as
+// the experiment exists, and this row outlives it. But editing one arm's prompt while leaving its
+// key and weight alone is a substantive change to the experiment and moves nothing above, so the
+// whole variant array is compared.
+//
+// `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
+function auditProjection(r: {
+  name: string;
+  agentId: bigint | null;
+  variants: unknown;
+  enabled: boolean;
+}) {
+  const variants = Array.isArray(r.variants) ? r.variants : [];
+  return {
+    name: r.name,
+    agentId: r.agentId === null ? null : String(r.agentId),
+    enabled: r.enabled,
+    variants: variants.map((v) => {
+      const o = (v ?? {}) as Record<string, unknown>;
+      return { key: o.key ?? null, weight: o.weight ?? null };
+    }),
+  };
+}
+
+// The column the projection above may not publish, compared and never carried
+// (`@/modules/audit/projection`). A variant carries its own prompt overrides, which is exactly the
+// free text a row may not keep; what the row shows is which keys exist and how the traffic splits.
+const UNDISCLOSED = ["variants"] as const;
+
+// ── what a write may say ──
+
+export const EXPERIMENT_NAME_MAX = 200;
+
+// The name is how a human tells one experiment from another in a list, and it was bounded on the
+// REST body (1-200) and nowhere else — so the MCP road stored a blank one and a 5000-character one
+// alike. Here instead, on the two functions both roads converge on, which is where the variants'
+// ceiling already lives and for the same reason.
+export function assertExperimentNameUsable(name: string | undefined): void {
+  if (name === undefined) return;
+  if (name.trim().length === 0 || name.length > EXPERIMENT_NAME_MAX) {
+    throw new AppError(
+      `name must be 1 to ${EXPERIMENT_NAME_MAX} characters and cannot be blank`,
+      400,
+      "errors.invalidExperimentName",
+      { max: EXPERIMENT_NAME_MAX },
+      "name",
+    );
+  }
+}
+
+// The agent is what an experiment IS FOR. `resolveVariantOverride` looks it up by exact id, so a row
+// that names none overrides no turn, ever, while reading `enabled: true` in `experiment_list`, in
+// `GET /v1/experiments` and in the audit trail. The REST body documented `null` as "any agent", which
+// it never was (#547). Refused here, on the two functions both write roads converge on, for the
+// reason the name ceiling above gives.
+//
+// `undefined` on the UPDATE is a patch that does not mention the agent, which is a different
+// statement and stays legal. The create has nothing else to state, so having none is the refusal.
+// A row stored before this rule keeps its null and stays inert: naming an agent is what repairs it.
+export function requireExperimentAgent(
+  agentId: bigint | null | undefined,
+): bigint {
+  if (agentId === undefined || agentId === null) {
+    throw new AppError(
+      "an experiment applies to one agent, and this write names none",
+      400,
+      "errors.experimentAgentRequired",
+      undefined,
+      "agentId",
+    );
+  }
+  return agentId;
+}
+
+// `Experiment.agentId` is a plain BigInt with no `@relation`, so no foreign key ever caught an id
+// that names nothing — and `resolveVariantOverride` looks the agent up by exact id, so such a row is
+// an experiment that overrides no turn, ever, while reading `enabled: true` in the console and in
+// `experiment_list`. The same is true of another tenant's agent id, which RLS then hides from the
+// only query that would use it.
+//
+// Not a foreign key, because the delete side is already answered: `deleteAgent` nulls
+// `Experiment.agentId` inside its own transaction, deliberately, so a deleted agent leaves no
+// dangling binding. What was missing is the write side, and this is it.
+//
+// Only reached with an agent named, which `requireExperimentAgent` above is what guarantees: the
+// two questions are separate on purpose, because "no agent at all" and "an agent that is not here"
+// are different refusals and the second one costs a locked read.
+async function assertAgentPresent(
+  db: ScopedDb,
+  agentId: bigint,
+): Promise<void> {
+  // LOCKED, with the lock a foreign key would have taken, and that is the whole argument: there is
+  // no FK here, so at READ COMMITTED nothing stops `deleteAgent` from committing between an
+  // unlocked read and the write that references the row — it takes the agent's own `FOR UPDATE`,
+  // nulls the experiments that point at it, deletes it, and this write then commits the dangling
+  // reference it exists to refuse. `FOR KEY SHARE` is what an FK's referencing insert takes: it
+  // conflicts with the DELETE and with a key change, and with nothing else, so renaming the agent
+  // is not blocked and two experiments on one agent do not serialise against each other.
+  //
+  // RLS applies to the raw statement exactly as it does to the reads around it, so another tenant's
+  // agent comes back as zero rows and is refused here rather than stored and hidden later.
+  const rows = await db.$queryRaw<Array<{ id: bigint }>>`
+    SELECT id FROM agents WHERE id = ${agentId} FOR KEY SHARE`;
+  if (rows.length === 0) {
+    throw new AppError(
+      "agentId names no agent in this tenant",
+      404,
+      "errors.experimentAgentNotFound",
+      undefined,
+      "agentId",
+    );
+  }
+}
+
+// The read-backed half, for a preview to ask. ADVISORY, and the word is load-bearing: this runs its
+// own scoped read outside the transaction the apply writes in, so the agent can be deleted between
+// the two halves. `assertAgentPresent` INSIDE the write is what actually holds. This only moves the
+// refusal an operator will hit almost every time — an id they mistyped — to where they asked (#490).
+export async function assertExperimentAgentExists(
+  ctx: TenantContext,
+  agentId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  await runScopedOn(base, ctx, (db) => assertAgentPresent(db, agentId));
+}
+
 // ── CRUD ──
 
 export async function listExperiments(
@@ -139,12 +274,14 @@ export async function createExperiment(params: {
   base?: PrismaClient;
 }): Promise<{ id: bigint }> {
   const base = params.base ?? basePrisma;
+  assertExperimentNameUsable(params.name);
   const variants = parseInput(
     z.array(variantWriteSchema),
     params.variants,
     "variants",
   );
   return runScopedOn(base, params.ctx, async (db) => {
+    await assertAgentPresent(db, requireExperimentAgent(params.agentId));
     const exp = await db.experiment.create({
       data: {
         tenantId: params.ctx.tenantId as bigint,
@@ -153,7 +290,12 @@ export async function createExperiment(params: {
         variants: variants as unknown as object,
         enabled: params.enabled ?? true,
       },
-      select: { id: true },
+      select: EXPERIMENT_SELECT,
+    });
+    await auditMutation(db, params.ctx, {
+      action: "experiment.create",
+      target: `experiment:${exp.id}`,
+      after: auditProjection(exp),
     });
     return { id: exp.id };
   });
@@ -196,14 +338,26 @@ export async function updateExperiment(params: {
   base?: PrismaClient;
 }) {
   const base = params.base ?? basePrisma;
+  assertExperimentNameUsable(params.name);
   const variants =
     params.variants !== undefined
       ? parseInput(z.array(variantWriteSchema), params.variants, "variants")
       : undefined;
   return runScopedOn(base, params.ctx, async (db) => {
+    // NOTE: a patch that does not mention the agent leaves the stored one alone; a patch that
+    // mentions it names one, or does not get past the line above. And this goes BEFORE the
+    // experiment's own lock, not after: `deleteAgent` takes the agent and then the experiments that
+    // point at it, so taking them in the other order here is a deadlock between two writes that are
+    // each individually correct.
+    if (params.agentId !== undefined) {
+      await assertAgentPresent(db, requireExperimentAgent(params.agentId));
+    }
+    // LOCKED before the snapshot the trail compares against: at READ COMMITTED two concurrent
+    // updates both read state A, the first commits B, and the second files a row saying A became C.
+    await db.$queryRaw`SELECT 1 FROM "experiments" WHERE "id" = ${params.id} FOR UPDATE`;
     const current = await db.experiment.findUnique({
       where: { id: params.id },
-      select: { id: true },
+      select: EXPERIMENT_SELECT,
     });
     if (!current) {
       throw new NotFoundError(
@@ -222,10 +376,22 @@ export async function updateExperiment(params: {
         ...(params.enabled !== undefined ? { enabled: params.enabled } : {}),
       },
     });
-    return db.experiment.findUniqueOrThrow({
+    const row = await db.experiment.findUniqueOrThrow({
       where: { id: params.id },
       select: EXPERIMENT_SELECT,
     });
+    const beforeProj = auditProjection(current);
+    const afterProj = auditProjection(row);
+    const undisclosed = undisclosedMoved(current, row, UNDISCLOSED);
+    if (undisclosed || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, params.ctx, {
+        action: "experiment.update",
+        target: `experiment:${params.id}`,
+        before: undisclosed ? markUndisclosed(beforeProj) : beforeProj,
+        after: undisclosed ? markUndisclosed(afterProj) : afterProj,
+      });
+    }
+    return row;
   });
 }
 
@@ -235,13 +401,25 @@ export async function deleteExperiment(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Locked, then read before the delete: after `deleteMany` there is nothing left to name what
+    // was removed.
+    await db.$queryRaw`SELECT 1 FROM "experiments" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.experiment.findUnique({
+      where: { id },
+      select: EXPERIMENT_SELECT,
+    });
     const res = await db.experiment.deleteMany({ where: { id } });
-    if (res.count === 0) {
+    if (res.count === 0 || !current) {
       throw new NotFoundError(
         "experiment not found",
         "errors.experimentNotFound",
       );
     }
+    await auditMutation(db, ctx, {
+      action: "experiment.delete",
+      target: `experiment:${id}`,
+      before: auditProjection(current),
+    });
   });
 }
 

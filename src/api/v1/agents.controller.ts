@@ -1,7 +1,8 @@
 import { Elysia, t } from "elysia";
-import { getUserById, verifyPassword } from "@/api/features/auth/auth.service";
+import { currentLocale } from "@/api/lib/i18n";
 import { doc, errors } from "@/api/lib/openapi";
 import { parseQueryText } from "@/api/lib/query-filters";
+import { confirmStepUp, STEP_UP_PASSWORD_DESCRIPTION } from "@/api/lib/step-up";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import config from "@/config";
 import { requireDbId } from "@/lib/db-id";
@@ -12,7 +13,9 @@ import {
 } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
+import { readAgentConfigHealth } from "@/modules/agents/config-health-read";
 import {
+  AGENT_MODES,
   type AgentCreate,
   type AgentUpdate,
   cloneAgent,
@@ -53,6 +56,7 @@ import { listTtsOptions } from "@/modules/tts/listing";
 
 // translate('errors.agentConfirmMismatch', 'The agent name does not match')
 // translate('errors.agentModifiedElsewhere', 'This agent was changed somewhere else. Reload it and try again.')
+// translate('errors.agentObservesInboxes', 'This agent observes inboxes. Remove it as an observer first.')
 // translate('errors.agentNotRunnable', 'This agent has no runnable model configured.')
 // translate('errors.audioTooLarge', 'Audio file is too large')
 // translate('errors.baseUrlRequired', 'A base URL is required for this provider.')
@@ -72,6 +76,12 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.debugWindowTooLong', 'The log debug mode can be armed for at most {{hours}}h at a time.')
 // translate('errors.invalidToolPrecondition', '`{{tool}}` has an invalid precondition: it must name an attribute scope and key.')
 // translate('errors.halfConfiguredFallback', 'The fallback provider is only half configured: {{missing}} is missing.')
+// translate('errors.monitoringReservedGroupName', '"{{name}}" is a reserved label group name; pick another.')
+// translate('errors.monitoringDuplicateGroupName', 'Two label groups may not share the name "{{name}}".')
+// translate('errors.monitoringDuplicateLabelValue', '"{{value}}" is listed by more than one label group.')
+// translate('errors.monitoringLabelValueTaken', '"{{value}}" is already classified by "{{agent}}" on an inbox this agent shares.')
+// translate('errors.monitoringGroupNameTooLong', 'A label group name may have at most {{max}} characters.')
+// translate('errors.monitoringLabelValueTooLong', 'A label may have at most {{max}} characters.')
 // translate('errors.sttCredentialMissing', 'The transcription credential was not found.')
 // translate('errors.sttFailed', 'Transcription failed: {{detail}}')
 // translate('errors.sttNotConfigured', 'Speech-to-text is not configured for this workspace.')
@@ -342,13 +352,16 @@ export const agentsController = new Elysia({
   .get(
     "/:id/channel-binding",
     async ({ tenantContext, params }) =>
-      resolveAgentChannelBinding(ctxOrThrow(tenantContext), BigInt(params.id)),
+      resolveAgentChannelBinding(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      ),
     {
       detail: doc(
         "Get agent channel binding",
         "Whether the agent is bound to a Chatwoot inbox, a Z-PRO instance, both, or neither — an agent has no channel discriminator of its own. Used by the editor to hide/disable controls with no effect on a Z-PRO-only agent (e.g. the WhatsApp 24h window, which has no Z-PRO backend yet). Does not validate that the agent id exists — an unknown id resolves to {chatwoot:false, zpro:false}, same as a real, unbound agent.",
       ),
-      response: errors(400, 401, 403),
+      response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -375,6 +388,34 @@ export const agentsController = new Elysia({
       detail: doc(
         "Get guardrail health",
         "Counts the guardrail analyses that could not run for this agent in the recent window, with the most recent one and the error it carried. Analysis is fail-open, so a check counted here caught nothing and held nothing back. It does not follow that the turn went out unscreened: the other direction may still have screened it, and a split output analysis can carry an error from one half and a violation from the other.",
+      ),
+      response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  // "Is this agent's configuration healthy?", for a caller that is not the console. The same checks
+  // the editor's warning panel runs, over the SAVED row: an agent configured entirely over this API
+  // or over MCP never rendered that panel, so until this existed those warnings were not missed,
+  // they were never computed. Issue #467.
+  .get(
+    "/:id/config-health",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      ...(await readAgentConfigHealth(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        { locale: currentLocale() },
+      )),
+    }),
+    {
+      detail: doc(
+        "Get agent configuration health",
+        'The configuration warnings the agent editor shows, computed server-side over the SAVED agent: a feature switched on with no credential, a credential referenced but never filled, a credential the vault no longer holds, two settings that cancel each other out, and text past the cap its reader keeps. Each issue carries a `severity` — `blocking` (the agent does not answer, or answers without a protection whose switch reads "on"), `degraded` (it answers, and a feature that is on does not run) or `advisory` (nothing is off; the operator has a choice to make) — plus the same sentence the console shows, in the language of Accept-Language. `unchecked` names the live readings this call did not take (Chatwoot, guardrail health), because both of those fail as an empty result that reads exactly like a clean one — an empty `unchecked` is what makes a clean answer trustworthy. Shape: `{ agentId, agentName, healthy, counts, issues[], unchecked[] }`, where `healthy` is true when no blocking and no degraded issue is live.',
       ),
       response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
@@ -440,11 +481,18 @@ export const agentsController = new Elysia({
               "Whether the agent is active and may handle conversations.",
           }),
         ),
+        // NOTE: derived, not spelled. This list was written by hand here and in ten other places,
+        // and when `monitoring` was briefly held back from the write side (v1.15.0) the compiler
+        // found the copies one at a time because none of them derived from anything. Deriving is
+        // what makes the next change to the set one edit instead of eleven.
         mode: t.Optional(
-          t.Union([t.Literal("test"), t.Literal("production")], {
-            description:
-              "Operating mode: 'test' stays silent in a conversation until the customer sends /teste; 'production' answers normally.",
-          }),
+          t.Union(
+            AGENT_MODES.map((m) => t.Literal(m)),
+            {
+              description:
+                "Operating mode: 'test' stays silent in a conversation until the customer sends /teste; 'production' answers normally; 'monitoring' receives and remembers every message and never answers.",
+            },
+          ),
         ),
         transferWithSummary: t.Optional(
           t.Boolean({
@@ -526,11 +574,18 @@ export const agentsController = new Elysia({
               "Whether the agent is active and may handle conversations.",
           }),
         ),
+        // NOTE: derived, not spelled. This list was written by hand here and in ten other places,
+        // and when `monitoring` was briefly held back from the write side (v1.15.0) the compiler
+        // found the copies one at a time because none of them derived from anything. Deriving is
+        // what makes the next change to the set one edit instead of eleven.
         mode: t.Optional(
-          t.Union([t.Literal("test"), t.Literal("production")], {
-            description:
-              "Operating mode: 'test' stays silent in a conversation until the customer sends /teste; 'production' answers normally.",
-          }),
+          t.Union(
+            AGENT_MODES.map((m) => t.Literal(m)),
+            {
+              description:
+                "Operating mode: 'test' stays silent in a conversation until the customer sends /teste; 'production' answers normally; 'monitoring' receives and remembers every message and never answers.",
+            },
+          ),
         ),
         transferWithSummary: t.Optional(
           t.Boolean({
@@ -578,7 +633,7 @@ export const agentsController = new Elysia({
     "/:id",
     async ({ tenantContext, params, body }) => {
       const ctx = ctxOrThrow(tenantContext);
-      const b = body as { confirmName: string; password: string };
+      const b = body as { confirmName: string; password?: string };
       const agent = await getAgent(ctx, requireDbId(params.id));
       if (b.confirmName.trim() !== agent.name) {
         throw new AppError(
@@ -587,13 +642,7 @@ export const agentsController = new Elysia({
           "errors.agentConfirmMismatch",
         );
       }
-      const user = ctx.userId ? await getUserById(ctx.userId) : null;
-      if (
-        !user?.passwordHash ||
-        !(await verifyPassword(b.password, user.passwordHash))
-      ) {
-        throw new AppError("Incorrect password", 403, "errors.invalidPassword");
-      }
+      await confirmStepUp(ctx, b.password);
       await deleteAgent(ctx, requireDbId(params.id));
       return { instance: instanceIdentity, success: true };
     },
@@ -613,10 +662,9 @@ export const agentsController = new Elysia({
         confirmName: t.String({
           description: "The agent's name, re-typed to confirm.",
         }),
-        password: t.String({
-          minLength: 1,
-          description: "The acting user's password (step-up confirmation).",
-        }),
+        password: t.Optional(
+          t.String({ minLength: 1, description: STEP_UP_PASSWORD_DESCRIPTION }),
+        ),
       }),
     },
   )
@@ -1376,10 +1424,11 @@ export const agentsController = new Elysia({
                 t.Literal("MCP"),
                 t.Literal("INTEGRATION"),
                 t.Literal("DOCUMENT"),
+                t.Literal("CODE"),
               ],
               {
                 description:
-                  "Grant source: NATIVE (built-in tools), RAG (knowledge bases), HTTP (custom tool), MCP (MCP server connection), INTEGRATION (integration instance), or DOCUMENT (document template).",
+                  "Grant source: NATIVE (built-in tools), RAG (knowledge bases), HTTP (custom tool), MCP (MCP server connection), INTEGRATION (integration instance), DOCUMENT (document template), or CODE (operator-authored code tool).",
               },
             ),
             toolDefinitionId: t.Optional(
@@ -1404,6 +1453,12 @@ export const agentsController = new Elysia({
               t.Union([t.String(), t.Null()], {
                 description:
                   "Document template id (BigInt string) for DOCUMENT grants, or null.",
+              }),
+            ),
+            codeToolDefinitionId: t.Optional(
+              t.Union([t.String(), t.Null()], {
+                description:
+                  "Code tool id (BigInt string) for CODE grants, or null.",
               }),
             ),
             knowledgeBaseIds: t.Optional(

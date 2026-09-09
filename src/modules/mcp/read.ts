@@ -1,5 +1,21 @@
 import basePrisma from "@/api/lib/prisma";
+import {
+  CODE_TOOL_CONTEXT_MAX_CHARS,
+  CODE_TOOL_INPUT_MAX_CHARS,
+  SANDBOX_CODE_MAX_CHARS,
+  SANDBOX_MEMORY_BYTES,
+  SANDBOX_STACK_BYTES,
+  SANDBOX_TIMEOUT_MS,
+} from "@/graph/tools/code-sandbox-limits";
+import { AUDIT_SCOPES, isAuditScope } from "@/lib/audit/scope";
+import { checkCodeToolSyntax } from "@/lib/code-tool-syntax";
+import {
+  CODE_TOOL_CONTEXT_VARS,
+  CODE_TOOL_GLOBALS,
+} from "@/lib/code-tool-vocabulary";
 import { AppError } from "@/lib/errors";
+import { ACTOR_TYPES, type ActorType } from "@/lib/tenancy/actor";
+import { readAgentConfigHealth } from "@/modules/agents/config-health-read";
 import { getAgent, getAgentToolSelections } from "@/modules/agents/service";
 import type { MetricsFilter } from "@/modules/analytics/service";
 import {
@@ -8,13 +24,14 @@ import {
   getTimeseries,
 } from "@/modules/analytics/service";
 import { listApiKeys } from "@/modules/api-keys/service";
-import { listAudit } from "@/modules/audit/service";
+import { listAudit, parseAuditCursor } from "@/modules/audit/service";
 import { listBusinessHours } from "@/modules/business-hours/service";
 import {
   getChatwootDeployment,
   getChatwootInstance,
   listInboxes,
 } from "@/modules/chatwoot/management";
+import { getCodeTool, listCodeTools } from "@/modules/code-tools/service";
 import {
   getConversationDetail,
   getConversationMessages,
@@ -53,6 +70,7 @@ import {
   searchKnowledge,
 } from "@/modules/rag/service";
 import { getTenantSettings } from "@/modules/tenant-settings/service";
+import { MODEL_RESPONSE_CHAR_LIMIT } from "@/modules/tool-definitions/response-template";
 import {
   getToolDefinition,
   listToolDefinitions,
@@ -70,6 +88,7 @@ import { OUTBOUND_EVENTS } from "@/modules/webhooks/outbound/events";
 import { listWebhookSubscriptions } from "@/modules/webhooks/outbound/subscriptions";
 import type { VerifiedToken } from "./oauth/tokens";
 import {
+  authoringGate,
   err,
   ok,
   parseMcpId,
@@ -82,7 +101,16 @@ import {
 // write reads (mcp:read scope + a tenant target). Each tool projects a tenant-scoped service and
 // serializes bigints to strings (JSON.stringify throws on a bigint). Secret-bearing fields are
 // never returned: services redact them (Chatwoot adminToken → hasAdminToken, alert URL → urlMasked,
-// API key → prefix), and credentialRef values are projected back to vault entry NAMES, never values.
+// API key → prefix).
+//
+// A ref-bearing field comes back in one of TWO vocabularies. The settings reads translate to a vault
+// entry NAME here (`vaultNameByRef`); the entity reads hand back the service DTO, which carries the
+// stable `vault:<id>` the column holds. This comment claimed NAMES for all of them and was true of
+// the two it could see — the entity DTOs were passing the COLUMN through, and until #126 that column
+// took any string, so a secret typed into it reached every `mcp:read` client (issue #438). The
+// services redact through `readableVaultRef` now: a stored value that is not a reference reads as null. A ref whose
+// ENTRY was deleted still comes back — the guard proves the value is a reference, deliberately not
+// that it resolves, so a dangling ref stays visible instead of reading as an empty field.
 
 const sid = (v: bigint): string => v.toString();
 const sidn = (v: bigint | null): string | null =>
@@ -109,6 +137,28 @@ export async function agentGet(
   if (typeof id !== "bigint") return id;
   try {
     return ok({ agent: await getAgent(ctx, id, base) });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// "Is this agent's configuration healthy?" — the same warnings the console's editor panel computes,
+// for the caller that never opens it. An onboarding driven entirely through these tools is the path
+// the docs recommend, and until this existed it was also the one that ran blind: nothing on it ever
+// rendered the page those checks live on, so it finished by reporting success over a vault entry
+// nobody had filled. Issue #467.
+export async function agentConfigHealth(
+  principal: VerifiedToken,
+  args: { agent_id: string },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = readGate(principal);
+  if ("ok" in ctx) return ctx;
+  const id = parseMcpId(args.agent_id, "agent_id");
+  if (typeof id !== "bigint") return id;
+  try {
+    return ok({ health: await readAgentConfigHealth(ctx, id, { base }) });
   } catch (e) {
     return failOf(e);
   }
@@ -163,6 +213,123 @@ export async function toolGet(
   } catch (e) {
     return failOf(e);
   }
+}
+
+// ── code tools (operator-authored, issue #363) ──
+
+export async function codeToolList(
+  principal: VerifiedToken,
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = readGate(principal);
+  if ("ok" in ctx) return ctx;
+  try {
+    // The body is not in the list at all — `listCodeTools` does not read the column, for the reason
+    // the document list does not read its blocks: it is the bulk of the row (20k characters at
+    // most, each) and nobody browsing the list reads it. code_tool_get returns the whole thing.
+    return ok({ tools: await listCodeTools(ctx, base) });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function codeToolGet(
+  principal: VerifiedToken,
+  args: { code_tool_id: string },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = readGate(principal);
+  if ("ok" in ctx) return ctx;
+  const id = parseMcpId(args.code_tool_id, "code_tool_id");
+  if (typeof id !== "bigint") return id;
+  try {
+    const tool = await getCodeTool(ctx, id, base);
+    // The static check on the STORED body, and this is the only place it is offered after the save.
+    // An invalid body is saved on purpose and answered with a warning once, at the write; a caller
+    // reading the tool later would otherwise have to run the agent to discover the tool is
+    // known-broken. It is also what the update preview promises: a patch that leaves the body alone
+    // reports `[]` and defers to this (write-code-tools.ts). Always present, `[]` when the body
+    // parses, so "no warnings" and "not checked" are not the same answer.
+    return ok({ tool, warnings: await checkCodeToolSyntax(tool.code) });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// The authoring contract for a code tool body, served on demand rather than inlined into
+// `code_tool_create`'s description (issue #538). The precedent is `document_template_schema`, and
+// the reason is the same one measured there: a vocabulary that every caller pays for on every
+// session, for a contract only a caller actually WRITING a body needs.
+//
+// It answers what a body cannot discover by trying: which `context` keys exist, which of them can be
+// ABSENT (all but three, because the runtime builds that object by spreading conditionals), which
+// GLOBALS the sandbox puts in scope, and the limits that turn a run into a failure. Everything here
+// is derived from the modules that enforce it, never restated, so the answer cannot drift from the
+// sandbox.
+//
+// `available` is the same `CODE_TOOL_GLOBALS` the console's Ctrl-Space offers, as data rather than
+// as the sentence it used to be. The sentence named three of the twenty and went stale the moment a
+// name moved, which is the drift the vocabulary module exists to close: a caller writing through MCP
+// and a caller writing in the console have to be told the same list.
+//
+// Seven limits are served and they bite at three DIFFERENT moments, so they are described in three
+// sentences rather than one. `timeoutMs`, `memoryBytes`, `stackBytes` and `contextMaxChars` mark the
+// call failed. `inputMaxChars` is the model's doing and comes back as an ordinary result saying what
+// to change (graph/tools/code.ts). `codeMaxChars` never reaches a call at all: the write is REFUSED,
+// so nothing is saved. `resultMaxChars` is the fourth thing a body cannot discover by trying: what
+// the body returns is CLIPPED (code-sandbox.ts), and it bounds the VALUE rather than the rendered
+// line, so a caller reading it as a bound on the whole text sizes a return by the wrong number. The
+// cut itself is marked, but the `console.log` block is dropped WHOLE when the value leaves it under
+// forty characters of budget, and that is the one case nothing marks. A caller told these are all
+// failures reads a correctable argument size as a broken tool and an authoring refusal as an outage.
+//
+// The gate is `authoringGate`, not `readGate`: `code_tool_create` names this tool for the contract
+// it no longer restates, and `filterScopes` grants exactly the scopes a client asked for, so a token
+// holding `mcp:write` without `mcp:read` is a real token that would otherwise be sent to a tool it
+// can neither list nor call. It answers a constant either way, so admitting the writer gives away
+// nothing the reader was not already given.
+export function codeToolSchema(principal: VerifiedToken): WriteResult {
+  const ctx = authoringGate(principal);
+  if ("ok" in ctx) return ctx;
+  return ok({
+    signature: "function (input, context) { ... }",
+    input:
+      "The arguments the agent sent, validated against the tool's inputSchema before the body runs. Only the fields you declared are present.",
+    context: CODE_TOOL_CONTEXT_VARS.map((v) => ({
+      name: v.name,
+      type: v.type,
+      always: v.always,
+      description: v.description,
+    })),
+    result:
+      "Whatever the body returns is rendered for the agent, JSON where JSON can say it. Returning nothing answers `undefined`. A returned promise is an ERROR: the sandbox has no event loop, so `async`, `await` and a returned promise are not supported. resultMaxChars bounds the returned VALUE, not the whole line: over it the value is cut at that many characters and `…[truncated]` is appended, and the console.log block is then given whatever budget the main line leaves and cut with `…[output truncated]` of its own. If that leaves under 40 characters the output block is dropped ENTIRELY, which is the one case nothing marks. Return the summary the agent needs rather than the whole payload.",
+    failure:
+      "A throw, a syntax error, or hitting timeoutMs, memoryBytes or stackBytes is the OPERATOR's failure, not the agent's: the call is marked failed, the agent answers without the tool, and the flow log keeps the reason. The conversation's attributes exceeding contextMaxChars fails the same way, and is the tenant's data rather than the body. Only a returned value is a normal result.",
+    argumentsTooLarge:
+      "inputMaxChars is not a failure. Arguments over it never reach the body: the call comes back as an ordinary result telling the agent to call again with less, the way a schema refusal does, and nothing is marked failed.",
+    authoringRefusal:
+      "codeMaxChars is not a call limit at all. A body longer than it is REFUSED by code_tool_create and code_tool_update, so nothing is saved and no call is ever marked failed for it.",
+    available: {
+      globals: CODE_TOOL_GLOBALS.map((g) => ({
+        name: g.name,
+        kind: g.kind,
+        ...(g.description ? { description: g.description } : {}),
+      })),
+      absent:
+        "No network, no fetch, no imports, no require, no async, no timers: the sandbox has no event loop and no host bindings.",
+    },
+    limits: {
+      timeoutMs: SANDBOX_TIMEOUT_MS,
+      memoryBytes: SANDBOX_MEMORY_BYTES,
+      stackBytes: SANDBOX_STACK_BYTES,
+      codeMaxChars: SANDBOX_CODE_MAX_CHARS,
+      inputMaxChars: CODE_TOOL_INPUT_MAX_CHARS,
+      contextMaxChars: CODE_TOOL_CONTEXT_MAX_CHARS,
+      resultMaxChars: MODEL_RESPONSE_CHAR_LIMIT,
+    },
+  });
 }
 
 // ── document templates ──
@@ -222,7 +389,7 @@ export async function documentTemplateGet(
 export async function documentTemplateSchema(
   principal: VerifiedToken,
 ): Promise<WriteResult> {
-  const ctx = readGate(principal);
+  const ctx = authoringGate(principal);
   if ("ok" in ctx) return ctx;
   return ok({
     ...documentAuthoringSchema(),
@@ -751,21 +918,111 @@ export async function apiKeyList(
 
 // ── audit log ──
 
+export interface AuditQueryArgs {
+  action?: string;
+  actor_type?: string;
+  actor_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  cursor?: string;
+  scope?: string;
+  // The selector `registerTenantTool` adds for a fleet-level token. Declared here only so this tool
+  // can refuse it against a fleet scope instead of letting the wrapper resolve a tenant the read
+  // will never use.
+  tenant?: unknown;
+}
+
 export async function auditList(
   principal: VerifiedToken,
-  args: { action?: string; limit?: number },
+  args: AuditQueryArgs,
   deps: WriteDeps = {},
 ): Promise<WriteResult> {
   const base = deps.base ?? basePrisma;
-  const ctx = readGate(principal);
+  const opts: Parameters<typeof listAudit>[1] = {};
+  // The same three trails the console offers (#520), for the same reason: the rows keyed to no
+  // tenant are unreachable from a tenant read rather than filtered out of it, so an agent asking
+  // "was this MCP client ever created" against the tenant trail gets an empty answer that reads as
+  // "no". `listAudit` refuses the wider two to anyone but a SUPER_ADMIN, so the door is the same one
+  // the REST surface uses; this only forwards the ask.
+  //
+  // READ BEFORE THE GATE, because it is what the gate depends on: a tenant target is required by the
+  // SCOPE and not by the tool, exactly as `ctxOrThrow` has it on the REST side.
+  if (args.scope !== undefined) {
+    if (typeof args.scope !== "string" || !isAuditScope(args.scope)) {
+      return err(`scope must be one of: ${AUDIT_SCOPES.join(", ")}`);
+    }
+    opts.scope = args.scope;
+  }
+  const scope = opts.scope ?? "tenant";
+  // A target NAMED alongside a trail that has no place for one is a contradiction, and the two
+  // readings are far apart: `tenant: "acme"` with `scope: "all"` almost certainly meant acme's rows
+  // plus the fleet's, while `all` answers with EVERY tenant's. Dropping the argument would hand back
+  // that much wider trail as if it were what was asked for.
+  if (
+    scope !== "tenant" &&
+    typeof args.tenant === "string" &&
+    args.tenant.trim()
+  ) {
+    return err(
+      `scope=${scope} reads a trail that belongs to no tenant, so it cannot also target one: drop \`tenant\`, or ask for scope=tenant.`,
+    );
+  }
+  const ctx = readGate(principal, { requireTenant: scope === "tenant" });
   if ("ok" in ctx) return ctx;
+  // NOTE: PRESENCE is `!== undefined`, never truthiness, and it is the same rule the REST filters
+  // answer to. `""` is what a caller sends for a field it meant to fill and did not, and reading it
+  // as "no filter" answers a narrowed request with the WHOLE trail — which on a trail reads as "and
+  // nothing else happened". An empty cursor is worse still: it silently restarts the walk.
+  if (args.action !== undefined) {
+    if (args.action === "") return err("action must not be empty");
+    opts.action = args.action;
+  }
+  // NOTE: `parseIsoInstant`, never `new Date`: that one normalises February 30 into March 2 without
+  // saying so, and reads a non-ISO string in the SERVER's timezone. Either way the tool answers with
+  // rows from an interval the caller did not ask for, while the REST endpoint refuses the same value.
+  for (const [key, raw] of [
+    ["since", args.since],
+    ["until", args.until],
+  ] as const) {
+    if (raw === undefined) continue;
+    const d = parseIsoInstant(raw);
+    if (d === null) {
+      return err(`${key} must be an ISO 8601 instant with an offset`);
+    }
+    opts[key] = d;
+  }
+  if (args.limit !== undefined) opts.limit = args.limit;
+  if (args.actor_type !== undefined) {
+    if (!(ACTOR_TYPES as readonly string[]).includes(args.actor_type)) {
+      return err(`actor_type must be one of: ${ACTOR_TYPES.join(", ")}`);
+    }
+    opts.actorType = args.actor_type as ActorType;
+  }
+  if (args.actor_id !== undefined) {
+    const v = parseMcpId(args.actor_id, "actor_id");
+    if (typeof v !== "bigint") return v;
+    opts.actorId = v;
+  }
+  if (args.cursor !== undefined) {
+    // TWO COLUMNS SINCE #530, so not `parseMcpId`. A cursor from the release before it is a bare
+    // id, and the codec reads it as that release's own `id <` BOUND -- an agent that stored one
+    // mid-walk keeps walking, from the same place and not from a different one, for the length of
+    // one rolling deploy. See `AuditCursor.beforeId`.
+    const c = parseAuditCursor(args.cursor);
+    if (c === null) {
+      return err(
+        "cursor must be the `nextCursor` from a previous audit_list response, passed back verbatim.",
+      );
+    }
+    opts.cursor = c;
+  }
   try {
+    const res = await listAudit(ctx, opts, base);
     return ok({
-      entries: await listAudit(
-        ctx,
-        { action: args.action, limit: args.limit },
-        base,
-      ),
+      entries: res.entries,
+      nextCursor: res.nextCursor,
+      latestAt: res.latestAt,
     });
   } catch (e) {
     return failOf(e);

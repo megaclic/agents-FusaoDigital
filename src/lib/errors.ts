@@ -33,7 +33,7 @@ export class AppError extends Error {
   // It is the server's vocabulary and not the caller's on purpose. The same service function is
   // reached by REST and by MCP, which spell the same write differently, so a name taken from the
   // request shape would be a different string depending on who called, and the console already
-  // maps these exact paths (TEXT_CAP_TARGETS, src/client/lib/configHealth.ts), which is the map a
+  // maps these exact paths (TEXT_CAP_TARGETS, src/modules/agents/config-health.ts), which is the map a
   // refusal wants to reuse. Absent whenever the refusal is not about one input: see
   // src/api/lib/refusal.ts for what the wire then carries. Issue #231.
   readonly field?: string;
@@ -133,3 +133,12 @@ export class ServiceUnavailableError extends AppError {
     super(message, 503);
   }
 }
+
+// NOTE: the taxonomy collision two classifiers on one inbox are refused with
+// (`assertNoClassifierOverlap`). It carries no sentence and no key of its own — the throw site
+// writes both, with its values — and exists ONLY so a caller can recognise it: `bindInbox`'s
+// persistence transaction has already told Chatwoot to switch bots by the time this can be raised,
+// and it is the one failure there a retry cannot repair, since the preflight raises the same
+// refusal on the way back in. So that caller compensates instead of reporting, and keying off the
+// class is what keeps the translation key written exactly once, at the throw.
+export class ClassifierOverlapError extends AppError {}

@@ -1,6 +1,7 @@
 import {
   Check,
   ChevronDown,
+  Code2,
   FileText,
   Loader2,
   type LucideIcon,
@@ -41,6 +42,7 @@ import {
   withToolpackArgNotes,
 } from "@/client/lib/toolpackTools";
 import { cn } from "@/client/lib/utils";
+import { CodeToolEditModal } from "@/client/pages/resources/CodeToolEditModal";
 import {
   DocumentTemplateModal,
   type TemplateModalPayload,
@@ -523,6 +525,7 @@ export function ToolGrantsEditor({
   // Create/edit a resource without leaving the agent editor. On save the catalog refetches; a
   // newly-created one is auto-granted to this agent (still needs the Tools-tab save to persist).
   const toolModal = useModalController<{ id?: string }>();
+  const codeToolModal = useModalController<{ id?: string }>();
   const mcpModal = useModalController<{ id?: string }>();
   const integrationModal = useModalController<{ id?: string }>();
   // Documents are the one grant whose target has a PICTURE, and the row alone (name, tool name, one
@@ -554,13 +557,30 @@ export function ToolGrantsEditor({
   const rag = grants.filter((g) => g.source === "RAG");
   const emit = (nonRag: GrantState[]) => onChange([...rag, ...nonRag]);
   const nonRag = grants.filter((g) => g.source !== "RAG");
+  // The grants as they stand NOW, for the auto-grants below. They are called from a dialog's
+  // callback, which holds the closure of the render that opened it: a save that answers after the
+  // operator changed another grant would otherwise emit the older list and revert that change.
+  const grantsRef = useRef(grants);
+  grantsRef.current = grants;
+  // Adds one grant to the CURRENT list, dropping nothing the operator did in the meantime.
+  const addGrant = (grant: GrantState) =>
+    onChange([...grantsRef.current, grant]);
+  const hasGrant = (match: (g: GrantState) => boolean) =>
+    grantsRef.current.some(match);
 
   const nativeGrant = grants.find((g) => g.source === "NATIVE");
   const allNativeNames = catalog.native.map((n) => n.name);
+  const allNativeSet = new Set(allNativeNames);
   // No explicit NATIVE row ⇒ all native tools (the permissive default for new/legacy agents). The
   // first toggle persists an explicit allowlist (which may even become empty = no native tools).
+  //
+  // Intersected with the catalog's names on the way in, so a stored allowlist carrying a native that
+  // no longer exists (e.g. `run_code`, removed when code tools replaced it) does not have that stale
+  // name re-sent on the next save — the toggle rebuilds the set from this one.
   const selectedNative = nativeGrant
-    ? new Set(nativeGrant.enabledTools ?? [])
+    ? new Set(
+        (nativeGrant.enabledTools ?? []).filter((n) => allNativeSet.has(n)),
+      )
     : new Set(allNativeNames);
   const handoffEnabled = selectedNative.has(HANDOFF_TOOL);
   // handoff_to_human + kanban_move_card carry their own settings; rendered as configurable cards
@@ -778,38 +798,68 @@ export function ToolGrantsEditor({
 
   // Idempotent grant-on (used to auto-select a just-created tool, vs the toggle above).
   function selectHttp(id: string) {
-    if (nonRag.some((g) => g.source === "HTTP" && g.toolDefinitionId === id))
+    if (hasGrant((g) => g.source === "HTTP" && g.toolDefinitionId === id))
       return;
-    emit([...nonRag, { source: "HTTP", toolDefinitionId: id }]);
+    addGrant({ source: "HTTP", toolDefinitionId: id });
   }
 
+  // The grant goes on BEFORE the refetch is awaited, and the order is the point: `selectHttp` reads
+  // the `nonRag` of the render that created this callback, so anything the operator changed while
+  // the catalog was in flight would be overwritten by that older list. Nothing here needs the
+  // refreshed catalog — the id is in hand — unlike the integration above, whose grant carries the
+  // instance's tool names and therefore waits for it.
   async function onToolSaved(
     saved: { id: string; name: string },
     isNew: boolean,
   ) {
-    await onCatalogChange();
     if (isNew) selectHttp(saved.id);
+    await onCatalogChange();
+  }
+
+  function toggleCode(id: string) {
+    const exists = nonRag.some(
+      (g) => g.source === "CODE" && g.codeToolDefinitionId === id,
+    );
+    emit(
+      exists
+        ? nonRag.filter(
+            (g) => !(g.source === "CODE" && g.codeToolDefinitionId === id),
+          )
+        : [...nonRag, { source: "CODE", codeToolDefinitionId: id }],
+    );
+  }
+
+  // Idempotent grant-on (used to auto-select a just-created code tool, vs the toggle above).
+  function selectCode(id: string) {
+    if (hasGrant((g) => g.source === "CODE" && g.codeToolDefinitionId === id))
+      return;
+    addGrant({ source: "CODE", codeToolDefinitionId: id });
+  }
+
+  async function onCodeToolSaved(
+    saved: { id: string; name: string },
+    isNew: boolean,
+  ) {
+    // Granted first, then refreshed — the reason is on `onToolSaved` above.
+    if (isNew) selectCode(saved.id);
+    await onCatalogChange();
   }
 
   // Idempotent grant-on for a just-created MCP server (empty tool subset; the operator then discovers
   // + picks tools, same as toggling one on).
   function selectMcp(id: string) {
-    if (
-      nonRag.some((g) => g.source === "MCP" && g.mcpServerConnectionId === id)
-    )
+    if (hasGrant((g) => g.source === "MCP" && g.mcpServerConnectionId === id))
       return;
-    emit([
-      ...nonRag,
-      { source: "MCP", mcpServerConnectionId: id, enabledTools: [] },
-    ]);
+    addGrant({ source: "MCP", mcpServerConnectionId: id, enabledTools: [] });
   }
 
   async function onMcpSaved(
     saved: { id: string; name: string },
     isNew: boolean,
   ) {
-    await onCatalogChange();
+    // Granted first, then refreshed — the reason is on `onToolSaved` above.
     if (isNew) selectMcp(saved.id);
+    await onCatalogChange();
   }
 
   async function onIntegrationSaved(
@@ -1037,6 +1087,58 @@ export function ToolGrantsEditor({
       </Section>
 
       <Section
+        id="tools-code"
+        icon={Code2}
+        title={t("editor.tools.code", "Code tools")}
+        description={t(
+          "editor.tools.codeDesc",
+          "Small functions you wrote, called with typed arguments.",
+        )}
+        action={
+          <CreateButton
+            label={t("editor.tools.createNew", "New")}
+            onClick={() => codeToolModal.open({})}
+          />
+        }
+      >
+        {catalog.codeTools.length === 0 ? (
+          <p className="text-text-muted text-xs">
+            {t(
+              "editor.tools.noCode",
+              "No code tools yet. Create some in Components.",
+            )}
+          </p>
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2">
+            {catalog.codeTools.map((ct) => (
+              <EditableCard
+                key={ct.id}
+                editLabel={t("common.edit", "Edit")}
+                onEdit={() => codeToolModal.open({ id: ct.id })}
+              >
+                <SelectableCard
+                  selected={nonRag.some(
+                    (g) =>
+                      g.source === "CODE" && g.codeToolDefinitionId === ct.id,
+                  )}
+                  onToggle={() => toggleCode(ct.id)}
+                  icon={Code2}
+                  title={ct.label}
+                  badge={
+                    !ct.enabled ? (
+                      <Badge variant="secondary">
+                        {t("common.disabled", "Disabled")}
+                      </Badge>
+                    ) : undefined
+                  }
+                />
+              </EditableCard>
+            ))}
+          </div>
+        )}
+      </Section>
+
+      <Section
         id="tools-mcp"
         icon={Plug}
         title={t("editor.tools.mcp", "MCP servers")}
@@ -1120,15 +1222,19 @@ export function ToolGrantsEditor({
                               : t("editor.tools.mcpCollapseList", "Hide tools")}
                           </span>
                           <span className="text-text-muted text-xs">
-                            {t("editor.tools.mcpSelected", "{{n}} selected", {
-                              n: grant.enabledTools?.length ?? 0,
-                            })}
+                            {t(
+                              "editor.tools.mcpSelected",
+                              "{{count}} selected",
+                              {
+                                count: grant.enabledTools?.length ?? 0,
+                              },
+                            )}
                           </span>
                         </button>
                       ) : (
                         <span className="text-text-muted text-xs">
-                          {t("editor.tools.mcpSelected", "{{n}} selected", {
-                            n: grant.enabledTools?.length ?? 0,
+                          {t("editor.tools.mcpSelected", "{{count}} selected", {
+                            count: grant.enabledTools?.length ?? 0,
                           })}
                         </span>
                       )}
@@ -1288,8 +1394,8 @@ export function ToolGrantsEditor({
                             )}
                       </span>
                       <span className="text-text-muted text-xs">
-                        {t("editor.tools.mcpSelected", "{{n}} selected", {
-                          n: grant.enabledTools?.length ?? 0,
+                        {t("editor.tools.mcpSelected", "{{count}} selected", {
+                          count: grant.enabledTools?.length ?? 0,
                         })}
                       </span>
                     </button>
@@ -1681,8 +1787,8 @@ export function ToolGrantsEditor({
                 }
                 error={refusals.kanbanInstructions}
                 group
-                description={t(
-                  "editor.kanbanInstructionsHint",
+                help={t(
+                  "editor.kanbanInstructionsHelp",
                   "Optional. Explains your funnel and when to move a card between steps. The AI already sees the current step, the available steps, and the card data; this adds your rules. Appended to the kanban tool description.",
                 )}
               >
@@ -1760,7 +1866,7 @@ export function ToolGrantsEditor({
               group
               description={t(
                 "editor.updateKanbanInstructionsHint",
-                "Optional. Explains when and how the agent should edit the card's title, description, priority or dates. The AI already sees the current card values; this adds your rules. Appended to the tool description.",
+                "Optional. Say when and how the agent should change the card's title, description, priority, or dates.",
               )}
             >
               <Textarea
@@ -1793,7 +1899,7 @@ export function ToolGrantsEditor({
               group
               description={t(
                 "editor.attrInstructionsHint",
-                "Optional. Explains which attribute to set on the conversation, the contact, or the kanban card, and when. The AI already sees the defined attributes; this adds your rules. Appended to the tool description.",
+                "Optional. Say which conversation, contact, or kanban card attribute the agent should set, and when.",
               )}
             >
               <Textarea
@@ -1857,6 +1963,11 @@ export function ToolGrantsEditor({
       </CollapsibleSection>
 
       <ToolEditModal modal={toolModal} sharedNotice onSaved={onToolSaved} />
+      <CodeToolEditModal
+        modal={codeToolModal}
+        sharedNotice
+        onSaved={onCodeToolSaved}
+      />
       <McpEditModal modal={mcpModal} sharedNotice onSaved={onMcpSaved} />
       <IntegrationEditModal
         modal={integrationModal}

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { getActiveTenantId } from "@/client/lib/activeTenant";
 import { api } from "@/client/lib/api";
 import { canonicalVaultRef, formatVaultRef } from "@/client/lib/credentialRef";
+import { dialableBaseUrl } from "@/client/lib/secretTypes";
+import type { VaultRefFacts } from "@/modules/agents/config-health";
 
 // Derived from the treaty response, never hand-mirrored (see docs/eden-treaty.md).
 export type VaultEntry = NonNullable<
@@ -101,6 +103,15 @@ export async function refreshVault(): Promise<VaultEntry[]> {
   }
 }
 
+// WHICH VAULT THIS TAB IS ON, as a number that moves when the vault is CHANGED and not when a
+// listener is merely told to re-read. `refreshVault` announces twice on purpose — once on the drop
+// and once when the new list lands — so counting notifications counts one mutation as two, and a
+// reader that pins something to "the vault as it was" would see it expire between the two halves of
+// a single refresh (round 15 of review).
+export function vaultRevision(): number {
+  return generation;
+}
+
 // Drop cached vault data (after a mutation, e.g. a VaultPanel delete) and notify listeners; the next
 // loadVault re-fetches.
 export function invalidateVault(): void {
@@ -138,11 +149,15 @@ export function useVaultBaseUrls(): (ref: string) => string | null {
     return () => window.removeEventListener(VAULT_CHANGED_EVENT, onChanged);
   }, [load]);
   return useCallback(
-    (ref: string) =>
-      (ref
-        ? entries.find((e) => formatVaultRef(e.id) === canonicalVaultRef(ref))
-            ?.baseUrl
-        : null) ?? null,
+    (ref: string) => {
+      if (!ref) return null;
+      // NOTE: the DIALABLE one. The listing reports the row as it is, so a stray base URL stays
+      // visible; what a page DECIDES with has to be what the runtime will use (#504).
+      const entry = entries.find(
+        (e) => formatVaultRef(e.id) === canonicalVaultRef(ref),
+      );
+      return entry ? dialableBaseUrl(entry.kind, entry.baseUrl) : null;
+    },
     [entries],
   );
 }
@@ -159,6 +174,11 @@ export function useVaultBaseUrls(): (ref: string) => string | null {
 export function useVaultRefs(): {
   known: Set<string> | null;
   pending: Set<string>;
+  // What the vault says each ref in `known` IS, keyed the same way, so a field can ask whether the
+  // entry it names can actually serve it — resolving and serving are different questions (issue
+  // #471). The value's shape comes back as a boolean the server computed, never as the value. Null
+  // alongside `known` and for the same reason: an empty map would read as "nothing fits".
+  facts: Map<string, VaultRefFacts> | null;
   pendingEntries: VaultEntry[];
 } {
   const [entries, setEntries] = useState<VaultEntry[] | null>(null);
@@ -198,6 +218,18 @@ export function useVaultRefs(): {
     pending: useMemo(
       () => new Set(pendingEntries.map((e) => formatVaultRef(e.id))),
       [pendingEntries],
+    ),
+    facts: useMemo(
+      () =>
+        entries
+          ? new Map(
+              entries.map((e) => [
+                formatVaultRef(e.id),
+                { kind: e.kind, valueFitsKind: e.valueFitsKind },
+              ]),
+            )
+          : null,
+      [entries],
     ),
     pendingEntries,
   };

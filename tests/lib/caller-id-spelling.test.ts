@@ -62,6 +62,20 @@ const NOT_A_CALLERS_ID: Record<string, string> = {
     "a subscription id off the DTO of the row this function just updated.",
   "src/graph/tools/documents.ts | issued.id":
     "the id of the document row this tool just issued.",
+  "src/modules/zpro/debounce.ts | parts[1] as string":
+    "parsed out of a threadId this app minted (zproThreadId); parts.length and the `zpro` tag are checked above, and the whole parse is inside a try/catch that answers null.",
+  "src/modules/zpro/debounce.ts | parts[2] as string":
+    "same threadId, same guard.",
+  "src/modules/zpro/debounce.ts | last":
+    "a watermark id from readLastMessageId, which answers null on anything it cannot parse; the caller returns before this line runs on that null.",
+  "src/modules/zpro/mirror.ts | msg.timestamp":
+    "a WhatsApp webhook field written straight to a message row's own timestamp column, never used to authorize or address anything.",
+  "src/modules/zpro/status-reconcile.ts | zproInstanceIdRaw":
+    "a scheduler job payload this app enqueued; typeof-checked above and the cast is inside a try/catch that answers 'done' rather than throwing.",
+  "src/modules/channel-redirect/followup.ts | entryZproInstanceId":
+    "an operator-configured agent setting (agent.settings.channelRedirect.entryZproInstanceId), never caller input.",
+  "src/api/v1/zpro-conversations.controller.ts | cursor":
+    "the keyset cursor, parsed inside parseCursor's own try/catch that answers null on anything malformed — the same shape requireDbId argues for, spelled locally because a cursor is not a caller's id (it never resolves to a row on its own).",
 };
 
 // Comments and string CONTENTS blanked to spaces of the same length, so a `BigInt(` quoted inside a
@@ -287,7 +301,15 @@ export function unwaived(
 async function sources(): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   for await (const file of new Glob("src/**/*.{ts,tsx}").scan(".")) {
-    files.set(file, await Bun.file(file).text());
+    // RAW on purpose. `bigIntArgs` runs its own `blankNonCode` for the detection and then takes the
+    // argument's TEXT as the ledger key, so pre-stripping rewrites the keys: `BigInt(ref.slice(
+    // "vault:".length))` becomes an argument full of spaces and the waiver stops matching. The one
+    // sweep in this family that must not be handed stripped source (found by review).
+    //
+    // bun's Glob yields OS-native separators (backslashes on Windows); normalized here so the map
+    // key matches the forward-slash literals NOT_A_CALLERS_ID is written with.
+    const normalized = file.replaceAll("\\", "/");
+    files.set(normalized, await Bun.file(normalized).text());
   }
   return files;
 }
@@ -325,7 +347,7 @@ describe("a caller's id is parsed, never cast", () => {
   });
 
   test("the not-a-callers-id ledger may only shrink", () => {
-    expectWaiverLedger("NOT_A_CALLERS_ID", NOT_A_CALLERS_ID, 17);
+    expectWaiverLedger("NOT_A_CALLERS_ID", NOT_A_CALLERS_ID, 24);
   });
 
   // The sweep is worth nothing if it reads no files, and a wrong cwd or a renamed directory is

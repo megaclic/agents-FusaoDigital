@@ -27,6 +27,7 @@ import {
 import { enqueueJob } from "@/modules/scheduler/service";
 import { generateRouteToken } from "@/modules/webhooks/inbound/route-token";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { isOwnershipRead } from "../utils/ownership-read";
 
 // /reset drives real ChatwootClient calls (the command path builds its own client — no injectable
 // factory reaches it), so the double here is `globalThis.fetch` shaped like a Chatwoot server.
@@ -366,6 +367,13 @@ describe.skipIf(!dbUp)(
           name: "Atendente",
           systemPrompt: "x",
           mode: "test",
+          // A RUNNABLE model configuration, which the hand-back asks for since issue #495 review
+          // round 6: an unconfigured agent cannot answer, so it cannot be handed a conversation.
+          modelConfig: {
+            provider: "openai-compatible",
+            model: "local",
+            baseURL: "https://llm.example.invalid/v1",
+          },
         },
       });
       const inbox = await suDb.inbox.create({
@@ -686,6 +694,13 @@ describe.skipIf(!dbUp)(
             name: "Atendente",
             systemPrompt: "x",
             mode: "test",
+            // A RUNNABLE model configuration, which the hand-back asks for since issue #495 review
+            // round 6: an unconfigured agent cannot answer, so it cannot be handed a conversation.
+            modelConfig: {
+              provider: "openai-compatible",
+              model: "local",
+              baseURL: "https://llm.example.invalid/v1",
+            },
           },
         });
         const inbox = await suDb.inbox.create({
@@ -837,6 +852,92 @@ describe.skipIf(!dbUp)(
       // Nor the takeover sentence: the agent HAS it back, and a sentence that fired on every
       // hand-back would pass the takeover tests without meaning anything.
       expect(ack).not.toContain("Alguém assumiu");
+    });
+
+    // #398. Everything above is what the operator sees; this is the only thing that survives the
+    // conversation being deleted. The command erases an episode, and until now it left no durable
+    // record of any kind.
+    test("the erase, and the hand-back inside it, are on the trail", async () => {
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM audit_logs WHERE tenant_id = ${tenantId}`,
+      );
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset("/reset", CONV_ID, {
+        status: "open",
+        assigneeType: "User",
+      });
+
+      const rows = await suDb.auditLog.findMany({
+        where: { tenantId },
+        orderBy: { id: "asc" },
+      });
+      // Two acts, two rows, and neither is the other: the hand-back is the state change a console
+      // button also performs, and the reset is the erase that has no button at all.
+      expect(rows.map((r) => r.action)).toEqual([
+        "conversation.return",
+        "conversation.reset",
+      ]);
+      // NOT `user`, which is what an unset actorType defaults to. /reset is only recognized on an
+      // INCOMING message, so the person who typed it is the contact, who is nobody in `users`, and
+      // a row reading `user` with a null id would say the platform could not identify an operator
+      // rather than that there was none.
+      expect(rows.every((r) => r.actorType === "system")).toBe(true);
+      expect(rows.every((r) => r.actorId === null)).toBe(true);
+      const reset = rows[1];
+      expect(reset?.after).toEqual({
+        complete: true,
+        failed: [],
+        handBack: "returned",
+      });
+    });
+
+    // The hand-back has THREE outcomes and `undefined` is one of them: the conversation was already
+    // the agent's, so nothing was attempted. Left as it came, Prisma drops the key on the way into
+    // the jsonb column and the row simply lacks the field the other rows carry.
+    test("a reset with nothing to hand back still says so", async () => {
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM audit_logs WHERE tenant_id = ${tenantId}`,
+      );
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      const rows = await suDb.auditLog.findMany({
+        where: { tenantId },
+        orderBy: { id: "asc" },
+      });
+      expect(rows.map((r) => r.action)).toEqual(["conversation.reset"]);
+      expect(rows[0]?.after).toEqual({
+        complete: true,
+        failed: [],
+        handBack: "not-attempted",
+      });
+    });
+
+    test("a partial erase names the steps that did not run", async () => {
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM audit_logs WHERE tenant_id = ${tenantId}`,
+      );
+      const cw = fakeChatwoot(/\/custom_attributes$/);
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      const [row, ...rest] = await suDb.auditLog.findMany({
+        where: { tenantId, action: "conversation.reset" },
+        orderBy: { id: "asc" },
+      });
+      expect(rest).toEqual([]);
+      const after = row?.after as {
+        complete: boolean;
+        failed: string[];
+        handBack: string | null;
+      };
+      expect(after.complete).toBe(false);
+      expect(after.failed).toContain("clear custom attributes");
+      // The steps that DID run are not in the list, which is what makes it readable as "what
+      // survived" rather than as "the reset failed".
+      expect(after.failed).not.toContain("clear labels");
     });
 
     // The other way the conversation can still be a human's when the reset ends: the assignment call
@@ -1392,10 +1493,86 @@ describe.skipIf(!dbUp)(
       });
     });
 
+    // A verdict armed AFTER the command belongs to the new episode (issue #477 review, round 21).
+    // The cancel runs late in the reset — past the memory clear and a dozen Chatwoot calls — so a
+    // customer message landing in that stretch arms a burst the operator wants classified, and an
+    // unqualified prefix cancel marked it DONE.
+    test("a verdict armed after the command survives the reset", async () => {
+      const threadId = `${tenantId}:${instanceId}:${CONV_ID}`;
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
+      await suDb.schedulerJob.createMany({
+        data: [
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:7`,
+            runAt: new Date(Date.now() + 3_600_000),
+            payload: {
+              threadId,
+              agentId: "7",
+              reason: "burst",
+              atMessageId: 1,
+            },
+          },
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:9`,
+            runAt: new Date(Date.now() + 3_600_000),
+            // Above any id this suite's commands carry (`9000 + n`): the new episode's burst.
+            payload: {
+              threadId,
+              agentId: "9",
+              reason: "burst",
+              atMessageId: 999_999,
+            },
+          },
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:11`,
+            runAt: new Date(Date.now() + 3_600_000),
+            // A RESOLVE names no message, so it orders against nothing here and is left to the
+            // tick's own reopen fence — the command is an incoming message, so the conversation the
+            // verdict was armed for is no longer resolved.
+            payload: { threadId, agentId: "11", reason: "resolved" },
+          },
+        ],
+      });
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      const jobs = await suDb.schedulerJob.findMany({
+        where: { tenantId, kind: "OBSERVE" },
+        select: { dedupeKey: true, status: true },
+        orderBy: { dedupeKey: "asc" },
+      });
+      expect(
+        jobs.map((j) => [j.dedupeKey.split(":").at(-1), j.status]),
+      ).toEqual([
+        ["11", "PENDING"],
+        ["7", "DONE"],
+        ["9", "PENDING"],
+      ]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: CONV_ID },
+        select: { resetAtMessageId: true },
+      });
+      // The boundary the cancel was fenced on is the command's own message id.
+      expect(conv.resetAtMessageId).toBeGreaterThan(2);
+      expect(conv.resetAtMessageId).toBeLessThan(999_999);
+    });
+
     // Jobs the episode armed. /reset already cancels FOLLOWUP and MEMORY_COMPACT; these two carry
     // exactly the same argument and were left running.
     test("the jobs the episode armed are cancelled with it", async () => {
       const threadId = `${tenantId}:${instanceId}:${CONV_ID}`;
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
       await suDb.schedulerJob.createMany({
         data: [
           {
@@ -1421,6 +1598,36 @@ describe.skipIf(!dbUp)(
             runAt: new Date(Date.now() + 3_600_000),
             payload: { threadId, agentBotId: 1, burstStartedAt: Date.now() },
           },
+          // A watcher's queued VERDICT (issue #477 review, round 5). It reads the conversation from
+          // Chatwoot rather than from memory, so left armed it wakes up after this command and
+          // writes back the very labels the reset cleared. Two of them, because the key carries the
+          // classifier and a conversation can have two.
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:7`,
+            runAt: new Date(Date.now() + 3_600_000),
+            payload: {
+              threadId,
+              agentId: "7",
+              reason: "burst",
+              // Below the command's own id, which is what makes these the OLD episode's verdicts
+              // (round 21). The command arrives as message `9000 + n`.
+              atMessageId: 1,
+            },
+          },
+          {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: `observe:${threadId}:9`,
+            runAt: new Date(Date.now() + 3_600_000),
+            payload: {
+              threadId,
+              agentId: "9",
+              reason: "burst",
+              atMessageId: 2,
+            },
+          },
         ],
       });
       const cw = fakeChatwoot();
@@ -1431,17 +1638,27 @@ describe.skipIf(!dbUp)(
         where: {
           tenantId,
           kind: {
-            in: ["REDIRECT_FOLLOWUP", "APPOINTMENT_REMINDER", "DEBOUNCE"],
+            in: [
+              "REDIRECT_FOLLOWUP",
+              "APPOINTMENT_REMINDER",
+              "DEBOUNCE",
+              "OBSERVE",
+            ],
           },
         },
         select: { kind: true, status: true, payload: true },
         orderBy: { kind: "asc" },
       });
+      expect(
+        jobs.filter((j) => j.kind === "OBSERVE").map((j) => j.status),
+      ).toEqual(["DONE", "DONE"]);
       // Enum declaration order, which is what Prisma sorts an enum column by.
       expect(jobs.map((j) => [j.kind, j.status])).toEqual([
         ["DEBOUNCE", "DONE"],
         ["APPOINTMENT_REMINDER", "DONE"],
         ["REDIRECT_FOLLOWUP", "DONE"],
+        ["OBSERVE", "DONE"],
+        ["OBSERVE", "DONE"],
       ]);
       // Tombstoned too, and for the same reason as the reminder: a flush already CLAIMED is past
       // every cancel, so the stamp is the only thing its handler can see.
@@ -2566,18 +2783,13 @@ describe.skipIf(!dbUp)(
     // ownership answers `none`: the irreversible half (taking the conversation off a human) is the
     // one that must not fire on a guess.
     test("an ownership read that fails does not strand the command", async () => {
+      let fenceReads = 0;
       const blind = appDb.$extends({
         query: {
           conversation: {
             findUnique({ args, query }) {
-              const sel = (args.select ?? {}) as Record<string, unknown>;
-              // The fence's own read, identified by the three columns it asks for.
-              if (
-                Object.keys(sel).length === 3 &&
-                sel.assigneeType === true &&
-                sel.assigneeId === true &&
-                sel.status === true
-              ) {
+              if (isOwnershipRead(args.select)) {
+                fenceReads += 1;
                 return Promise.reject(new Error("connection reset"));
               }
               return query(args);
@@ -2593,6 +2805,9 @@ describe.skipIf(!dbUp)(
         base: blind,
       });
 
+      // Guards the guard: a fence that stopped selecting these columns would make this test pass by
+      // injecting nothing at all.
+      expect(fenceReads).toBeGreaterThan(0);
       // The command still reports what it did — including the sentence about the hand-back, whose
       // own ownership read is the second place this could have thrown after the cleanup.
       expect(ackCalls(cw.calls).length).toBeGreaterThan(0);
@@ -2664,17 +2879,13 @@ describe.skipIf(!dbUp)(
         where: { id: agentId },
         data: { enabled: false },
       });
+      let fenceReads = 0;
       const blind = appDb.$extends({
         query: {
           conversation: {
             findUnique({ args, query }) {
-              const sel = (args.select ?? {}) as Record<string, unknown>;
-              if (
-                Object.keys(sel).length === 3 &&
-                sel.assigneeType === true &&
-                sel.assigneeId === true &&
-                sel.status === true
-              ) {
+              if (isOwnershipRead(args.select)) {
+                fenceReads += 1;
                 return Promise.reject(new Error("connection reset"));
               }
               return query(args);
@@ -2691,6 +2902,7 @@ describe.skipIf(!dbUp)(
           base: blind,
         });
 
+        expect(fenceReads).toBeGreaterThan(0);
         expect(ackCalls(cw.calls).length).toBeGreaterThan(0);
         expect(
           cw.calls.filter((c) =>

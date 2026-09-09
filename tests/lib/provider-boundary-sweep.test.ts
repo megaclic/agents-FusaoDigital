@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { codeOnly } from "@/tests/utils/source-text";
 
 // THE GUARD AGAINST THE TENTH CALL SITE.
 //
@@ -52,6 +53,11 @@ const BOUNDARIES: Record<string, Discharge> = {
   // operator credential.
   "src/modules/zpro/stt.ts": "not-a-provider",
   "src/modules/zpro/vision.ts": "not-a-provider",
+  // Matches on two UNRELATED sites, neither a boundary. The re-engage runnability probe's `apiKey`
+  // feeds `createChatModel`, which only builds the client object and calls nobody (the request runs
+  // elsewhere, behind `runModelCall`); the file's own `await fetch(` is the avatar proxy, an
+  // unauthenticated Chatwoot/WhatsApp CDN image download that carries no operator credential.
+  "src/modules/conversations/service.ts": "not-a-provider",
 };
 
 // Authenticates to something the operator configured, AND issues the request itself.
@@ -69,7 +75,10 @@ async function candidates(): Promise<string[]> {
     // bun's Glob yields OS-native separators (backslashes on Windows); the list below is written
     // with forward slashes, like every path elsewhere in this repo.
     const normalized = file.replaceAll("\\", "/");
-    if (isCandidate(await Bun.file(file).text())) found.push(normalized);
+    // Through the scan, so a comment naming `await fetch(` does not make a file a provider boundary
+    // (#424). Measured: same six files with and without, which is what makes it safe to adopt.
+    if (isCandidate(codeOnly(await Bun.file(file).text())))
+      found.push(normalized);
   }
   return found.sort();
 }
@@ -99,7 +108,7 @@ describe("every provider boundary answers for the other end's text", () => {
   test("each answer is the one the file actually gives", async () => {
     const offenders: string[] = [];
     for (const [file, discharge] of Object.entries(BOUNDARIES)) {
-      const src = await Bun.file(file).text();
+      const src = codeOnly(await Bun.file(file).text());
       if (discharge === "throughProvider") {
         // Per ENTRY POINT, not per file. Checking the file only asks whether the wrapper appears
         // somewhere in it, and a module with two exported calls satisfies that with one of them

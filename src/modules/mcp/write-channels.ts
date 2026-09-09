@@ -1,14 +1,22 @@
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
-import { truncForAudit } from "@/modules/audit/projection";
 import {
+  assertAccountsClaimable,
+  assertAccountsSelectable,
+  assertBindTargetNotObserving,
+  assertDeploymentConnectable,
+  assertDeploymentNotSwitching,
+  assertInboxBindable,
+  assertInboxReconnectable,
   bindInbox,
   connectChatwootDeployment,
   getChatwootInstance,
   listChatwootAccounts,
   listDeploymentAccounts,
   listInboxes,
+  observeInbox,
   previewInboxRemoval,
+  readObserveTarget,
   reconcileInboxBots,
   reconnectInbox,
   removeInbox,
@@ -16,6 +24,7 @@ import {
   setConnectedAccounts,
   softDisconnectChatwootInstance,
   syncInboxes,
+  unobserveInbox,
 } from "@/modules/chatwoot/management";
 import type { VerifiedToken } from "./oauth/tokens";
 import {
@@ -24,7 +33,6 @@ import {
   gate,
   ok,
   parseMcpId,
-  recordMcpAudit,
   type WriteDeps,
   type WriteResult,
 } from "./write";
@@ -63,34 +71,34 @@ export async function deploymentConnect(
   const ctx = adminGate(principal);
   if ("ok" in ctx) return ctx;
   if (!args.admin_token) return err("admin_token is required");
-  if (args.dry_run !== false) {
-    return ok({
-      dryRun: true,
-      action: "connect",
-      resource: "chatwoot_deployment",
-      // The raw token is never echoed back, not even in the preview.
-      preview: { baseUrl: args.base_url, adminToken: "(redacted)" },
-    });
-  }
   try {
+    if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      const data = await assertDeploymentConnectable({
+        baseUrl: args.base_url,
+        adminToken: args.admin_token,
+      });
+      // ADVISORY, unlike the line above it: this one READS. It passes the base URL that line
+      // NORMALIZED, because that is what the write compares against and what it stores — asking
+      // with the raw string would call a connect to the same server a switch (#490).
+      await assertDeploymentNotSwitching(ctx, data.baseUrl, base);
+      return ok({
+        dryRun: true,
+        action: "connect",
+        resource: "chatwoot_deployment",
+        // The raw token is never echoed back, not even in the preview.
+        preview: { baseUrl: args.base_url, adminToken: "(redacted)" },
+      });
+    }
     const result = await connectChatwootDeployment(
       ctx,
       { baseUrl: args.base_url, adminToken: args.admin_token },
       {},
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "deployment.connect",
-      target: `chatwoot_deployment:${result.deployment.id}`,
-      before: null,
-      after: truncForAudit({
-        id: result.deployment.id,
-        baseUrl: result.deployment.baseUrl,
-        reachableAccounts: result.accounts.length,
-      }),
-    });
     return ok({ dryRun: false, applied: true, ...result });
   } catch (e) {
     return failOf(e);
@@ -124,14 +132,6 @@ export async function deploymentRotateToken(
       {},
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "deployment.rotate_token",
-      target: `chatwoot_deployment:${updated.id}`,
-      before: null,
-      after: truncForAudit({ id: updated.id, adminTokenRotated: true }),
-    });
     return ok({ dryRun: false, applied: true, deployment: updated });
   } catch (e) {
     return failOf(e);
@@ -166,33 +166,44 @@ export async function deploymentSetAccounts(
   const ctx = adminGate(principal);
   if ("ok" in ctx) return ctx;
   const target = "chatwoot_deployment:accounts";
-  if (args.dry_run !== false) {
-    return ok({
-      dryRun: true,
-      action: "set_accounts",
-      target,
-      accountIds: args.account_ids,
-      note: "Connects newly-selected accounts (syncs their inboxes) and soft-disconnects de-selected ones (history kept). Calls Chatwoot.",
-    });
-  }
   try {
+    if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      await assertAccountsClaimable(ctx, args.account_ids, base);
+      // NOTE: ADVISORY, like the claim check above it: the list lives on the operator's Chatwoot and
+      // can move between the preview and the apply, which asks again inside its own sequence. What
+      // it buys is that an id this deployment cannot operate is refused here instead of being
+      // previewed as a connection the apply then declines (#490, #503).
+      let reported: number[] | null = null;
+      try {
+        reported = (
+          await listDeploymentAccounts(
+            ctx,
+            { fetchProfile: deps.fetchProfile },
+            base,
+          )
+        ).map((a) => a.id);
+      } catch {
+        // probe failed — the core applies the same fallback cap for itself
+      }
+      assertAccountsSelectable([...new Set(args.account_ids)], reported);
+      return ok({
+        dryRun: true,
+        action: "set_accounts",
+        target,
+        accountIds: args.account_ids,
+        note: "Connects newly-selected accounts (syncs their inboxes) and soft-disconnects de-selected ones (history kept). Calls Chatwoot.",
+      });
+    }
     const accounts = await setConnectedAccounts(
       ctx,
       args.account_ids,
-      {},
+      { fetchProfile: deps.fetchProfile, makeClient: deps.makeClient },
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "deployment.set_accounts",
-      target,
-      before: null,
-      after: truncForAudit({
-        accountIds: args.account_ids,
-        connected: accounts.filter((a) => a.disconnectedAt === null).length,
-      }),
-    });
     return ok({ dryRun: false, applied: true, accounts });
   } catch (e) {
     return failOf(e);
@@ -224,14 +235,6 @@ export async function instanceDisconnect(
       });
     }
     await softDisconnectChatwootInstance(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "instance.disconnect",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -282,14 +285,6 @@ export async function instanceSyncInboxes(
       });
     }
     const result = await syncInboxes(ctx, id, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "instance.sync_inboxes",
-      target,
-      before: null,
-      after: truncForAudit(result),
-    });
     return ok({ dryRun: false, applied: true, target, result });
   } catch (e) {
     return failOf(e);
@@ -320,6 +315,15 @@ export async function inboxBind(
     if (!current) return err("inbox not found");
     const target = `inbox:${inboxId}`;
     if (args.dry_run !== false) {
+      // NOTE: the core's own two questions past existence — the account is still connected, and the
+      // agent being bound exists. `listInboxes` above answers neither, and the preview approved a
+      // bind the apply refuses with a 409 (#510).
+      await assertInboxBindable(ctx, inboxId, agentId, base);
+      // The apply refuses an agent that already OBSERVES this inbox (issue #476 review, round 25),
+      // and a preview that approves it hands the caller a confident yes followed by a 422.
+      if (agentId !== null) {
+        await assertBindTargetNotObserving(ctx, inboxId, agentId, base);
+      }
       return ok({
         dryRun: true,
         action: "bind",
@@ -330,14 +334,71 @@ export async function inboxBind(
       });
     }
     const updated = await bindInbox(ctx, inboxId, agentId, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "inbox.bind",
-      target,
-      before: truncForAudit({ agentId: current.agentId }),
-      after: truncForAudit({ agentId: updated.agentId }),
-    });
+    return ok({ dryRun: false, applied: true, target, inbox: updated });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// The OBSERVER binding (issue #476): attach a monitoring agent to an inbox as an observer, or
+// detach it. Same preview shape as `inboxBind`; the apply provisions/attaches the agent's bot on
+// Chatwoot (or detaches it) and records the observer list before and after.
+export async function inboxObserve(
+  principal: VerifiedToken,
+  args: { inbox_id: string; agent_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  return observerWrite(principal, args, "observe", deps);
+}
+
+export async function inboxUnobserve(
+  principal: VerifiedToken,
+  args: { inbox_id: string; agent_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  return observerWrite(principal, args, "unobserve", deps);
+}
+
+async function observerWrite(
+  principal: VerifiedToken,
+  args: { inbox_id: string; agent_id: string; dry_run?: boolean },
+  action: "observe" | "unobserve",
+  deps: WriteDeps,
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const inboxId = parseMcpId(args.inbox_id, "inbox_id");
+  if (typeof inboxId !== "bigint") return inboxId;
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
+  try {
+    const inboxes = await listInboxes(ctx, base);
+    const current = inboxes.find((i) => i.id === String(inboxId));
+    if (!current) return err("inbox not found");
+    const target = `inbox:${inboxId}`;
+    if (args.dry_run !== false) {
+      // Only `observe` has preconditions; `unobserve` is idempotent on both sides and refuses
+      // nothing, so there is nothing for its preview to re-ask.
+      if (action === "observe") {
+        await readObserveTarget(ctx, inboxId, agentId, base);
+      }
+      return ok({
+        dryRun: true,
+        action,
+        target,
+        currentObserverAgentIds: current.observerAgentIds,
+        agentId: String(agentId),
+        note:
+          action === "observe"
+            ? "Observing provisions the agent's bot and attaches it to the inbox as an observer (calls Chatwoot). Only a monitoring agent can observe."
+            : "Detaches the agent's bot as an observer of the inbox (calls Chatwoot).",
+      });
+    }
+    const updated =
+      action === "observe"
+        ? await observeInbox(ctx, inboxId, agentId, {}, base)
+        : await unobserveInbox(ctx, inboxId, agentId, {}, base);
     return ok({ dryRun: false, applied: true, target, inbox: updated });
   } catch (e) {
     return failOf(e);
@@ -366,6 +427,11 @@ export async function inboxRemove(
       name: inbox.name,
       chatwootInboxId: inbox.chatwootInboxId,
       agentId: inbox.agentId,
+      // THE WATCHERS THE CASCADE WILL TAKE (issue #476 review, round 50). `InboxObserver` cascades on
+      // the inbox's foreign key, so this removal discards bindings the caller never named — and those
+      // bindings are what refuse the agent's mode change and its deletion elsewhere. A preview that
+      // omits them shows a removal smaller than the one it is approving.
+      observerAgentIds: inbox.observerAgentIds,
     };
     if (args.dry_run !== false) {
       return ok({
@@ -380,14 +446,6 @@ export async function inboxRemove(
       });
     }
     await removeInbox(ctx, inboxId, cw, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "inbox.remove",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -405,24 +463,21 @@ export async function inboxReconnect(
   const inboxId = parseMcpId(args.inbox_id, "inbox_id");
   if (typeof inboxId !== "bigint") return inboxId;
   const target = `inbox:${inboxId}`;
-  if (args.dry_run !== false) {
-    return ok({
-      dryRun: true,
-      action: "reconnect",
-      target,
-      note: "Re-provisions the inbox's bot on Chatwoot (calls Chatwoot).",
-    });
-  }
   try {
+    if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      await assertInboxReconnectable(ctx, inboxId, base);
+      return ok({
+        dryRun: true,
+        action: "reconnect",
+        target,
+        note: "Re-provisions the inbox's bot on Chatwoot (calls Chatwoot).",
+      });
+    }
     const updated = await reconnectInbox(ctx, inboxId, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "inbox.reconnect",
-      target,
-      before: null,
-      after: truncForAudit({ id: updated.id, agentId: updated.agentId }),
-    });
     return ok({ dryRun: false, applied: true, target, inbox: updated });
   } catch (e) {
     return failOf(e);
@@ -443,20 +498,20 @@ export async function inboxReconcile(
       dryRun: true,
       action: "reconcile",
       target,
-      note: "Checks every bound inbox's bot against Chatwoot and re-provisions missing ones (calls Chatwoot).",
+      note: "Reads every bound inbox's bot status from Chatwoot (calls Chatwoot). Changes nothing: repairing one is inbox_reconnect.",
     });
   }
   try {
-    const status = await reconcileInboxBots(ctx, {}, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "inbox.reconcile",
+    const reconciled = await reconcileInboxBots(ctx, {}, base);
+    // `status` stays the flat responder map it has always been — a caller reading `status[inboxId]`
+    // is not broken by the observers arriving beside it, under their own key (issue #476).
+    return ok({
+      dryRun: false,
+      applied: true,
       target,
-      before: null,
-      after: truncForAudit(status),
+      status: reconciled.inboxes,
+      observerStatus: reconciled.observers,
     });
-    return ok({ dryRun: false, applied: true, target, status });
   } catch (e) {
     return failOf(e);
   }

@@ -30,6 +30,7 @@ const {
   ALERT_COALESCE_WINDOW_MS,
   FLOWLOG_RETENTION_DAYS,
   HEARTBEAT_INTERVAL_MS,
+  SPEND_CEILING_POLL_INTERVAL_MS,
   MCP_STDIO_ENABLED,
   ALLOW_SUPERUSER_RUNTIME,
   DOCUMENTS_STORAGE_DIR,
@@ -194,7 +195,13 @@ const config = {
     MAX_PORT,
   ),
   publicUrl: PUBLIC_URL || "http://localhost:3000",
-  env: (NODE_ENV || "development") as "development" | "production",
+  // "test" IS ONE OF THE VALUES, and leaving it out of the union was not cosmetic. `bun test` sets
+  // NODE_ENV=test itself, and it WINS over the `.env` (measured: a suite file reads
+  // `config.env === "test"` with `NODE_ENV=development` sitting in `.env`). So every `=== "development"`
+  // in this codebase is false under the suite while the type says that branch is the only alternative
+  // to production, which is how the logger below ended up building a thread-stream worker in a
+  // context nobody meant it to. Anything guarded on `!== "production"` still covers test, as intended.
+  env: (NODE_ENV || "development") as "development" | "production" | "test",
   // NOTE: Distribution edition. Single source of truth shared with the frontend bundle
   // (BUN_PUBLIC_EDITION is baked into the client at build AND kept as a runtime ENV by the
   // Dockerfile), so the client gate and the server never disagree. Defaults to "full"; the Free
@@ -361,6 +368,20 @@ const config = {
       "HEARTBEAT_INTERVAL_MS",
       60_000,
       "It is the cadence of the heartbeat outbound webhook.",
+      MAX_DURATION_MS,
+    ),
+  },
+  // NOTE: Cadence of the per-tenant `SPEND_CEILING_POLL` scheduler job (issue #426): how often a
+  // tenant's month-to-date cost is read from Langfuse into the local snapshot the spend ceiling's
+  // gate reads. Armed only while the tenant's ceiling is on. The ceiling's effective lag is THIS plus
+  // Langfuse's own ingestion lag, and the two ADD, so it is the overshoot bound an operator accepts
+  // by leaving it. Default 5 min.
+  spendCeiling: {
+    pollIntervalMs: parseIntSetting(
+      SPEND_CEILING_POLL_INTERVAL_MS,
+      "SPEND_CEILING_POLL_INTERVAL_MS",
+      300_000,
+      "It is how often a tenant's month-to-date cost is read from Langfuse for the spend ceiling.",
       MAX_DURATION_MS,
     ),
   },

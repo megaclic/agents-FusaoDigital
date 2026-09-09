@@ -1,8 +1,8 @@
 import type { InboundAuthStrategy } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
-import { truncForAudit } from "@/modules/audit/projection";
 import {
+  assertAlertChannelWritable,
   createAlertChannel,
   deleteAlertChannel,
   listAlertChannels,
@@ -22,6 +22,8 @@ import {
 } from "@/modules/webhooks/outbound/deliveries";
 import { isOutboundEvent } from "@/modules/webhooks/outbound/events";
 import {
+  assertWebhookSubscriptionCreatable,
+  assertWebhookSubscriptionUpdatable,
   createWebhookSubscription,
   deleteWebhookSubscription,
   listWebhookSubscriptions,
@@ -36,7 +38,6 @@ import {
   gate,
   ok,
   parseMcpId,
-  recordMcpAudit,
   resolveSecretRef,
   resolveSecretValue,
   type WriteDeps,
@@ -82,6 +83,16 @@ export async function webhookCreate(
   }
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      await assertWebhookSubscriptionCreatable({
+        url: args.url,
+        events: args.events,
+        secretRef,
+        enabled: args.enabled,
+      });
       return ok({
         dryRun: true,
         action: "create",
@@ -104,18 +115,6 @@ export async function webhookCreate(
       },
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "webhook.create",
-      target: `webhook:${created.id}`,
-      before: null,
-      after: truncForAudit({
-        id: created.id,
-        url: created.url,
-        events: created.events,
-      }),
-    });
     return ok({ dryRun: false, applied: true, webhook: created });
   } catch (e) {
     return failOf(e);
@@ -180,6 +179,11 @@ export async function webhookUpdate(
       afterProj[k] = patch[k];
     }
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      await assertWebhookSubscriptionUpdatable(patch);
       return ok({
         dryRun: true,
         target,
@@ -187,18 +191,6 @@ export async function webhookUpdate(
       });
     }
     const updated = await updateWebhookSubscription(ctx, id, patch, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "webhook.update",
-      target,
-      before: truncForAudit(beforeProj),
-      after: truncForAudit({
-        url: updated.url,
-        events: updated.events,
-        enabled: updated.enabled,
-      }),
-    });
     return ok({ dryRun: false, applied: true, target, webhook: updated });
   } catch (e) {
     return failOf(e);
@@ -234,14 +226,6 @@ export async function webhookDelete(
       });
     }
     await deleteWebhookSubscription(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "webhook.delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -303,19 +287,7 @@ export async function webhookDeliveryRequeue(
     // `before` is the service's own LOCKED read, which is what makes the audit describe the write
     // that happened: any read this tool took first would be one the row can move away from, and
     // for a URL the SSRF guard refuses that takes a single tick.
-    const { delivery: after, before } = await requeueWebhookDelivery(
-      ctx,
-      id,
-      base,
-    );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "webhook_delivery.requeue",
-      target,
-      before: truncForAudit(before),
-      after: truncForAudit({ status: after.status, attempts: after.attempts }),
-    });
+    const after = await requeueWebhookDelivery(ctx, id, base);
     return ok({ dryRun: false, applied: true, target, delivery: after });
   } catch (e) {
     return failOf(e);
@@ -372,6 +344,21 @@ export async function alertChannelCreate(
     secretRef = resolved.ref;
   }
   if (args.dry_run !== false) {
+    // NOTE: the core's own two questions, asked before the preview answers it. The URL is RESOLVED
+    // here — the same read the apply does two lines below — because the destination this channel
+    // would post to is not in the arguments, it is the value behind `url_ref`, and vetting the ref
+    // instead of the value is what let a preview approve `not-a-url` and a loopback address (#510).
+    // The value is never returned: only its verdict is.
+    const urlValue = await resolveSecretValue(ctx, args.url_ref, base);
+    if ("fail" in urlValue) return urlValue.fail;
+    try {
+      await assertAlertChannelWritable({
+        url: urlValue.value,
+        stages: args.stages ?? [],
+      });
+    } catch (e) {
+      return failOf(e);
+    }
     return ok({
       dryRun: true,
       action: "create",
@@ -403,19 +390,6 @@ export async function alertChannelCreate(
       },
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "alert_channel.create",
-      target: `alert_channel:${created.id}`,
-      before: null,
-      after: truncForAudit({
-        id: created.id,
-        name: created.name,
-        type: created.type,
-        urlMasked: created.urlMasked,
-      }),
-    });
     return ok({ dryRun: false, applied: true, channel: created });
   } catch (e) {
     return failOf(e);
@@ -492,6 +466,19 @@ export async function alertChannelUpdate(
       afterProj[k] = nonSecret[k];
     }
     if (args.dry_run !== false) {
+      // Same pair as on create, on the patch: the stage list, and the VALUE behind a rotated
+      // `url_ref` rather than the ref (#510). Resolved only when the patch rotates it, so an
+      // unrelated rename does not read a secret it has no question about.
+      let urlValue: string | undefined;
+      if (urlRotated && args.url_ref !== undefined) {
+        const resolved = await resolveSecretValue(ctx, args.url_ref, base);
+        if ("fail" in resolved) return resolved.fail;
+        urlValue = resolved.value;
+      }
+      await assertAlertChannelWritable({
+        url: urlValue,
+        stages: nonSecret.stages,
+      });
       return ok({
         dryRun: true,
         target,
@@ -508,18 +495,6 @@ export async function alertChannelUpdate(
     }
     if (secretRotated) patch.secretRef = secretRef;
     const updated = await updateAlertChannel(ctx, id, patch, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "alert_channel.update",
-      target,
-      before: truncForAudit(beforeProj),
-      after: truncForAudit({
-        urlMasked: updated.urlMasked,
-        urlRotated,
-        secretRotated,
-      }),
-    });
     return ok({ dryRun: false, applied: true, target, channel: updated });
   } catch (e) {
     return failOf(e);
@@ -555,14 +530,6 @@ export async function alertChannelDelete(
       });
     }
     await deleteAlertChannel(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "alert_channel.delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -641,18 +608,6 @@ export async function integrationCreate(
       },
       base,
     );
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "integration.create",
-      target: `integration:${created.id}`,
-      before: null,
-      after: truncForAudit({
-        id: String(created.id),
-        catalogType: args.catalog_type,
-        name: args.name,
-      }),
-    });
     // The route token is a generated secret: surface it via the console, never raw to the model.
     return ok({
       dryRun: false,
@@ -749,14 +704,6 @@ export async function integrationUpdate(
     const appliedProj: Record<string, unknown> = {};
     for (const k of keys)
       appliedProj[k] = (updated as unknown as Record<string, unknown>)[k];
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "integration.update",
-      target,
-      before: truncForAudit(beforeProj),
-      after: truncForAudit(appliedProj),
-    });
     return ok({
       dryRun: false,
       applied: true,
@@ -795,14 +742,6 @@ export async function integrationDelete(
       });
     }
     await deleteIntegrationInstance(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "integration.delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);

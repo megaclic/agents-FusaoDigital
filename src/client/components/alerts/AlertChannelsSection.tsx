@@ -61,6 +61,14 @@ function AlertChannelModal({
   const [minLevel, setMinLevel] = useState<"warn" | "error">("error");
   const [stages, setStages] = useState<Set<string>>(new Set());
   const [secretRef, setSecretRef] = useState("");
+  // Whether the operator touched the picker at all. The wire needs to tell "left this alone" apart
+  // from "chose this", because an untouched field is OMITTED and a sent one is obeyed — and the
+  // difference cannot be read off the VALUE. A channel whose stored ref names no vault entry arrives
+  // as `hasSecret` with no ref to show (`readableVaultRef` hides it rather than publish whatever text
+  // the column held before #126), so its picker opens empty and choosing "None" moves nothing.
+  // Comparing values would call that unchanged and leave the operator unable to clear a secret the
+  // list is calling Signed.
+  const [secretTouched, setSecretTouched] = useState(false);
   const [enabled, setEnabled] = useState(true);
   const [error, setError] = useState("");
   const refusal = useFieldRefusal(
@@ -87,7 +95,11 @@ function AlertChannelModal({
     setStages(
       new Set(ch?.stages && ch.stages.length > 0 ? ch.stages : FLOW_STAGES),
     );
-    setSecretRef("");
+    // Loaded, not blanked: the save below sends `secretRef` unconditionally and the service reads a
+    // null there as "clear it", so a blank field here unsigns the channel on a save that meant to
+    // change the name. The URL above CAN start blank because the PATCH omits it when it is.
+    setSecretRef(ch?.secretRef ?? "");
+    setSecretTouched(false);
     setEnabled(ch?.enabled ?? true);
     setError("");
   });
@@ -113,6 +125,14 @@ function AlertChannelModal({
     stages.size > 0 &&
     (editing ? true : url.trim().length > 0);
 
+  // `secretRef` is three-valued on the way in — absent leaves it, null clears it, a value sets it —
+  // and this is where the form picks which one it means. Unchanged since the modal opened is the
+  // ABSENT case; anything else is what the picker holds now, with an empty picker meaning null.
+  const secretRefChanged = editing ? secretTouched : true;
+  // Configured, and not showable. The list says "Signed" for this channel; without a sentence here
+  // the modal would say "None" and read as a bug worth "fixing".
+  const secretUnshowable = !!editing?.hasSecret && !secretRef && !secretTouched;
+
   // What the inputs hold right now, in the server's vocabulary. `url` is omitted on an edit that
   // leaves it blank, which is how "keep the stored one" is spelled on the wire.
   const currentOf = () => {
@@ -121,9 +141,9 @@ function AlertChannelModal({
       type,
       minLevel,
       stages: allStagesChecked ? [] : [...stages],
-      secretRef: secretRef.trim() || null,
       enabled,
     };
+    if (secretRefChanged) body.secretRef = secretRef.trim() || null;
     if (!editing || url.trim()) body.url = url.trim();
     return body;
   };
@@ -153,9 +173,9 @@ function AlertChannelModal({
           type,
           minLevel,
           stages: stagesArr,
-          secretRef: ref,
           enabled,
         };
+        if (secretRefChanged) patch.secretRef = ref;
         if (url.trim()) patch.url = url.trim();
         apiError = (
           await api.api.v1["alert-channels"]({ id: editing.id }).patch(patch)
@@ -357,14 +377,24 @@ function AlertChannelModal({
             label={t("alerts.secretRef", "Signing secret (optional)")}
             group
             error={refusal.at("secretRef", secretRef.trim() || null)}
-            description={t(
-              "alerts.secretRefHint",
-              "Signs each delivery (HMAC) so your endpoint can verify it. Discord ignores this.",
-            )}
+            description={
+              secretUnshowable
+                ? t(
+                    "alerts.secretRefOpaque",
+                    "A signing secret is set but does not point at a credential in the vault, so deliveries go unsigned and it cannot be shown. Pick a credential to sign again, or clear it.",
+                  )
+                : t(
+                    "alerts.secretRefHint",
+                    "Signs each delivery (HMAC) so your endpoint can verify it. Leave blank for unsigned. Discord ignores this.",
+                  )
+            }
           >
             <CredentialPicker
               value={secretRef}
-              onChange={setSecretRef}
+              onChange={(v) => {
+                setSecretTouched(true);
+                setSecretRef(v);
+              }}
               disabled={loading}
               ariaLabel={t("alerts.secretRef", "Signing secret (optional)")}
             />
@@ -403,11 +433,37 @@ function AlertChannelModal({
 
 // The keys of the body this form writes: the route refuses by them, and `requireVaultRef` names
 // `secretRef`. `stages` and `minLevel` are chip rows and a Select with nowhere to render a sentence.
+// What the channel DOES, never what the column holds. Three things have to line up for a delivery to
+// carry an HMAC — the type is `webhook`, a secret is configured, and its ref names a vault entry — and
+// the list used to report only the middle one. Both other cases were reachable and both read as
+// "Signed" while the worker sent nothing: a channel switched to Discord keeps its ref (the editor
+// omits an untouched picker rather than erasing it), and a ref stored before #126 may name nothing,
+// which the read hides. `alert-worker.ts` is the authority: `if (a.secretRef && a.type === "webhook")`,
+// and inside it a ref that resolves to no row leaves `secret` null.
+//
+// The three are what a ROW can answer. A fourth case is real and this cannot see it: a well-formed
+// ref whose vault entry was deleted or is still `pending` resolves to null in that same worker, so
+// "Signed" is wrong for it too. Reading it means asking the vault rather than the row, which is a
+// different mechanism and not one a per-row projection can grow.
+function signingLabel(
+  ch: { type: string; hasSecret: boolean; secretRef: string | null },
+  t: (k: string, d: string) => string,
+): string {
+  if (!ch.hasSecret) return "";
+  if (ch.type !== "webhook")
+    return ` · ${t("alerts.signedIgnored", "Signing secret ignored on this channel type")}`;
+  if (ch.secretRef === null)
+    return ` · ${t("alerts.signedUnavailable", "Signing secret set, but its credential is not in the vault: deliveries go unsigned")}`;
+  return ` · ${t("alerts.signed", "Signed")}`;
+}
+
 const ALERT_FIELDS = ["name", "type", "url"] as const;
 
-// The signing secret belongs to a webhook, and its picker is drawn only there. The ref stays in the
-// BODY when the operator switches to Discord, though — a credential picked and then stranded — so
-// the server can still refuse it by name, on a dialog with no picker to mark.
+// The signing secret belongs to a webhook, and its picker is drawn only there. It can still reach the
+// BODY from a dialog showing no picker: an operator who picks a credential and then switches to
+// Discord in the same save sends a ref that MOVED, stranded — so the server can still refuse it by
+// name, and the field has to be listed for that refusal to be placeable. A ref the operator never
+// touched is omitted instead, so switching type leaves the stored one alone rather than clearing it.
 const ALERT_WEBHOOK_FIELDS = [...ALERT_FIELDS, "secretRef"] as const;
 
 export function AlertChannelsSection() {
@@ -561,7 +617,7 @@ export function AlertChannelsSection() {
                   {ch.stages.length > 0
                     ? ch.stages.map((s) => flowStageLabel(s, t)).join(", ")
                     : t("alerts.allStages", "All stages")}
-                  {ch.hasSecret ? ` · ${t("alerts.signed", "Signed")}` : ""}
+                  {signingLabel(ch, t)}
                   {" · "}
                   {t("alerts.createdAt", "Created {{date}}", {
                     date: formatDate(ch.createdAt),

@@ -14,6 +14,7 @@ import {
   registerDeliverySweepHandler,
 } from "@/modules/chatwoot/delivery-sweep";
 import { registerDeliveryRecoveryHandler } from "@/modules/chatwoot/recover-delivery";
+import { registerTakeoverRecoveryHandler } from "@/modules/chatwoot/recover-takeover";
 import { registerDebounceHandler } from "@/modules/debounce/handler";
 import {
   startDebounceWorker,
@@ -36,9 +37,12 @@ import {
   startCompactionWorker,
   stopCompactionWorker,
 } from "@/modules/memory/worker";
+import { registerObserveHandler } from "@/modules/observe/job";
 import { registerRagIngestHandler } from "@/modules/rag/documents";
 import { registerScheduledMessageHandler } from "@/modules/scheduled-messages/service";
 import { startScheduler, stopScheduler } from "@/modules/scheduler/worker";
+import { ensureAllSpendPolls } from "@/modules/spend-ceiling/arm";
+import { registerSpendPollHandler } from "@/modules/spend-ceiling/poll";
 import { registerHeartbeatHandler } from "@/modules/webhooks/outbound/heartbeat";
 import {
   startOutboundWorker,
@@ -179,8 +183,11 @@ if (config.schedulerWorker.enabled) {
   registerScheduledMessageHandler();
   registerZproStatusCheckHandler();
   registerMemoryHandlers();
+  registerObserveHandler();
   registerDeliverySweepHandler();
   registerDeliveryRecoveryHandler();
+  registerTakeoverRecoveryHandler();
+  registerSpendPollHandler();
   startScheduler();
   // Arm the per-tenant execution-log retention sweep for every existing tenant (best-effort: a
   // boot-time DB outage just means the sweep arms on the next restart).
@@ -197,6 +204,11 @@ if (config.schedulerWorker.enabled) {
   // what makes the recovery reach the rows the restart itself created.
   void ensureAllDeliverySweeps().catch((error) =>
     logger.warn({ error }, "Failed to arm Chatwoot delivery sweeps"),
+  );
+  // Arm the per-tenant spend ceiling poll for every tenant whose ceiling is on (issue #426), so a
+  // row lost to a reset is not a ceiling deciding on a figure frozen at its last poll.
+  void ensureAllSpendPolls().catch((error) =>
+    logger.warn({ error }, "Failed to arm spend ceiling polls"),
   );
 }
 

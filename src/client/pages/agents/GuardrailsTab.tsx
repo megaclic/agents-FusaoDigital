@@ -154,24 +154,20 @@ export function GuardrailsTab({
                         "Adherence to the agent's instructions",
                       )}
                     />
-                    <div className="flex flex-col gap-1">
-                      <SwitchField
-                        checked={d.checks.answerRelevance}
-                        onCheckedChange={(v) =>
-                          setCheck(dir, "answerRelevance", v)
-                        }
-                        label={t(
-                          "editor.guardrails.checkRelevance",
-                          "The reply answers what the customer asked",
-                        )}
-                      />
-                      <p className="text-text-muted text-xs">
-                        {t(
-                          "editor.guardrails.checkRelevanceHint",
-                          "Sends the customer's message to the guardrails agent so it can compare. Off by default: after a short message like “sim”, a correct answer can look like an answer to another question, and the action above would replace it.",
-                        )}
-                      </p>
-                    </div>
+                    <SwitchField
+                      checked={d.checks.answerRelevance}
+                      onCheckedChange={(v) =>
+                        setCheck(dir, "answerRelevance", v)
+                      }
+                      label={t(
+                        "editor.guardrails.checkRelevance",
+                        "The reply answers what the customer asked",
+                      )}
+                      help={t(
+                        "editor.guardrails.checkRelevanceHelp",
+                        "This check determines whether the agent's reply addresses the customer's message.\n\nIf it fails, the configured action always uses the prepared message. The model does not write a replacement reply.\n\nIt is off by default because short messages such as “yes” can cause false failures. When another check is active, each reply makes two separately billed model requests.",
+                      )}
+                    />
                   </>
                 )}
               </div>
@@ -196,7 +192,7 @@ export function GuardrailsTab({
                 ))}
               </Select>
             </FormField>
-            {/* NOTE: Shown for "generated" too, because that action falls back to this text whenever no
+            {/* Shown for "generated" too, because that action falls back to this text whenever no
                 replacement is written: when the model returns none, and always when the relevance
                 check is what tripped. Hiding it here left the operator unable to see or edit the
                 message their customers actually receive. */}
@@ -208,18 +204,28 @@ export function GuardrailsTab({
                     ? refusals.inputTemplateMessage
                     : refusals.outputTemplateMessage
                 }
+                // The two directions say different KINDS of thing about the same box, so they take
+                // different homes. Outbound is one sentence about when this text is used, which is
+                // what the operator needs to fill the field: inline. Inbound is why the field can
+                // never be anything else, read once: behind the `?`. It matters here more than
+                // elsewhere that the inbound text is not inline, because this field renders an
+                // `error` in the same slot, so a refusal would erase the explanation of the rule
+                // it just enforced.
                 description={
-                  d.action !== "generated"
-                    ? undefined
-                    : dir === "input"
-                      ? t(
-                          "editor.guardrails.templateInboundHint",
-                          "On the customer's message this is ALWAYS what gets sent. There is nothing to rewrite here, because the text under review is the customer's own message, so the guardrails agent is never asked to compose a reply. When it was, the customer could dictate that reply: a message telling it to state a price and a partnership produced exactly that, word for word, in every one of 16 runs.",
-                        )
-                      : t(
-                          "editor.guardrails.templateFallbackHint",
-                          "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
-                        )
+                  d.action === "generated" && dir === "output"
+                    ? t(
+                        "editor.guardrails.templateFallbackHint",
+                        "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
+                      )
+                    : undefined
+                }
+                help={
+                  d.action === "generated" && dir === "input"
+                    ? t(
+                        "editor.guardrails.templateInboundHelp",
+                        "On customer messages, this text is ALWAYS what gets sent.\n\nThere is no reply to rewrite: the text under review is the customer's own message.\n\nThis was measured: a message telling it to state a price and a partnership produced exactly that, word for word, in all 16 runs.",
+                      )
+                    : undefined
                 }
               >
                 <Textarea
@@ -232,7 +238,7 @@ export function GuardrailsTab({
                 />
               </FormField>
             )}
-            {/* NOTE: Output only. On the customer's message nothing is ever composed, so this field
+            {/* Output only. On the customer's message nothing is ever composed, so this field
                 would steer nothing — and a control that visibly does nothing is worse than one that
                 is not offered. The template hint above says why, where the operator is looking. */}
             {d.action === "generated" && dir === "output" && (

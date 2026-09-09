@@ -2,14 +2,26 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import {
+  CODE_TOOL_CONTEXT_MAX_CHARS,
+  CODE_TOOL_INPUT_MAX_CHARS,
+  SANDBOX_CODE_MAX_CHARS,
+  SANDBOX_TIMEOUT_MS,
+} from "@/graph/tools/code-sandbox-limits";
+import { CODE_TOOL_GLOBALS } from "@/lib/code-tool-vocabulary";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import {
   agentGet,
   apiKeyList,
+  codeToolGet,
+  codeToolList,
+  codeToolSchema,
+  documentTemplateSchema,
   instanceList,
   toolList,
   vaultList,
 } from "@/modules/mcp/read";
+import { MODEL_RESPONSE_CHAR_LIMIT } from "@/modules/tool-definitions/response-template";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // MCP read tools: the read gate (mcp:read scope + tenant target) is DB-free and always runs; the
@@ -46,6 +58,144 @@ describe("MCP read gate (no DB)", () => {
     const r = await agentGet(principal({}), { agent_id: "not-a-number" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("invalid agent_id");
+  });
+
+  // `code_tool_schema` is a CONSTANT, not tenant data, and it still goes through the read gate: a
+  // surface that answers before the fence is one more thing to remember, and the answer costs the
+  // same either way (issue #538).
+  test("code_tool_schema is behind the gate like every other read", () => {
+    const r = codeToolSchema(principal({ scopes: [] }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("insufficient_scope");
+  });
+
+  // What it answers, and the assertions are about the two things the description cannot carry: the
+  // `context` keys WITH their absent-when, and the limits read off the modules that enforce them
+  // rather than restated here.
+  test("code_tool_schema serves the vocabulary and the enforced limits", () => {
+    const r = codeToolSchema(principal({}));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const body = r.data as {
+      context: Array<{ name: string; type: string; always: boolean }>;
+      limits: Record<string, number>;
+      result: string;
+      failure: string;
+    };
+    const names = body.context.map((v) => v.name);
+    expect(names).toContain("contact_email");
+    expect(names).toContain("conversationAttributes");
+    // The three that are always there, and the rest that are not: the field a body acts on.
+    expect(
+      body.context
+        .filter((v) => v.always)
+        .map((v) => v.name)
+        .sort(),
+    ).toEqual(["agent_name", "contactAttributes", "conversationAttributes"]);
+    expect(body.limits.timeoutMs).toBe(SANDBOX_TIMEOUT_MS);
+    expect(body.limits.codeMaxChars).toBe(SANDBOX_CODE_MAX_CHARS);
+    expect(body.limits.contextMaxChars).toBe(CODE_TOOL_CONTEXT_MAX_CHARS);
+    // The two semantics an agent cannot discover by trying without breaking a live turn.
+    expect(body.result).toContain("promise");
+    expect(body.failure).toContain("OPERATOR");
+  });
+
+  // The globals half of the same vocabulary. It was a SENTENCE naming three of them until #538's
+  // follow-up, and the console's Ctrl-Space listing twenty while this answered three is exactly the
+  // drift `lib/code-tool-vocabulary.ts` exists to close: a body written through MCP and a body
+  // written in the console are the same body, in the same sandbox.
+  test("code_tool_schema serves the globals the console offers", () => {
+    const r = codeToolSchema(principal({}));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const body = r.data as {
+      available: {
+        globals: Array<{ name: string; kind: string; description?: string }>;
+        absent: string;
+      };
+    };
+    expect(body.available.globals.map((g) => g.name)).toEqual(
+      CODE_TOOL_GLOBALS.map((g) => g.name),
+    );
+    // The four the sandbox itself installs are the four that carry a description: the standard
+    // library explains itself, and `Date` here is NOT the standard one (it runs in the agent's
+    // zone), which is the difference a body has to be told.
+    expect(
+      body.available.globals.filter((g) => g.description).map((g) => g.name),
+    ).toEqual(["TIMEZONE", "NOW_LOCAL", "console", "Date"]);
+    // What no list can say, and what a caller would otherwise try: there is no event loop.
+    expect(body.available.absent).toContain("async");
+  });
+
+  // The seven limits bite at THREE different moments, and a contract that groups them misleads in
+  // both directions: a correctable argument size reads as a broken tool, and an authoring refusal
+  // reads as an outage. `timeoutMs`/`memoryBytes`/`stackBytes`/`contextMaxChars` mark the call
+  // failed; `inputMaxChars` comes back as an ordinary result saying to call again with less
+  // (graph/tools/code.ts marks `failed: false`); `codeMaxChars` is refused on the WRITE, so no call
+  // exists to fail. Each sentence is asserted to claim its own and not the others'.
+  test("each limit is described at the moment it actually bites", () => {
+    const r = codeToolSchema(principal({}));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const body = r.data as {
+      limits: Record<string, number>;
+      result: string;
+      failure: string;
+      argumentsTooLarge: string;
+      authoringRefusal: string;
+    };
+    expect(body.limits.inputMaxChars).toBe(CODE_TOOL_INPUT_MAX_CHARS);
+    expect(body.limits.resultMaxChars).toBe(MODEL_RESPONSE_CHAR_LIMIT);
+    for (const named of [
+      "timeoutMs",
+      "memoryBytes",
+      "stackBytes",
+      "contextMaxChars",
+    ]) {
+      expect([named, body.failure.includes(named)]).toEqual([named, true]);
+    }
+    for (const notAFailure of ["inputMaxChars", "codeMaxChars"]) {
+      expect([notAFailure, body.failure.includes(notAFailure)]).toEqual([
+        notAFailure,
+        false,
+      ]);
+    }
+    expect(body.argumentsTooLarge).toContain("inputMaxChars");
+    expect(body.argumentsTooLarge).toContain("not a failure");
+    // An authoring refusal, not a call outcome: nothing is saved, so nothing can fail.
+    expect(body.authoringRefusal).toContain("codeMaxChars");
+    expect(body.authoringRefusal).toContain("REFUSED");
+    // The return value is cut, so the cap is published rather than left to be discovered by a wrong
+    // answer, and it is published for what it BOUNDS: the value, not the rendered line. The marker
+    // the clipper appends is named too, because it is what tells a reader the answer is partial, and
+    // so is the one case that carries no marker at all.
+    expect(body.result).toContain("resultMaxChars");
+    expect(body.result).toContain("VALUE, not the whole line");
+    expect(body.result).toContain("[truncated]");
+    expect(body.result).toContain("[output truncated]");
+    expect(body.result).toContain("dropped ENTIRELY");
+  });
+
+  // `code_tool_create` no longer carries the contract, it names this tool for it, and `filterScopes`
+  // grants exactly the scopes a client asked for: a token with `mcp:write` and no `mcp:read` is a
+  // real token, and gating this on read alone pointed it at a tool it could neither list nor call.
+  // Same for `document_template_schema`, which `document_template_create` names the same way.
+  test("a write-only token reaches both authoring contracts", async () => {
+    const writeOnly = principal({ scopes: ["mcp:write"] });
+    expect(codeToolSchema(writeOnly).ok).toBe(true);
+    expect((await documentTemplateSchema(writeOnly)).ok).toBe(true);
+    // And neither scope is still a refusal: the gate moved, it did not disappear.
+    const none = principal({ scopes: [] });
+    const r = codeToolSchema(none);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("insufficient_scope");
+    // And the tenant fence is still there: a SUPER_ADMIN token that has not targeted one gets the
+    // same refusal every other tenant tool gives, rather than an answer from outside any tenant.
+    const untargeted = codeToolSchema(
+      principal({ tenantId: null, role: "SUPER_ADMIN" }),
+    );
+    expect(untargeted.ok).toBe(false);
+    if (!untargeted.ok) expect(untargeted.error).toContain("no tenant target");
   });
 });
 
@@ -112,6 +262,9 @@ describe.skipIf(!dbUp)("MCP read tools (DB)", () => {
       if (!tid) continue;
       await suDb.$executeRawUnsafe(
         `DELETE FROM chatwoot_instances WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM code_tool_definitions WHERE tenant_id = ${tid}`,
       );
       await suDb.$executeRawUnsafe(
         `DELETE FROM vault_entries WHERE tenant_id = ${tid}`,
@@ -184,6 +337,96 @@ describe.skipIf(!dbUp)("MCP read tools (DB)", () => {
     const r = await toolList(principal({ tenantId: tenantB }), { base: appDb });
     expect(r.ok).toBe(true);
     if (r.ok) expect((r.data.tools as unknown[]).length).toBe(0);
+  });
+
+  test("code_tool_list / code_tool_get answer an mcp:read principal, tenant-fenced", async () => {
+    const created = await suDb.codeToolDefinition.create({
+      data: {
+        tenantId: tenantA,
+        name: "validar_cpf",
+        label: "Validar CPF",
+        description: "Valida um CPF.",
+        inputSchema: { cpf: { type: "string", required: true } },
+        code: "return { valid: input.cpf.length === 11 };",
+      },
+      select: { id: true },
+    });
+    const readOnly = { tenantId: tenantA, scopes: ["mcp:read"] };
+    const list = await codeToolList(principal(readOnly), { base: appDb });
+    expect(list.ok).toBe(true);
+    if (list.ok) {
+      const tools = list.data.tools as Record<string, unknown>[];
+      expect(tools.map((t) => t.name)).toEqual(["validar_cpf"]);
+      // The body is code_tool_get's to return.
+      expect("code" in (tools[0] ?? {})).toBe(false);
+    }
+    const got = await codeToolGet(
+      principal(readOnly),
+      { code_tool_id: String(created.id) },
+      { base: appDb },
+    );
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      const tool = got.data.tool as { id: string; code: string };
+      expect(tool.id).toBe(String(created.id));
+      expect(tool.code).toBe("return { valid: input.cpf.length === 11 };");
+    }
+    const fenced = await codeToolGet(
+      principal({ tenantId: tenantB, scopes: ["mcp:read"] }),
+      { code_tool_id: String(created.id) },
+      { base: appDb },
+    );
+    expect(fenced.ok).toBe(false);
+    if (!fenced.ok) expect(fenced.error).toContain("not found");
+  });
+
+  // Round 24. An invalid body is SAVED on purpose and answered with a warning, so the warning is
+  // the only record that the tool is known-broken — and it is written once, at the save. An MCP
+  // operator reading the tool afterwards had no way to that fact: `code_tool_get` returned the
+  // source and ran no check, so the problem surfaced when an agent called it. The update preview
+  // makes it worse by pointing here: it reports `[]` for a patch that leaves the body alone,
+  // "the stored body's own warnings are code_tool_get's to show" (write-code-tools.ts).
+  test("code_tool_get reports the stored body's own warnings", async () => {
+    const broken = await suDb.codeToolDefinition.create({
+      data: {
+        tenantId: tenantA,
+        name: "quebrada",
+        label: "Quebrada",
+        description: "Um corpo que nao compila.",
+        inputSchema: {},
+        code: "const x = ;",
+      },
+      select: { id: true },
+    });
+    const got = await codeToolGet(
+      principal({ tenantId: tenantA, scopes: ["mcp:read"] }),
+      { code_tool_id: String(broken.id) },
+      { base: appDb },
+    );
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      expect(got.data.warnings).toMatchObject([{ kind: "syntax", line: 1 }]);
+    }
+    // ...and a body that parses answers with none, rather than an absent key the caller has to
+    // tell apart from "not checked".
+    const clean = await suDb.codeToolDefinition.create({
+      data: {
+        tenantId: tenantA,
+        name: "inteira",
+        label: "Inteira",
+        description: "Um corpo que compila.",
+        inputSchema: {},
+        code: "return 1;",
+      },
+      select: { id: true },
+    });
+    const fine = await codeToolGet(
+      principal({ tenantId: tenantA, scopes: ["mcp:read"] }),
+      { code_tool_id: String(clean.id) },
+      { base: appDb },
+    );
+    expect(fine.ok).toBe(true);
+    if (fine.ok) expect(fine.data.warnings).toEqual([]);
   });
 
   test("api_key_list returns no secrets for a fresh tenant", async () => {

@@ -3,22 +3,83 @@ name: Run Tests on PR
 on:
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.claude/**'
+      - 'licensing/**'
+      - '.github/ISSUE_TEMPLATE/**'
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - '.claude/**'
+      - 'licensing/**'
+      - '.github/ISSUE_TEMPLATE/**'
+  # Nightly full run; only agents-pro acts on it (see the job's `if`).
+  schedule:
+    - cron: '0 6 * * *'
   workflow_dispatch:
+
+# A newer push on the same ref supersedes the run in progress: with 10-20 pushes a day per PR, the
+# superseded runs were 4-9% of the bill for a verdict nobody reads.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    # agents-pro only ever receives mirror pushes of a tree this master already tested, and the
+    # stripped Pro tree is lint + build-checked by `check:editions` before it is mirrored. Its own
+    # copy of this workflow therefore runs on a nightly schedule and on dispatch, not on push:
+    # 267 mirror pushes in August cost 1,469 paid minutes for a second verdict on the same code.
+    # agents (public, free) keeps running on push as the visible proof of green.
+    if: >-
+      (github.event_name == 'schedule' && github.repository == 'fazer-ai/agents-pro')
+      || (github.event_name != 'schedule' && !(github.repository == 'fazer-ai/agents-pro' && github.event_name == 'push'))
     runs-on: ubuntu-latest
 
-    # NOTE: a REAL Postgres, not a mock. Roughly 1600 of this suite's assertions are database-backed
-    # and every one of them is gated on `describe.skipIf(!dbUp)`, so without a server here they do
-    # not fail: they SKIP, and the job reports green having never run the end-to-end layer the
-    # project's testing standard is built on. A stubbed database would be worse than none, because
-    # row-level security is enforced by the server and a stub cannot enforce it.
+    strategy:
+      # Every shard runs: one red shard must not cancel the other three, or the report names one
+      # failure when there may be four.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    name: test (${{ matrix.shard }}/4)
+
+    # SHARDED FOUR WAYS. Each job gets its own runner, its own vCPUs and its own database, and
+    # `--shard=k/4` splits the files by index so the four sets are disjoint and cover the tree.
     #
-    # pgvector, not plain postgres: `scripts/db-bootstrap.sql` runs CREATE EXTENSION vector. pg17 is
-    # what every docker-compose in this repo ships, so CI tests the server operators actually run.
+    # It could not be turned on before, and the reason was never the split: this suite was only ever
+    # green in the order the full serial run happens to give it, so `--shard=1/4` failed on a clean
+    # main. Two rounds found and fixed the causes, all of them the same shape: a test writing to
+    # something the whole process shares, undone by nothing:
+    #
+    #   - src/app.ts exported ONE Elysia instance and three files mutated it.
+    #   - `mock.module` on a module whose teardown handed the registry back the namespace
+    #     `await import()` returned, which is the object the rewrite already changed in place. Six
+    #     files; tests/lib/module-mock-undo.test.ts now refuses the shape.
+    #   - `mock.module("react-i18next", …)` in nine client test files, each freezing `i18n.language`
+    #     at a literal for every file downstream. Replaced by a per-file instance delivered through
+    #     `I18nextProvider` (tests/utils/i18n.tsx).
+    #   - an unfenced `runSchedulerTick` draining rows other files had enqueued
+    #     (tests/modules/scheduler-tenant-fence.test.ts).
+    #
+    # Every one of them failed in a DIFFERENT file than the one at fault, which is why three of the
+    # four are now static sweeps rather than notes.
+    #
+    # HOW THEY WERE FOUND, because two full pairwise sweeps (133 files each) found none of them: bun
+    # ignores argument order, so narrow with `--shard=k/N` doubling N. A file in `1/8` is in `1/16`
+    # or `9/16`. When the victim lands alone in a passing shard, the culprit is in the sibling shard.
+    # Neutralise candidates in halves by replacing their CONTENTS, never their paths: moving a file
+    # moves it in the ordering, which is also why adding one test file reshuffles every shard.
+    #
+    # `bun test --parallel` stays off here. It is right on a developer machine (189s to 51s at 18
+    # workers) and wrong on a 4-vCPU runner, measured at 257s against a 187s serial baseline: four
+    # workers take all four vCPUs and take them from the Postgres container beside them. Sharding
+    # buys the same wall clock by adding runners instead of dividing one.
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -26,7 +87,13 @@ jobs:
           POSTGRES_PASSWORD: postgres
         ports:
           - 5432:5432
+        # tmpfs for the DATA DIRECTORY: this database is created, migrated, written to for three
+        # minutes and thrown away, so nothing it writes has to survive the job, and 183 of this
+        # suite's files are database-backed. On a 4-vCPU runner the server competes for the same
+        # cores as the tests, and every fsync it does is paid out of them. Borrowed from the
+        # Chatwoot upstream, which does the same on its own spec matrix.
         options: >-
+          --mount type=tmpfs,destination=/var/lib/postgresql/data
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
@@ -76,4 +143,4 @@ jobs:
         run: bun run db:test:setup
 
       - name: Run Tests
-        run: bun run test
+        run: bun test --shard=${{ matrix.shard }}/4

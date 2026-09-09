@@ -3,13 +3,14 @@ import basePrisma from "@/api/lib/prisma";
 import { parseDbId } from "@/lib/db-id";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
 import {
+  assertChunkingUpdatable,
   cancelPendingJob,
   createDocument,
   refuseUnstorable,
   resolveEmbeddingConfig,
-  validateChunkParams,
 } from "./documents";
 import { embedQuery } from "./embeddings";
 import { type ChunkHit, searchChunks } from "./sql";
@@ -104,6 +105,74 @@ export async function listKnowledgeBases(
   });
 }
 
+// What a knowledge base's audit row carries.
+//
+// Identity and the indexing policy: the name, the description, the embedding model and the two chunk
+// parameters, all of which an operator sets and any of which changes what a search returns. Nothing
+// here is content: the documents are the payload, and they have their own action and their own rule
+// (`documents.ts`).
+type KbAuditRow = {
+  id: bigint;
+  name: string;
+  description: string | null;
+  embeddingModel: string;
+  chunkSize: number;
+  chunkOverlap: number;
+};
+
+function auditProjection(r: KbAuditRow) {
+  return {
+    id: String(r.id),
+    name: r.name,
+    description: r.description,
+    embeddingModel: r.embeddingModel,
+    chunkSize: r.chunkSize,
+    chunkOverlap: r.chunkOverlap,
+  };
+}
+
+const KB_AUDIT_SELECT = {
+  id: true,
+  name: true,
+  description: true,
+  embeddingModel: true,
+  chunkSize: true,
+  chunkOverlap: true,
+} as const;
+
+export const KB_NAME_MAX = 200;
+
+// A knowledge base's name is not decoration: `buildRagTools` filters the tenant's bases on
+// `name.trim()` and builds the `knowledge_base` enum from what survives, so a blank name is a base
+// the agent cannot scope a search to — and, with only one other base left named, the parameter
+// disappears for THAT base too. At the other end the name goes whole into the search tool's
+// description, which keeps a 1000-character budget so "a verbose KB never bloats the prompt": the
+// description is clipped to 140 characters and the name was never bounded at all, so one long name
+// spends the budget and the remaining bases are dropped to `<more count="N"/>`.
+//
+// The rule lived on the REST body (`minLength: 1`) and nowhere else, so the MCP road walked past it.
+// Here instead, where all of REST, the MCP tools and their previews reach it. Undefined is NOT
+// judged: a patch that never names the name is not a statement about it, the same way an absent body
+// is not judged in tool-definitions (issue #501).
+// The rule, without the throw, because the agent import needs the answer rather than the refusal: a
+// bundle carrying an unusable name is one component to leave out and name, not a bundle to reject.
+export function knowledgeBaseNameUsable(name: string): boolean {
+  return name.trim().length > 0 && name.length <= KB_NAME_MAX;
+}
+
+export function assertKnowledgeBaseNameUsable(name: string | undefined): void {
+  if (name === undefined) return;
+  if (!knowledgeBaseNameUsable(name)) {
+    throw new AppError(
+      `name must be 1 to ${KB_NAME_MAX} characters and cannot be blank`,
+      400,
+      "errors.invalidKnowledgeBaseName",
+      { max: KB_NAME_MAX },
+      "name",
+    );
+  }
+}
+
 // Every text this module stores is held to what its column can hold, at the core rather than at a
 // transport, because three roads reach these writes: REST, the MCP write tools, and the agent's own
 // suggestion tool. Refused rather than repaired: the writer here reads the answer and can send the
@@ -121,6 +190,7 @@ export async function createKnowledgeBase(params: {
     ["description", params.description],
     ["embeddingModel", params.embeddingModel],
   ]);
+  assertKnowledgeBaseNameUsable(params.name);
   return runScopedOn(base, params.ctx, async (db) => {
     // New bases inherit the tenant's default embedding model (so the tenant's one embedding config
     // applies uniformly) unless the caller pins one explicitly.
@@ -134,7 +204,12 @@ export async function createKnowledgeBase(params: {
         description: params.description,
         embeddingModel,
       },
-      select: { id: true },
+      select: KB_AUDIT_SELECT,
+    });
+    await auditMutation(db, params.ctx, {
+      action: "knowledge.create",
+      target: `knowledge_base:${kb.id}`,
+      after: auditProjection(kb),
     });
     return { id: kb.id };
   });
@@ -357,17 +432,54 @@ export async function editApprovalItem(
     ["content", params.proposedContent],
     ["rationale", params.rationale],
   ]);
-  const data: Record<string, unknown> = { status: "EDITED" };
+  const patch: Record<string, unknown> = {};
   if (params.proposedTitle !== undefined)
-    data.proposedTitle = params.proposedTitle;
+    patch.proposedTitle = params.proposedTitle;
   if (params.proposedContent !== undefined)
-    data.proposedContent = params.proposedContent;
-  if (params.rationale !== undefined) data.rationale = params.rationale;
+    patch.proposedContent = params.proposedContent;
+  if (params.rationale !== undefined) patch.rationale = params.rationale;
+  // The same refusal `updateDocument` gives: a patch that names no field is a request the caller
+  // can only have made by mistake, and the route's body makes all three optional.
+  if (Object.keys(patch).length === 0) {
+    throw new AppError("nothing to update", 400);
+  }
   return runScopedOn(base, params.ctx, async (db) => {
+    // NOTE: LOCKED and read before the write, because WHICH fields moved is what the row carries and
+    // two reviewers editing the same proposal would otherwise each report the other's change as
+    // their own.
+    await db.$queryRaw`SELECT id FROM approval_queue_items WHERE id = ${params.id} FOR UPDATE`;
+    const current = await db.approvalQueueItem.findFirst({
+      where: { id: params.id, status: { in: ["PENDING", "EDITED"] } },
+      select: {
+        status: true,
+        proposedTitle: true,
+        proposedContent: true,
+        rationale: true,
+      },
+    });
+    if (!current) return "not-pending";
+    const before = current as unknown as Record<string, unknown>;
+    const fields = Object.keys(patch)
+      .filter((k) => patch[k] !== before[k])
+      .sort();
+    // A form re-submitted unchanged reaches here with every field equal, and the status is not a
+    // change of its own: an item marked EDITED because somebody opened it and saved it back says a
+    // human rewrote a proposal they did not touch.
+    if (fields.length === 0) return "updated";
     const res = await db.approvalQueueItem.updateMany({
       where: { id: params.id, status: { in: ["PENDING", "EDITED"] } },
-      data,
+      data: { ...patch, status: "EDITED" },
     });
+    // NOTE: WHICH fields the operator rewrote, never what they wrote. An edit before approval is the
+    // operator putting their words into what the agent proposed, and the trail's business is that it
+    // happened; the text lands in the knowledge base, which is where it is read.
+    if (res.count > 0) {
+      await auditMutation(db, params.ctx, {
+        action: "knowledge.edit",
+        target: `approval:${params.id}`,
+        after: { id: String(params.id), status: "EDITED", fields },
+      });
+    }
     return res.count > 0 ? "updated" : "not-pending";
   });
 }
@@ -394,24 +506,37 @@ export async function claimApprovalForStorage(
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<ClaimedApproval | null> {
-  const rows = await runScopedOn(
-    base,
-    ctx,
-    (db) =>
-      db.$queryRaw<
-        {
-          knowledge_base_id: bigint;
-          proposed_title: string | null;
-          proposed_content: string;
-        }[]
-      >`
+  const rows = await runScopedOn(base, ctx, async (db) => {
+    const claimed = await db.$queryRaw<
+      {
+        knowledge_base_id: bigint;
+        proposed_title: string | null;
+        proposed_content: string;
+      }[]
+    >`
       UPDATE approval_queue_items
          SET status = 'APPROVED', updated_at = now()
        WHERE id = ${id}
          AND status IN ('PENDING', 'EDITED')
       RETURNING knowledge_base_id, proposed_title, proposed_content
-    `,
-  );
+    `;
+    // NOTE: In the claim's own transaction, and only when the claim WON: the statement above is what
+    // makes an approval exclusive, so a second operator racing it gets no row and records nothing.
+    // The document this approval becomes records itself separately (`knowledge_document.create`),
+    // which is where the text goes; this row is the decision.
+    if (claimed[0]) {
+      await auditMutation(db, ctx, {
+        action: "knowledge.approve",
+        target: `approval:${id}`,
+        after: {
+          id: String(id),
+          knowledgeBaseId: String(claimed[0].knowledge_base_id),
+          status: "APPROVED",
+        },
+      });
+    }
+    return claimed;
+  });
   const row = rows[0];
   if (!row) return null;
   return {
@@ -508,6 +633,16 @@ export async function rejectApprovalItem(params: {
       where: { id: params.id, status: { in: ["PENDING", "EDITED"] } },
       data: { status: "REJECTED" },
     });
+    // NOTE: The condition IS the test, so a retry on an item somebody else already decided records
+    // nothing. What the row carries is the DECISION and never the proposal's text: the body is what
+    // the agent suggested about a customer, and this row outlives the queue item.
+    if (res.count > 0) {
+      await auditMutation(db, params.ctx, {
+        action: "knowledge.reject",
+        target: `approval:${params.id}`,
+        after: { id: String(params.id), status: "REJECTED" },
+      });
+    }
     return res.count > 0 ? "rejected" : "not-pending";
   });
 }
@@ -523,6 +658,8 @@ export async function getKnowledgeBase(params: {
   name: string;
   description: string | null;
   embeddingModel: string;
+  chunkSize: number;
+  chunkOverlap: number;
   chunkCount: number;
   createdAt: Date;
   updatedAt: Date;
@@ -536,6 +673,11 @@ export async function getKnowledgeBase(params: {
         name: true,
         description: true,
         embeddingModel: true,
+        // NOTE: the pair `listKnowledgeBases` has always returned. Reading one base was the only
+        // knowledge read that omitted it, which is why the MCP preview had nothing to measure a chunking patch
+        // against (#524).
+        chunkSize: true,
+        chunkOverlap: true,
         createdAt: true,
         updatedAt: true,
       },
@@ -567,23 +709,26 @@ export async function updateKnowledgeBase(params: {
     ["name", params.name],
     ["description", params.description],
   ]);
-
-  if (params.chunkSize !== undefined && params.chunkOverlap !== undefined) {
-    validateChunkParams(params.chunkSize, params.chunkOverlap);
-  } else if (params.chunkSize !== undefined) {
-    if (params.chunkSize < 100 || params.chunkSize > 8000) {
-      throw new AppError("chunkSize must be between 100 and 8000", 400);
-    }
-  } else if (params.chunkOverlap !== undefined) {
-    if (params.chunkOverlap < 0 || params.chunkOverlap > 4000) {
-      throw new AppError(
-        "chunkOverlap must be between 0 and floor(chunkSize/2)",
-        400,
-      );
-    }
-  }
+  assertKnowledgeBaseNameUsable(params.name);
 
   await runScopedOn(base, params.ctx, async (db) => {
+    // NOTE: LOCKED and read before the write, because this snapshot is the row's `before`. Two
+    // overlapping saves would otherwise both read the same base and the second would report a
+    // transition its actor never made.
+    await db.$queryRaw`SELECT id FROM knowledge_bases WHERE id = ${params.id} FOR UPDATE`;
+    const before = await db.knowledgeBase.findUnique({
+      where: { id: params.id },
+      select: KB_AUDIT_SELECT,
+    });
+    if (!before) {
+      throw new NotFoundError(
+        "knowledge base not found",
+        "errors.knowledgeBaseNotFound",
+      );
+    }
+    // NOTE: inside the transaction, and after the row is locked, because the bound is a fact about
+    // the row: a patch naming one of the two numbers is measured against the other as it will stand.
+    assertChunkingUpdatable(before, params);
     const res = await db.knowledgeBase.updateMany({
       where: { id: params.id },
       data: {
@@ -605,6 +750,22 @@ export async function updateKnowledgeBase(params: {
         "errors.knowledgeBaseNotFound",
       );
     }
+    const after = await db.knowledgeBase.findUniqueOrThrow({
+      where: { id: params.id },
+      select: KB_AUDIT_SELECT,
+    });
+    const beforeProj = auditProjection(before);
+    const afterProj = auditProjection(after);
+    // NOTE: A row only when something moved. The console PATCHes the whole form on every save, and
+    // the chunk parameters are the half an operator re-submits without touching.
+    if (projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, params.ctx, {
+        action: "knowledge.update",
+        target: `knowledge_base:${params.id}`,
+        before: beforeProj,
+        after: afterProj,
+      });
+    }
   });
 }
 
@@ -615,6 +776,19 @@ export async function deleteKnowledgeBase(params: {
 }): Promise<void> {
   const base = params.base ?? basePrisma;
   await runScopedOn(base, params.ctx, async (db) => {
+    // NOTE: Read with the row LOCKED before the delete, so the row describes the base actually
+    // removed and counts what went with it: the chunks and the documents cascade, and afterwards
+    // there is nothing left to count.
+    await db.$queryRaw`SELECT id FROM knowledge_bases WHERE id = ${params.id} FOR UPDATE`;
+    const before = await db.knowledgeBase.findUnique({
+      where: { id: params.id },
+      select: KB_AUDIT_SELECT,
+    });
+    const documents = before
+      ? await db.knowledgeDocument.count({
+          where: { knowledgeBaseId: params.id },
+        })
+      : 0;
     // KnowledgeChunk cascades via its FK to KnowledgeBase.
     const res = await db.knowledgeBase.deleteMany({ where: { id: params.id } });
     if (res.count === 0) {
@@ -622,6 +796,13 @@ export async function deleteKnowledgeBase(params: {
         "knowledge base not found",
         "errors.knowledgeBaseNotFound",
       );
+    }
+    if (before) {
+      await auditMutation(db, params.ctx, {
+        action: "knowledge.delete",
+        target: `knowledge_base:${params.id}`,
+        before: { ...auditProjection(before), documents },
+      });
     }
   });
 }

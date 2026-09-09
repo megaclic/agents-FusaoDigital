@@ -2,27 +2,38 @@ import { z } from "zod";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
-import { revokeApiKey } from "@/modules/api-keys/service";
+import {
+  assertApiKeyRevocable,
+  revokeApiKey,
+} from "@/modules/api-keys/service";
 import { truncForAudit } from "@/modules/audit/projection";
 import {
+  assertBusinessHoursCreatable,
+  assertBusinessHoursUpdatable,
   createBusinessHours,
   deleteBusinessHours,
   getBusinessHours,
   updateBusinessHours,
 } from "@/modules/business-hours/service";
 import {
+  assertExperimentAgentExists,
+  assertExperimentNameUsable,
   createExperiment,
   deleteExperiment,
   getExperiment,
+  requireExperimentAgent,
   updateExperiment,
   variantWriteSchema,
 } from "@/modules/experiments/service";
 import {
+  assertEmbeddingCredentialUsable,
+  assertLangfuseCredentialUsable,
   getTenantSettings,
   updateEmbeddingSettings,
   updateLangfuse,
 } from "@/modules/tenant-settings/service";
 import {
+  assertVaultEntryCreatable,
   createVaultEntry,
   resolveVaultRefByName,
   updateVaultEntry,
@@ -99,14 +110,24 @@ export async function experimentCreate(
   }
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own questions, asked before the preview answers them and INSIDE the branch,
+      // because the apply reaches the core, which asks them again (#490). The first is pure; the
+      // second READS, outside the transaction the apply writes in, and is ADVISORY for it.
+      assertExperimentNameUsable(args.name);
+      // In the apply's own order: name, then variants, then the agent. The first two are pure and
+      // the third READS, so a preview that asked the agent first would refuse a call the apply
+      // refuses for another reason, and would take a round trip to do it.
+      const variants = mapVariants(args.variants);
+      const named = requireExperimentAgent(agentId);
+      await assertExperimentAgentExists(ctx, named, base);
       return ok({
         dryRun: true,
         action: "create",
         resource: "experiment",
         preview: {
           name: args.name,
-          agentId: agentId ? String(agentId) : null,
-          variants: mapVariants(args.variants),
+          agentId: String(named),
+          variants,
           enabled: args.enabled ?? true,
         },
       });
@@ -120,14 +141,6 @@ export async function experimentCreate(
       base,
     });
     const target = `experiment:${created.id}`;
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "experiment.create",
-      target,
-      before: null,
-      after: truncForAudit({ id: String(created.id), name: args.name }),
-    });
     return ok({ dryRun: false, applied: true, id: String(created.id), target });
   } catch (e) {
     return failOf(e);
@@ -185,12 +198,18 @@ export async function experimentUpdate(
   try {
     const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
-    const beforeProj = {
-      name: current.name,
-      enabled: current.enabled,
-      agentId: current.agentId ? String(current.agentId) : null,
-    };
     if (args.dry_run !== false) {
+      assertExperimentNameUsable(patch.name);
+      // NOTE: ADVISORY, like the create half. A patch that does not mention the agent leaves the
+      // stored one alone; one that mentions it names an agent, which `requireExperimentAgent` asks
+      // first because it is pure and the lookup below is a read.
+      if (patch.agentId !== undefined) {
+        await assertExperimentAgentExists(
+          ctx,
+          requireExperimentAgent(patch.agentId),
+          base,
+        );
+      }
       return ok({
         dryRun: true,
         target,
@@ -200,19 +219,7 @@ export async function experimentUpdate(
         },
       });
     }
-    const updated = await updateExperiment({ ctx, id, ...patch, base });
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "experiment.update",
-      target,
-      before: truncForAudit(beforeProj),
-      after: truncForAudit({
-        name: updated.name,
-        enabled: updated.enabled,
-        agentId: updated.agentId ? String(updated.agentId) : null,
-      }),
-    });
+    await updateExperiment({ ctx, id, ...patch, base });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -242,14 +249,6 @@ export async function experimentDelete(
       });
     }
     await deleteExperiment(ctx, id, base);
-    await recordMcpAudit(ctx, base, {
-      actorId: principal.userId,
-      actorType: "mcp",
-      action: "experiment.delete",
-      target,
-      before: truncForAudit(beforeProj),
-      after: null,
-    });
     return ok({ dryRun: false, applied: true, target });
   } catch (e) {
     return failOf(e);
@@ -288,6 +287,16 @@ export async function businessHoursCreate(
   if ("ok" in ctx) return ctx;
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      assertBusinessHoursCreatable({
+        name: args.name,
+        timezone: args.timezone,
+        windows: args.windows,
+        exceptions: args.exceptions,
+      });
       return ok({
         dryRun: true,
         action: "create",
@@ -359,6 +368,9 @@ export async function businessHoursUpdate(
       exceptions: current.exceptions,
     };
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it — and INSIDE the branch,
+      // because the apply reaches `updateBusinessHours`, which asks it again (#490, #510).
+      assertBusinessHoursUpdatable(patch);
       const previewAfter = {
         name: patch.name ?? current.name,
         timezone: patch.timezone ?? current.timezone,
@@ -472,6 +484,15 @@ export async function tenantSettingsUpdate(
   const target = "tenant_settings";
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own KIND question, which resolving the ref above does not answer — a
+      // `vault:<id>` names an entry of any kind, and this preview said "will wire" for one whose
+      // kind `updateLangfuse` refuses (#510). Only when the patch actually sets a ref.
+      if (typeof embeddingRef === "string") {
+        await assertEmbeddingCredentialUsable(ctx, embeddingRef, base);
+      }
+      if (typeof langfuseRef === "string") {
+        await assertLangfuseCredentialUsable(ctx, langfuseRef, base);
+      }
       return ok({
         dryRun: true,
         target,
@@ -565,22 +586,36 @@ export async function langfuseConnect(
   if (!args.base_url) return err("base_url is required");
   const name = args.name?.trim() || "langfuse";
   const enabled = args.enabled ?? true;
-  if (args.dry_run !== false) {
-    return ok({
-      dryRun: true,
-      action: "connect",
-      resource: "langfuse",
-      // The keys are never echoed back, not even in the preview.
-      preview: {
-        name,
-        baseUrl: args.base_url,
-        enabled,
-        publicKey: "(redacted)",
-        secretKey: "(redacted)",
-      },
-    });
-  }
   try {
+    if (args.dry_run !== false) {
+      // NOTE: the vault's own rule, asked before the preview answers, on the ENTRY THE APPLY WOULD
+      // BUILD rather than on one field of it. An earlier version checked `base_url` alone, and the
+      // apply also judges the vault name and both key values through `createVaultEntry` — a key
+      // with surrounding whitespace previewed clean and then refused, which is the same shape as
+      // the divergence this whole change is about, one level in (#490).
+      //
+      // `langfuse` is a kind that REQUIRES a base URL, so "   " — which normalizes to the empty
+      // string without raising — is refused in here rather than by a separate check out here.
+      assertVaultEntryCreatable({
+        name,
+        value: { publicKey: args.public_key, secretKey: args.secret_key },
+        kind: "langfuse",
+        baseUrl: args.base_url,
+      });
+      return ok({
+        dryRun: true,
+        action: "connect",
+        resource: "langfuse",
+        // The keys are never echoed back, not even in the preview.
+        preview: {
+          name,
+          baseUrl: args.base_url,
+          enabled,
+          publicKey: "(redacted)",
+          secretKey: "(redacted)",
+        },
+      });
+    }
     // Upsert the filled vault entry so a re-connect (e.g. rotated keys) is idempotent.
     const existing = await resolveVaultRefByName(ctx, name, "langfuse", base);
     let ref: string;
@@ -653,6 +688,11 @@ export async function apiKeyRevoke(
   const target = `api_key:${id}`;
   try {
     if (args.dry_run !== false) {
+      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
+      // branch rather than above it because the apply reaches the core, which asks it again —
+      // and several of these read a row or resolve DNS, so above the branch is a second lookup
+      // that can even disagree with the first (#490).
+      await assertApiKeyRevocable(ctx, id, base);
       return ok({
         dryRun: true,
         action: "revoke",

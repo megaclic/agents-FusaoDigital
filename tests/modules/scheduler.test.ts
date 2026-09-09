@@ -16,8 +16,10 @@ import {
   reapStaleJobs,
   rescheduleJob,
   retireJobsByDedupeKey,
+  upsertJobRows,
 } from "@/modules/scheduler/service";
 import { registerJobHandler, runClaimed } from "@/modules/scheduler/worker";
+import { burnSchedulerJobId } from "../utils/scheduler";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -161,6 +163,165 @@ describe.skipIf(!dbUp)("scheduler", () => {
   // opposite reasons — DEBOUNCE because it must be fast, MEMORY_COMPACT because it is slow and fires
   // for every agent on every closed attendance — and neither may be picked up here, or the split
   // buys nothing.
+  // The set-based sibling of the single-row upsert. It exists because a caller that arms many rows
+  // INSIDE one transaction pays a round trip per row against a five-second budget, and it has to
+  // answer the same two questions the single-row version does: what a re-arm means for the failure
+  // budget, and whether the payload it carries is authoritative.
+  describe("arming many rows at once", () => {
+    const key = (n: number) => `bulk-${process.pid}-${n}`;
+    const sysCtx = () => ({
+      tenantId,
+      userId: null,
+      role: "TENANT_ADMIN" as const,
+    });
+
+    // The set-based sibling cannot express `upsertJobRow`'s "no payload means keep the stored one":
+    // the rows travel as a `text[]`, so an omission would have to be spelled as a JSON value and
+    // every spelling of it is also a payload somebody could mean. It used to be optional and
+    // coerced to `{}`, which REPLACED the stored payload and cleared its secret half on a re-arm
+    // that never asked to. `@ts-expect-error` is the assertion here, the same way it is in
+    // `delivery-sweep.test.ts`: making the field optional again removes the error and fails the
+    // typecheck on this line, which is the only thing that can catch a narrowing being widened back.
+    test("refuses at COMPILE time to arm a row with no payload", () => {
+      const shape = (rows: Parameters<typeof upsertJobRows>[1]["rows"]) =>
+        rows.length;
+      expect(
+        shape([
+          // @ts-expect-error: a bulk row carries its own payload; omitting it does not typecheck.
+          { dedupeKey: key(99) },
+        ]),
+      ).toBe(1);
+    });
+
+    test("arms every row it is given, and nothing for an empty list", async () => {
+      expect(
+        await runScopedOn(appDb, sysCtx(), (db) =>
+          upsertJobRows(db, {
+            tenantId,
+            kind: "RAG_INGEST",
+            rearm: "new-work",
+            runAt: past(),
+            rows: [],
+          }),
+        ),
+      ).toBe(0);
+      const written = await runScopedOn(appDb, sysCtx(), (db) =>
+        upsertJobRows(db, {
+          tenantId,
+          kind: "RAG_INGEST",
+          rearm: "new-work",
+          runAt: past(),
+          rows: [
+            { dedupeKey: key(1), payload: { documentId: "1" } },
+            { dedupeKey: key(2), payload: { documentId: "2" } },
+          ],
+        }),
+      );
+      expect(written).toBe(2);
+      const rows = await suDb.schedulerJob.findMany({
+        where: { tenantId, dedupeKey: { in: [key(1), key(2)] } },
+        orderBy: { dedupeKey: "asc" },
+        select: { status: true, attempts: true, payload: true },
+      });
+      expect(rows.map((r) => r.status)).toEqual(["PENDING", "PENDING"]);
+      expect(rows.map((r) => r.attempts)).toEqual([0, 0]);
+      expect(rows.map((r) => r.payload)).toEqual([
+        { documentId: "1" },
+        { documentId: "2" },
+      ]);
+    });
+
+    test("a re-arm answers the budget question the same way the single-row upsert does", async () => {
+      await suDb.schedulerJob.updateMany({
+        where: { tenantId, dedupeKey: key(1) },
+        data: { attempts: 4, status: "FAILED", lastError: "boom" },
+      });
+      await suDb.schedulerJob.updateMany({
+        where: { tenantId, dedupeKey: key(2) },
+        data: { attempts: 4, status: "FAILED", lastError: "boom" },
+      });
+      await runScopedOn(appDb, sysCtx(), (db) =>
+        upsertJobRows(db, {
+          tenantId,
+          kind: "RAG_INGEST",
+          rearm: "same-work",
+          runAt: past(),
+          rows: [{ dedupeKey: key(1), payload: { documentId: "1b" } }],
+        }),
+      );
+      await runScopedOn(appDb, sysCtx(), (db) =>
+        upsertJobRows(db, {
+          tenantId,
+          kind: "RAG_INGEST",
+          rearm: "new-work",
+          runAt: past(),
+          rows: [{ dedupeKey: key(2), payload: { documentId: "2b" } }],
+        }),
+      );
+      const same = await suDb.schedulerJob.findFirstOrThrow({
+        where: { tenantId, dedupeKey: key(1) },
+        select: {
+          attempts: true,
+          status: true,
+          lastError: true,
+          payload: true,
+        },
+      });
+      const fresh = await suDb.schedulerJob.findFirstOrThrow({
+        where: { tenantId, dedupeKey: key(2) },
+        select: {
+          attempts: true,
+          status: true,
+          lastError: true,
+          payload: true,
+        },
+      });
+      // Same work pushed again keeps the budget it has already spent; new work gets a fresh one.
+      expect(same.attempts).toBe(4);
+      expect(fresh.attempts).toBe(0);
+      // Both are live again, with the payload of the LATEST arming.
+      expect([same.status, fresh.status]).toEqual(["PENDING", "PENDING"]);
+      expect([same.lastError, fresh.lastError]).toEqual([null, null]);
+      expect(same.payload).toEqual({ documentId: "1b" });
+      expect(fresh.payload).toEqual({ documentId: "2b" });
+    });
+
+    // The ceiling is Postgres's, not ours: a statement takes at most 65535 bind parameters, so a
+    // tuple list at five per row dies at 13108 documents. Nothing upstream caps a knowledge base at
+    // any number, and an import fills one in bulk, so the size that trips it is the customer's
+    // catalogue. 14000 is over the line by enough that a tuple list cannot pass it.
+    test("arms more rows in one statement than a tuple list could carry parameters for", async () => {
+      const many = Array.from({ length: 14000 }, (_, i) => ({
+        dedupeKey: `bulk-wide-${process.pid}-${i}`,
+        payload: { documentId: String(i) },
+      }));
+      const written = await runScopedOn(appDb, sysCtx(), (db) =>
+        upsertJobRows(db, {
+          tenantId,
+          kind: "RAG_INGEST",
+          rearm: "new-work",
+          runAt: past(),
+          rows: many,
+        }),
+      );
+      expect(written).toBe(14000);
+      expect(
+        await suDb.schedulerJob.count({
+          where: {
+            tenantId,
+            dedupeKey: { startsWith: `bulk-wide-${process.pid}-` },
+          },
+        }),
+      ).toBe(14000);
+      await suDb.schedulerJob.deleteMany({
+        where: {
+          tenantId,
+          dedupeKey: { startsWith: `bulk-wide-${process.pid}-` },
+        },
+      });
+    });
+  });
+
   test("the shared lane claims neither debounce nor compaction jobs", async () => {
     const shared = await enqueueJob({
       rearm: "same-work",
@@ -750,6 +911,44 @@ describe.skipIf(!dbUp)("scheduler", () => {
     await suDb.schedulerJob.delete({ where: { id: gone.id } });
     expect(await jobRetired(gone, appDb)).toBe(false);
     expect(await sqlSaysRetired(gone)).toBe(false);
+  });
+
+  // The absent row above is the branch every hand-built `ClaimedJob` in this suite rides: an id
+  // nobody holds reads as NOT retired, which is what makes a fixture a fixture. What keeps it there
+  // is `burnSchedulerJobId`, and the guarantee it owes is not "an id that looks free" but one the
+  // sequence has already spent, since anything else is a number some later insert lands on.
+  // tests/modules/claimed-job-fixture-ids.test.ts carries the failure that costs.
+  test("a burned fixture id is one no insert can land on", async () => {
+    const burned = await burnSchedulerJobId(suDb);
+    expect(burned).toBeGreaterThan(0n);
+    const fixture: ClaimedJob = {
+      id: burned,
+      tenantId,
+      kind: "FOLLOWUP",
+      payload: {},
+      attempts: 0,
+      claimSeq: 0,
+    };
+    expect(await jobRetired(fixture, appDb)).toBe(false);
+
+    // The next row the sequence hands out, and the next burn after it: both strictly past the id the
+    // fixture holds, which is the whole claim. A helper that returned a constant would pass every
+    // other test in the tree, because an unreachable id and a stale one read the same until an
+    // insert takes it.
+    const id = await enqueueJob({
+      rearm: "same-work",
+      tenantId,
+      kind: "FOLLOWUP",
+      dedupeKey: "dk-burned-next",
+      // Not due, and deleted below: a claimable row left behind here is one the next test's
+      // `claimDueJobs(1, ...)` returns instead of its own.
+      runAt: new Date(Date.now() + 3_600_000),
+      base: appDb,
+    });
+    expect(id).toBeGreaterThan(burned);
+    expect(await burnSchedulerJobId(suDb)).toBeGreaterThan(id);
+    expect(await jobRetired(fixture, appDb)).toBe(false);
+    await suDb.schedulerJob.delete({ where: { id } });
   });
 
   // The reason jobRetired takes a connection at all, measured rather than argued. runScopedOn opens

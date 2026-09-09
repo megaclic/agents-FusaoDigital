@@ -4,8 +4,10 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { mayCloseConversation, postedOutcomeFor } from "@/graph/close-intent";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { agentStillSpeaks } from "@/modules/agents/speaks";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { describeClosedGate } from "@/modules/chatwoot/gate-close";
@@ -25,12 +27,16 @@ import { renderInboundMessage } from "@/modules/chatwoot/render";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import type { AuthContext } from "@/modules/contact-auth/check";
 import { withAuthContextSection } from "@/modules/contact-auth/context";
+import { recordConversationError } from "@/modules/conversations/error";
 import {
   type ObservedConversation,
   observeBeforeClose,
   recordResolutionOrigin,
 } from "@/modules/conversations/record-resolution";
-import { advanceHandledWatermark } from "@/modules/debounce/watermark";
+import {
+  advanceHandledWatermark,
+  claimReplyBurst,
+} from "@/modules/debounce/watermark";
 import {
   emitFlowEvent,
   type FlowContext,
@@ -44,7 +50,7 @@ import {
 } from "@/modules/guardrails/gate";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
 import { armCompaction } from "@/modules/memory/compact";
-import { deliverReply } from "@/modules/split/service";
+import { deliverReply, type ReplyDelivery } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import {
@@ -58,9 +64,15 @@ import {
   resolveGraphThreadId,
 } from "./checkpointer";
 import { lastAssistantText } from "./graph";
+import { owesHandbackNote } from "./handback";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
-import { conversationDividerMessage, conversationStamp } from "./markers";
+import {
+  conversationDividerMessage,
+  conversationStamp,
+  humanHandbackMessage,
+  turnWasCalledOff,
+} from "./markers";
 import type { ResolvedModelConfig } from "./models";
 import {
   type AgentConfig,
@@ -71,6 +83,8 @@ import {
   loadAgentConfig,
 } from "./prepare";
 import { undoRefusedTurn } from "./refused-turn";
+import { stillInSameEpisode } from "./reset-episode";
+import { customerFacingReply } from "./silence";
 import { AgentStatusReporter } from "./status";
 import {
   clearTurnOwning,
@@ -104,17 +118,32 @@ function sysCtx(tenantId: bigint): TenantContext {
 
 export type RunAgentTurnOutcome =
   | "posted"
+  // PART of what the turn promised reached the customer, and the rest is not coming (issue #429).
+  // Everything that keys off "did this turn answer" reads it like "posted" — the burst is consumed,
+  // the watermark advances, the ledger row is settled — because the customer HAS part of it and a
+  // re-run would send that part twice. The one thing it must NOT do is clear the operator's error
+  // badge, which is why it is a separate word instead of a boolean the callers would each have to
+  // remember to ask for. Produced by `postedOutcomeFor` from the same two bits that decide whether
+  // the turn may close the conversation.
+  | "posted-partial"
   | "skipped"
   // NO AGENT IS BOUND to this inbox. The mirror creates a row for any inbox that sends traffic, so
   // this is the state a channel connected in Chatwoot and never bound here sits in, and the caller
   // reports it (issue #318). Its sibling below is the binding that EXISTS and cannot answer.
   | "no-agent"
   // Bound, and the config would not load: the agent is switched off (the common one, and deliberate)
-  // or its row is gone. Same silence, different repair, and deliberately not the same word.
+  // or its row is gone. Same silence, different repair, and deliberately not the same word. ALSO the
+  // turn that loaded and then stood down because the operator switched the agent off or flipped it
+  // to monitoring while it ran (`agentStillSpeaks` at the send fence, issue #209 review). Not
+  // "stale" on purpose: that word's bookkeeping is /reset's — the burst is left unmarked for a
+  // thread the command cleared — while this one asks the caller to read the agent again and, for
+  // an observer, to fold the burst into memory and mark it handled.
   | "agent-unavailable"
   | "empty"
   | "taken-over"
-  // The run was CALLED OFF while it worked — today only by /reset retiring the job that queued it.
+  // The run was CALLED OFF while it worked — by /reset retiring the job that queued it, or by the
+  // operator switching the agent off or flipping it to monitoring (`agentStillSpeaks`, read at every
+  // send fence).
   // Distinct from "superseded" on purpose: both leave the watermark where it is, but superseded says
   // "a newer message will re-answer this burst" and this one says "the burst was withdrawn along
   // with the thread". Reading one bit for both questions is how a caller ends up re-arming work the
@@ -152,6 +181,43 @@ export interface RuntimeDeps {
   now?: () => Date;
 }
 
+// THE BADGE FOR A DELIVERY THAT ENDED INCOMPLETE, written at the two sites that can produce one (a
+// reply, attachments alone) so `"posted-partial"` is never a word without the line that explains it.
+//
+// It exists because the callers cannot write it: past the return the turn is a word, and both of
+// them read that word as an answer and CLEAR the badge. Measured against a real Chatwoot before this
+// existed — a reply whose second balloon failed and whose retry failed too came back "posted", the
+// flush cleared `lastError`, and a customer holding one of three balloons sat on a conversation
+// whose only operator-visible state said the last turn went fine. The cause stays in the flow log
+// (`stage: "split"`, `outcome: "send_failed"`); this is the badge that sends an operator to look.
+//
+// Best-effort by contract (see recordConversationError): bookkeeping must never turn a half-answer
+// that WAS delivered into a thrown turn.
+async function notePartialDelivery(params: {
+  tenantId: bigint;
+  instanceId: bigint;
+  conversationId: number;
+  base: PrismaClient;
+  // WHETHER THE LOSS IS A FACT OR A DOUBT, because the operator acts on the difference (issue
+  // #499). "Part of it did not arrive" sends them to re-send what is missing; on the timeout this
+  // change is about, the message may be sitting in the conversation, and the same sentence would
+  // have them post a duplicate by hand. Default false, so every existing caller keeps saying what
+  // it already said.
+  unproven?: boolean;
+}): Promise<void> {
+  await recordConversationError({
+    tenantId: params.tenantId,
+    instanceId: params.instanceId,
+    chatwootConversationId: params.conversationId,
+    error: new Error(
+      params.unproven
+        ? "não foi possível confirmar a entrega: o envio foi rejeitado e o Chatwoot não respondeu à releitura, então parte da resposta pode ou não ter chegado ao cliente. Confira a conversa antes de reenviar."
+        : "a entrega ficou incompleta: parte do que o turno prometeu não chegou ao cliente, e não será reenviada",
+    ),
+    base: params.base,
+  });
+}
+
 export interface RunLoadedTurnParams {
   loaded: AgentConfig;
   // What the authorization endpoint said about this contact on the check that let THIS turn happen,
@@ -172,14 +238,50 @@ export interface RunLoadedTurnParams {
   // Chatwoot id of the triggering message, surfaced to HTTP tools as {{message_id}}. Direct path: the
   // incoming message id; debounce flush: the burst watermark. Omitted ⇒ {{message_id}} stays unset.
   messageId?: number;
+  // Every inbound message this turn is answering, for the WhatsApp read receipt. A debounce flush
+  // passes the whole burst; the direct path passes its single message. Empty ⇒ no receipt is sent.
+  //
+  // MANDATORY, and that is the point. Optional, a third entry point that coalesces messages would
+  // compile while acknowledging only the newest of them, leaving every earlier message of the burst
+  // on grey ticks — a silent loss the type system is perfectly able to prevent. Required, `tsc`
+  // names the site.
+  readMessageIds: number[];
   // Whether the customer's turn included a voice note — drives the "mirror" TTS reply mode.
   userSentAudio?: boolean;
   base?: PrismaClient;
   deps?: RuntimeDeps;
   // Optional last-moment gate, called AFTER the assignee re-check and BEFORE the post. Returning
-  // false suppresses the reply (outcome "superseded"). Used by the debounce flush to drop a reply
-  // when a newer message arrived mid-turn; the re-armed flush then answers the full burst.
+  // false suppresses the reply (outcome "superseded"). Used by the posting paths to drop a reply
+  // when a newer message arrived mid-turn; the re-armed flush then answers the full burst. It is
+  // the SUPERSEDE question only — the at-most-once claim is `claimReply` below, taken here rather
+  // than by each caller.
   shouldPost?: () => Promise<boolean>;
+  // WHICH BURST THIS TURN CLAIMS, and it is asked of every caller (nullable, never defaulted)
+  // because the answer is what makes two posting paths exclusive. `null` says this turn posts
+  // nothing anyone else could also post — the playground, and a direct turn with no mirrored
+  // conversation or no triggering message.
+  //
+  // Claimed HERE and not by the caller: the claim's own correctness is that ONE column decides for
+  // every path that sends, and a per-caller claim is how the flush and the manual re-engage came to
+  // contend on different rows and both answer the same burst (issue #452). Whoever adds the next
+  // posting path gets the protocol by construction, including the release.
+  claimReply: {
+    conversationDbId: bigint;
+    toMessageId: number;
+    // HOW FAR THE HANDLED WATERMARK MAY HAVE MOVED and this claim still stand — the second question
+    // the claim settles, under the same row lock, because a skip landing between a separate read of
+    // the watermark and the claim is exactly the window the CAS this replaced used to close for
+    // free.
+    //
+    // A NUMBER rather than a flag, because the two kinds of caller differ by degree and not in kind
+    // (issue #452). The direct turn and the flush answer messages ABOVE the mark, so anything at or
+    // past their target says somebody else settled these: they pass `toMessageId - 1`. The manual
+    // re-engage answers a tail the mark ALREADY covers — that is its whole job — but it is not
+    // entitled to ignore a skip that lands while the model is running, so it passes the watermark it
+    // read on the way IN — and null is THAT reading ("no mark was there"), not the absence of a
+    // ceiling: any mark standing at claim time was written after the read and refuses the claim.
+    maxHandledAllowed: number | null;
+  } | null;
   // Whether the run that queued this turn is still wanted. Asked INSIDE the `ingest:` critical
   // section, and again immediately before each post — the two moments this function writes
   // something the customer or the next turn can see.
@@ -296,6 +398,10 @@ interface AttachmentDelivery {
   // picture has delivered one, and reporting "stale" would hand the burst back to the next flush,
   // which would send that picture again.
   calledOff: boolean;
+  // Another turn holds the reply claim on this burst, so the batch never started. Always with
+  // `sent: false`: the ask is one statement before the first send, and the gate is memoized, so a
+  // batch that delivered anything had already won the claim.
+  lostClaim: boolean;
 }
 
 async function deliverPendingAttachments(
@@ -308,6 +414,10 @@ async function deliverPendingAttachments(
   // separated from the last by a Chatwoot round trip, so a run called off after the second file
   // would go on posting the third into a conversation the operator was told had been cleared.
   calledOff: () => Promise<boolean> = async () => false,
+  // Asked immediately before the FIRST send of the batch, for the same reason `calledOff` is asked
+  // before each one: a batch whose files were all revoked, or that never got to send, must not mark
+  // the burst answered. Memoized by the caller, so the files after the first cost nothing.
+  claimBeforeSend: () => Promise<boolean> = async () => true,
 ): Promise<AttachmentDelivery> {
   // NOTE: Sorted by the model's tool-call order, not by the order the downloads finished in — the
   // batch runs concurrently, and a caption only makes sense next to the picture it was written for.
@@ -317,6 +427,7 @@ async function deliverPendingAttachments(
   let sent = false;
   let failed = false;
   let stopped = false;
+  let lostClaim = false;
   for (const file of queued) {
     // A document is queued as BYTES, and bytes cannot say whether the row is still deliverable. The
     // operator can revoke between the tool issuing it and this loop running — the model still had a
@@ -392,6 +503,13 @@ async function deliverPendingAttachments(
       stopped = true;
       break;
     }
+    // AND THE CLAIM LAST OF ALL, after both asks above and one statement before the send: this is
+    // the first thing in the turn that reaches the customer on an attachment-only answer, so it is
+    // where the burst stops being anybody else's to answer.
+    if (!(await claimBeforeSend())) {
+      lostClaim = true;
+      break;
+    }
     try {
       await client.sendFileAttachment(
         conversationId,
@@ -427,14 +545,96 @@ async function deliverPendingAttachments(
       failed = true;
     }
   }
-  return { sent, failed, calledOff: stopped };
+  return { sent, failed, calledOff: stopped, lostClaim };
+}
+
+// THE REPLY CLAIM, taken here because this is the tail every posting path shares (issue #452): the
+// direct webhook turn, the debounce flush and the manual re-engage all arrive at this function, and
+// at-most-once only holds while the three claim the same column.
+//
+// TAKEN BEFORE THE SEND AND NEVER GIVEN BACK, which is the contract this file already had when the
+// claim was the watermark's own CAS: a burst is marked the moment a turn commits to answering it, so
+// a send that fails leaves it marked and nothing re-answers it. That trades a lost reply for never
+// sending a duplicate, deliberately and unchanged — the reply a customer already has cannot be taken
+// back, while a burst nobody answered is exactly what `lastError`, the console's error badge and the
+// re-engage button exist to surface.
+//
+// A release on failure was built here and then removed. It is a real improvement — a send that
+// failed SHOULD become retryable — but it changes that trade for every posting path, which is a
+// different change from this one, and five review rounds of consequences said so: which throws prove
+// non-delivery, what "stale" means for a claim, what a restored predecessor does to a later retry,
+// and whether an in-flight claim may be read as an answer. It belongs in an issue of its own.
+export async function runLoadedTurn(
+  params: RunLoadedTurnParams,
+): Promise<RunAgentTurnOutcome> {
+  const target = params.claimReply;
+  if (!target) return runTurnBody(params);
+  const base = params.base ?? basePrisma;
+  // MEMOIZED, AND ASKED BY WHOEVER IS ABOUT TO SEND. Not by the supersede gate: that gate runs
+  // before the output guardrail and before the empty-reply branch, so a claim taken there is taken
+  // by turns that then say NOTHING — a guardrail silencing the reply, a model returning empty, a
+  // batch whose only document was revoked. Marking those bursts answered is the reported bug wearing
+  // a different cause: the tail stays unanswered and the operator's click can never reach it again.
+  //
+  // So the first site that is one statement away from a real send asks, and the answer stands for
+  // the rest of the turn. That keeps the exclusion exactly as strong — two turns racing one burst
+  // still meet in one atomic CAS, and the loser has sent nothing when it loses — while a turn that
+  // never sends leaves the column untouched.
+  let decided: boolean | null = null;
+  const claimBeforeSend = async (): Promise<boolean> => {
+    if (decided !== null) return decided;
+    const claim = await claimReplyBurst({
+      tenantId: params.tenantId,
+      conversationDbId: target.conversationDbId,
+      toMessageId: target.toMessageId,
+      maxHandledAllowed: target.maxHandledAllowed,
+      base,
+    });
+    if (!claim.won) {
+      logger.info(
+        "turn: %s (conv=%s target=%s), deferring",
+        claim.reason === "handled"
+          ? "the burst was already handled"
+          : "another turn holds the reply claim",
+        String(params.conversationId),
+        String(target.toMessageId),
+      );
+    }
+    decided = claim.won;
+    return decided;
+  };
+  return runTurnBody({ ...params, claimBeforeSend });
 }
 
 // Builds the client + tools + graph from an already-loaded AgentConfig, invokes the thread, re-checks
 // the live assignee, optionally consults `shouldPost`, then posts via the bot token.
-export async function runLoadedTurn(
-  params: RunLoadedTurnParams,
+// The body's own input: `RunLoadedTurnParams` plus the gate the wrapper above built. It is not on
+// the public type because no caller may supply it — the claim belongs to the wrapper, which is what
+// makes it ONE column for every posting path. Absent (the playground, a turn with no triggering
+// message) it stands aside and answers yes.
+type RunTurnBodyParams = RunLoadedTurnParams & {
+  claimBeforeSend?: () => Promise<boolean>;
+};
+
+// Whether a read receipt on this channel can reach anything. Written as "not known to be something
+// else" rather than `=== "Channel::Whatsapp"`, because the question has THREE answers and the third
+// is the common one: `channelType` is mirrored from Chatwoot into the local Inbox row and stays null
+// until a sync populates it, so the strict form would silently drop the tick on a real WhatsApp
+// conversation whose mirror lags — the single outcome this feature exists to produce. The two
+// mistakes are not the same size. Treating unknown as WhatsApp costs one request that Chatwoot
+// answers 200 and its listener drops (`return unless channel.respond_to?(:read_messages)`), so
+// Api/Instagram/WebWidget never reach a provider; treating unknown as not-WhatsApp costs the
+// feature, without a log line to say so.
+function channelCanReadReceipt(channelType: string | null): boolean {
+  return channelType === null || channelType === "Channel::Whatsapp";
+}
+
+async function runTurnBody(
+  params: RunTurnBodyParams,
 ): Promise<RunAgentTurnOutcome> {
+  // Every real send in this function is one statement after an ask on this. The default is what a
+  // turn with nothing to be exclusive about wants: send.
+  const claimBeforeSend = params.claimBeforeSend ?? (async () => true);
   // Applied HERE, before anything reads the config, so the prompt the model is built on, the one
   // the output guardrail judges adherence against, and the one the audited row records are the same
   // prompt. Appending it later, at the graph build, would leave the other two describing a turn
@@ -465,15 +665,136 @@ export async function runLoadedTurn(
     makeClient: params.deps?.makeClient,
     botToken: loaded.agentBotToken ?? undefined,
   });
+
   // The question, and it is asked AT each outward write rather than somewhere upstream of it. Four
   // review rounds found the same defect in four different places, and every one of them was an ask
   // that sat next to its effect when it was written and then had a round trip grow between the two:
   // the output guardrail, the supersede re-fetch, the speech normalizer, the synthesis call.
   // Adjacency is not something a call site can be trusted to keep — it has to be where the question
   // is asked.
-  const writeCalledOff = async (): Promise<boolean> =>
-    params.stillWanted !== null &&
-    !(await params.stillWanted({ strict: false }));
+  //
+  // THE OPERATOR'S OWN SILENCES ride the same ask (issue #209 review, rounds 3 and 4). The config
+  // this turn loaded is a model call old by the first send and several waits old by the last — the
+  // input guardrail's template, the slow-tool ack, the output guardrail, the speech normalizer, the
+  // synthesis, the typing pause before each balloon — and an agent switched off or flipped to
+  // monitoring inside any of them must not see one more message go out. Asked in ONE place rather
+  // than as a check beside the model call, for the reason the paragraph above gives: a check placed
+  // at one send is a check the next send is born without. Never on the playground, which does not
+  // come through here — its reply is to an operator.
+  //
+  // WHICH silence, for the caller's bookkeeping (round 6). Both answers stop the run before it
+  // writes, and the callers do different things with the burst afterwards: one withdrawn by /reset
+  // leaves it unmarked for the thread the command cleared, one the operator silenced is read again
+  // by the caller — an observer's burst is folded into memory and marked handled. Latched on the
+  // first refusal, because every ask after it repeats the question; the episode is asked first, so
+  // a run that lost both answers "stale".
+  let silenced = false;
+  const writeCalledOff = async (): Promise<boolean> => {
+    if (
+      params.stillWanted !== null &&
+      !(await params.stillWanted({ strict: false }))
+    ) {
+      return true;
+    }
+    if (!(await agentStillSpeaks(tenantId, loaded.agentId, base))) {
+      silenced = true;
+      return true;
+    }
+    return false;
+  };
+  const standDown = (): "stale" | "agent-unavailable" =>
+    silenced ? "agent-unavailable" : "stale";
+
+  // WHO OWNS IT ACCORDING TO THE MIRROR, RIGHT NOW (issue #457, review round 7). The receiver's gate
+  // proved bot ownership before this turn was queued, and the note is written much later — after the
+  // toolset is built, after the ingestion drain, and after a claim that WAITS on an append's lease
+  // and on the row lock a /reset holds. A person taking the conversation over inside that window
+  // leaves the gate's answer saying the bot owns it, and the note would then state that a human
+  // attendance ended while the human is in it. The post-generation recheck suppresses the SEND and
+  // cannot unwrite a message. Same read that recheck makes, asked at the moment this writes; a read
+  // that fails leaves the note OWED, which costs nothing because nothing is consumed to write it.
+  const botOwnsItNow = async (): Promise<boolean> =>
+    await runScopedOn(base, sysCtx(tenantId), async (db) => {
+      const conv = await db.conversation.findUnique({
+        where: {
+          tenantId_chatwootInstanceId_chatwootConversationId: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: conversationId,
+          },
+        },
+        select: { assigneeType: true, assigneeId: true, status: true },
+      });
+      return shouldBotHandle(
+        {
+          assigneeType: conv?.assigneeType ?? null,
+          assigneeId: conv?.assigneeId ?? null,
+          status: conv?.status ?? null,
+        },
+        { ourAgentBotId: loaded.agentBotId ?? agentBotId },
+      );
+    }).catch((err) => {
+      logger.warn(
+        { err, conv: conversationId },
+        "hand-back note: ownership read failed; leaving the note owed",
+      );
+      return false;
+    });
+
+  // Blue-ticks the contact's messages on WhatsApp. Here because this is the tail BOTH entry points
+  // share, so the direct path and the debounce flush get it from one site instead of two that can
+  // drift; and because a turn reaching this line has read the messages, which is exactly what the
+  // tick claims. It says nothing about a reply coming, so a turn that later defers, hands off or is
+  // silenced keeps it honest.
+  //
+  // Deliberately NOT driven by `lastHandledMessageId`. That watermark also advances for a burst the
+  // bot skipped on purpose (nothing renders to answerable text, a mid-turn takeover, a guardrail
+  // silence), and ticking those would tell the contact somebody read what nobody read.
+  //
+  // `conversationId > 0` keeps the playground out: it runs turns against a dummy client and id 0.
+  // Best-effort, because a Chatwoot older than the endpoint answers 401 (its bot allowlist predates
+  // `read_receipt`) or 404 (no route), and no blue tick is worth failing a turn over.
+  //
+  // A blue tick is an outward write, so it asks what every other outward write in this function asks,
+  // AT the write. Two review rounds arrived here one question at a time; the set is enumerated from
+  // the decision rather than grepped from the code, and it is closed:
+  //
+  //   1. a real conversation      `conversationId > 0`   — the playground runs on a dummy client, id 0
+  //   2. a channel that can show it  `channelCanReadReceipt`
+  //   3. the caller still wants the turn  `writeCalledOff` — `/reset`, or a retired job
+  //   4. the bot still holds the conversation  `botOwnsItNow` — a human took it over mid-turn
+  //   5. something to acknowledge  — inside `markRead`, which does not call on an empty list
+  //
+  // And deliberately NOT `shouldPost`/`claimBeforeSend`, the sixth question the send path asks. That
+  // one CLAIMS the burst as its CAS, advancing the handled watermark; a tick that claimed would mark
+  // messages handled on the way to acknowledging them, which is the defect the watermark rule exists
+  // to prevent. A receipt observes, it does not consume.
+  //
+  // (3) and (4) both suppress the SEND further down and neither can unwrite a tick, which is the
+  // whole reason they are asked here instead. `strict: false` on the fence for the same reason every
+  // other write uses it: an unreadable fence is not evidence that anybody withdrew the run. (4) is
+  // fail-closed, inherited from the read's existing caller and left that way on purpose — "a human
+  // owns it" and "cannot tell" are the same answer to a customer-visible claim made by a bot that
+  // may already have stood down.
+  //
+  // Nothing is lost to (3): a job is retired because a NEWER burst took over, and that flush
+  // acknowledges a superset of these ids.
+  if (
+    params.conversationId > 0 &&
+    channelCanReadReceipt(loaded.channelType) &&
+    !(await writeCalledOff()) &&
+    (await botOwnsItNow())
+  ) {
+    // try/catch and NOT `.catch()`: the latter only covers a rejected promise, and the failure this
+    // has to survive can happen while INVOKING — a client that predates the method (a test double,
+    // an older build) throws TypeError synchronously and walks straight past a `.catch()`. Measured:
+    // the first version of this line took 95 turn tests down with it.
+    try {
+      await client.markRead(params.conversationId, params.readMessageIds);
+    } catch {
+      // Swallowed on purpose: see above.
+    }
+  }
 
   // The two gates that stand between this turn and a post, and neither is the fence — the fences are
   // the asks at the sends themselves. This is where a run that is already called off stops before
@@ -496,10 +817,12 @@ export async function runLoadedTurn(
   // alternative is posting into a conversation the customer just reset. It is also not new: the
   // output-guardrail path has returned "stale" past this same claim since the ask after that model
   // call was added.
-  const postBlocked = async (): Promise<"stale" | "superseded" | null> => {
-    if (await writeCalledOff()) return "stale";
+  const postBlocked = async (): Promise<
+    "stale" | "agent-unavailable" | "superseded" | null
+  > => {
+    if (await writeCalledOff()) return standDown();
     if (params.shouldPost && !(await params.shouldPost())) return "superseded";
-    if (await writeCalledOff()) return "stale";
+    if (await writeCalledOff()) return standDown();
     return null;
   };
 
@@ -515,6 +838,14 @@ export async function runLoadedTurn(
     customerMessage: null as string | null,
     completed: false,
   };
+  // The SAME reading every send makes, handed down whole (issue #209 review, round 5). A fence
+  // derived from `params.stillWanted` alone let a tool call run — the label write, and the slow-tool
+  // ack that posts to the customer — for an agent flipped to monitoring inside the model call, while
+  // the reply after it was refused. Always present now, where it used to be absent for a turn
+  // nothing could retire: the switch and the mode can change under any turn.
+  const stillWantedFence = async (): Promise<boolean> =>
+    !(await writeCalledOff());
+
   const tools = await buildToolset(
     loaded,
     {
@@ -524,6 +855,9 @@ export async function runLoadedTurn(
       client,
       conversationId,
       threadId,
+      // And into the toolset, for the slow-tool ack (round 10): its send is a wait after the
+      // graph's ask at the tool boundary.
+      stillWanted: stillWantedFence,
       messageId: params.messageId,
       imageDeps: params.deps?.imageDeps,
       documentsStorageDir: params.deps?.documentsStorageDir,
@@ -537,6 +871,17 @@ export async function runLoadedTurn(
   const graph = await buildModelAndGraph(loaded, tools, {
     makeModel: params.deps?.makeModel,
     checkpointer: params.deps?.checkpointer,
+    // THE ONE SEAM INSIDE THE INVOKE (issue #449). Every other ask this function makes sits BETWEEN
+    // steps — before the divider, after the claim, before the invoke, at each outward write — and a
+    // tool call happens inside one. Handed down here so the graph can ask it at the tool boundary,
+    // where the alternative is the turn writing an attribute, a label and a kanban card onto the
+    // conversation a `/reset` just cleared.
+    //
+    // `strict: false`, bound here rather than there, and it is the same reading `writeCalledOff`
+    // makes one screen down: what the graph guards is a WRITE TO THE WORLD, and an unreadable mark
+    // is not a withdrawal. The graph cannot honour the other answer anyway — it says why — so
+    // binding the strictness at this end is what keeps the option meaning one thing.
+    stillWanted: stillWantedFence,
     // Hard tool-call limit reached → surface a warn in the turn trail/Logs so the operator sees the
     // agent was forced to answer (vs silently looping or erroring with GraphRecursionError).
     onToolLimit: ({ maxToolCalls, toolCalls }) =>
@@ -677,16 +1022,19 @@ export async function runLoadedTurn(
     // The same sink the turn's own callbacks use. A test that injects one and leaves guardrails on
     // would otherwise capture the agent's row and send the guardrail's to the real database.
     persistUsage: params.deps?.persistUsage,
+    langfuseCfg: loaded.langfuseCfg,
   });
 
   // One piece of customer-facing text, delivered the way this agent delivers text: as audio when the
   // modality calls for it, otherwise split into typing-paced balloons. Returns how many balloons
-  // landed (1 for audio). TTS is best-effort — a synthesis failure falls back to text and never
-  // drops the message.
+  // landed (1 for audio) AND whether part of the reply is missing — `deliverReply` no longer reports
+  // a partial send by throwing (issue #429), so the two have to travel together for the callers
+  // below to keep deciding what a total failure means. TTS is best-effort — a synthesis failure
+  // falls back to text and never drops the message.
   const deliverText = async (
     text: string,
     voiceReply: boolean | null,
-  ): Promise<number | "stale"> => {
+  ): Promise<ReplyDelivery | "stale" | "superseded"> => {
     const wantAudio = shouldReplyWithAudio(
       loaded.ttsConfig.mode,
       params.userSentAudio ?? false,
@@ -723,6 +1071,7 @@ export async function runLoadedTurn(
         // call, so an answer taken before them is an answer about a different moment.
         if (await writeCalledOff()) return "stale";
         if (tts) {
+          if (!(await claimBeforeSend())) return "superseded";
           await client.sendAudioMessage(
             conversationId,
             tts.audio,
@@ -736,7 +1085,11 @@ export async function runLoadedTurn(
             threadId,
             text.length,
           );
-          return 1;
+          // The audio send RETURNED, so there is nothing unaccounted for. A rejected one never
+          // reaches this line: it is caught below and the reply falls back to text, which is its
+          // own delivery question and a different mechanism from this one (issue #499 covers the
+          // text path only).
+          return { delivered: 1, failed: false, unproven: false };
         }
       } catch (e) {
         logger.warn(
@@ -749,6 +1102,7 @@ export async function runLoadedTurn(
     // And again for the text path, which is reached either directly or after the whole TTS attempt
     // above has failed and fallen through — the longest wait of the two.
     if (await writeCalledOff()) return "stale";
+    if (!(await claimBeforeSend())) return "superseded";
     const balloons = await deliverReply(
       client,
       conversationId,
@@ -757,13 +1111,18 @@ export async function runLoadedTurn(
       params.deps?.sleep,
       flow,
       writeCalledOff,
+      // The customer message this turn is answering, which the reply is by definition newer than.
+      // It is what the read-back stops at when the FIRST send is the one that fails, and it costs
+      // nothing: the claim already named it (issue #499).
+      params.claimReply?.toMessageId ?? null,
     );
     logger.info(
-      "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d",
+      "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d partial=%s",
       String(conversationId),
       threadId,
       text.length,
-      balloons,
+      balloons.delivered,
+      String(balloons.failed),
     );
     return balloons;
   };
@@ -824,8 +1183,20 @@ export async function runLoadedTurn(
       // later gate can catch — it leaves before them. A run called off during the model call reaches
       // exactly here, so this is where it stops. The transfer itself stays done: the tool ran, the
       // conversation is the human queue's, and withholding the sentence is the part still ours.
-      if (delivered === "stale" || delivered === 0) return;
-      deliveredBalloons = delivered;
+      //
+      // NOTE: a partial send is not raised here, unlike the reply path below. This whole delivery is
+      // best-effort by design (the catch around it says why), so a missing half of the goodbye must
+      // not become a turn error on a conversation that was answered and correctly handed over.
+      // "superseded" here means another turn holds the claim on this burst, so nothing was sent and
+      // there is nothing to report: the transfer itself already happened, and the sentence is the
+      // only part that was still ours to withhold.
+      if (
+        delivered === "stale" ||
+        delivered === "superseded" ||
+        delivered.delivered === 0
+      )
+        return;
+      deliveredBalloons = delivered.delivered;
     } catch (e) {
       // Best-effort, the semantics the line had while the tool sent it. The transfer succeeded, so
       // branding the turn as errored would stamp lastError and announce "a human has to take over"
@@ -862,6 +1233,16 @@ export async function runLoadedTurn(
   // Set inside the `ingest:` lock when the ask below says this run was called off. A flag and not a
   // throw: the lock's transaction has to commit and release before this function can return.
   let calledOff = false;
+  // What the turn produced, kept when the TOKEN silenced it, and consumed in the `finally` once the
+  // in-flight flag the rollback refuses on has been released. The messages travel rather than a
+  // boolean because the rollback runs outside the scope that has them.
+  let silenceProduced: BaseMessage[] | null = null;
+  // Set when the hand-back note was OWED and could not be appended durably, because an older invoke
+  // was reading the channel. It then rides in this turn's own invoke input instead (issue #457,
+  // review round 6): deferring the durable write is right, but deferring the CORRECTION would leave
+  // this turn reading a transfer with no ending — which is the silence this whole PR is about, on
+  // the first turn after the return, for the customer who is waiting right now.
+  let handbackDeferred = false;
   try {
     // ── Attendance boundary. A NEW conversation reusing this contact-inbox thread gets the
     //    "fresh attendance" divider, and the attendance it replaced becomes compactable.
@@ -1012,6 +1393,46 @@ export async function runLoadedTurn(
               THREAD_STATE_NODE,
             );
           }
+          // THE HAND-BACK NOTE, and this is the turn that owes it (issue #457): the conversation is
+          // back with the bot — it got here, so the gate said so — and the thread still reads as if a
+          // person were handling it. Written here rather than when ownership changed, for three
+          // reasons: an ownership change that never leads to a turn owes no note; here it lands
+          // BEFORE the customer's message, which is the order the model has to read it in; and this
+          // is inside the same section that guards the divider, so it cannot be erased by an invoke
+          // that started earlier.
+          //
+          // Whether it is owed is DERIVED from the channel (./handback.ts), never from a column
+          // tracking ownership: the evidence is what the model itself is looking at, and the note
+          // sitting after it is what makes a second announcement impossible.
+          const channelNow = (
+            (
+              await dividerGraph.getState({
+                configurable: { thread_id: graphThreadId },
+              })
+            ).values as { messages?: BaseMessage[] } | undefined
+          )?.messages;
+          // DEFERRED WHILE ANOTHER INVOKE IS READING, the same rule the divider follows and for the
+          // same reason: that invoke saves the channel it LOADED, so a note appended beside it is
+          // erased. Deferring costs nothing here, and that is the derived model paying off — there
+          // is no marker to advance and nothing to lose, so the next turn asks the same question of
+          // the same thread and writes it then.
+          if (
+            owesHandbackNote(channelNow ?? []) &&
+            // Asked LAST, after the channel read above: that read is a round trip to the
+            // checkpointer's own store, and a takeover during it would make an earlier answer stale
+            // in exactly the same way.
+            (await botOwnsItNow())
+          ) {
+            if (anotherInvokeIsReading) {
+              handbackDeferred = true;
+            } else {
+              await dividerGraph.updateState(
+                { configurable: { thread_id: graphThreadId } },
+                { messages: [humanHandbackMessage(conversationId)] },
+                THREAD_STATE_NODE,
+              );
+            }
+          }
           // THE TURN RECORDS THE INBOUND ID IT HANDLED (issue #194). Ingestion decides whether an
           // out-of-order message may still speak for the thread's attendance by comparing it with
           // the newest inbound id the thread has seen (./attendance-boundary.ts,
@@ -1093,6 +1514,34 @@ export async function runLoadedTurn(
           base,
         });
       }
+    } else {
+      // THE CONVERSATION-KEYED FALLBACK THREAD, which has none of the bookkeeping above: no
+      // ingestion barrier, no claim, no divider. It still carries the one piece of evidence this
+      // decision needs, because a successful handoff is written by the turn's OWN invoke whatever
+      // the thread is keyed by — so leaving it out would leave issue #457 unfixed on a path the
+      // runtime supports.
+      //
+      // Best-effort, and the derived model is what makes that acceptable: with no claim there is no
+      // way to know whether another invoke is reading, so a note appended here can be erased — and
+      // the next turn asks the same question of the same thread and writes it again. Nothing is
+      // consumed, so nothing is lost.
+      const fallbackGraph = buildThreadStateGraph(
+        params.deps?.checkpointer ?? (await getCheckpointer()),
+      );
+      const channelNow = (
+        (
+          await fallbackGraph.getState({
+            configurable: { thread_id: graphThreadId },
+          })
+        ).values as { messages?: BaseMessage[] } | undefined
+      )?.messages;
+      if (owesHandbackNote(channelNow ?? []) && (await botOwnsItNow())) {
+        await fallbackGraph.updateState(
+          { configurable: { thread_id: graphThreadId } },
+          { messages: [humanHandbackMessage(conversationId)] },
+          THREAD_STATE_NODE,
+        );
+      }
     }
 
     // INPUT guardrail: screen the customer message BEFORE the agent processes it. On a violation,
@@ -1104,15 +1553,17 @@ export async function runLoadedTurn(
     // costs a model call, and its silent branch returns "blocked" — a word that says the burst was
     // consumed, so the watermark advances. A run the command called off during that call would be
     // the one path that reports a retired burst as handled.
-    if (await writeCalledOff()) return "stale";
+    if (await writeCalledOff()) return standDown();
     if (guardrailTripped(inGuard)) {
       const inReply = screenedText(inGuard, text);
       if (inReply !== null) {
-        // NOTE: The guardrail reply is a post like any other, so it claims the trigger through the
-        // same gate: without this, two concurrent deliveries that both trip the guardrail each post
-        // their template, and a stale one posts over newer customer input.
+        // NOTE: The guardrail reply is a post like any other, so it passes the same two gates:
+        // without them, two concurrent deliveries that both trip the guardrail each post their
+        // template, and a stale one posts over newer customer input. The claim is asked second and
+        // last, one statement before the send.
         const blocked = await postBlocked();
         if (blocked) return blocked;
+        if (!(await claimBeforeSend())) return "superseded";
         await client.sendMessage(conversationId, inReply);
         deliveredBalloons = 1;
         return "posted";
@@ -1138,6 +1589,26 @@ export async function runLoadedTurn(
     // Wrapped so a throw from INSIDE the graph still delivers what a handoff already promised: the
     // tool can complete the transfer and the model's next step can then fail, and the exception
     // leaves through here with the line still unsent and no later attempt able to send it.
+    // RE-DERIVED IMMEDIATELY BEFORE THE INVOKE (issue #457, review round 10). Between the decision
+    // above and here, the other invoke — the one this deferred to — can finish and append the note
+    // itself. Carrying ours as well would put two of them in the channel, which is the idempotence
+    // this design promises. The question is the same one, asked of the thread as it is now: if the
+    // note is there, nothing is owed and nothing is carried.
+    //
+    // It NARROWS the window rather than closing it: the invoke below loads the channel again, so an
+    // append landing between this read and that load is still possible. The remaining duplicate is
+    // two identical system notes, and nothing consumes either.
+    const carriedHandback =
+      handbackDeferred &&
+      owesHandbackNote(
+        (
+          (
+            await buildThreadStateGraph(
+              params.deps?.checkpointer ?? (await getCheckpointer()),
+            ).getState({ configurable: { thread_id: graphThreadId } })
+          ).values as { messages?: BaseMessage[] } | undefined
+        )?.messages ?? [],
+      );
     const result = await withFlowStage(
       flow,
       "generate",
@@ -1153,6 +1624,14 @@ export async function runLoadedTurn(
         graph.invoke(
           {
             messages: [
+              // The deferred hand-back note, carried by the invoke that owes it rather than by a
+              // durable append beside an older invoke that would erase it. BEFORE the customer's
+              // message, which is the order the model has to read it in, and durable only insofar as
+              // this invoke's own write survives — if it does not, nothing was consumed and the next
+              // turn asks the same question of the same thread.
+              ...(carriedHandback
+                ? [humanHandbackMessage(conversationId)]
+                : []),
               // Stamped with the conversation it belongs to: that stamp, not the divider, is what the
               // compaction cut reads to find where this attendance starts.
               new HumanMessage({
@@ -1220,7 +1699,57 @@ export async function runLoadedTurn(
       }
       return outcome;
     };
-    let reply = lastAssistantText(result.messages).trim();
+    // THE BOUNDARY'S REFUSAL IS NOT AN EMPTY TURN, and read from here the two are identical: both end
+    // on an empty assistant message. Asked of the RESULT and not of the fence, because the fence is
+    // what can have changed its mind — `writeCalledOff` below reads it live, and not every fence this
+    // path is given is monotonic — and a refusal read as "the agent had nothing to say" advances the
+    // handled watermark over a customer message nothing answered and skips the rollback (issue #449,
+    // review round 5). Before `drafted`, which is the first line that treats the empty turn as a
+    // result.
+    if (turnWasCalledOff(result.messages)) return refuse(standDown());
+
+    // The follow-up's silence token is not vocabulary of this path, but it IS in this thread: the
+    // memory is keyed per contact-inbox, so every silent follow-up leaves an assistant turn whose
+    // whole content is the token, and the model reproduces it here (issue #454). Reduced to it, the
+    // reply is silence — the shape `skip_reply` produces, and the one the `!reply` branch below
+    // already handles; carrying it, the reply keeps its text and loses the token. Before the output
+    // guardrail on purpose: the judge would otherwise be asked to screen a marker as if it were
+    // something the agent wrote for the customer.
+    const drafted = customerFacingReply(lastAssistantText(result.messages));
+    let reply = drafted.text;
+    // NOTE: Silence the operator can explain. `skip_reply` records itself in the timeline, and a turn that
+    // went quiet because the model emitted the token would otherwise be indistinguishable from the
+    // agent ignoring a customer who is waiting.
+    if (drafted.bySentinel) {
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        detail: { silenceTokenSuppressed: true },
+      });
+      // NOTE: ...and the turn must not leave the token behind, or the defect FEEDS itself: the raw message
+      // is already checkpointed (graph.invoke persisted it before this line), the thread is shared
+      // per contact-inbox, and the next turn reads one more sentinel answer — reinforcing exactly the
+      // condition that produced this one.
+      //
+      // ARMED here and run in the `finally`, not called here, and that is not tidiness: the rollback
+      // takes the ingest queue and REFUSES while `isTurnInFlight` holds, which is this very turn.
+      // Called inline it returns `keep` every time and silently does nothing — measured, the message
+      // stayed in the channel with the test green on everything else.
+      silenceProduced = result.messages as BaseMessage[];
+    }
+    // NOTE: The other half, and it exists because the rule REFUSES to edit the token out of a real answer
+    // (that is the data loss `docs/graph.md` prohibits). So the reply goes out carrying it, and the
+    // operator hears about it here rather than from the customer — a cosmetic leak that is reported
+    // is a different thing from one that is silent.
+    if (drafted.carriesToken) {
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        detail: { silenceTokenInReply: true },
+      });
+    }
 
     // The deferred resolve falls with the TRANSFER, not with the suppression of the final text: a
     // conversation the human queue now owns is not ours to close, and that holds even when the
@@ -1334,7 +1863,7 @@ export async function runLoadedTurn(
     const outGuard = screened ? await runGuardrail("output", screened) : null;
     // Same wait, same reason: `postBlocked` answered before this model call, and the suppressed
     // branch below returns "blocked" without passing any later ask.
-    if (await writeCalledOff()) return refuse("stale");
+    if (await writeCalledOff()) return refuse(standDown());
     if (outGuard && guardrailTripped(outGuard)) {
       turnState.pendingAttachments.length = 0;
       const replacement = screenedText(outGuard, screened);
@@ -1352,12 +1881,13 @@ export async function runLoadedTurn(
     // reported "empty" would leave a stale turn error on a conversation that was just answered.
     if (!reply) {
       // Nothing has left this turn yet on this branch, so the whole thing stands down.
-      if (await writeCalledOff()) return refuse("stale");
+      if (await writeCalledOff()) return refuse(standDown());
       const queued = turnState.pendingAttachments.length;
       const {
         sent,
         failed,
         calledOff: attachmentsCalledOff,
+        lostClaim,
       } = await deliverPendingAttachments(
         client,
         conversationId,
@@ -1365,12 +1895,16 @@ export async function runLoadedTurn(
         flow,
         { tenantId: params.tenantId, base },
         writeCalledOff,
+        claimBeforeSend,
       );
+      // The files WERE this turn, and another turn holds the burst: nothing went out, and the whole
+      // turn stands down rather than reporting an empty answer it did not choose.
+      if (lostClaim) return refuse("superseded");
       // Only when NOTHING left. A batch called off after its second attachment already reached the
       // customer, and "stale" would leave the watermark where it is — handing the same burst to the
       // next flush, which would send that attachment again. What was delivered decides the word, the
       // same rule the reply below follows.
-      if (attachmentsCalledOff && !sent) return refuse("stale");
+      if (attachmentsCalledOff && !sent) return refuse(standDown());
       // NOTE: The attachments WERE the turn and none of them reached the customer. That is a failed
       // turn, not a silent one: returning "empty" here would let the deferred resolve close a
       // conversation nobody answered, and the callers only record a turn error (private note,
@@ -1395,7 +1929,18 @@ export async function runLoadedTurn(
       // Skipped, not returned on: closing a conversation the operator has just cleared is a write
       // of its own, and by here something may already have reached the customer — the outcome still
       // has to describe that.
-      if (!(await writeCalledOff())) {
+      //
+      // AND SKIPPED ON A PARTIAL BATCH: the customer holds some of what the turn owed them, so a
+      // `resolved` conversation tells the operator this attendance is finished when the agent knows
+      // it is not. The rule itself lives in ./close-intent.ts, asked the same way at all three
+      // sites — it was answered differently at each until a review round found them one by one.
+      if (
+        mayCloseConversation({
+          replyPartial: false,
+          attachmentFailed: failed,
+        }) &&
+        !(await writeCalledOff())
+      ) {
         await applyDeferredResolve(client, conversationId, turnState, flow, {
           tenantId,
           instanceId,
@@ -1403,12 +1948,27 @@ export async function runLoadedTurn(
           observed: recheck.observed,
         });
       }
-      return sent || handedOff ? "posted" : "empty";
+      // Partial here too, and the same rule: a batch where one file failed is an attendance the
+      // customer did not fully receive, so it neither closes nor clears the badge.
+      if (!sent && !handedOff) return "empty";
+      const postedFiles = postedOutcomeFor({
+        replyPartial: false,
+        attachmentFailed: failed,
+      });
+      if (postedFiles === "posted-partial") {
+        await notePartialDelivery({
+          tenantId,
+          instanceId,
+          conversationId,
+          base,
+        });
+      }
+      return postedFiles;
     }
 
     // The image lands before the text that talks about it, and before the TTS branch: an audio
     // reply must not swallow the attachment.
-    if (await writeCalledOff()) return refuse("stale");
+    if (await writeCalledOff()) return refuse(standDown());
     const attachments = await deliverPendingAttachments(
       client,
       conversationId,
@@ -1416,14 +1976,51 @@ export async function runLoadedTurn(
       flow,
       { tenantId: params.tenantId, base },
       writeCalledOff,
+      claimBeforeSend,
     );
+    if (attachments.lostClaim) return refuse("superseded");
     // Called off mid-batch with something already out: the text below would stand down anyway, and
     // returning "stale" from there would replay a burst whose attachment the customer has. The turn
     // reports what it delivered and stops here.
     if (attachments.calledOff)
-      return attachments.sent ? "posted" : refuse("stale");
+      return attachments.sent ? "posted" : refuse(standDown());
 
     const delivered = await deliverText(reply, recheck.voiceReply);
+    // Another turn holds the claim on this burst. Nothing left here — the ask sits one statement
+    // before the send — and an attachment cannot have gone out either, because the batch above asks
+    // the same memoized gate first, so this stands down whole.
+    if (delivered === "superseded") return refuse("superseded");
+    // NOTHING LANDED AND A SEND FAILED: a failed turn, and the ONE shape of partial delivery that
+    // still throws (issue #429). Nothing reached the customer, so there is nothing a retry could
+    // duplicate — which is exactly what makes the throw safe here and unsafe one balloon later. The
+    // throw is also the only way the operator hears about it: the callers record a turn error
+    // (private note, lastError, alert) on a throw and on nothing else, and the recovery reads it to
+    // decide the row is still owed an answer.
+    //
+    // Same rule as the attachment-only branch above, and stated the same way there: delivered
+    // nothing AND failed is a failure; delivered nothing without failing is not.
+    //
+    // NOTE: ...unless an ATTACHMENT already went out. Then the customer holds part of the answer,
+    // and a re-run would send that attachment a second time — the same reason the branch below
+    // reports "posted" rather than standing down.
+    if (
+      delivered !== "stale" &&
+      delivered.failed &&
+      delivered.delivered === 0
+    ) {
+      // ...AND ONLY WHEN NOTHING LANDED IS A FACT rather than an absence of evidence (issue #499).
+      // `unproven` means a send was rejected and Chatwoot could not be asked whether it landed, so
+      // the reply may be sitting in the conversation. Throwing on that is not a louder report, it is
+      // a different action: the throw is what eventually marks the ledger row DEAD and hands it to
+      // the delivery recovery, which re-runs this turn in full — every side-effecting tool included
+      // — over a message that may already have been answered. The operator still hears about it
+      // through the badge the branch below writes.
+      if (!attachments.sent && !delivered.unproven) {
+        throw new Error(
+          "envio da resposta: nenhum balão foi entregue ao cliente",
+        );
+      }
+    }
     // Zero is the split loop standing down on its FIRST balloon: nothing reached the customer, so
     // this is a stale turn and not a delivered one. Treating every number as posted would advance
     // the handled watermark over a burst nobody answered, and the next flush starts after it.
@@ -1432,10 +2029,70 @@ export async function runLoadedTurn(
     // and the third place it has to be written: the images were delivered before this line ran, so a
     // command landing in the text send leaves a customer holding part of the answer. "stale" would
     // hand the burst back to the next flush, which sends that attachment again.
-    if (delivered === "stale" || delivered === 0) {
-      return attachments.sent ? "posted" : refuse("stale");
+    if (delivered === "stale" || delivered.delivered === 0) {
+      // An UNPROVEN zero is not a stand-down either: standing down hands the burst back to the next
+      // flush, which would answer it again — the same duplicate the throw above was just kept from
+      // arming, arriving through the other door. It is reported instead, so the burst is consumed,
+      // the conversation stays open and the badge says a delivery could not be accounted for.
+      if (delivered !== "stale" && delivered.unproven) {
+        await notePartialDelivery({
+          tenantId,
+          instanceId,
+          conversationId,
+          base,
+          unproven: true,
+        });
+        return "posted-partial";
+      }
+      if (!attachments.sent) return refuse(standDown());
+      // The attachment IS the answer the customer got, and this is the third shape of a partial
+      // delivery rather than a fourth kind of success: a text send that failed outright leaves them
+      // holding the file and none of the words, which is exactly what the badge exists to say.
+      //
+      // `stale` is deliberately NOT partial. Nothing was attempted after the fence, by decision, and
+      // reporting the operator's own /reset as an incomplete delivery puts `lastError` back on the
+      // conversation they had just cleared — the rule `deliverReply` states for the same case.
+      // `attachmentFailed` is still asked on that path, because a file that failed BEFORE the fence
+      // failed on its own.
+      const postedOnFiles = postedOutcomeFor({
+        replyPartial: delivered !== "stale" && delivered.failed,
+        attachmentFailed: attachments.failed,
+      });
+      if (postedOnFiles === "posted-partial") {
+        await notePartialDelivery({
+          tenantId,
+          instanceId,
+          conversationId,
+          base,
+        });
+      }
+      return postedOnFiles;
     }
-    deliveredBalloons = delivered;
+    deliveredBalloons = delivered.delivered;
+    // AN ATTENDANCE THE CUSTOMER DID NOT FULLY RECEIVE DOES NOT CLOSE, and this branch owes the
+    // answer for BOTH halves of what the turn promised: the text AND the files that went out ahead
+    // of it. Asking only about the text is how a reply that landed while a promised photo did not
+    // still closed the conversation.
+    //
+    // The reply is still `posted` for retry bookkeeping — the customer HAS part of it, and re-running
+    // would send that part twice — so the two questions genuinely differ. The flow lines from the
+    // failed sends are what tell the operator why the conversation stayed open.
+    const posted = postedOutcomeFor({
+      replyPartial: delivered.failed,
+      attachmentFailed: attachments.failed,
+    });
+    if (posted === "posted-partial") {
+      await notePartialDelivery({
+        tenantId,
+        instanceId,
+        conversationId,
+        base,
+        // Some of the reply landed and one send could not be accounted for, so what is missing is
+        // a doubt rather than a fact here too.
+        unproven: delivered.unproven,
+      });
+      return posted;
+    }
     // Same rule as the branch above: the reply is out, the resolve is a separate write.
     if (await writeCalledOff()) return "posted";
     await applyDeferredResolve(client, conversationId, turnState, flow, {
@@ -1447,13 +2104,6 @@ export async function runLoadedTurn(
     return "posted";
   } finally {
     clearTurnInFlight(threadId);
-    // Only what this turn actually took: releasing a claim we never made would release a CONCURRENT
-    // turn's, and hand the thread to a compaction while that turn is still reading it.
-    // NOTE: releasing is best-effort, and deliberately cannot fail the turn. By here the reply may
-    // already be with the customer; a throw from this line would skip `status.finished` and make the
-    // caller treat a delivered turn as failed, which a retry then answers a second time. The row
-    // carries a lease precisely so a release that never lands is recovered by expiry instead of by
-    // anyone waiting on it.
     if (graphOwner) {
       const heldOwner: ThreadOwner = graphOwner;
       try {
@@ -1466,6 +2116,65 @@ export async function runLoadedTurn(
         logger.warn(
           { err, thread: heldOwner.graphThreadId },
           "failed to release the durable turn claim; its lease will expire",
+        );
+      }
+    }
+    // NOTE: LAST, and the order is the whole point. `undoRefusedTurn` stands down while the GRAPH thread is
+    // in flight, and there are two claims on this turn: `markTurnInFlight(threadId)` cleared at the
+    // top of this block, and the durable one `markTurnOwning` takes on `graphThreadId` — which is a
+    // DIFFERENT key whenever the conversation has a contact-inbox, i.e. the normal case. Released
+    // only by `clearTurnOwning` just above, so anywhere earlier the rollback reads this turn's own
+    // claim and answers `another-invoke-is-reading`: a no-op, silently, in exactly the production
+    // shape. Round 5 put it after the first clear and the test agreed, because the test seeded a
+    // conversation with no contact-inbox and the two keys collapsed into one.
+    if (silenceProduced) {
+      const produced = silenceProduced;
+      try {
+        const plan = await undoRefusedTurn({
+          checkpointer: params.deps?.checkpointer ?? (await getCheckpointer()),
+          graphThreadId,
+          produced,
+          kind: "reactive",
+          // The claim this turn has just released, taken again for the write — so a turn STARTING on
+          // another replica waits for it instead of loading the sentinel and saving it back. Null
+          // when the conversation has no contact inbox: no row, hence nothing durable to hold, and
+          // the process-local check is all there is (thread-claim.ts).
+          owner: graphOwner,
+          base,
+        });
+        if (plan?.action === "remove") {
+          logger.info(
+            "turn rolled back a token-silenced turn: conv=%s messages=%d",
+            String(conversationId),
+            plan.ids.length,
+          );
+        } else if (plan?.reason === "already-gone") {
+          // NOTE: NOT A MISS: the words are not in the thread, which is the whole goal. This is what a
+          // REFUSAL after the silence looks like — a takeover, a supersede, a `/reset` — because
+          // every refusal exits through `refuse`, whose own rollback removes the same messages.
+          //
+          // The two race, and this side always loses: `return refuse(...)` is not awaited, so this
+          // `finally` runs while that rollback is still in flight, and the `ingest:` queue decides
+          // the order. Clearing a flag inside `refuse` cannot fix it — this block has already read
+          // it by then (measured, round 25). Reading the OUTCOME instead of the ordering is what
+          // makes the answer stable.
+          logger.info(
+            "turn: the token-silenced turn was already taken back out: conv=%s",
+            String(conversationId),
+          );
+        } else {
+          // NOTE: Named rather than silent: the history still holds a message the customer never received,
+          // which is the compounding this exists to stop.
+          logger.warn(
+            "turn could not roll back a token-silenced turn: conv=%s reason=%s",
+            String(conversationId),
+            plan?.reason ?? "unknown",
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "turn: could not roll back a token-silenced turn",
         );
       }
     }
@@ -1572,10 +2281,17 @@ export async function runAgentTurn(
 
   // NOTE: Post gate, mirroring the debounce flush (issue #49): concurrent direct turns on the same
   // conversation (webhook deliveries are not serialized) each generate a reply — without this gate
-  // the STALE one posts too, answering a message the customer already moved past. Re-fetch to
-  // detect a newer incoming message (defer to its own turn), then advance the watermark via the
-  // monotonic CAS so a duplicate/stale claim can never double-post. Re-fetch failure is non-fatal
-  // (same contract as the flush); the CAS is the backstop.
+  // the STALE one posts too, answering a message the customer already moved past.
+  //
+  // THREE QUESTIONS, where the CAS this used to be answered two of them with one write (issue #452).
+  // "Has a newer message arrived?" is this re-fetch. The other two are settled together, under one
+  // row lock, by the claim `claimReply` names below: "was this trigger already handled" (the
+  // watermark, against the ceiling this path passes — a delivery arriving late for a message an
+  // earlier turn answered or skipped stands down, which is what the losing CAS used to say) and "is
+  // anybody else answering it right now" (the reply claim, the ONE column every posting path
+  // shares, which is what makes this turn and a manual re-engage of the same message exclusive).
+  // Splitting those two apart would reopen the window a deliberate skip lands in. Re-fetch failure
+  // is non-fatal (same contract as the flush).
   const triggerId = n.message?.id ?? null;
   const convDbId = loaded.conversationDbId;
   const shouldPost =
@@ -1603,19 +2319,30 @@ export async function runAgentTurn(
               e instanceof Error ? e.message : String(e),
             );
           }
-          return advanceHandledWatermark({
-            tenantId,
-            conversationDbId: convDbId,
-            toMessageId: triggerId,
-            base,
-          });
+          return true;
         }
       : undefined;
 
   const outcome = await runLoadedTurn({
-    // Nothing queued this turn: it is the delivery itself, arriving from the webhook. There is no
-    // job for /reset to retire and no other run that could call it off.
-    stillWanted: null,
+    // The direct path answers exactly one message, so the receipt set is that message.
+    readMessageIds: typeof n.message?.id === "number" ? [n.message.id] : [],
+    // Nothing QUEUED this turn — it is the delivery itself, arriving from the webhook — so there is
+    // no job for /reset to retire. What names this run instead is the EPISODE, read off the message
+    // it is answering, and ./reset-episode.ts carries the measurement: without it the operator's
+    // /reset is acknowledged and this turn then runs its tools on the conversation that was just
+    // cleared. `null` stays for a turn with no mirrored conversation to read the boundary from (the
+    // playground), where nothing can reset it either.
+    stillWanted:
+      convDbId === null
+        ? null
+        : stillInSameEpisode({
+            tenantId,
+            conversationDbId: convDbId,
+            // The same id the supersede gate claims with, and for a related reason: it is what
+            // names this run in the order the SOURCE put it in.
+            triggerMessageId: triggerId,
+            base,
+          }),
     loaded,
     authContext: params.authContext ?? null,
     tenantId,
@@ -1629,20 +2356,40 @@ export async function runAgentTurn(
     base,
     deps: params.deps,
     shouldPost,
+    // The same id the supersede gate is written around: this turn answers ONE message, so that
+    // message is the burst it claims. Null where there is nothing to be exclusive about — no
+    // mirrored conversation (the playground), or no triggering message.
+    claimReply:
+      triggerId !== null && convDbId !== null
+        ? {
+            conversationDbId: convDbId,
+            toMessageId: triggerId,
+            // Nothing at or past this message may have been handled: this turn answers that one
+            // message, so a mark that already covers it means somebody else settled it.
+            maxHandledAllowed: triggerId - 1,
+          }
+        : null,
   });
-  // NOTE: Watermark tail for the outcomes shouldPost's CAS did not cover ("posted" already advanced):
+  // NOTE: Watermark tail, now for every outcome including "posted" — the post gate claims in its own
+  // column and no longer advances this one on the way past (issue #452).
   // empty/blocked consumed the message, taken over hands it to the human — left alone the watermark
   // stays NULL forever, and the first flush after debounce is later enabled (or after an arm failure
   // fell back here) re-answers the whole recent page (issue #8). "superseded" stays put BY DESIGN:
   // the newer message's own turn advances past it. Best-effort — a watermark miss must not fail the
   // turn.
-  // "stale" joins it, for the opposite reason and the same effect: the run was called off, so the
-  // message it carried was withdrawn rather than handled. This path never produces it today (a
-  // webhook turn passes `stillWanted: null`), and it is listed so the next caller that does not
-  // inherit a silent advance.
+  // "stale" ADVANCES IT, and used not to. It was excluded when nothing on this path could produce
+  // it, on the reasoning that a called-off run withdraws its message rather than handling it — which
+  // is the flush's truth, where a re-armed flush answers the burst, and not this path's. Here the
+  // only thing that calls a run off is the operator's own /reset (./reset-episode.ts), nothing else
+  // is coming for the message, and the receiver settles its ledger row as CONSUMED. The watermark
+  // has to agree with the ledger: left behind, the row is terminal while the watermark still sits
+  // below the message, and the first flush after debounce is enabled re-answers it (issue #8).
+  //
+  // Not covered by the command's own advance, which is the shape a review round measured: /reset
+  // writes the boundary in its FIRST step and advances this watermark in its LAST, with a dozen
+  // Chatwoot calls in between, so a process dying in that stretch leaves exactly the gap above.
   if (
     outcome !== "superseded" &&
-    outcome !== "stale" &&
     n.message?.id != null &&
     loaded.conversationDbId !== null
   ) {

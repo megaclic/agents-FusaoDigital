@@ -18,6 +18,7 @@ import {
   agentUpdate,
   toolCreate,
 } from "@/modules/mcp/write-agents";
+import { seedChatwootInstance } from "../utils/chatwoot";
 
 // Agent-builder write tools: gate (scope + tenant target) is DB-free; dry-run/apply/audit, the
 // credential-by-NAME resolution and tenant fencing need a real Postgres (skipIf).
@@ -71,7 +72,36 @@ describe("MCP agent-builder gate (no DB)", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("invalid agent export");
   });
+});
 
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+describe.skipIf(!dbUp)("MCP agent-builder tools (DB)", () => {
+  // MOVED OUT OF THE DB-FREE BLOCK, because the dry run stopped being a summary of the payload and
+  // became the apply itself, rolled back (#501): what it reports is what the apply produces, and
+  // producing it needs the database. That is the direction this file's header already describes —
+  // the gate is DB-free, the dry run is not.
   test("agent_import dry-run (default) previews without writing", async () => {
     const exp = {
       version: AGENT_EXPORT_VERSION,
@@ -88,7 +118,11 @@ describe("MCP agent-builder gate (no DB)", () => {
         credentials: [{ name: "OpenAI", kind: "openai" }],
       },
     };
-    const r = await agentImport(principal({}), { export: exp });
+    const r = await agentImport(
+      principal({ tenantId: tenantA }),
+      { export: exp },
+      { base: appDb },
+    );
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.data.dryRun).toBe(true);
@@ -137,7 +171,11 @@ describe("MCP agent-builder gate (no DB)", () => {
         ],
       },
     };
-    const r = await agentImport(principal({}), { export: exp });
+    const r = await agentImport(
+      principal({ tenantId: tenantA }),
+      { export: exp },
+      { base: appDb },
+    );
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const components = r.data.components as Record<string, number>;
@@ -146,32 +184,7 @@ describe("MCP agent-builder gate (no DB)", () => {
     );
     expect(components.documentTemplates).toBe(1);
   });
-});
 
-const appUrl = process.env.TEST_APP_DATABASE_URL;
-const suUrl = process.env.MIGRATION_DATABASE_URL;
-let dbUp = false;
-let su: PrismaClient | undefined;
-let app: PrismaClient | undefined;
-if (appUrl && suUrl) {
-  try {
-    su = new PrismaClient({
-      adapter: new PrismaPg({ connectionString: suUrl }),
-    });
-    await su.$queryRaw`SELECT 1`;
-    app = new PrismaClient({
-      adapter: new PrismaPg({ connectionString: appUrl }),
-    });
-    await app.$queryRaw`SELECT 1`;
-    dbUp = true;
-  } catch {
-    dbUp = false;
-  }
-}
-const appDb = app as PrismaClient;
-const suDb = su as PrismaClient;
-
-describe.skipIf(!dbUp)("MCP agent-builder tools (DB)", () => {
   let tenantA = 0n;
   let tenantB = 0n;
   let agentA = 0n;
@@ -499,6 +512,71 @@ describe.skipIf(!dbUp)("MCP agent-builder tools (DB)", () => {
     if (!r.ok) expect(r.error).toContain("not found");
     const row = await suDb.agent.findUnique({ where: { id: agentA } });
     expect(row?.name).toBe("Builder");
+  });
+
+  // BOTH REFUSALS THE OBSERVER BINDING ADDED (issue #476 review, round 46), asked by the PREVIEW too.
+  // `updateAgent` refuses to save a non-monitoring mode on an agent that observes an inbox, and
+  // `deleteAgent` refuses to delete one; a preview that cannot ask either approves the one write the
+  // apply is certain to reject, and the caller learns the truth from the 422.
+  test("the previews refuse an observing agent exactly as the applies do", async () => {
+    const p = principal({ tenantId: tenantA });
+    const inst = await seedChatwootInstance(suDb, {
+      tenantId: tenantA,
+      accountId: 8123,
+      baseUrl: "https://chat.mcp-observer.example",
+    });
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId: tenantA,
+        chatwootInstanceId: inst.id,
+        chatwootInboxId: 8123,
+        name: "Observada",
+      },
+      select: { id: true },
+    });
+    const watcher = await suDb.agent.create({
+      data: {
+        tenantId: tenantA,
+        name: "Watcher",
+        systemPrompt: "p",
+        mode: "monitoring",
+      },
+      select: { id: true },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId: tenantA, inboxId: inbox.id, agentId: watcher.id },
+    });
+
+    try {
+      const demote = await agentUpdate(
+        p,
+        { agent_id: String(watcher.id), mode: "production" },
+        { base: appDb },
+      );
+      expect(demote.ok).toBe(false);
+      if (!demote.ok) expect(demote.error).toContain("observes inboxes");
+
+      const del = await agentDelete(
+        p,
+        { agent_id: String(watcher.id) },
+        { base: appDb },
+      );
+      expect(del.ok).toBe(false);
+      if (!del.ok) expect(del.error).toContain("observes inboxes");
+
+      // ...and a mode change that STAYS monitoring is not refused by either.
+      const rename = await agentUpdate(
+        p,
+        { agent_id: String(watcher.id), name: "Watcher 2" },
+        { base: appDb },
+      );
+      expect(rename.ok).toBe(true);
+    } finally {
+      await suDb.inboxObserver.deleteMany({ where: { inboxId: inbox.id } });
+      await suDb.inbox.delete({ where: { id: inbox.id } });
+      await suDb.agent.delete({ where: { id: watcher.id } });
+      await suDb.chatwootInstance.delete({ where: { id: inst.id } });
+    }
   });
 
   test("agent_delete dry-run keeps the agent; apply removes it", async () => {

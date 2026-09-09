@@ -1,8 +1,9 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
-import { decryptJson, encryptJson } from "@/api/lib/crypto";
+import { decryptJson } from "@/api/lib/crypto";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { AppError } from "@/lib/errors";
+import { fetchBounded } from "@/lib/outbound";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
@@ -10,7 +11,7 @@ import {
   encryptOAuthState,
   newNonce,
 } from "./oauth-core";
-import { vaultRefWhere } from "./service";
+import { persistRefreshedOAuthSecret, vaultRefWhere } from "./service";
 
 // Generic OAuth 2.1 client mechanics for the `mcp_oauth` vault kind: discovery (RFC 8414 / 9728) +
 // Dynamic Client Registration (RFC 7591) + Authorization Code + PKCE (RFC 7636) + RFC 8707
@@ -82,21 +83,37 @@ export function defaultNetOpts(): OAuthNetOpts {
 
 // ── low-level fetch helpers (SSRF-guarded, timed out) ──
 
+// Returns the body as TEXT rather than the `Response`, and that is the point: a `Response` handed
+// back with its body unread is a body read outside the bound, which is the defect #464 measured in
+// the HTTP tool. `fetchBounded` covers the whole exchange and caps what it retains.
+interface TimedResponse {
+  ok: boolean;
+  status: number;
+  text: string;
+}
+
 async function timedFetch(
   url: string,
   init: RequestInit,
   opts: OAuthNetOpts,
-): Promise<Response> {
+): Promise<TimedResponse> {
   await assertSafeOutboundUrl(url, {
     allowHttp: opts.allowHttp,
     allowPrivate: opts.allowPrivate,
   });
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TOKEN_TIMEOUT_MS);
+  const { res, body } = await fetchBounded(url, init, {
+    timeoutMs: TOKEN_TIMEOUT_MS,
+  });
+  return { ok: res.ok, status: res.status, text: body.text };
+}
+
+// What `res.json().catch(() => ({}))` did: a body that is not JSON leaves the caller reading the
+// STATUS, which is the only thing it has.
+function parseJsonOrEmpty<T>(text: string): T {
   try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
+    return JSON.parse(text) as T;
+  } catch {
+    return {} as T;
   }
 }
 
@@ -110,7 +127,9 @@ async function getJson<T>(url: string, opts: OAuthNetOpts): Promise<T> {
       { url, status: res.status },
     );
   }
-  return (await res.json()) as T;
+  // Unguarded on purpose: `res.json()` threw on a body that is not JSON and every caller here was
+  // written against that, so a discovery document that is not one must keep failing loudly.
+  return JSON.parse(res.text) as T;
 }
 
 // ── discovery (RFC 9728 protected-resource → RFC 8414 authorization-server) ──
@@ -263,7 +282,7 @@ export async function registerClient(params: {
     },
     params.opts,
   );
-  const json = (await res.json().catch(() => ({}))) as DcrResponse;
+  const json = parseJsonOrEmpty<DcrResponse>(res.text);
   if (!res.ok || !json.client_id) {
     throw new AppError(
       `dynamic client registration failed: ${json.error ?? res.status}`,
@@ -391,7 +410,7 @@ async function postToken(
     },
     opts,
   );
-  const json = (await res.json().catch(() => ({}))) as TokenResponse;
+  const json = parseJsonOrEmpty<TokenResponse>(res.text);
   if (!res.ok || json.error) {
     throw new AppError(
       `mcp token endpoint error: ${json.error ?? res.status}`,
@@ -528,12 +547,10 @@ async function refreshNow(
     scopes: json.scope ? json.scope.split(/\s+/).filter(Boolean) : cred.scopes,
   };
 
-  await runScopedOn(base, ctx, async (db) => {
-    await db.vaultEntry.updateMany({
-      where: vaultRefWhere(ref),
-      data: { secret: encryptJson(refreshed) },
-    });
-  });
+  // Through the seam, not straight at the column: see `persistRefreshedOAuthSecret`, which writes
+  // the same blob and records a row ONLY when the durable half moved (a rotated refresh token, or
+  // scopes the grant changed upstream). A renewed access token on its own is bookkeeping.
+  await persistRefreshedOAuthSecret(ctx, entryId, refreshed, base);
 
   return refreshed.accessToken as string;
 }

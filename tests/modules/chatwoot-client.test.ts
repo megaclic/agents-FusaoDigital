@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import logger from "@/api/lib/logger";
 import {
   ChatwootApiError,
   ChatwootMissingTokenError,
@@ -69,6 +70,36 @@ describe("ChatwootClient", () => {
     });
   });
 
+  // THE NAME TRAVELS OUT WITH THE REQUEST (issue #499), because the send that fails never returns
+  // anything: an id assigned by the response cannot help the attempt that timed out. Verified
+  // against the fork that `content_attributes` handed to the create is persisted verbatim and comes
+  // back on the read.
+  test("sendMessage carries the send id in content_attributes when asked", async () => {
+    const { fetchImpl, calls } = stub(200, { id: 1 });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.sendMessage(42, "olá", { sendId: "abc-123" });
+    expect(calls[0]?.body).toMatchObject({
+      content: "olá",
+      content_attributes: { fazer_ai_send_id: "abc-123" },
+    });
+  });
+
+  // And OMITTED otherwise, rather than sent empty: the fork stores the bag verbatim, so a key
+  // written on every message whether or not anything will read it is exactly the hypothesis-shaped
+  // debt this repo asks callers not to leave behind.
+  test("sendMessage sends no content_attributes when no id was asked for", async () => {
+    const { fetchImpl, calls } = stub(200, { id: 1 });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.sendMessage(42, "olá");
+    expect(calls[0]?.body).not.toHaveProperty("content_attributes");
+  });
+
   test("sendPrivateNote sets private:true", async () => {
     const { fetchImpl, calls } = stub();
     const client = await createChatwootClient(baseConfig, {
@@ -130,6 +161,46 @@ describe("ChatwootClient", () => {
     expect(calls[0]?.url).toContain("/conversations/42/toggle_typing_status");
     expect(calls[0]?.body).toMatchObject({ typing_status: "on" });
     expect(calls[0]?.headers["api-access-token"]).toBe("BOT_TOK");
+  });
+
+  test("markRead uses the bot token (read_receipt is bot-accessible)", async () => {
+    const { fetchImpl, calls } = stub();
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.markRead(42, [7, 9]);
+    expect(calls[0]?.url).toContain("/conversations/42/read_receipt");
+    expect(calls[0]?.body).toMatchObject({ message_ids: [7, 9] });
+    expect(calls[0]?.headers["api-access-token"]).toBe("BOT_TOK");
+  });
+
+  // An empty list is the endpoint's "I processed nothing", which acknowledges nothing. Sending it
+  // would be a wasted round trip on every turn that has no ids to name, so the call never happens.
+  test("markRead sends nothing when there are no message ids", async () => {
+    const { fetchImpl, calls } = stub();
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.markRead(42, []);
+    expect(calls.length).toBe(0);
+  });
+
+  // A Chatwoot older than the endpoint answers 401 (the bot allowlist has no `read_receipt`) or 404
+  // (no route at all). The client reports it like any other failure; swallowing it is the caller's
+  // job, and every call site does exactly that.
+  test("markRead surfaces the failure of a Chatwoot without the endpoint", async () => {
+    for (const status of [401, 404]) {
+      const { fetchImpl } = stub(status, { error: "nope" });
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      await expect(client.markRead(42, [7])).rejects.toBeInstanceOf(
+        ChatwootApiError,
+      );
+    }
   });
 
   test("read methods use the admin token", async () => {
@@ -531,6 +602,42 @@ describe("ChatwootClient", () => {
     });
   });
 
+  // THE SHAPE THIS ENDPOINT ACTUALLY ANSWERS (issue #495 review, round 3). The fork's view is
+  // `json.agent_bot do ... if @agent_bot.present?`, so the key is always there and its EMPTINESS is
+  // the answer. The first version of this parser read `res.id` and would have reported "no bot" for
+  // every attached bot there is — a stub handing back a bare number could never have caught it,
+  // which is why the three shapes are driven through the real client here.
+  describe("the inbox's attached agent bot", () => {
+    const read = async (payload: unknown) => {
+      const { fetchImpl, calls } = stub(200, payload);
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      const got = await client.inboxAgentBotId(9);
+      return { got, calls };
+    };
+    test("an attached bot answers its id, off the nested object", async () => {
+      const { got, calls } = await read({
+        agent_bot: { id: 501, name: "Ops" },
+      });
+      expect(got).toBe(501);
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[0]?.url).toContain("/inboxes/9/agent_bot");
+      expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+    });
+    test("an empty agent_bot is a definite none", async () => {
+      expect((await read({ agent_bot: {} })).got).toBeNull();
+      expect((await read({ agent_bot: null })).got).toBeNull();
+    });
+    // Not `null`: a body without the key is a Chatwoot that does not serve this route, or a shape we
+    // do not recognise, and a caller must not read that as "there is no bot".
+    test("a body without the key is unknown, not none", async () => {
+      expect((await read({})).got).toBeUndefined();
+      expect((await read({ something_else: 1 })).got).toBeUndefined();
+    });
+  });
+
   test("updateContact can clear an identifier with null", async () => {
     // The unique index is `(identifier, account_id)` with no partial predicate, so an empty string is
     // a value like any other and a second contact cleared that way would collide with the first.
@@ -542,5 +649,179 @@ describe("ChatwootClient", () => {
     await client.updateContact(7, { identifier: null });
     expect(calls[0]?.method).toBe("PUT");
     expect(calls[0]?.body).toEqual({ identifier: null });
+  });
+
+  // Chatwoot names whoever made the request on the activity line it writes, so the token this write
+  // carries decides whether the timeline reads "Observadora added cancelamento" or the name of the
+  // person whose token provisioned the instance (issue #493).
+  describe("conversation labels are written by the persona", () => {
+    test("the write carries the bot token and the read stays on the admin one", async () => {
+      const { fetchImpl, calls } = stub(200, { payload: ["cancelamento"] });
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+
+      await client.getConversationLabels(42);
+      await client.setConversationLabels(42, ["cancelamento"]);
+
+      expect(calls[0]?.method).toBe("GET");
+      expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+      expect(calls[1]?.method).toBe("POST");
+      expect(calls[1]?.url).toBe(
+        "https://chat.example.com/api/v1/accounts/5/conversations/42/labels",
+      );
+      expect(calls[1]?.headers[CHATWOOT_AUTH_HEADER]).toBe("BOT_TOK");
+      expect(calls[1]?.body).toEqual({ labels: ["cancelamento"] });
+    });
+
+    test("asAdmin writes as the admin, for an operator-initiated clear", async () => {
+      const { fetchImpl, calls } = stub(200, {});
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+
+      await client.setConversationLabels(42, [], { asAdmin: true });
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+    });
+
+    // `conversations/labels` entered BOT_ACCESSIBLE_ENDPOINTS only on 2026-06-05 (upstream #14655),
+    // and self-hosted versions are not ours to pick: an older instance answers 401. The label is the
+    // observer's whole product, so it is written anyway, by the admin, and the attribution is what is
+    // lost — never the label.
+    // A 401 whose reason is the bot token being refused ON THIS ENDPOINT, which is what a server
+    // older than 2026-06-05 answers.
+    function refusingBot(reason: string) {
+      const calls: Captured[] = [];
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        calls.push({
+          url,
+          method: init?.method ?? "GET",
+          headers,
+          body: init?.body ? JSON.parse(init.body as string) : undefined,
+        });
+        const refused = headers[CHATWOOT_AUTH_HEADER] === "BOT_TOK";
+        return {
+          ok: !refused,
+          status: refused ? 401 : 200,
+          text: async () =>
+            refused ? JSON.stringify({ error: reason }) : "{}",
+        } as unknown as Response;
+      }) as unknown as typeof fetch;
+      return { fetchImpl, calls };
+    }
+
+    test("an instance that does not open the endpoint to bots falls back to the admin token", async () => {
+      const { fetchImpl, calls } = refusingBot(
+        "Access to this endpoint is not authorized for bots",
+      );
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+
+      await client.setConversationLabels(42, ["cancelamento"]);
+
+      expect(calls).toHaveLength(2);
+      expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("BOT_TOK");
+      expect(calls[1]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+      expect(calls[1]?.body).toEqual({ labels: ["cancelamento"] });
+    });
+
+    // A BROKEN CREDENTIAL IS ALSO 401 (issue #493 review, round 1), and falling back on it would
+    // hide it behind a write that succeeds under a person's name — this bug, restored, with nothing
+    // left to notice it. Both of Chatwoot's credential refusals are raised instead.
+    test.each([
+      ["Invalid Access Token"],
+      ["Bot is not authorized to access this account"],
+    ])(
+      "a 401 that means the bot's token is no good is raised: %s",
+      async (reason) => {
+        const { fetchImpl, calls } = refusingBot(reason);
+        const client = await createChatwootClient(baseConfig, {
+          fetchImpl,
+          assertSafe: passthroughSafe,
+        });
+
+        await expect(
+          client.setConversationLabels(42, ["cancelamento"]),
+        ).rejects.toBeInstanceOf(ChatwootApiError);
+        expect(calls).toHaveLength(1);
+        expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("BOT_TOK");
+      },
+    );
+
+    // The warning names the instance, and the instance is the operator's configured base URL: a URL
+    // carrying userinfo would keep it all the way into the log line (issue #493 review, round 2).
+    test("the fallback warning carries no credential from the base URL", async () => {
+      const { fetchImpl } = refusingBot(
+        "Access to this endpoint is not authorized for bots",
+      );
+      const client = await createChatwootClient(
+        { ...baseConfig, baseUrl: "https://user:s3cr3t@chat.example.com" },
+        { fetchImpl, assertSafe: passthroughSafe },
+      );
+      const warn = spyOn(logger, "warn");
+
+      try {
+        await client.setConversationLabels(42, ["cancelamento"]);
+
+        expect(warn).toHaveBeenCalled();
+        const logged = JSON.stringify(warn.mock.calls);
+        expect(logged).not.toContain("s3cr3t");
+        expect(logged).not.toContain("user:");
+        // Still says WHICH instance, which is what the field is for.
+        expect(logged).toContain("chat.example.com");
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    // A 401 Chatwoot did not name (an intermediary, a body that does not parse) is not evidence that
+    // the endpoint is closed to bots, so it is raised too.
+    test("a 401 with no reason Chatwoot recognizes is raised", async () => {
+      const { fetchImpl, calls } = refusingBot("something else entirely");
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+
+      await expect(
+        client.setConversationLabels(42, ["cancelamento"]),
+      ).rejects.toBeInstanceOf(ChatwootApiError);
+      expect(calls).toHaveLength(1);
+    });
+
+    test("a client built outside a persona has no bot token and still writes", async () => {
+      const { fetchImpl, calls } = stub(200, {});
+      const client = await createChatwootClient(
+        { ...baseConfig, botToken: "" },
+        { fetchImpl, assertSafe: passthroughSafe },
+      );
+
+      await client.setConversationLabels(42, ["cancelamento"]);
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+    });
+
+    // Only the two refusals above fall back: anything else is a real failure and must not be turned
+    // into a write by somebody else.
+    test("any other failure is raised, not written as the admin", async () => {
+      const { fetchImpl, calls } = stub(500, {});
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+
+      await expect(
+        client.setConversationLabels(42, ["cancelamento"]),
+      ).rejects.toBeInstanceOf(ChatwootApiError);
+      expect(calls).toHaveLength(1);
+    });
   });
 });

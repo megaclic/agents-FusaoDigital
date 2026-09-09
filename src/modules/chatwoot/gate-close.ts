@@ -1,3 +1,5 @@
+import type { HumanReplyRoute } from "./normalize";
+
 // Why an ownership gate closed, in the one vocabulary every gate that closes has to answer in.
 //
 // Three gates ask `shouldBotHandle` before a customer message can be answered — the webhook on each
@@ -17,6 +19,27 @@ export type GateCloseDetail =
   | { outcome: "taken_over" }
   | { outcome: "ownership_lost"; status: string };
 
+// THE SAME WORD, for the moment the takeover happens rather than for the message that finds the gate
+// already shut (issue #430). A person answering the customer is a real handoff, so the outcome is the
+// one `describeClosedGate` gives a human assignee — but this transition assigns nobody (there is no
+// Chatwoot `User` behind a reply typed on the paired phone), so the gate on the NEXT customer message
+// reads the conversation as merely no longer ours and says `ownership_lost`. True about the status,
+// wrong about the cause, which is the confusion issue #225 was about. `via` is what a reader needs
+// next: whether to look in the CRM or at somebody's phone.
+//
+// Spelled HERE and nowhere else, like everything else in this vocabulary, and a test walks `src` to
+// hold that.
+export type HumanTakeoverDetail = {
+  outcome: "taken_over";
+  via: HumanReplyRoute;
+};
+
+export function describeHumanTakeover(
+  via: HumanReplyRoute,
+): HumanTakeoverDetail {
+  return { outcome: "taken_over", via };
+}
+
 export function describeClosedGate(observed: {
   assigneeType: string | null;
   status: string | null;
@@ -27,3 +50,12 @@ export function describeClosedGate(observed: {
     status: observed.status ?? "unknown",
   };
 }
+
+// Z-PRO's own post-invoke recheck (src/modules/zpro/runtime.ts's runLoadedZproTurn) needs only this
+// half of the vocabulary: ZproConversation.agentActive is a bare boolean, with no Chatwoot
+// assigneeType/status to read a `status` off of, so there is no `ownership_lost` case for it to
+// reach. Exported rather than re-spelled there, for the same reason `describeClosedGate` exists
+// instead of every gate writing its own ternary (issue #271) — "spelled HERE and nowhere else".
+export const ZPRO_TAKEN_OVER_DETAIL: { outcome: "taken_over" } = {
+  outcome: "taken_over",
+};

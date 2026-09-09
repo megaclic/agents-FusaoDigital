@@ -127,6 +127,23 @@ export function bracketedTables(sql: string): Set<string> {
   );
 }
 
+// The tables a file's DML READS: FORCE binds a SELECT exactly like an UPDATE, so a backfill that
+// decides what to write by reading a forced table decides on zero rows and reports success — which
+// is what the migration renaming HTTP tools did with its scan of `agents` for prompts naming the
+// old tool (PR #485, round 19): the rename landed, the audit lines it was meant to leave did not.
+// Blunt like `tablesWrittenBy`, and for the same reason: a `DELETE FROM` target lands here too,
+// which costs nothing since it is bracketed as a write already.
+export function tablesReadBy(sql: string): string[] {
+  const stripped = sql.replace(/^\s*--.*$/gm, "");
+  const names: string[] = [];
+  const re = /\b(?:FROM|JOIN)\s+"?([A-Za-z_][\w]*)"?/gi;
+  for (const m of stripped.matchAll(re)) {
+    const name = m[1];
+    if (name) names.push(name);
+  }
+  return names;
+}
+
 // Written FORCE-RLS tables this file does not bracket. Empty is the only acceptable answer from the
 // split onward; before it, the GUC covered the whole file and the question does not apply.
 export function unbracketedWrites(
@@ -145,6 +162,23 @@ export function unbracketedWrites(
   ].filter((t) => !bracketed.has(t));
 }
 
+// Read FORCE-RLS tables this file does not bracket, from the split onward, on the same argument.
+export function unbracketedReads(
+  sql: string,
+  forcedTables: Set<string>,
+  migrationName: string,
+): string[] {
+  if (migrationName < POLICY_SPLIT_MIGRATION) return [];
+  const bracketed = bracketedTables(sql);
+  return [
+    ...new Set(
+      tablesReadBy(sql)
+        .filter((t) => forcedTables.has(t))
+        .map((t) => t.toLowerCase()),
+    ),
+  ].filter((t) => !bracketed.has(t));
+}
+
 describe.skipIf(!dbUp)("every data migration sets the RLS bypass", () => {
   test("no migration writes to a FORCE-RLS table without it", async () => {
     const dir = "prisma/migrations";
@@ -152,7 +186,9 @@ describe.skipIf(!dbUp)("every data migration sets the RLS bypass", () => {
     for await (const entry of new Bun.Glob("*/migration.sql").scan({
       cwd: dir,
     })) {
-      const name = entry.split("/")[0] ?? entry;
+      // Bun.Glob().scan() yields OS-native separators (backslash on Windows), so the migration
+      // directory name has to be split on either.
+      const name = entry.split(/[/\\]/)[0] ?? entry;
       if (GRANDFATHERED.has(name)) continue;
       const sql = await Bun.file(`${dir}/${entry}`).text();
       if (needsBypass(sql, forced) && !hasBypass(sql, name)) {
@@ -163,6 +199,9 @@ describe.skipIf(!dbUp)("every data migration sets the RLS bypass", () => {
       // question correctly while B's UPDATE silently reaches zero rows.
       for (const t of unbracketedWrites(sql, forced, name)) {
         offenders.push(`${name} (writes ${t} without bracketing it)`);
+      }
+      for (const t of unbracketedReads(sql, forced, name)) {
+        offenders.push(`${name} (reads ${t} without bracketing it)`);
       }
     }
     expect(offenders).toEqual([]);
@@ -226,6 +265,20 @@ describe.skipIf(!dbUp)("every data migration sets the RLS bypass", () => {
         `ALTER TABLE "${table}" NO FORCE ROW LEVEL SECURITY;\n${bare}`,
       ),
     ).toEqual([table.toLowerCase()]);
+    // A READ of a forced table is bound the same way, and asked the same way: bracketed or not,
+    // per table, from the split onward.
+    const read = `SELECT count(*) FROM "${table}";`;
+    expect(unbracketedReads(read, forced, after)).toEqual([
+      table.toLowerCase(),
+    ]);
+    expect(unbracketedReads(read, forced, before)).toEqual([]);
+    expect(
+      unbracketedReads(
+        `ALTER TABLE "${table}" NO FORCE ROW LEVEL SECURITY;\n${read}\nALTER TABLE "${table}" FORCE ROW LEVEL SECURITY;`,
+        forced,
+        after,
+      ),
+    ).toEqual([]);
 
     // DDL alone never needs it.
     expect(
@@ -245,7 +298,9 @@ describe.skipIf(!dbUp)("every data migration sets the RLS bypass", () => {
     for await (const entry of new Bun.Glob("*/migration.sql").scan({
       cwd: dir,
     })) {
-      const name = entry.split("/")[0] ?? entry;
+      // Bun.Glob().scan() yields OS-native separators (backslash on Windows), so the migration
+      // directory name has to be split on either.
+      const name = entry.split(/[/\\]/)[0] ?? entry;
       const sql = (await Bun.file(`${dir}/${entry}`).text()).replace(
         /^\s*--.*$/gm,
         "",

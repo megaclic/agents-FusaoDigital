@@ -9,6 +9,11 @@ export {
 } from "./BusinessHoursForm";
 export { Button } from "./Button";
 export { Card } from "./Card";
+export {
+  CodeEditor,
+  type CodeEditorProps,
+  scopeKeyLabel,
+} from "./CodeEditor";
 export { ComboBox, type ComboItem } from "./ComboBox";
 export { ConfirmDialog, type ConfirmPayload } from "./ConfirmDialog";
 export { CredentialForm } from "./CredentialForm";
@@ -25,6 +30,7 @@ export { FormField } from "./FormField";
 export { GlobalApiToasts } from "./GlobalApiToasts";
 export { GoogleSignInButton } from "./GoogleSignInButton";
 export { Header } from "./Header";
+export { HelpPopover } from "./HelpPopover";
 export { HighlightedTemplateField } from "./HighlightedTemplateField";
 export { InboxRow, type InboxRowStatus } from "./InboxRow";
 export { Input } from "./Input";
@@ -46,6 +52,7 @@ export {
 export { ModelPicker } from "./ModelPicker";
 export { OutOfHoursBadge } from "./OutOfHoursBadge";
 export { PageContainer } from "./PageContainer";
+export { Popover } from "./Popover";
 export { type ProFeature, ProGate } from "./ProGate";
 export { ProtectedRoute } from "./ProtectedRoute";
 export { type AgentRef, AgentReferences } from "./ResourceReferences";
@@ -57,6 +64,12 @@ export { Select } from "./Select";
 export { SelectableCard } from "./SelectableCard";
 export { Sidebar } from "./Sidebar";
 export { Skeleton } from "./Skeleton";
+export {
+  SPEND_NOT_CONFIGURED,
+  SpendBar,
+  SpendHealthLines,
+  type SpendUsageEntry,
+} from "./SpendBar";
 export {
   StrongConfirmModal,
   type StrongConfirmPayload,

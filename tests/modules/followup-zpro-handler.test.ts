@@ -11,12 +11,14 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { type Prisma, PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
+import { recordAppointment } from "@/modules/appointments/record";
 import {
   followUpHandler,
   registerFollowUpHandlers,
 } from "@/modules/followups/handlers";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import { getJobHandler } from "@/modules/scheduler/worker";
+import { burnSchedulerJobId } from "../utils/scheduler";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -44,6 +46,7 @@ const suDb = su as PrismaClient;
 let tenantId = 0n;
 let zproInstanceId = 0n;
 let agentId = 0n;
+let phantomJobId = 0n;
 
 function threadOf(ticketId: number) {
   return `zpro:${tenantId}:${zproInstanceId}:${ticketId}`;
@@ -51,7 +54,7 @@ function threadOf(ticketId: number) {
 
 function jobFor(ticketId: number, stepIndex?: number): ClaimedJob {
   return {
-    id: 1n,
+    id: phantomJobId,
     tenantId,
     kind: "FOLLOWUP",
     payload:
@@ -123,6 +126,7 @@ describe.skipIf(!dbUp)(
   "followUpHandler — Z-PRO branch (pre-nudge gates)",
   () => {
     beforeAll(async () => {
+      phantomJobId = await burnSchedulerJobId(suDb);
       const t = await suDb.tenant.create({
         data: { name: "FUZ", slug: `fuz-${process.pid}` },
       });
@@ -302,15 +306,15 @@ describe.skipIf(!dbUp)(
         lastInboundAt: new Date(Date.now() - 5 * 60_000),
         lastFollowUpAt: null,
       });
-      await suDb.schedulerJob.create({
-        data: {
-          tenantId,
-          kind: "APPOINTMENT_REMINDER",
-          dedupeKey: "reminder:ev_zh:1",
-          status: "PENDING",
-          runAt: new Date(Date.now() + 60 * 60_000),
-          payload: { threadId: threadOf(2008), eventId: "ev_zh" },
-        },
+      // (#376) An appointment is a RECORD now, not a projection of the reminder jobs (see
+      // followup-handler.test.ts's own seedAppointment/(m)): hasLiveAppointment reads the
+      // Appointment table, so a bare scheduler_jobs row never trips the gate on its own.
+      await recordAppointment({
+        tenantId,
+        threadId: threadOf(2008),
+        externalId: "ev_zh",
+        startISO: new Date(Date.now() + 60 * 60_000).toISOString(),
+        base: appDb,
       });
       const result = await followUpHandler(jobFor(2008), appDb);
       expect(result.outcome).toBe("reschedule");
@@ -369,6 +373,7 @@ describe.skipIf(!dbUp)(
 
 describe.skipIf(!dbUp)("FOLLOWUP_SWEEP — Z-PRO eligibility", () => {
   beforeAll(async () => {
+    phantomJobId = await burnSchedulerJobId(suDb);
     const t = await suDb.tenant.create({
       data: { name: "FUZS", slug: `fuzs-${process.pid}` },
     });
@@ -432,7 +437,7 @@ describe.skipIf(!dbUp)("FOLLOWUP_SWEEP — Z-PRO eligibility", () => {
     expect(sweep).toBeDefined();
     await sweep?.(
       {
-        id: 1n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},

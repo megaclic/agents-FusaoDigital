@@ -14,7 +14,7 @@ import basePrisma from "@/api/lib/prisma";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn } from "@/lib/tenancy";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
-import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { visionAcceptsDocuments } from "@/modules/vision/document-support";
 import {
   getVisionProvider,
@@ -114,9 +114,20 @@ export async function extractZproFile(
     return skip("no_credential");
   }
   const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
-    tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
+    tryResolveApiKeyEntry(db, cfg.credentialRef as string),
   );
-  if (!entry) {
+  if (entry.state !== "ok") {
+    // Gone/unfilled and wrong-KIND are separate lines because the operator's move differs: re-pick or
+    // fill one, move the other to the field it belongs on (issue #471) — mirrors
+    // src/modules/vision/service.ts exactly.
+    if (entry.state === "unusable") {
+      logger.warn(
+        "zpro:vision: credential %s is a %s credential, which cannot be used as an API key — skipping",
+        cfg.credentialRef,
+        entry.kind,
+      );
+      return skip("credential_unusable");
+    }
     logger.warn(
       "zpro:vision: credential %s not found in the vault — skipping",
       cfg.credentialRef,

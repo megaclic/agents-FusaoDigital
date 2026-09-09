@@ -20,6 +20,7 @@ import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import config from "@/config";
+import { withFollowupSilenceChannel } from "@/graph/silence";
 import { DEFAULT_TIMEZONE } from "@/graph/time";
 import { buildHttpTools, loadToolSelections } from "@/graph/tools/assemble";
 import type { NativeToolName } from "@/graph/tools/catalog";
@@ -63,6 +64,13 @@ export interface ZproAgentTools {
   // tool-precondition state read both read from — untyped like the Prisma Json column it is
   // (attributeBagsFrom's plainBag does the narrowing); null on a playground/no-conversation call.
   contactExtraInfoBag: unknown;
+  // The native allowlist actually used to build `tools` above — widened by `forceSilenceChannel`
+  // when the caller asked for that (src/graph/silence.ts's withFollowupSilenceChannel). The caller
+  // is what knows whether it needs this for anything (today: runtime.ts's runLoadedZproTurn, to
+  // answer followupSilenceChannel(cfg, tools) against the REAL assembled list rather than the grant
+  // that asked for it — a grant is not an assembled tool, the native builder above runs only when a
+  // live conversation resolved).
+  nativeToolsAllow: string[] | undefined;
 }
 
 export interface LoadZproAgentToolsParams {
@@ -106,6 +114,12 @@ export interface LoadZproAgentToolsParams {
   // send_image's host allowlist (agent.settings.sendImage), resolved by the caller (runtime.ts's
   // loadZproAgent) from the same settings bag pipelineId/maxDistance already come from.
   sendImage?: SendImageConfig;
+  // Set ONLY by the proactive nudge caller (runtime.ts's runLoadedZproTurn, when params.nudge is
+  // present) — mirrors src/graph/nudge.ts's own runAgentNudge exactly: a follow-up must ALWAYS have
+  // a way to say nothing, so `skip_reply` is not operator-revocable on this path. Widens the native
+  // grant before it reaches buildZproNativeTools below, via src/graph/silence.ts's
+  // withFollowupSilenceChannel — same function, same reasoning as Chatwoot's copy.
+  forceSilenceChannel?: boolean;
 }
 
 export async function loadZproAgentTools(
@@ -140,6 +154,16 @@ export async function loadZproAgentTools(
     },
   );
   const conversationId = conversation?.id ?? null;
+
+  // See the `forceSilenceChannel` field comment: widens the native grant (never the raw
+  // `selections.nativeToolsAllow` used everywhere else below) so a follow-up always has
+  // `skip_reply` to call, unless an operator's own HTTP tool already answers to that name.
+  const nativeToolsAllow = params.forceSilenceChannel
+    ? withFollowupSilenceChannel({
+        nativeToolsAllow: selections.nativeToolsAllow,
+        httpToolDefs: selections.httpToolDefs,
+      }).nativeToolsAllow
+    : selections.nativeToolsAllow;
 
   const resolveCredential = (ref: string) =>
     resolveInjectableCredential(base, tenantId, ref);
@@ -251,7 +275,7 @@ export async function loadZproAgentTools(
   // allowlist (undefined ⇒ all utility tools — same permissive default as Chatwoot).
   const utilityTools = buildNativeTools(
     { client: {} as ChatwootClient, conversationId: 0, tenantId, base },
-    utilityNativeAllow(selections.nativeToolsAllow),
+    utilityNativeAllow(nativeToolsAllow),
   );
 
   // Conversation-scoped NATIVE tools (handoff/note/attribute/label/resolve/funnel/skip), built ONLY
@@ -263,7 +287,7 @@ export async function loadZproAgentTools(
   let nativeConversationTools: StructuredToolInterface[] = [];
   if (params.client && conversationId != null && conversation) {
     const client = params.client;
-    const allow = selections.nativeToolsAllow;
+    const allow = nativeToolsAllow;
     const cacheKey = `${tenantId}:${zproInstanceId}`;
 
     // get_contact_info also needs both catalogs (to resolve the CURRENT queue/tag names, not just
@@ -406,16 +430,17 @@ export async function loadZproAgentTools(
     );
   }
 
+  const tools = [
+    ...nativeConversationTools,
+    ...toolpackTools,
+    ...ragTools,
+    ...httpTools,
+    ...documentTools,
+    ...mcpTools,
+    ...utilityTools,
+  ];
   return {
-    tools: [
-      ...nativeConversationTools,
-      ...toolpackTools,
-      ...ragTools,
-      ...httpTools,
-      ...documentTools,
-      ...mcpTools,
-      ...utilityTools,
-    ],
+    tools,
     conversationId,
     grounded: !!selections.ragConfig?.tools.includes("search_knowledge"),
     // The MIRRORED bag (ZproConversation.contactExtraInfo), not params.contactExtraInfo (the live
@@ -423,5 +448,6 @@ export async function loadZproAgentTools(
     // direct turn and the debounce flush (which has no live payload) see the same value, same
     // reasoning as Chatwoot's own attribute-context read (chatwoot/attributes.ts's header note).
     contactExtraInfoBag: conversation?.contactExtraInfo ?? null,
+    nativeToolsAllow,
   };
 }

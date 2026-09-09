@@ -23,7 +23,7 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
-import { type AgentNudge, renderNudge } from "@/graph/nudge";
+import type { AgentNudge } from "@/graph/nudge";
 import { runScopedOn } from "@/lib/tenancy";
 import { contactAuthFlowEvent } from "@/modules/contact-auth/service";
 import { emitFlowEvent } from "@/modules/flowlog/service";
@@ -151,7 +151,6 @@ export async function runZproAgentNudge(
     }
   }
 
-  const text = renderNudge(params.nudge, true);
   const event: NormalizedZproEvent = {
     messageId: `nudge-${crypto.randomUUID()}`,
     threadId: String(ticketId),
@@ -178,7 +177,12 @@ export async function runZproAgentNudge(
     tenantId,
     zproInstanceId,
     event,
-    text,
+    // The directive is rendered inside runLoadedZproTurn instead of here, because it depends on the
+    // silence CHANNEL (tool vs sentinel — see docs/graph.md / src/graph/silence.ts), which is only
+    // knowable once this turn's toolset has actually been assembled. text is left empty; a `nudge`
+    // param is what runLoadedZproTurn actually renders from.
+    text: "",
+    nudge: params.nudge,
     turnId: crypto.randomUUID(),
     userSentAudio: false,
     base,

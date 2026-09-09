@@ -17,7 +17,7 @@ import {
   assertPlaygroundSpendCeiling,
   spendCeilingVerdict,
 } from "@/modules/spend-ceiling/service";
-import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { visionAcceptsDocuments } from "./document-support";
 import {
   getVisionProvider,
@@ -56,21 +56,30 @@ export async function resolveVisionConfig(
   instanceId: bigint,
   chatwootInboxId: number,
   base: PrismaClient = basePrisma,
+  // The agent whose settings answer, when the caller already knows it: a delivery on an OBSERVER's
+  // route (issue #476) is read by the observer's runtime, not by whoever `Inbox.agentId` names —
+  // nobody, on an inbox a human team answers — so the inbox read below would answer for the wrong
+  // agent, or for none. Absent, the inbox's responder answers, as before.
+  opts: { agentId?: bigint | null } = {},
 ): Promise<VisionConfig | null> {
   const cfg = await runScopedOn(base, sysCtx(tenantId), async (db) => {
-    const inbox = await db.inbox.findUnique({
-      where: {
-        tenantId_chatwootInstanceId_chatwootInboxId: {
-          tenantId,
-          chatwootInstanceId: instanceId,
-          chatwootInboxId,
-        },
-      },
-      select: { agentId: true },
-    });
-    if (!inbox?.agentId) return null;
+    const agentId =
+      opts.agentId ??
+      (
+        await db.inbox.findUnique({
+          where: {
+            tenantId_chatwootInstanceId_chatwootInboxId: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              chatwootInboxId,
+            },
+          },
+          select: { agentId: true },
+        })
+      )?.agentId;
+    if (!agentId) return null;
     const agent = await db.agent.findUnique({
-      where: { id: inbox.agentId },
+      where: { id: agentId },
       select: { enabled: true, settings: true },
     });
     if (!agent?.enabled) return null;
@@ -238,9 +247,19 @@ export async function extractInboundFile(
     return skip("no_credential");
   }
   const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
-    tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
+    tryResolveApiKeyEntry(db, cfg.credentialRef as string),
   );
-  if (!entry) {
+  if (entry.state !== "ok") {
+    // Gone/unfilled and wrong-KIND are separate lines because the operator's move differs: re-pick or
+    // fill one, move the other to the field it belongs on (issue #471).
+    if (entry.state === "unusable") {
+      logger.warn(
+        "vision: credential %s is a %s credential, which cannot be used as an API key — skipping",
+        cfg.credentialRef,
+        entry.kind,
+      );
+      return skip("credential_unusable");
+    }
     logger.warn(
       "vision: credential %s not found in the vault — skipping",
       cfg.credentialRef,
@@ -329,8 +348,8 @@ export async function extractInboundFile(
     logger.info(
       "vision: spend ceiling reached (tenant=%s used=%s ceiling=%s) — the attachment was not read",
       String(params.tenantId),
-      String(ceiling.usedTokens),
-      String(ceiling.ceilingTokens),
+      String(ceiling.usedUsd),
+      String(ceiling.ceilingUsd),
     );
     return skip("spend_ceiling");
   }
@@ -479,9 +498,17 @@ export async function extractPlaygroundFile(
     );
   }
   const entry = await runScopedOn(base, params.ctx, (db) =>
-    tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
+    tryResolveApiKeyEntry(db, cfg.credentialRef as string),
   );
-  if (!entry) {
+  if (entry.state !== "ok") {
+    if (entry.state === "unusable") {
+      throw new AppError(
+        `vision credential is a "${entry.kind}" credential and cannot be used as an API key`,
+        400,
+        "errors.credentialKindUnusableAsKey",
+        { kind: entry.kind },
+      );
+    }
     throw new AppError(
       "vision credential not found",
       400,

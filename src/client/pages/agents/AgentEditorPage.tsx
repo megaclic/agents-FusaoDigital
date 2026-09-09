@@ -44,6 +44,7 @@ import {
   useToast,
 } from "@/client/components";
 import { BusinessHoursForm } from "@/client/components/BusinessHoursForm";
+import { MonitoringBadge } from "@/client/components/MonitoringBadge";
 import type { DiscoveredMcpTool } from "@/client/components/mcp/DiscoveredMcpTools";
 import { useBreadcrumbLabel } from "@/client/contexts/BreadcrumbContext";
 import { useNavGuard } from "@/client/contexts/NavGuardContext";
@@ -52,7 +53,6 @@ import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
-import { computeConfigIssues, issueHasAction } from "@/client/lib/configHealth";
 import {
   type EditorControlsShown,
   type EditorTab,
@@ -67,18 +67,26 @@ import {
   readRefusal,
   settlesRefusal,
 } from "@/client/lib/fieldRefusal";
+import { importWarningCount } from "@/client/lib/importWarningCount";
 import { formatRelativeTime, slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
   useVaultBaseUrls,
   useVaultRefs,
 } from "@/client/lib/vaultCache";
+import { CodeToolEditModal } from "@/client/pages/resources/CodeToolEditModal";
 import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditModal";
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
 import { readModelFallbackConfig } from "@/graph/fallback-settings";
 import { modelOptionalFor } from "@/graph/model-defaults";
+import {
+  computeConfigIssues,
+  issueHasAction,
+} from "@/modules/agents/config-health";
+import { configIssueMessage } from "@/modules/agents/config-health-message";
+import { type AgentMode, normalizeAgentMode } from "@/modules/agents/mode";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import type { Schedule } from "@/modules/business-hours/hours";
 import {
@@ -96,8 +104,10 @@ import {
   BehaviorTab,
   type ContactAuthState,
   type MemoryState,
+  MONITORING_SECTIONS,
   type ModelFallbackState,
   type SendImageState,
+  type TakeoverState,
 } from "./BehaviorTab";
 import {
   type ChannelRedirectFormState,
@@ -119,6 +129,11 @@ import {
   observabilityToForm,
   observabilityToStored,
 } from "./observabilityFormState";
+import {
+  type ObservationState,
+  observationToForm,
+  observationToStored,
+} from "./observationFormState";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
 import {
@@ -196,6 +211,58 @@ const TAB_KEYS: TabKey[] = [
   "playground",
 ];
 
+// A watcher's editor (issue #494): the tabs that configure how the agent ANSWERS — tools,
+// knowledge, guardrails, the redirect, the playground — are not drawn for an agent in monitoring
+// mode, which never does; drawn for one, they read as if it could. A URL that still names one
+// lands on General. Nothing is deleted: flip the mode back and the tabs return as they were.
+const MONITORING_TABS: ReadonlySet<string> = new Set<TabKey>([
+  "general",
+  "channels",
+  "behavior",
+]);
+// Whether a configuration warning has a CONTROL BEHIND IT in a watcher's editor. Asked of the
+// issue's own deep-link target rather than of a list of keys (issue #494 review, round 3): every
+// issue already carries the tab and section it would scroll to, so the question "is that section on
+// screen for a watcher" is answerable directly — and a key list answers it only for the keys
+// somebody remembered. It had already missed `textCap`, which targets whatever section holds the
+// oversized field and is therefore actionable on Vision, a section the watcher DOES draw.
+//
+// A warning pointing at a control that is not on screen is the failure the warnings exist to
+// prevent; one with no target at all points nowhere for any agent, so it is kept rather than
+// singled out here.
+function watcherCanActOn(issue: {
+  key: string;
+  tab?: string;
+  sectionId?: string;
+}): boolean {
+  // RAG has no tab for a watcher and no use either. Both of these come through with no `tab` — the
+  // knowledge one opens the Knowledge tab's documents modal, the embedding one points at the
+  // tenant's credential — so the target rule below would keep them, and a watcher never invokes
+  // retrieval (issue #494 review, round 4). Sent to configure the embedding credential, the operator
+  // fixes it and is answered with a `knowledge` issue that IS filtered, which is the shape of
+  // busywork a warning panel must not create.
+  if (issue.key === "knowledge" || issue.key === "embedding") return false;
+  // An issue with no target at all points nowhere for any agent, so it is kept rather than singled
+  // out here.
+  if (issue.tab === undefined) return true;
+  return watcherSectionReachable(issue.tab, issue.sectionId);
+}
+
+// Whether a deep-link target is somewhere a watcher's editor actually shows. Shared with the import
+// warnings' Review button (issue #494 review, round 6), which deep-links by the same tab+section
+// pair: a target on a hidden tab is redirected straight back to General, and one on a hidden
+// Behavior section scrolls to something CSS keeps invisible — an action that appears to work and
+// exposes no setting, which is worse than not offering it.
+function watcherSectionReachable(tab: string, sectionId?: string): boolean {
+  if (!MONITORING_TABS.has(tab)) return false;
+  // Behavior is drawn, but only some of its sections are.
+  return (
+    tab !== "behavior" ||
+    sectionId === undefined ||
+    MONITORING_SECTIONS.has(sectionId)
+  );
+}
+
 // The four config sections with their own unsaved-changes baseline + save button. Each is tracked
 // independently so saving one never re-baselines (or drops) another's pending edits.
 type SectionKey =
@@ -230,6 +297,8 @@ function mapGrants(grants: ToolSelectionView["grants"]): GrantState[] {
     toolDefinitionId: g.toolDefinitionId,
     mcpServerConnectionId: g.mcpServerConnectionId,
     integrationInstanceId: g.integrationInstanceId,
+    documentTemplateId: g.documentTemplateId,
+    codeToolDefinitionId: g.codeToolDefinitionId,
     knowledgeBaseIds: [...g.knowledgeBaseIds],
     enabledTools: [...g.enabledTools],
   }));
@@ -247,12 +316,14 @@ function canonicalGrants(grants: GrantState[]): string {
       toolDefinitionId: g.toolDefinitionId ?? null,
       mcpServerConnectionId: g.mcpServerConnectionId ?? null,
       integrationInstanceId: g.integrationInstanceId ?? null,
+      documentTemplateId: g.documentTemplateId ?? null,
+      codeToolDefinitionId: g.codeToolDefinitionId ?? null,
       knowledgeBaseIds: [...(g.knowledgeBaseIds ?? [])].sort(),
       enabledTools: [...(g.enabledTools ?? [])].sort(),
     }))
     .sort((a, b) =>
-      `${a.source}:${a.toolDefinitionId}:${a.mcpServerConnectionId}:${a.integrationInstanceId}`.localeCompare(
-        `${b.source}:${b.toolDefinitionId}:${b.mcpServerConnectionId}:${b.integrationInstanceId}`,
+      `${a.source}:${a.toolDefinitionId}:${a.mcpServerConnectionId}:${a.integrationInstanceId}:${a.documentTemplateId}:${a.codeToolDefinitionId}`.localeCompare(
+        `${b.source}:${b.toolDefinitionId}:${b.mcpServerConnectionId}:${b.integrationInstanceId}:${b.documentTemplateId}:${b.codeToolDefinitionId}`,
       ),
     );
   return JSON.stringify(norm);
@@ -427,6 +498,13 @@ function readBehaviorState(a: Agent) {
       task: attrKeys(ac.task),
     },
     sendImage: { allowedHosts: attrKeys(si.allowedHosts).join("\n") },
+    // NOTE: ON unless the stored bag says otherwise, mirroring readTakeoverConfig. A bag written
+    // before this block existed has no key and must read as on, or loading an old agent would show
+    // the switch off while the runtime has it on.
+    takeover: {
+      onHumanReply:
+        ((s.takeover ?? {}) as Record<string, unknown>).onHumanReply !== false,
+    },
     // NOTE: through the SAME reader the runtime uses, not a hand-rolled check: a bag that came from
     // REST or an import can carry the string "true", which the runtime honors — reading it stricter
     // here would show the switch off while values were being logged, and would then persist that lie
@@ -437,6 +515,8 @@ function readBehaviorState(a: Agent) {
     // predates the feature, then persist that lie on the next save.
     memory: memoryToForm(s),
     modelFallback: modelFallbackToForm(s),
+    // Through the runtime's reader as well (issue #494), and for the same reason as memory.
+    observation: observationToForm(s),
   };
 }
 
@@ -666,9 +746,23 @@ function AgentEditor() {
   // or the "Save and export" that writes General from wherever they are — would place its mark on a
   // control nobody is rendering. Off that tab the sentence goes to the toast.
   const [enabled, setEnabled] = useState(true);
-  const [agentMode, setAgentMode] = useState<"test" | "production">(
-    "production",
-  );
+  const [agentMode, setAgentMode] = useState<AgentMode>("production");
+  const watcher = agentMode === "monitoring";
+  // NOTE: A URL naming a tab the watcher's editor does not draw (issue #494) lands on General —
+  // CARRYING
+  // the origin (issue #494 review, round 1). Dropping the query string here made `backToConversation`
+  // null and took away the way back, on the one navigation the operator did not ask for; every tab
+  // link on this page preserves it deliberately, and this one has to as well.
+  useEffect(() => {
+    if (agentMode === "monitoring" && !MONITORING_TABS.has(tab)) {
+      navigate(
+        `/agents/${id}/general${
+          backToConversation ? `?from=${backToConversation}` : ""
+        }`,
+        { replace: true },
+      );
+    }
+  }, [agentMode, tab, id, navigate, backToConversation]);
   const [transferWithSummary, setTransferWithSummary] = useState(true);
   const [businessHoursId, setBusinessHoursId] = useState("");
   const [awayEnabled, setAwayEnabled] = useState(false);
@@ -771,11 +865,17 @@ function AgentEditor() {
   // the round-trip pair produces, so a field added to `compaction` cannot default differently here
   // than it does everywhere else.
   const [memory, setMemory] = useState<MemoryState>(() => memoryToForm({}));
+  const [observation, setObservation] = useState<ObservationState>(() =>
+    observationToForm({}),
+  );
   const [modelFallback, setModelFallback] = useState<ModelFallbackState>(() =>
     modelFallbackToForm({}),
   );
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
+  const [takeover, setTakeover] = useState<TakeoverState>({
+    onHumanReply: true,
+  });
   const [sendImage, setSendImage] = useState<SendImageState>({
     allowedHosts: "",
   });
@@ -1318,7 +1418,7 @@ function AgentEditor() {
     setName(a.name);
     setSystemPrompt(a.systemPrompt);
     setEnabled(a.enabled);
-    setAgentMode(a.mode === "test" ? "test" : "production");
+    setAgentMode(normalizeAgentMode(a.mode));
     setModel(readModelState(a));
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
@@ -1338,8 +1438,10 @@ function AgentEditor() {
     setObservability(b.observability);
     setSavedObservability(b.observability);
     setMemory(b.memory);
+    setObservation(b.observation);
     setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
+    setTakeover(b.takeover);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
     setGuardrails(readGuardrailsFormState(a.settings));
@@ -1352,7 +1454,7 @@ function AgentEditor() {
     setName(a.name);
     setSystemPrompt(a.systemPrompt);
     setEnabled(a.enabled);
-    setAgentMode(a.mode === "test" ? "test" : "production");
+    setAgentMode(normalizeAgentMode(a.mode));
     setModel(readModelState(a));
   }, []);
 
@@ -1377,8 +1479,10 @@ function AgentEditor() {
     setObservability(b.observability);
     setSavedObservability(b.observability);
     setMemory(b.memory);
+    setObservation(b.observation);
     setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
+    setTakeover(b.takeover);
     setAttributeContext(b.attributeContext);
   }, []);
 
@@ -1504,6 +1608,7 @@ function AgentEditor() {
   // opens its OWN editor right here (view the merged result) instead of bouncing to the resources page.
   // They fetch the full record by id; onSaved refetches the catalog so any tweak reflects immediately.
   const toolEditModal = useModalController<{ id?: string }>();
+  const codeToolEditModal = useModalController<{ id?: string }>();
   const mcpEditModal = useModalController<{ id?: string }>();
   const integrationEditModal = useModalController<{ id?: string }>();
   // A reused-schedule "Review" opens the schedule's OWN editor in place (a business-hours warning has
@@ -1675,12 +1780,22 @@ function AgentEditor() {
       // field the form dropped would be deleted on the next save — which is exactly how
       // `tts.baseURL` was lost once, and the round-trip test over ./memoryFormState is the guard.
       memory: memoryToStored(memory),
+      // Written unconditionally again (issue #567). Rounds 7 and 9 of #494 taught this line to skip
+      // the half-named pair for a watcher, because the section was hidden and the write boundary's
+      // refusal reached the operator as a 400 on a control they could not see. The section is drawn
+      // for a watcher again, its validator is back on the save gate, and a field on screen that
+      // blocks Save is a better answer than a key the save drops: skipping now would discard an edit
+      // the operator can see themselves making.
       modelFallback: modelFallbackToStored(modelFallback),
+      // The Observation block (issue #494) replaces `monitoring` the same way; the round-trip test
+      // over ./observationFormState is its guard.
+      monitoring: observationToStored(observation),
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
         task: attributeContext.task,
       },
+      takeover: { onHumanReply: takeover.onHumanReply },
       sendImage: {
         allowedHosts: sendImage.allowedHosts
           .split("\n")
@@ -1721,9 +1836,13 @@ function AgentEditor() {
       limits,
       attributeContext,
       sendImage,
+      takeover,
       observability,
       memory,
       modelFallback,
+      // Named after the block the save writes (`monitoring`), which is what the dirty-snapshot
+      // fence reads off the writer; the form state behind it is `observation`.
+      monitoring: observation,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1793,6 +1912,7 @@ function AgentEditor() {
   const {
     known: knownRefs,
     pending: pendingRefs,
+    facts: refFacts,
     pendingEntries,
   } = useVaultRefs();
 
@@ -1892,6 +2012,9 @@ function AgentEditor() {
   // secrets is the common trigger; each issue deep-links to its tab + section, or to the vault fill
   // modal when pending. Per-issue messages (dynamic key by issue.key) registered for extraction:
   // t('editor.configIssue.model', 'The model has no API key set, so the agent cannot reply.')
+  // t('editor.configIssue.modelNotRunnable', 'This model configuration cannot be built, so the agent cannot reply. Check the provider and the model.')
+  // t('editor.configIssue.modelNoEndpoint', 'This model needs a base URL and has none, so it cannot be reached and the agent cannot reply.')
+  // t('editor.configIssue.modelBadEndpoint', 'The model\'s base URL is not an http(s) address, so every request goes nowhere and the agent cannot reply.')
   // t('editor.configIssue.stt', 'Voice transcription is on but has no API key set.')
   // t('editor.configIssue.tts', 'Audio replies are on but have no API key set.')
   // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
@@ -1904,8 +2027,8 @@ function AgentEditor() {
   // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
   // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
   // t('editor.configIssueUnresolved.guardrails', 'The guardrails credential no longer exists, so messages go out unscreened.')
-  // t('editor.configIssueGuardrailsFailing', 'Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. Check the model, the endpoint and the key.')
-  // t('editor.configIssueGuardrailsFailingCause', 'Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. The last one said: {{error}}')
+  // t('editor.configIssueGuardrailsFailing', "Guardrails are on, but {{failures}} of the Checks could not run in the last {{hours}} hours (the most recent {{when}}). A check that could not run caught nothing and held nothing back. Check “Guardrails model”, “Base URL” and “API key”.")
+  // t('editor.configIssueGuardrailsFailingCause', "Guardrails are on, but {{failures}} of the Checks could not run in the last {{hours}} hours (the most recent {{when}}). A check that could not run caught nothing and held nothing back. The last one said: {{error}}")
   // t('editor.configIssuePending.model', 'The model credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.stt', 'The transcription credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.tts', 'The audio-reply credential is referenced but not filled in yet.')
@@ -1926,6 +2049,23 @@ function AgentEditor() {
   // t('editor.configIssueUnresolved.modelFallback', 'The fallback-provider credential no longer exists, so the fallback cannot take a turn.')
   // t('editor.configIssueUnresolved.vision', 'The image-reading credential no longer exists, so images and documents are not read.')
   // t('editor.configIssueUnresolved.embedding', 'A knowledge base needs indexing, but the embedding credential no longer exists.')
+  // The fourth verdict: the entry is there and filled, and its TYPE cannot serve the field. Each
+  // sentence names the consequence its feature already owns, like the three families above, and ends
+  // in the one move that fixes it — which is neither "fill it in" nor "pick a new one because it is
+  // gone", but "this key belongs somewhere else". Issue #471.
+  // t('editor.configIssueWrongKind.model', 'The model credential is a type that cannot be used as an API key, so the agent cannot reply. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.stt', 'The transcription credential is a type that cannot be used as an API key, so voice messages are not transcribed. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.tts', 'The audio-reply credential is a type that cannot be used as an API key, so replies are sent as text. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.ttsNormalize', 'The speech-rewrite credential is a type that cannot be used as an API key, so replies are spoken without the rewrite. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.memoryModel', 'The summary-model credential is a type that cannot be used as an API key, so attendances that end are not summarized. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.modelFallback', 'The fallback-provider credential is a type that cannot be used as an API key, so the fallback cannot take a turn. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.vision', 'The image-reading credential is a type that cannot be used as an API key, so images and documents are not read. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.guardrails', 'The guardrails credential is a type that cannot be used as an API key, so messages go out unscreened. Pick a credential that holds a single key.')
+  // t('editor.configIssueWrongKind.embedding', 'A knowledge base needs indexing, but the embedding credential is a type that cannot be used as an API key. Pick a credential that holds a single key.')
+  // The contact-authorization gate is the one field here that accepts a connected account, so its
+  // sentence cannot say "a single key": what it refuses is the opposite case, a credential this
+  // product only ever reads internally and never sends to another service.
+  // t('editor.configIssueWrongKind.contactAuth', 'The contact-authorization credential is a type this product never sends to another service, so the check fails and the agent stays silent. Pick a credential that can authenticate a request.')
   // Knowledge bases this agent uses (its RAG grant) that still have documents awaiting indexing —
   // surfaced as a config warning so a freshly-imported agent flags "index me" right in the editor.
   const ragGrant = grants.find((g) => g.source === "RAG");
@@ -1958,13 +2098,21 @@ function AgentEditor() {
     readModelFallbackConfig(syncedAgentRef.current?.settings).credentialRef ??
       "",
   );
-  const configIssues = computeConfigIssues({
+  const allConfigIssues = computeConfigIssues({
     settings: syncedAgentRef.current?.settings,
     // Saved, like the settings above. Absent only before the first load lands, and nothing that
     // reads it can be non-empty that early.
     agentEnabled: syncedAgentRef.current?.enabled ?? true,
     modelProvider: model.provider,
     modelCredentialRef: model.credentialRef,
+    // The endpoint as the runtime would resolve it: the credential's own base URL outranks the
+    // typed field. Read off the form rather than the row, like the pair above it — this half of
+    // General is what the tab is about to save.
+    modelBaseURL: modelCredBaseUrl ?? model.baseURL,
+    // The bag this tab would SAVE, so the runnability check judges what is about to be stored
+    // rather than a reconstruction of it. Built by the same function the save uses, which is what
+    // keeps the two from drifting.
+    modelConfig: buildModelConfig(),
     sttEnabled: stt.enabled,
     sttCredentialRef: stt.credentialRef,
     ttsMode: tts.mode,
@@ -1993,6 +2141,7 @@ function AgentEditor() {
     guardrailsLastFailureAt: guardrailHealth?.lastAt,
     pendingRefs,
     knownRefs,
+    refFacts,
     knowledgeBasesNeedingIndex,
     embeddingCredentialRef,
     redirectEnabled: channelRedirect.enabled,
@@ -2000,10 +2149,13 @@ function AgentEditor() {
     redirectEntryZproInstanceId: channelRedirect.entryZproInstanceId,
     redirectWidgetInboxId: channelRedirect.widgetInboxId,
     outOfOfficeInboxes,
-    // The SAVED schedule, next to the saved settings above and for the same reason: the panel
+    // NOTE: The SAVED schedule, next to the saved settings above and for the same reason: the panel
     // describes the row, and a schedule picked but not saved gates nothing yet.
     savedSchedule: scheduleOf(hours, syncedAgentRef.current?.businessHoursId),
   });
+  const configIssues = watcher
+    ? allConfigIssues.filter(watcherCanActOn)
+    : allConfigIssues;
 
   // Deep-link to a config issue. For a PENDING credential the fix lives in the vault, so jump to the
   // vault list with the fill modal pre-opened (?fill=<id>). Otherwise switch to the issue's tab
@@ -2064,102 +2216,18 @@ function AgentEditor() {
   // gone" each read differently from the classic "no credential set", because the operator's next
   // move differs (fill it, pick another, set one). Kept out of the JSX so the dynamic-key lint
   // suppression sits on the t() call.
+  // The sentence for one warning, from the shared renderer (modules/agents/config-health-message.ts)
+  // so the console and the API answer with the same words. What stays here is what only this reader
+  // has: the live `t`, the operator's language for the relative timestamp, and the guardrail-health
+  // snapshot the panel already fetched.
   function issueMessage(issue: (typeof configIssues)[number]): string {
-    // Text already in the row, over its cap: whatever passes the cap is dropped by the reader, which
-    // is invisible everywhere else. The message stops at that, without claiming the model receives
-    // the rest — with the section switched off it receives none of it. When the field has no control
-    // in the editor the message says so, instead of leaving the operator hunting for a tab.
-    if (issue.key === "textCap") {
-      const params = {
-        field: issue.field ?? "",
-        len: issue.length ?? 0,
-        max: issue.max ?? 0,
-      };
-      return issue.tab
-        ? t(
-            "editor.configIssueTextCap",
-            "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored.",
-            params,
-          )
-        : t(
-            "editor.configIssueTextCapNoField",
-            "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored. This note has no field in the console, so it can only be shortened through the API.",
-            params,
-          );
-    }
-    if (issue.key === "knowledge") {
-      return t(
-        "editor.configIssueKnowledge",
-        'Knowledge base "{{name}}" has documents that need indexing.',
-        { name: issue.knowledgeBaseName ?? "" },
-      );
-    }
-    // A guardrail that HAS its credential and still could not run. The count is the whole point: the
-    // panel's other lines describe a state ("no key set"), this one describes what already happened,
-    // and an operator has to be told that those turns went out unscreened rather than blocked.
-    if (issue.key === "guardrailsFailing") {
-      const params = {
-        failures: issue.failures ?? 0,
-        hours: guardrailHealth?.windowHours ?? 24,
-        when: issue.lastFailureAt
-          ? formatRelativeTime(issue.lastFailureAt, i18n.language)
-          : "-",
-        error: guardrailHealth?.lastError ?? "",
-      };
-      // The vendor's own words when they survived the write, generic advice when they did not. They
-      // are what separates "look at this" from "fix this": "400 temperature is not supported" names
-      // the setting, while a list of three things to check makes the operator try all of them.
-      //
-      // The line stops at what a failure row proves, which is less than it looks. It does not say
-      // the message went out unscreened: a failed input check leaves the output check free to screen
-      // the reply, and a split output analysis merges both halves, so it can carry an error from one
-      // and a violation from the other and still replace or suppress the send. All that is certain
-      // is fail-open, and it applies to the failed check alone: that one caught nothing and held
-      // nothing back.
-      return params.error
-        ? t(
-            "editor.configIssueGuardrailsFailingCause",
-            "Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. The last one said: {{error}}",
-            params,
-          )
-        : t(
-            "editor.configIssueGuardrailsFailing",
-            "Guardrails are on, but {{failures}} of their checks could not run in the last {{hours}} hours (the most recent {{when}}). Analysis is fail-open, so a check that could not run caught nothing and held nothing back. Check the model, the endpoint and the key.",
-            params,
-          );
-    }
-    // Two out-of-hours messages on one inbox, or one announcing a closure the other serves through.
-    // The inboxes are NAMED, not counted: half of every fix is on Chatwoot's screen, and "two of
-    // your inboxes" does not tell anyone which two to open there.
-    if (issue.key === "outOfHoursBoth" || issue.key === "outOfHoursChatwoot") {
-      const inboxes = (issue.inboxNames ?? []).join(", ");
-      return issue.key === "outOfHoursBoth"
-        ? t(
-            "editor.configIssueOutOfHoursBoth",
-            "Chatwoot already replies out of hours on {{inboxes}}, and this agent's out-of-hours message is on as well, so the customer gets both. The two schedules are set in different products and Chatwoot's has no dates in it, so on a holiday they will disagree too.",
-            { inboxes },
-          )
-        : t(
-            "editor.configIssueOutOfHoursChatwoot",
-            "Chatwoot replies out of hours on {{inboxes}}, and this agent does not read that schedule: it answers whenever its own says it is open. The customer can be told the business is closed and served in the same breath.",
-            { inboxes },
-          );
-    }
-    if (issue.pending) {
-      // biome-ignore lint/plugin/no-dynamic-i18n-key: pending keys registered via magic comments above computeConfigIssues
-      return t(`editor.configIssuePending.${issue.key}` as const, {
-        defaultValue: "This credential is referenced but not filled in yet.",
-      });
-    }
-    if (issue.unresolved) {
-      // biome-ignore lint/plugin/no-dynamic-i18n-key: unresolved keys registered via magic comments above computeConfigIssues
-      return t(`editor.configIssueUnresolved.${issue.key}` as const, {
-        defaultValue: "This credential no longer exists. Pick another one.",
-      });
-    }
-    // biome-ignore lint/plugin/no-dynamic-i18n-key: issue keys registered via magic comments above computeConfigIssues
-    return t(`editor.configIssue.${issue.key}` as const, {
-      defaultValue: "This feature is enabled but has no credential set.",
+    return configIssueMessage(issue, {
+      translate: (key, defaultValue, params) =>
+        // biome-ignore lint/plugin/no-dynamic-i18n-key: issue keys registered via magic comments above computeConfigIssues
+        t(key as never, { defaultValue, ...(params ?? {}) }),
+      guardrailWindowHours: guardrailHealth?.windowHours ?? 24,
+      guardrailLastError: guardrailHealth?.lastError ?? "",
+      formatWhen: (iso) => formatRelativeTime(iso, i18n.language),
     });
   }
 
@@ -2201,6 +2269,15 @@ function AgentEditor() {
           'Credential "{{name}}" was not found here, so a placeholder was created. Fill in its secret to activate it.',
           p,
         );
+      // The entry was found and wired; what does not fit is the PAIRING. Named by field rather than
+      // by credential name, unlike the four around it: the same credential can be right on one field
+      // and wrong on the next, so the name alone would not say where to look. Issue #471.
+      case "credentialKindUnusable":
+        return t(
+          "editor.importWarning.credentialKindUnusable",
+          'The credential wired to "{{field}}" is a "{{kind}}" credential, which that field cannot use. It was left wired so you can see it; pick another one there.',
+          p,
+        );
       case "credentialMissingMeta":
         return t(
           "editor.importWarning.credentialMissingMeta",
@@ -2225,17 +2302,26 @@ function AgentEditor() {
           'Business hours "{{name}}" already existed and were reused; check the schedule is right.',
           p,
         );
+      // NOTE: `importWarningCount` is the other half of the rolling-deploy overlap (see `transfer.ts`): it
+      // reads the count under either name, because an editor from THIS release can reach a container
+      // from the previous one, which sends `n` only.
+      //
+      // NOTE: The four counters below hand `count` in as a LITERAL property, next to the spread, and the
+      // repetition is load-bearing: `i18next-parser` reads the call site, not the runtime, so a
+      // shared helper that returned the same object would leave the parser seeing only the spread
+      // and, with `keepRemoved: false`, delete the plural forms on the next `i18n:extract`. That is
+      // how these four ended up flat while every other counter carries forms (issue #513).
       case "hoursWindowsDropped":
         return t(
           "editor.importWarning.hoursWindowsDropped",
-          'Business hours "{{name}}": {{count}} weekly window(s) were not stored as written. Open the schedule and check the days are right.',
-          p,
+          'Business hours "{{name}}": {{count}} weekly windows were not stored as written. Open the schedule and check the days are right.',
+          { ...p, count: importWarningCount(p) },
         );
       case "hoursExceptionsDropped":
         return t(
           "editor.importWarning.hoursExceptionsDropped",
-          'Business hours "{{name}}": {{count}} date exception(s) were not stored as written. Open the schedule and check the holidays and closures are right.',
-          p,
+          'Business hours "{{name}}": {{count}} date exceptions were not stored as written. Open the schedule and check the holidays and closures are right.',
+          { ...p, count: importWarningCount(p) },
         );
       case "httpToolBodyIgnored":
         return t(
@@ -2243,10 +2329,34 @@ function AgentEditor() {
           'Tool "{{name}}" had a request body in a shape this version does not accept, so it was reduced to the part that was actually being sent. The request is unchanged; open it under Body to check it.',
           p,
         );
+      case "httpToolMethodUnsupported":
+        return t(
+          "editor.importWarning.httpToolMethodUnsupported",
+          'Tool "{{name}}" asks for the HTTP method {{method}}, which is not one this platform sends, so the tool was not imported. The rest of the agent was.',
+          p,
+        );
+      case "httpToolUrlTemplateUnusable":
+        return t(
+          "editor.importWarning.httpToolUrlTemplateUnusable",
+          'Tool "{{name}}" has a request URL this platform cannot call, so the tool was not imported. The rest of the agent was.',
+          p,
+        );
+      case "knowledgeBaseNameUnusable":
+        return t(
+          "editor.importWarning.knowledgeBaseNameUnusable",
+          'Knowledge base "{{name}}" has a name this platform cannot store, so it was not imported. The rest of the agent was.',
+          p,
+        );
       case "httpToolReused":
         return t(
           "editor.importWarning.httpToolReused",
           'Tool "{{name}}" already existed and was reused; check it is right.',
+          p,
+        );
+      case "httpToolRenamed":
+        return t(
+          "editor.importWarning.httpToolRenamed",
+          'Tool "{{name}}" carries the name of a built-in tool, so it was imported as "{{renamed}}"; a prompt that names it must follow.',
           p,
         );
       case "httpToolCredNotFound":
@@ -2288,8 +2398,8 @@ function AgentEditor() {
       case "kbReusedDocsSkipped":
         return t(
           "editor.importWarning.kbReusedDocsSkipped",
-          'Knowledge base "{{name}}" already existed and was reused; its {{n}} bundled document(s) were not imported.',
-          p,
+          'Knowledge base "{{name}}" already existed and was reused; its {{count}} bundled documents were not imported.',
+          { ...p, count: importWarningCount(p) },
         );
       case "kbGrantNotFound":
         return t(
@@ -2303,6 +2413,32 @@ function AgentEditor() {
           'Tool "{{name}}" was not found, so its grant was skipped.',
           p,
         );
+      // Says WHY nothing was granted, which "not found" would not: the tools are there, and there
+      // are too many of them for the name to mean one of them.
+      case "httpToolAmbiguous":
+        return t(
+          "editor.importWarning.httpToolAmbiguous",
+          '{{n}} tools here already answer to the name "{{name}}", so the bundled tool was not imported. Rename them apart and import again.',
+          p,
+        );
+      case "codeToolAmbiguous":
+        return t(
+          "editor.importWarning.codeToolAmbiguous",
+          '{{n}} code tools here already answer to the name "{{name}}", so the bundled tool was not imported. Rename them apart and import again.',
+          p,
+        );
+      case "httpGrantAmbiguous":
+        return t(
+          "editor.importWarning.httpGrantAmbiguous",
+          '{{n}} tools here answer to the name "{{name}}", so the grant was skipped rather than bound to one of them. Rename them apart and grant it by hand.',
+          p,
+        );
+      case "codeGrantAmbiguous":
+        return t(
+          "editor.importWarning.codeGrantAmbiguous",
+          '{{n}} code tools here answer to the name "{{name}}", so the grant was skipped rather than bound to one of them. Rename them apart and grant it by hand.',
+          p,
+        );
       case "mcpGrantNotFound":
         return t(
           "editor.importWarning.mcpGrantNotFound",
@@ -2312,8 +2448,8 @@ function AgentEditor() {
       case "unknownGrantSourceSkipped":
         return t(
           "editor.importWarning.unknownGrantSourceSkipped",
-          "{{n}} tool grant(s) came from a newer version and were skipped.",
-          p,
+          "{{count}} tool grants came from a newer version and were skipped.",
+          { ...p, count: importWarningCount(p) },
         );
       case "documentGrantNotFound":
         return t(
@@ -2333,6 +2469,24 @@ function AgentEditor() {
           'Document template "{{name}}" was not imported: this account already has a template with that name ({{existing}}). Names have to be unique, because the agent picks between documents by name.',
           p,
         );
+      case "codeToolBodyWarning":
+        return t(
+          "editor.importWarning.codeToolBodyWarning",
+          'Code tool "{{name}}": the imported body has a problem — {{reason}}. It was saved as written and will fail when the agent calls it.',
+          p,
+        );
+      case "toolSchemaAdjusted":
+        return t(
+          "editor.importWarning.toolSchemaAdjusted",
+          'Tool "{{name}}": the imported input schema was adjusted — {{reason}}. Check the arguments the agent may send.',
+          p,
+        );
+      case "documentToolNameTaken":
+        return t(
+          "editor.importWarning.documentToolNameTaken",
+          'Document template "{{name}}" was not imported: the tool name {{tool}} it would publish is already used by the tool "{{holder}}". One name reaches the model, so one of the two would stop being callable.',
+          p,
+        );
       case "documentTemplateInvalid":
         return t(
           "editor.importWarning.documentTemplateInvalid",
@@ -2343,6 +2497,30 @@ function AgentEditor() {
         return t(
           "editor.importWarning.integrationGrantNotFound",
           'Integration "{{name}}" was not found, so its grant was skipped.',
+          p,
+        );
+      case "codeToolRenamed":
+        return t(
+          "editor.importWarning.codeToolRenamed",
+          'Code tool "{{name}}" carries the name of a built-in tool, so it was imported as "{{renamed}}"; a prompt that names it must follow.',
+          p,
+        );
+      case "codeToolReused":
+        return t(
+          "editor.importWarning.codeToolReused",
+          'Code tool "{{name}}" already existed and was reused; check it is right.',
+          p,
+        );
+      case "codeGrantNotFound":
+        return t(
+          "editor.importWarning.codeGrantNotFound",
+          'Code tool "{{name}}" was not found, so its grant was skipped.',
+          p,
+        );
+      case "nativeToolUnknown":
+        return t(
+          "editor.importWarning.nativeToolUnknown",
+          'Built-in tool "{{name}}" is not one this version has, so it was left out of the agent.',
           p,
         );
       default:
@@ -2393,6 +2571,12 @@ function AgentEditor() {
             (x) => x.name === target.name,
           );
           if (tool) toolEditModal.open({ id: tool.id });
+          else navigate("/resources/tools");
+          break;
+        }
+        case "codeTool": {
+          const ct = catalog?.codeTools.find((x) => x.name === target.name);
+          if (ct) codeToolEditModal.open({ id: ct.id });
           else navigate("/resources/tools");
           break;
         }
@@ -2504,6 +2688,14 @@ function AgentEditor() {
   // (TabActionBar) on the config tabs, and the panel itself renders below (PlaygroundFab).
   const [playgroundOpen, setPlaygroundOpen] = useState(false);
   const openPlayground = () => setPlaygroundOpen(true);
+  // NOTE: ...AND THE PANEL CLOSES WITH ITS TRIGGER (issue #494 review, round 6). Flipping a
+  // production agent to monitoring removed the entry point and left an ALREADY-OPEN playground
+  // mounted and usable — a reply surface for an agent whose answering UI is meant to be gone. It is
+  // the one place where hiding the control was not enough, because the control had already been
+  // used.
+  useEffect(() => {
+    if (agentMode === "monitoring") setPlaygroundOpen(false);
+  }, [agentMode]);
   // Guards LEAVING the editor (sidebar, breadcrumbs, the Back link, browser
   // Back, refresh/close) when there are unsaved changes. Switching tabs keeps
   // the component mounted (state survives), so it is intentionally not guarded.
@@ -2519,7 +2711,7 @@ function AgentEditor() {
     setName(a.name);
     setSystemPrompt(a.systemPrompt);
     setEnabled(a.enabled);
-    setAgentMode(a.mode === "test" ? "test" : "production");
+    setAgentMode(normalizeAgentMode(a.mode));
     setModel(readModelState(a));
   };
   const revertBehavior = () => {
@@ -2544,8 +2736,10 @@ function AgentEditor() {
     setObservability(b.observability);
     setSavedObservability(b.observability);
     setMemory(b.memory);
+    setObservation(b.observation);
     setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
+    setTakeover(b.takeover);
     setAttributeContext(b.attributeContext);
   };
   const revertChannelRedirect = () => {
@@ -3065,7 +3259,7 @@ function AgentEditor() {
       title: t("editor.deleteTitle", "Delete agent"),
       warning: t(
         "editor.deleteWarning",
-        'This permanently deletes "{{name}}" (its prompt, tool grants and behavior settings) and detaches every inbox bound to it. It cannot be undone. The shared building blocks (tools, knowledge bases, integrations) are not touched.',
+        'This permanently deletes "{{name}}", including its Agent instructions, tool permissions, and behavior settings. Every inbox is detached. Shared tools, knowledge bases, and integrations remain.',
         { name: confirmName },
       ),
       confirmPhrase: confirmName,
@@ -3147,6 +3341,9 @@ function AgentEditor() {
       icon: MessageSquare,
     },
   ];
+  const visibleTabs = watcher
+    ? tabs.filter((item) => MONITORING_TABS.has(item.key))
+    : tabs;
 
   return (
     <PageContainer className="flex min-h-full flex-col gap-4">
@@ -3190,6 +3387,7 @@ function AgentEditor() {
                     : t("common.disabled", "Disabled")}
                 </Badge>
                 {agentMode === "test" && <TestModeBadge state="agent" />}
+                {agentMode === "monitoring" && <MonitoringBadge />}
                 {anyDirty && (
                   <Badge
                     variant="warning"
@@ -3240,7 +3438,7 @@ function AgentEditor() {
             </div>
 
             <Tabs
-              items={tabs}
+              items={visibleTabs}
               value={tab}
               // Preserve the ?from origin across tab switches so the "back to conversation" link
               // survives navigation within the editor.
@@ -3253,6 +3451,14 @@ function AgentEditor() {
               }
               aria-label={t("editor.tabs", "Agent settings")}
             />
+            {watcher && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "editor.monitoringTabsHint",
+                  "This agent only observes: the tabs that configure how an agent answers are not shown while it is in monitoring mode. What it does with what it reads is under Behavior, in Observation.",
+                )}
+              </p>
+            )}
 
             {staleNotice && (
               <div
@@ -3345,15 +3551,21 @@ function AgentEditor() {
                         <span className="min-w-0 text-text-secondary text-xs">
                           {importWarningMessage(w)}
                         </span>
-                        {w.target && (
-                          <button
-                            type="button"
-                            onClick={() => goToImportWarning(w)}
-                            className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
-                          >
-                            {t("editor.importWarningReview", "Review")}
-                          </button>
-                        )}
+                        {w.target &&
+                          (!watcher ||
+                            w.target.kind !== "agentField" ||
+                            watcherSectionReachable(
+                              w.target.tab,
+                              w.target.sectionId,
+                            )) && (
+                            <button
+                              type="button"
+                              onClick={() => goToImportWarning(w)}
+                              className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
+                            >
+                              {t("editor.importWarningReview", "Review")}
+                            </button>
+                          )}
                       </li>
                     ))}
                   </ul>
@@ -3480,7 +3692,7 @@ function AgentEditor() {
                   );
                 }}
                 onDiscard={revertGeneral}
-                onOpenPlayground={openPlayground}
+                onOpenPlayground={watcher ? undefined : openPlayground}
                 onDelete={askDelete}
                 previewVars={playgroundChat.promptVars}
                 catalog={catalog}
@@ -3492,6 +3704,16 @@ function AgentEditor() {
               <ChannelsTab
                 agentId={id}
                 agentName={name}
+                // NOTE: The SAVED mode, not the one General is editing (issue #494 review,
+                // round 1):
+                // binding acts immediately and the server judges the STORED agent, so a draft
+                // flipped to monitoring would route the call to the observer endpoint and be
+                // refused, on a switch with no save behind it.
+                mode={
+                  syncedAgentRef.current
+                    ? normalizeAgentMode(syncedAgentRef.current.mode)
+                    : agentMode
+                }
                 onBindingChanged={() => {
                   setServerSyncTick((n) => n + 1);
                 }}
@@ -3630,12 +3852,17 @@ function AgentEditor() {
                 setLimits={setLimits}
                 memory={memory}
                 setMemory={setMemory}
+                mode={agentMode}
+                observation={observation}
+                setObservation={setObservation}
                 modelFallback={modelFallback}
                 setModelFallback={setModelFallback}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}
                 setSendImage={setSendImage}
+                takeover={takeover}
+                setTakeover={setTakeover}
                 attributeContext={attributeContext}
                 setAttributeContext={setAttributeContext}
                 onScheduleSaved={onScheduleSaved}
@@ -3702,7 +3929,7 @@ function AgentEditor() {
                   )
                 }
                 onDiscard={revertBehavior}
-                onOpenPlayground={openPlayground}
+                onOpenPlayground={watcher ? undefined : openPlayground}
               />
             )}
 
@@ -3859,6 +4086,12 @@ function AgentEditor() {
           by id and refetch the catalog on save so any in-place tweak reflects without a reload. */}
       <ToolEditModal
         modal={toolEditModal}
+        onSaved={() => {
+          void refreshCatalog();
+        }}
+      />
+      <CodeToolEditModal
+        modal={codeToolEditModal}
         onSaved={() => {
           void refreshCatalog();
         }}

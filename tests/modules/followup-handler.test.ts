@@ -20,6 +20,7 @@ import {
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import { getJobHandler } from "@/modules/scheduler/worker";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { burnSchedulerJobId } from "../utils/scheduler";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -43,6 +44,9 @@ if (appUrl && suUrl) {
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
+
+// Burned from `scheduler_jobs_id_seq`, never a literal: tests/utils/scheduler.ts says why.
+let phantomJobId = 0n;
 
 let tenantId = 0n;
 let instanceId = 0n;
@@ -98,7 +102,7 @@ function threadOf(convId: number) {
 
 function jobFor(convId: number, stepIndex?: number): ClaimedJob {
   return {
-    id: 1n,
+    id: phantomJobId,
     tenantId,
     kind: "FOLLOWUP",
     payload:
@@ -229,6 +233,7 @@ async function lastFollowUpOf(convId: number): Promise<Date | null> {
 
 describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
   beforeAll(async () => {
+    phantomJobId = await burnSchedulerJobId(suDb);
     const t = await suDb.tenant.create({
       data: { name: "FUT", slug: `fut-${process.pid}` },
     });
@@ -814,7 +819,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     expect(sweep).toBeDefined();
     await sweep?.(
       {
-        id: 999n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -839,6 +844,50 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     });
     expect(botJob).not.toBeNull();
     expect(humanJob).toBeNull();
+  });
+
+  // A MONITORING agent chases nobody, and the exclusion has to be in the sweep's own SQL and not
+  // only in the handler's predicate (issue #209): rows the handler would drop still fill the
+  // batch's LIMIT, and a busy monitoring agent could keep every eligible production follow-up out
+  // of it.
+  test("(o2) sweep enqueues nothing for a monitoring agent, whatever its conversations look like", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { mode: "monitoring" },
+    });
+    try {
+      await seedConversation(1022, {
+        assigneeType: "AgentBot",
+        lastInboundAt: new Date(Date.now() - 5 * 60_000),
+        lastFollowUpAt: null,
+      });
+      registerFollowUpHandlers();
+      const sweep = getJobHandler("FOLLOWUP_SWEEP");
+      await sweep?.(
+        {
+          id: phantomJobId,
+          tenantId,
+          kind: "FOLLOWUP_SWEEP",
+          payload: {},
+          attempts: 0,
+          claimSeq: 0,
+        },
+        appDb,
+      );
+      const job = await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1022)}`,
+        },
+      });
+      expect(job).toBeNull();
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { mode: "production" },
+      });
+    }
   });
 
   // NOTE: The permissive sweep makes a conversation owned by a DIFFERENT Agent Bot reachable, so
@@ -905,7 +954,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 998n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -940,7 +989,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 997n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -998,7 +1047,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 996n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1049,7 +1098,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 995n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1096,7 +1145,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 994n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1186,7 +1235,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 992n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1238,7 +1287,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 991n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1317,7 +1366,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
       registerFollowUpHandlers();
       await getJobHandler("FOLLOWUP_SWEEP")?.(
         {
-          id: 992n,
+          id: phantomJobId,
           tenantId,
           kind: "FOLLOWUP_SWEEP",
           payload: {},
@@ -1375,7 +1424,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     registerFollowUpHandlers();
     await getJobHandler("FOLLOWUP_SWEEP")?.(
       {
-        id: 993n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1475,7 +1524,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 998n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1514,7 +1563,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 997n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1549,7 +1598,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 996n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1592,7 +1641,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 995n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1634,7 +1683,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 993n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1675,7 +1724,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 994n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},
@@ -1768,7 +1817,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     const sweep = getJobHandler("FOLLOWUP_SWEEP");
     await sweep?.(
       {
-        id: 992n,
+        id: phantomJobId,
         tenantId,
         kind: "FOLLOWUP_SWEEP",
         payload: {},

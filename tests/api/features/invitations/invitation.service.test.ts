@@ -11,6 +11,7 @@ import {
   listInvites,
   revokeInvite,
 } from "@/api/features/invitations/invitation.service";
+import type { TenantContext } from "@/lib/tenancy";
 
 // Invitation security invariants need a real Postgres (CAS single-use, the (tenant,email) unique
 // index, the role<>SUPER_ADMIN CHECK, cross-tenant scoping). Skips when the DB is unavailable.
@@ -37,6 +38,15 @@ if (appUrl && suUrl) {
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
+
+// The inviter, as the principal the invite now records itself under (#400). `invitedById` used to be
+// an argument and comes off this instead, so a caller can no longer attribute an invitation to
+// somebody who never issued it.
+const inviter = (tenantId: bigint): TenantContext => ({
+  tenantId,
+  userId: 9400n,
+  role: "TENANT_ADMIN",
+});
 
 describe.skipIf(!dbUp)("invitation service (DB)", () => {
   let tenantA = 0n;
@@ -75,11 +85,11 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
 
   test("createInvite mints a hashed token (plaintext never stored)", async () => {
     const inv = await createInvite(
+      inviter(tenantA),
       {
         tenantId: tenantA,
         email: "a1@x.com",
         role: "AGENT",
-        invitedById: null,
       },
       appDb,
     );
@@ -92,18 +102,27 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
   });
 
   test("createInvite refuses SUPER_ADMIN role", async () => {
-    expect(
-      createInvite(
+    // A plain try/catch, not `.rejects`: on this machine, bun's `.rejects` matcher hangs (rather
+    // than resolving or timing out promptly) once a promise from this Prisma client has gone
+    // through `acceptInvite`'s `$transaction` — see the same note below, in "acceptInvite binds
+    // tenant+role from the row and is single-use". Applied consistently across the file rather than
+    // only where it was first measured, since every one of these shares the same client.
+    let err: unknown;
+    try {
+      await createInvite(
+        inviter(tenantA),
         {
           tenantId: tenantA,
           // biome-ignore lint/suspicious/noExplicitAny: testing the runtime guard past the type.
           role: "SUPER_ADMIN" as any,
           email: "evil@x.com",
-          invitedById: null,
         },
         appDb,
-      ),
-    ).rejects.toBeInstanceOf(InviteInvalidError);
+      );
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InviteInvalidError);
   });
 
   test("the DB CHECK also rejects a SUPER_ADMIN invitation row", async () => {
@@ -123,11 +142,11 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
 
   test("acceptInvite binds tenant+role from the row and is single-use", async () => {
     const inv = await createInvite(
+      inviter(tenantA),
       {
         tenantId: tenantA,
         email: "join@x.com",
         role: "TENANT_ADMIN",
-        invitedById: null,
       },
       appDb,
     );
@@ -138,27 +157,40 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
     expect(user.tenantId).toBe(tenantA);
     expect(user.role).toBe("TENANT_ADMIN");
     expect(user.email).toBe("join@x.com");
-    // Second accept of the same token → rejected (consumed).
-    expect(
-      acceptInvite({ token: inv.token, password: "supersecret" }, appDb),
-    ).rejects.toBeInstanceOf(InviteInvalidError);
+    // Second accept of the same token → rejected (consumed). A plain try/catch, not `.rejects`:
+    // measured on this machine, `await expect(promise).rejects...` never resolves once `promise`
+    // comes from a Prisma client (`appDb`) that has already run a `$transaction` — which the FIRST
+    // `acceptInvite` call just did — while an identical `try { await … } catch {}` on the exact same
+    // rejection settles in under a millisecond. Bun v1.3.14 on Windows; not a defect in
+    // `acceptInvite` itself (isolated outside `bun:test`'s matcher it behaves correctly).
+    let err: unknown;
+    try {
+      await acceptInvite({ token: inv.token, password: "supersecret" }, appDb);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InviteInvalidError);
   });
 
   test("acceptInvite rejects an expired token generically", async () => {
     const inv = await createInvite(
+      inviter(tenantA),
       {
         tenantId: tenantA,
         email: "old@x.com",
         role: "AGENT",
-        invitedById: null,
         ttlDays: -1,
       },
       appDb,
     );
-    expect(findValidInviteByToken(inv.token, appDb)).resolves.toBeNull();
-    expect(
-      acceptInvite({ token: inv.token, password: "supersecret" }, appDb),
-    ).rejects.toBeInstanceOf(InviteInvalidError);
+    expect(await findValidInviteByToken(inv.token, appDb)).toBeNull();
+    let err: unknown;
+    try {
+      await acceptInvite({ token: inv.token, password: "supersecret" }, appDb);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InviteInvalidError);
   });
 
   test("createInvite refuses an email already in the tenant", async () => {
@@ -170,26 +202,30 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
         role: "AGENT",
       },
     });
-    expect(
-      createInvite(
+    let err: unknown;
+    try {
+      await createInvite(
+        inviter(tenantA),
         {
           tenantId: tenantA,
           email: "taken@x.com",
           role: "AGENT",
-          invitedById: null,
         },
         appDb,
-      ),
-    ).rejects.toBeInstanceOf(InviteEmailInUseError);
+      );
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InviteEmailInUseError);
   });
 
   test("listInvites + revokeInvite are tenant-scoped (no cross-tenant access)", async () => {
     const inv = await createInvite(
+      inviter(tenantA),
       {
         tenantId: tenantA,
         email: "scoped@x.com",
         role: "AGENT",
-        invitedById: null,
       },
       appDb,
     );
@@ -199,10 +235,14 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
     expect(bList.some((i) => i.email === "scoped@x.com")).toBe(false);
 
     // tenant B cannot revoke tenant A's invite.
-    expect(revokeInvite(tenantB, BigInt(inv.id), appDb)).rejects.toBeInstanceOf(
-      InviteNotFoundError,
-    );
-    await revokeInvite(tenantA, BigInt(inv.id), appDb);
+    let err: unknown;
+    try {
+      await revokeInvite(inviter(tenantB), BigInt(inv.id), appDb);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(InviteNotFoundError);
+    await revokeInvite(inviter(tenantA), BigInt(inv.id), appDb);
     const after = await listInvites(tenantA, appDb);
     expect(after.some((i) => i.email === "scoped@x.com")).toBe(false);
   });

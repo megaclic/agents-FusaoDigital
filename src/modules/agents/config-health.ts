@@ -8,6 +8,7 @@ import {
   hasModelFallback,
   readModelFallbackConfig,
 } from "@/graph/fallback-settings";
+import { modelConfigSchema } from "@/graph/model-config";
 import { resolveModelOverride } from "@/graph/model-override";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import { readAvailabilityConfig } from "@/modules/availability/away";
@@ -17,6 +18,20 @@ import {
 } from "@/modules/business-hours/hours";
 import { readMemoryConfig } from "@/modules/memory/settings";
 import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
+import {
+  type CredentialUse,
+  credentialServes,
+} from "@/modules/vault/secret-types";
+
+// What the vault answers about one ref beyond "it exists". Kept as a pair rather than two parallel
+// maps because the two are read together and a caller that had one and not the other would be
+// asking the half-question this module exists to stop asking.
+export interface VaultRefFacts {
+  kind: string | null;
+  // Whether the stored value is the shape `kind` declares (secretValueFitsKind, computed server-side
+  // so no secret crosses the wire). True for a pending entry, which has no value yet.
+  valueFitsKind: boolean;
+}
 
 // Live configuration-health checks for the agent editor (item 1): detect features that are turned on
 // but missing the credential they need to actually run. The common trigger is importing an agent —
@@ -25,6 +40,19 @@ import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 
 export type ConfigIssueKey =
   | "model"
+  // The PRIMARY model failing to BUILD, which the credential check above cannot see: it asks whether
+  // a configured provider has a key, and these are about the bag itself. Two keys because the fixes
+  // differ — one is the configuration, the other is an address — and both states are storable:
+  // `modelConfig` may be `{}` by design (validateModelConfigForWrite: "unconfigured — the agent
+  // simply won't run until set"), an import stores whatever record the export carried, and an
+  // openai-compatible bag with no endpoint passes every write boundary there is.
+  | "modelNotRunnable"
+  // Two spellings of one unreachable endpoint, because the operator's move differs: fill a field
+  // that is required and empty, or correct one that is filled and undialable. The wording cannot
+  // carry both — and it must not quote the value, since a base URL is one of the places a
+  // credential gets pasted (the audit projection treats it that way already).
+  | "modelNoEndpoint"
+  | "modelBadEndpoint"
   | "stt"
   | "tts"
   | "ttsNormalize"
@@ -72,6 +100,11 @@ export interface ConfigIssue {
   // NAMES, which no resolver matches). There is nothing to fill in, so this deep-links to the field
   // like a missing credential does.
   unresolved?: boolean;
+  // When true, the credential exists and its secret is filled, and its TYPE cannot serve this field:
+  // a multi-field or managed-blob entry where a plain API key is read, or one the catalog says never
+  // travels outbound. The fix is a different credential, not filling this one in, so it deep-links to
+  // the field like a missing credential does rather than to the vault fill modal.
+  wrongKind?: boolean;
   // For "knowledge" issues: the base that has imported-but-unindexed documents (and its name), so the
   // editor can open that base's documents modal.
   knowledgeBaseId?: string;
@@ -129,6 +162,21 @@ export interface ConfigHealthInput {
   // which is a question about what the General tab is about to save.
   modelProvider: string;
   modelCredentialRef: string;
+  // The endpoint that model would DIAL, with the credential's own base URL winning over the typed
+  // field exactly as `loadAgentConfig` reads it. Only openai-compatible needs one, and it is the
+  // one provider that authenticates by URL rather than by key — so for it, this is the field a
+  // missing-credential check would otherwise be standing in for.
+  modelBaseURL?: string;
+  // The model bag AS IT WILL BE STORED, judged by the runtime's own schema rather than by a second
+  // reading of the same rules here. Required, and the compiler is the only thing that could catch a
+  // caller dropping it: a bag nobody validated is exactly the case this exists for.
+  //
+  // The three fields above are PROJECTIONS of this one, kept separate because the other checks
+  // consume them and one of them (the endpoint) is resolved against the vault rather than read off
+  // the bag. Both real callers derive all four from the same state — the editor from the form it is
+  // about to save, the server from the row — so a bag that disagrees with its own projections is not
+  // a state either of them can produce.
+  modelConfig: unknown;
   // The agent's own on/off, AS SAVED. Required rather than optional, and read by exactly one check:
   // the out-of-hours collision is the only line in this panel that claims something about what the
   // CUSTOMER receives. Every other line describes the configuration ("on, but no key"), which stays
@@ -204,6 +252,12 @@ export interface ConfigHealthInput {
   // Under-reporting for a moment is the safe direction here; over-reporting trains the operator to
   // ignore the panel.
   knownRefs?: Set<string> | null;
+  // What each ref in `knownRefs` IS, keyed the same way. Resolving is not the same question as
+  // serving: an entry can exist, be filled, and still be unusable — by its type, or by holding a
+  // value that type does not describe (issue #471). `null`/absent has the same meaning it has for
+  // `knownRefs` — the vault has not answered yet — and for the same reason: reporting on an empty
+  // map would flag every credentialled field on the page for the first paint.
+  refFacts?: Map<string, VaultRefFacts> | null;
   // Knowledge bases this agent uses that still have documents awaiting indexing (status UNINDEXED),
   // e.g. right after an import that bundled the source text. Each becomes a "knowledge" issue — unless
   // the embedding prerequisite below is missing, in which case a single "embedding" issue is raised.
@@ -229,13 +283,28 @@ export interface ConfigHealthInput {
   savedSchedule?: Schedule | null;
 }
 
-// The three ways one credentialed feature can be unrunnable. Every credential ref on the agent goes
-// through this one function, all six of them: a rule that reaches half its fields is worse than no
+// The four ways one credentialed feature can be unrunnable. Every credential ref on the agent goes
+// through this one function, all ten of them: a rule that reaches half its fields is worse than no
 // rule, because the half it misses now reads as checked.
 type CredVerdict =
   | { kind: "missing" }
   | { kind: "pending"; vaultId: string }
-  | { kind: "unresolved" };
+  | { kind: "unresolved" }
+  | { kind: "wrongKind" };
+
+// What the vault has answered so far, as the three questions this module asks of a ref. Grouped
+// because they travel together and are read together: a ref is judged against all three or none, and
+// passing them one by one had already produced ten call sites of the same four arguments.
+interface VaultView {
+  pending: Set<string> | undefined;
+  known: Set<string> | null | undefined;
+  // What the vault knows about each ref in `known` beyond its existence: the kind it declares, and
+  // whether its stored value is the shape that kind describes. Both, because the runtime asks both
+  // and a panel that asks fewer calls an agent healthy on a configuration the turn refuses. Absent
+  // (not merely empty) until the vault answers, exactly like `known`: an empty map would read as
+  // "nothing fits" and flag every credential on the page for one paint.
+  facts: Map<string, VaultRefFacts> | null | undefined;
+}
 
 // For one credentialed feature, decides which issue (if any) to raise:
 //   - not enabled → none;
@@ -250,13 +319,13 @@ type CredVerdict =
 function credIssue(
   enabled: boolean,
   ref: string,
-  pendingRefs: Set<string> | undefined,
-  knownRefs: Set<string> | null | undefined,
+  use: CredentialUse,
+  vault: VaultView,
 ): CredVerdict | null {
   if (!enabled) return null;
   if (!ref) return { kind: "missing" };
   const canonical = canonicalVaultRef(ref);
-  if (canonical !== null && pendingRefs?.has(canonical)) {
+  if (canonical !== null && vault.pending?.has(canonical)) {
     return {
       kind: "pending",
       vaultId: canonical.slice(VAULT_REF_PREFIX.length),
@@ -265,8 +334,24 @@ function credIssue(
   // A ref no id can be read out of is unresolvable on its own terms, but it is still only REPORTED
   // once the vault has answered: one panel that stays quiet until it knows is easier to trust than
   // one that is right about a rare case and wrong about every field for a paint.
-  if (knownRefs && (canonical === null || !knownRefs.has(canonical))) {
+  if (vault.known && (canonical === null || !vault.known.has(canonical))) {
     return { kind: "unresolved" };
+  }
+  // Present, filled, and unable to serve this field. Two ways, one verdict: the TYPE cannot supply
+  // what the field reads (a multi-field or managed-blob entry where a plain API key goes, or one the
+  // catalog says never leaves in a request), or the stored VALUE is not the shape its own type
+  // declares. Both are what `tryResolveApiKeyEntry` refuses at the turn, and asking one of the two
+  // here would put the panel back to calling an agent healthy on a configuration the runtime drops.
+  //
+  // The write boundary refuses both now, so what reaches here is what was already stored — an
+  // import, or a row that predates the rule. Reported last of the four because the other three are
+  // about the entry itself and this one is about the pairing; and only once the vault has answered,
+  // for the same reason `unresolved` waits on `known`. Issue #471.
+  if (canonical !== null && vault.facts) {
+    const facts = vault.facts.get(canonical);
+    if (facts !== undefined && !credentialServes(facts, use)) {
+      return { kind: "wrongKind" };
+    }
   }
   return null;
 }
@@ -303,16 +388,49 @@ function endpointCouldStillArrive(
   return inherits && Boolean(agent.credentialRef);
 }
 
+// Whether the endpoint this model would DIAL is unusable, asked per provider because only two of
+// the six read the field at all (`createChatModel`, measured): `openai-compatible` REQUIRES it and
+// throws without one, `openrouter` uses it when present and falls back to its own API root. The
+// other four — openai, anthropic, google, deepseek — ignore `baseURL` entirely, so a malformed value
+// there breaks nothing and flagging it would be a warning about a field with no reader.
+//
+// "Unusable" is two things with one consequence: absent where it is required, or present and not
+// dialable anywhere. The second needs saying because the write boundary does not catch it — the
+// schema's `z.string().url()` accepts `llama:8080`, a valid URI with a `llama:` scheme (measured) —
+// and because `isValidHttpUrl` answers TRUE for the empty string on purpose, leaving emptiness to
+// the caller that knows whether the field is required. This is that caller.
+function endpointVerdict(
+  provider: string,
+  baseURL: string,
+): "missing" | "invalid" | null {
+  const stated = baseURL.trim();
+  if (provider === "openai-compatible") {
+    if (!stated) return "missing";
+    return isValidHttpUrl(stated) ? null : "invalid";
+  }
+  if (provider === "openrouter") {
+    // Optional: no endpoint is the DEFAULT and is correct. One that was typed still has to work,
+    // because `cfg.baseURL || OPENROUTER_BASE_URL` hands the typed value straight to the client.
+    return stated && !isValidHttpUrl(stated) ? "invalid" : null;
+  }
+  return null;
+}
+
 export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
-  const pending = input.pendingRefs;
-  const known = input.knownRefs;
+  const vault: VaultView = {
+    pending: input.pendingRefs,
+    known: input.knownRefs,
+    facts: input.refFacts,
+  };
   const push = (base: ConfigIssue, res: CredVerdict | null): void => {
     if (!res) return;
     if (res.kind === "pending") {
       issues.push({ ...base, pending: true, vaultId: res.vaultId });
     } else if (res.kind === "unresolved") {
       issues.push({ ...base, unresolved: true });
+    } else if (res.kind === "wrongKind") {
+      issues.push({ ...base, wrongKind: true });
     } else {
       issues.push(base);
     }
@@ -322,6 +440,54 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   // credential and nothing else: a ref that IS set is resolved by `loadAgentConfig` before the
   // provider is ever consulted, and a ref that does not resolve returns null for the whole agent,
   // which is silence on every message rather than one feature going quiet.
+  // CAN THIS MODEL BE BUILT AT ALL, asked of the two things that actually decide it at runtime
+  // rather than re-derived here. The credential check below answers a different question — does a
+  // configured provider have a key — and every state in this block passes it while the agent
+  // answers nobody.
+  //
+  // Both authorities are the runtime's own, and that is the whole design: a second copy of these
+  // rules is a second copy to drift. It is the same shape the three model OVERRIDES already use
+  // (they ask `resolveModelOverride`/`resolveNormalizeModel` and report `!runnable`); the primary
+  // model was the one that had nobody asking.
+  //
+  //   the schema     `parseModelConfig` runs this on every turn and THROWS. It covers the empty bag
+  //                  (`modelConfig` may be `{}` by design), a provider this build does not have, a
+  //                  missing `model` on a provider that requires one (openai-compatible is the only
+  //                  exemption), a malformed base URL, and `reasoningEffort` outside openai. An
+  //                  import is the common way in: `agentExportSchema` takes an arbitrary record and
+  //                  `importAgent` stores it as it came.
+  //   the endpoint   `createChatModel` throws for openai-compatible with nowhere to dial. The schema
+  //                  cannot judge this one, because the address is allowed to arrive on the
+  //                  CREDENTIAL instead of in the bag.
+  const modelTarget = {
+    key: "modelNotRunnable",
+    tab: "general",
+    sectionId: "general-model",
+  } as const;
+  if (!modelConfigSchema.safeParse(input.modelConfig).success) {
+    issues.push({ ...modelTarget });
+  } else {
+    const endpoint = endpointVerdict(
+      input.modelProvider,
+      input.modelBaseURL ?? "",
+    );
+    // An endpoint can still ARRIVE on a credential the vault has not answered for yet, and calling a
+    // runnable model broken is the false alarm the null-until-loaded rule exists to prevent. Same
+    // wait the three overrides take, and it covers BOTH verdicts.
+    //
+    // Not obvious, and I had it backwards for a round: the credential's own base URL WINS over the
+    // typed field, here and at runtime alike, so a credential still unread is exactly what would
+    // replace an undialable string with a working host. The editor makes this concrete — it passes
+    // `credentialBaseUrl ?? model.baseURL`, so while the vault is unread the typed `llama:8080` IS
+    // what arrives here, and a verdict on it is a verdict on a value the runtime will not use.
+    const owed = vault.known === null && Boolean(input.modelCredentialRef);
+    if (endpoint !== null && !owed) {
+      issues.push({
+        ...modelTarget,
+        key: endpoint === "invalid" ? "modelBadEndpoint" : "modelNoEndpoint",
+      });
+    }
+  }
   push(
     { key: "model", tab: "general", sectionId: "general-model" },
     credIssue(
@@ -329,21 +495,21 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
         (input.modelProvider !== "openai-compatible" ||
           Boolean(input.modelCredentialRef)),
       input.modelCredentialRef,
-      pending,
-      known,
+      "apiKey",
+      vault,
     ),
   );
   push(
     { key: "stt", tab: "behavior", sectionId: "stt" },
-    credIssue(input.sttEnabled, input.sttCredentialRef, pending, known),
+    credIssue(input.sttEnabled, input.sttCredentialRef, "apiKey", vault),
   );
   push(
     { key: "tts", tab: "behavior", sectionId: "tts" },
     credIssue(
       input.ttsMode !== "never",
       input.ttsCredentialRef,
-      pending,
-      known,
+      "apiKey",
+      vault,
     ),
   );
   // The speech rewrite. Both ways it fails are SILENT at runtime (best-effort: the audio still goes
@@ -408,7 +574,7 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   // (`credentialBaseUrl ?? mc.baseURL`), so a credential still unread can replace an undialable
   // string with a working host. What settles it is having no credential to hear from, which is the
   // case in the reviewer's example — a keyless openai-compatible rewrite pointed at `llama:8080`.
-  const endpointsKnown = known !== null;
+  const endpointsKnown = vault.known !== null;
   const endpointStillOwed = endpointCouldStillArrive(
     endpointsKnown,
     {
@@ -435,8 +601,8 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
         normalizeResolution !== null &&
           Boolean(input.ttsNormalizeCredentialRef),
         input.ttsNormalizeCredentialRef ?? "",
-        pending,
-        known,
+        "apiKey",
+        vault,
       ),
     );
   }
@@ -509,8 +675,8 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       credIssue(
         compactionResolution !== null && Boolean(compaction.credentialRef),
         compaction.credentialRef ?? "",
-        pending,
-        known,
+        "apiKey",
+        vault,
       ),
     );
   }
@@ -578,14 +744,14 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       credIssue(
         fallbackResolution !== null && Boolean(fallback.credentialRef),
         fallback.credentialRef ?? "",
-        pending,
-        known,
+        "apiKey",
+        vault,
       ),
     );
   }
   push(
     { key: "vision", tab: "behavior", sectionId: "vision" },
-    credIssue(input.visionEnabled, input.visionCredentialRef, pending, known),
+    credIssue(input.visionEnabled, input.visionCredentialRef, "apiKey", vault),
   );
   // NOTE: gated on the ref being present, so "missing" can never fire for this feature: enabled
   // without a credential is a legitimate configuration here, unlike the blocks above.
@@ -595,8 +761,12 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       Boolean(input.contactAuthEnabled) &&
         Boolean(input.contactAuthCredentialRef),
       input.contactAuthCredentialRef ?? "",
-      pending,
-      known,
+      // The one field here that is not an API key: the gate resolves it through
+      // `resolveInjectableCredentialEntry`, which hands back a fresh access token for the
+      // managed-OAuth kinds. A `google_oauth` entry is correct configuration here and a warning
+      // about it would be the panel contradicting a feature that works.
+      "injectable",
+      vault,
     ),
   );
   // The unlock flow and the handoff want opposite things from the same refusal. Forwarding the
@@ -647,8 +817,8 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   const guardrailsCred = credIssue(
     Boolean(input.guardrailsEnabled),
     input.guardrailsCredentialRef ?? "",
-    pending,
-    known,
+    "apiKey",
+    vault,
   );
   push(
     { key: "guardrails", tab: "guardrails", sectionId: "gr-model" },
@@ -687,8 +857,11 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
     const embedding = credIssue(
       true,
       input.embeddingCredentialRef ?? "",
-      pending,
-      known,
+      // Not `apiKey`: this field's reader takes `{ apiKey, baseURL }` as well as the plain string,
+      // so holding its value to the kind here would put a warning on a working configuration. The
+      // KIND rule is the same one — a `google_oauth` entry is still flagged.
+      "embeddingKey",
+      vault,
     );
     if (embedding) {
       push({ key: "embedding" }, embedding);

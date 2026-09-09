@@ -5,12 +5,17 @@ import {
   HumanMessage,
   ToolMessage,
 } from "@langchain/core/messages";
-import { memoryHeadMessage, nudgeMessage } from "@/graph/markers";
+import {
+  calledOffToolResult,
+  memoryHeadMessage,
+  nudgeMessage,
+} from "@/graph/markers";
 import {
   planReactiveTurnRollback,
   planTurnRollback,
   type RollbackPlan,
 } from "@/graph/refused-turn";
+import { SKIP_REPLY_TOOL } from "@/graph/silence";
 
 // The decision, as a table. `undoRefusedTurn` does the reading and the writing; everything that is a
 // JUDGEMENT is here, because the write is a checkpointer round trip and a rule proven through one
@@ -32,8 +37,26 @@ function calling(id: string, name: string): BaseMessage {
     tool_calls: [{ id: `${id}-c`, name, args: {} }],
   });
 }
-function toolResult(id: string, text: string): BaseMessage {
-  return new ToolMessage({ id, content: text, tool_call_id: `${id}-c` });
+function toolResult(
+  id: string,
+  text: string,
+  // The tool NAME, which the rollback planner reads to tell an inert `skip_reply` from a real act.
+  name?: string,
+): BaseMessage {
+  return new ToolMessage({
+    id,
+    content: text,
+    tool_call_id: `${id}-c`,
+    ...(name ? { name } : {}),
+  });
+}
+// The graph's own refusal, carrying the marker that says the call never ran (issue #449). Built
+// through the production helper on purpose: a hand-rolled copy would keep passing if the marker
+// moved.
+function refused(id: string, name: string, callId: string): BaseMessage {
+  const m = calledOffToolResult({ id: callId, name });
+  m.id = id;
+  return m;
 }
 function nudge(id: string): BaseMessage {
   const m = nudgeMessage("An external system event just occurred…", 900);
@@ -48,6 +71,7 @@ describe("planTurnRollback", () => {
     name: string;
     produced: BaseMessage[];
     current: BaseMessage[];
+    inert?: ReadonlySet<string>;
     expected: RollbackPlan;
   }> = [
     (() => {
@@ -71,6 +95,86 @@ describe("planTurnRollback", () => {
         produced,
         current: produced,
         expected: { action: "remove", ids: ["n1", "a2"] },
+      };
+    })(),
+    (() => {
+      // Issue #454, review round 7. `skip_reply` is the one tool that acts on NOTHING — it IS the
+      // decision to stay quiet, and since this change it is how a follow-up says so. Counting it as
+      // an act pinned the directive and its tool result in shared memory after a `/reset`, a
+      // takeover, or any post-generation refusal: the residue this planner exists to clear, reached
+      // through the silence protocol itself.
+      const produced = [
+        nudge("n1"),
+        calling("a1", "skip_reply"),
+        toolResult("t1", "Produce no message now.", "skip_reply"),
+        a("a2", ""),
+      ];
+      return {
+        name: "a turn whose only tool was skip_reply acted on nothing, so it can still be taken back",
+        produced,
+        current: produced,
+        inert: new Set([SKIP_REPLY_TOOL]),
+        expected: { action: "remove", ids: ["n1", "a1", "t1", "a2"] },
+      };
+    })(),
+    (() => {
+      // ...and the exemption is for that tool ALONE: paired with a real one, the act happened.
+      const produced = [
+        nudge("n1"),
+        calling("a1", "skip_reply"),
+        toolResult("t1", "ok", "skip_reply"),
+        calling("a2", "assign_label"),
+        toolResult("t2", "ok", "assign_label"),
+        a("a3", ""),
+      ];
+      return {
+        name: "skip_reply next to a real tool still keeps the history",
+        produced,
+        current: produced,
+        inert: new Set([SKIP_REPLY_TOOL]),
+        expected: { action: "keep", reason: "tool-ran" },
+      };
+    })(),
+    (() => {
+      // The TOOL RESULT on its own, because the AI message that requested it can be trimmed out of a
+      // slice and would otherwise carry the verdict alone — a mutation restoring the by-name check on
+      // that branch survived a table where every row had both.
+      const produced = [nudge("n1"), toolResult("t1", "ok", "skip_reply")];
+      return {
+        name: "a lone inert tool result does not pin the turn",
+        produced,
+        current: produced,
+        inert: new Set([SKIP_REPLY_TOOL]),
+        expected: { action: "remove", ids: ["n1", "t1"] },
+      };
+    })(),
+    (() => {
+      const produced = [nudge("n1"), toolResult("t1", "ok", "skip_reply")];
+      return {
+        name: "...and the same lone result pins it when nothing was inert",
+        produced,
+        current: produced,
+        inert: new Set<string>(),
+        expected: { action: "keep", reason: "tool-ran" },
+      };
+    })(),
+    (() => {
+      // Review round 8. A NAME is not an identity: `toolDefinitionCreateSchema` reserves none of the
+      // native names, so an agent with native tools disabled can grant a custom HTTP tool called
+      // `skip_reply` that really calls something. The caller names what was inert; here nothing was,
+      // and the turn is kept even though the messages look identical to the case above.
+      const produced = [
+        nudge("n1"),
+        calling("a1", "skip_reply"),
+        toolResult("t1", "ok", "skip_reply"),
+        a("a2", ""),
+      ];
+      return {
+        name: "a CUSTOM tool that borrowed the name is not inert, and keeps the history",
+        produced,
+        current: produced,
+        inert: new Set<string>(),
+        expected: { action: "keep", reason: "tool-ran" },
       };
     })(),
     (() => {
@@ -168,11 +272,88 @@ describe("planTurnRollback", () => {
         expected: { action: "remove", ids: ["n1"] },
       };
     })(),
+    (() => {
+      // ISSUE #449. The graph's tool boundary refused the call, so nothing reached the world and the
+      // turn is as removable as a silent one. The tool's NAME says nothing here — it is whatever the
+      // operator granted — and neither does the content, which any tool may return. What answers is
+      // the marker the graph writes on its own refusal.
+      const produced = [
+        nudge("n1"),
+        calling("a1", "assign_label"),
+        refused("t1", "assign_label", "a1-c"),
+        a("a2", ""),
+      ];
+      return {
+        name: "a call the tool boundary refused never acted, so the turn comes back out",
+        produced,
+        current: produced,
+        expected: { action: "remove", ids: ["n1", "a1", "t1", "a2"] },
+      };
+    })(),
+    (() => {
+      // REVIEW ROUND 3. A provider may emit a call with no id — LangChain types it optional — and the
+      // refusal then carries `""`, which matches no call. Pairing by id read the wrong axis: the
+      // boundary refuses a BATCH, so what answers is the position, and this row is what says so.
+      const produced = [
+        nudge("n1"),
+        new AIMessage({
+          id: "a1",
+          content: "",
+          tool_calls: [{ name: "assign_label", args: {} }],
+        }),
+        refused("t1", "assign_label", ""),
+        a("a2", ""),
+      ];
+      return {
+        name: "a refused call with no id is still a call that never ran",
+        produced,
+        current: produced,
+        expected: { action: "remove", ids: ["n1", "a1", "t1", "a2"] },
+      };
+    })(),
+    (() => {
+      // ONLY OUR OWN REFUSAL makes a calling turn inert, and the mutation battery is what asked for
+      // this row: reading the position without reading the MARKER survived every other case, because
+      // a real tool result is caught on its own line. It is not caught here — a calling turn whose
+      // result is simply absent is a call that may well have gone out, and the conservative answer
+      // for a write nothing can undo is to keep the slice.
+      const produced = [
+        nudge("n1"),
+        calling("a1", "assign_label"),
+        a("a2", ""),
+      ];
+      return {
+        name: "a calling turn followed by anything else is still a turn that may have acted",
+        produced,
+        current: produced,
+        expected: { action: "keep", reason: "tool-ran" } as RollbackPlan,
+      };
+    })(),
+    (() => {
+      // The pairing, and the reason the answer is not "the slice contains a refusal". One hop RAN
+      // before the turn was called off, and that write is in the world: the slice stays whole.
+      const produced = [
+        nudge("n1"),
+        calling("a1", "assign_label"),
+        toolResult("t1", "Label applied.", "assign_label"),
+        calling("a2", "set_custom_attribute"),
+        refused("t2", "set_custom_attribute", "a2-c"),
+        a("a3", ""),
+      ];
+      return {
+        name: "a turn refused on its SECOND hop keeps the tool that already ran",
+        produced,
+        current: produced,
+        expected: { action: "keep", reason: "tool-ran" } as RollbackPlan,
+      };
+    })(),
   ];
 
   for (const row of ROWS) {
     test(row.name, () => {
-      expect(planTurnRollback(row.produced, row.current)).toEqual(row.expected);
+      expect(
+        planTurnRollback(row.produced, row.current, row.inert ?? new Set()),
+      ).toEqual(row.expected);
     });
   }
 });
@@ -197,6 +378,7 @@ describe("planReactiveTurnRollback", () => {
     name: string;
     produced: BaseMessage[];
     current: BaseMessage[];
+    inert?: ReadonlySet<string>;
     expected: RollbackPlan;
   }> = [
     (() => {
