@@ -389,6 +389,14 @@ export class ZproClient {
     return this.post(`deleteQueueData/${id}`, {});
   }
 
+  // Lista usuários (atendentes) cadastrados — candidatos para o "pinned"/"agent_choice" targeting do
+  // handoff_to_human (userId em updateTicketInfo). Mesmo formato GET de listQueues/listTags. A forma
+  // da resposta (e o campo de rótulo de cada item) não tem exemplo capturado na coleção Postman do
+  // fornecedor — ver crm.ts's loadZproUsers, que trata isso defensivamente como já faz para filas/tags.
+  async listUsers(opts?: { pageNumber?: number; searchParam?: string }) {
+    return this.get("listUsers", opts);
+  }
+
   // ── Contatos (complemento) ───────────────────────────────────────────────
 
   /** Busca contatos com filtros. */

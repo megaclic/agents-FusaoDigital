@@ -344,6 +344,7 @@ function serializeHandoff(h: HandoffUiState): {
   targetTeamId: number | null;
   targetInstanceId: number | null;
   targetQueueId: number | null;
+  targetUserId: number | null;
   instructions: string | null;
 } {
   const [kind, idStr] = h.target.split(":");
@@ -356,6 +357,7 @@ function serializeHandoff(h: HandoffUiState): {
     // The account the target was picked from (account-scoped), so the runtime can validate it.
     targetInstanceId: h.mode === "pinned" ? h.targetInstanceId : null,
     targetQueueId: h.mode === "pinned" ? h.targetQueueId : null,
+    targetUserId: h.mode === "pinned" ? h.targetUserId : null,
     instructions: h.instructions.trim() || null,
   };
 }
@@ -474,6 +476,8 @@ function readBehaviorState(a: Agent) {
         typeof ho.targetInstanceId === "number" ? ho.targetInstanceId : null,
       targetQueueId:
         typeof ho.targetQueueId === "number" ? ho.targetQueueId : null,
+      targetUserId:
+        typeof ho.targetUserId === "number" ? ho.targetUserId : null,
       instructions: str(ho.instructions),
     },
     vision: {
@@ -912,6 +916,7 @@ function AgentEditor() {
     target: "",
     targetInstanceId: null,
     targetQueueId: null,
+    targetUserId: null,
     instructions: "",
   });
   // Operator funnel guidance for kanban_move_card (Tools-tab config, like handoff). Synced only by

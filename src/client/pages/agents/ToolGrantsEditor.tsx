@@ -703,12 +703,42 @@ export function ToolGrantsEditor({
             "This agent serves multiple Z-PRO instances; use “Let the AI choose”.",
           )
         : undefined;
-  // "Pinned" is offered whenever EITHER channel can supply a live list to pin from — the two targets
-  // are independent (see HandoffConfig's targetInstanceId vs targetQueueId), so a dual-bound agent can
-  // configure one, the other, or both. Chatwoot-only relies solely on pinnedAvailable (unchanged);
-  // Z-PRO-bound also checks queuePinnedAvailable.
+
+  // Z-PRO's per-ATTENDANT pinned target: a user (human), independent of the queue above — an agent
+  // can pin a queue, an attendant, or both at once (HandoffConfig's targetQueueId/targetUserId are
+  // separate fields). Same single-instance-scoping rule and fetch-once-when-enabled pattern as
+  // zproQueueData; deliberately its OWN state (a separate endpoint, /users vs /queues) even though in
+  // practice the two share the same underlying agent↔instance bindings and so resolve to the same
+  // instanceCount — the "why is pinning disabled" hint below reuses queuePinnedHint for that reason
+  // rather than duplicating an identical message.
+  const [zproUserData, setZproUserData] = useState<{
+    users: Array<{ id: number; name: string }>;
+    instanceCount: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!handoffEnabled || !channelBinding.zpro || zproUserData) return;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.zpro.users({ agentId }).get();
+        setZproUserData(
+          data
+            ? { users: data.users, instanceCount: data.instanceCount }
+            : { users: [], instanceCount: 0 },
+        );
+      } catch {
+        setZproUserData({ users: [], instanceCount: 0 });
+      }
+    })();
+  }, [handoffEnabled, channelBinding.zpro, zproUserData, agentId]);
+  const userPinnedAvailable =
+    !!zproUserData && zproUserData.instanceCount === 1;
+
+  // "Pinned" is offered whenever ANY of the three sources can supply a live list to pin from — the
+  // targets are independent (see HandoffConfig's targetInstanceId/targetQueueId/targetUserId), so a
+  // dual-bound agent can configure any combination. Chatwoot-only relies solely on pinnedAvailable
+  // (unchanged); Z-PRO-bound also checks queuePinnedAvailable and userPinnedAvailable.
   const pinnedDisabled = channelBinding.zpro
-    ? !pinnedAvailable && !queuePinnedAvailable
+    ? !pinnedAvailable && !queuePinnedAvailable && !userPinnedAvailable
     : !pinnedAvailable;
   const pinnedDisabledHint = !pinnedDisabled
     ? undefined
@@ -721,13 +751,15 @@ export function ToolGrantsEditor({
   // Keeps the SAVED config consistent with what the UI shows and the runtime does; marks the Tools
   // section unsaved so the operator confirms the change. No loop: after the switch mode !== "pinned".
   const chatwootHandoffReady = !channelBinding.chatwoot || !!handoffData;
-  const zproHandoffReady = !channelBinding.zpro || !!zproQueueData;
+  const zproHandoffReady =
+    !channelBinding.zpro || (!!zproQueueData && !!zproUserData);
   useEffect(() => {
     if (
       chatwootHandoffReady &&
       zproHandoffReady &&
       !pinnedAvailable &&
       !queuePinnedAvailable &&
+      !userPinnedAvailable &&
       handoff.mode === "pinned"
     ) {
       setHandoff((h) => ({
@@ -736,6 +768,7 @@ export function ToolGrantsEditor({
         target: "",
         targetInstanceId: null,
         targetQueueId: null,
+        targetUserId: null,
       }));
     }
   }, [
@@ -743,6 +776,7 @@ export function ToolGrantsEditor({
     zproHandoffReady,
     pinnedAvailable,
     queuePinnedAvailable,
+    userPinnedAvailable,
     handoff.mode,
     setHandoff,
   ]);
@@ -1592,6 +1626,8 @@ export function ToolGrantsEditor({
                       value === "pinned" ? pinnedInstanceId : null,
                     targetQueueId:
                       value === "pinned" ? handoff.targetQueueId : null,
+                    targetUserId:
+                      value === "pinned" ? handoff.targetUserId : null,
                   })
                 }
                 items={[
@@ -1607,11 +1643,14 @@ export function ToolGrantsEditor({
                   {
                     value: "pinned",
                     label: zproOnly
-                      ? t("editor.handoffPinnedQueue", "A specific queue")
+                      ? t(
+                          "editor.handoffPinnedQueue",
+                          "A specific queue and/or attendant",
+                        )
                       : channelBinding.zpro
                         ? t(
                             "editor.handoffPinnedBoth",
-                            "A specific agent/team and/or queue",
+                            "A specific agent/team, queue and/or attendant",
                           )
                         : t("editor.handoffPinned", "A specific agent or team"),
                     disabled: pinnedDisabled,
@@ -1717,17 +1756,57 @@ export function ToolGrantsEditor({
                   )}
                 </FormField>
               )}
+            {handoff.mode === "pinned" &&
+              channelBinding.zpro &&
+              userPinnedAvailable && (
+                <FormField
+                  label={t("editor.handoffPickAttendant", "Attendant")}
+                  group
+                  description={t(
+                    "editor.handoffPickAttendantHint",
+                    "Loaded from your Z-PRO instance.",
+                  )}
+                >
+                  <Dropdown
+                    value={
+                      handoff.targetUserId != null
+                        ? String(handoff.targetUserId)
+                        : null
+                    }
+                    ariaLabel={t("editor.handoffPickAttendant", "Attendant")}
+                    placeholder={t("editor.handoffNone", "Select…")}
+                    onChange={(value) =>
+                      setHandoff({
+                        ...handoff,
+                        targetUserId: Number(value) || null,
+                      })
+                    }
+                    items={(zproUserData?.users ?? []).map((u) => ({
+                      value: String(u.id),
+                      label: u.name,
+                    }))}
+                  />
+                  {zproUserData && zproUserData.users.length === 0 && (
+                    <span className="text-text-muted text-xs">
+                      {t(
+                        "editor.handoffNoAttendants",
+                        "No attendants found. Check your Z-PRO panel.",
+                      )}
+                    </span>
+                  )}
+                </FormField>
+              )}
             {handoff.mode === "agent_choice" && (
               <p className="text-text-muted text-xs">
                 {zproOnly
                   ? t(
                       "editor.handoffAgentChoiceHintZpro",
-                      "The AI automatically sees your Z-PRO queues and picks one when handing off. Optionally steer it from the instructions (e.g. route billing questions to the Finance queue).",
+                      "The AI automatically sees your Z-PRO queues and attendants and picks among them when handing off. Optionally steer it from the instructions (e.g. route billing questions to the Finance queue).",
                     )
                   : channelBinding.zpro
                     ? t(
                         "editor.handoffAgentChoiceHintBoth",
-                        "The AI automatically sees your Chatwoot agents/teams and Z-PRO queues and picks one when handing off, depending on the channel. Optionally steer it from the instructions.",
+                        "The AI automatically sees your Chatwoot agents/teams and Z-PRO queues/attendants and picks one when handing off, depending on the channel. Optionally steer it from the instructions.",
                       )
                     : t(
                         "editor.handoffAgentChoiceHint",

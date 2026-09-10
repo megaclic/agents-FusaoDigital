@@ -6,12 +6,18 @@
 // implementation over ZproClient, mapped onto Z-PRO's own primitives:
 //
 //   handoff_to_human    → deactivateAgent (n8nStatus:false) + an optional note + an optional
-//                         customer message. "route" semantics ONLY: Chatwoot's pinned/agent_choice
-//                         targeting (agent.settings.handoff.targetAgentId/targetTeamId) are Chatwoot
-//                         USER ids — applying them to a Z-PRO ticket's `userId` would silently
-//                         assign the WRONG person (a cross-system id collision, same class of risk
-//                         already avoided for LlmUsage.zproConversationId — see docs/zpro.md). A
-//                         Z-PRO `listUsers` + a dedicated target picker is future work if ever needed.
+//                         customer message, then best-effort targeting by QUEUE (department,
+//                         targetQueueId) and/or ATTENDANT (a specific human, targetUserId) — Z-PRO's
+//                         own targeting dimensions, NOT Chatwoot's pinned/agent_choice
+//                         (agent.settings.handoff.targetAgentId/targetTeamId): those are Chatwoot USER
+//                         ids, and applying them to a Z-PRO ticket's `userId` would silently assign
+//                         the WRONG person (a cross-system id collision, same class of risk already
+//                         avoided for LlmUsage.zproConversationId — see docs/zpro.md). The pinned
+//                         attendant is folded into the SAME updateTicketInfo call deactivateAgent
+//                         already makes (the vendor's own example body sends userId/n8nStatus/queueId
+//                         together); queue routing and agent_choice attendant resolution stay
+//                         separate best-effort calls AFTER that, exactly like queue routing already
+//                         was — a routing/pinning failure must never block the handoff itself.
 //   private_note        → ZproClient.createNote (ticket-level, visible to human attendants only).
 //   set_custom_attribute → ZproClient.updateContactExtraInfo (CONTACT scope only — Z-PRO has no
 //                         conversation/ticket-level custom-field API). Read-merge-write: the
@@ -174,6 +180,13 @@ export interface ZproToolCtx {
   // Known queues (id+name), same resolve-once pattern as knownTags — lets route_to_queue suggest
   // existing queues AND resolve a name to an id without a network call inside the tool body.
   knownQueues?: ZproPipeline[];
+  // Known users/attendants (id+name), same resolve-once pattern as knownQueues — lets
+  // handoff_to_human's "agent_choice" mode suggest existing attendants AND resolve a model-supplied
+  // name to a userId without a network call inside the tool body. Reuses ZproPipeline's generic
+  // {id,name} shape rather than a dedicated type, matching how this file already reuses it for both
+  // tags and queues (crm.ts's loadZproUsers). Absent ⇒ handoff_to_human was not granted, or its mode
+  // is not "agent_choice" (tools.ts only resolves this catalog then — see needsUsers).
+  knownUsers?: ZproPipeline[];
   // This conversation's CRM deal context (see crm.ts). Absent ⇒ kanban_move_card/update_kanban_task
   // were not granted this turn (their resolve is skipped to avoid the extra network calls).
   kanban?: ZproKanbanContext;
@@ -239,26 +252,44 @@ function parseExtraInfo(raw: unknown): Array<{ name: string; value: string }> {
 }
 
 // ── handoff_to_human ────────────────────────────────────────────────────────
-// Targeting mirrors src/graph/tools/native.ts's handoffTool exactly (same HandoffMode), but Z-PRO's
-// target is a QUEUE (department) — the only Z-PRO concept close to "who receives the handoff", since
-// there is no Chatwoot-style agent/team here. "pinned" applies ctx.handoffCfg.targetQueueId directly
-// (an operator-configured id, no catalog needed). "agent_choice" lets the model pass `queue` — a name
-// resolved against ctx.knownQueues (same catalog route_to_queue uses), rendered as <available_queues>
-// in the description exactly like route_to_queue's own resolution. Routing is best-effort and runs
-// AFTER deactivateAgent: a queue-routing failure must never block the handoff itself — getting SOME
-// human on the line matters more than getting the RIGHT department.
+// Targeting mirrors src/graph/tools/native.ts's handoffTool exactly (same HandoffMode), but Z-PRO has
+// TWO independent targeting dimensions where Chatwoot has one (agent OR team): a QUEUE (department,
+// targetQueueId) and an ATTENDANT (a specific human, targetUserId) — both may be set at once, since
+// the vendor's own API accepts userId and queueId together on one request. "pinned" applies
+// ctx.handoffCfg.targetUserId by folding `userId` into the SAME updateTicketInfo call deactivateAgent
+// already makes below (no second request needed, unlike queue routing — see the module header);
+// ctx.handoffCfg.targetQueueId keeps routing via its own SEPARATE updateQueue call afterward, exactly
+// as before this file gained attendant targeting. "agent_choice" lets the model pass `queue` and/or
+// `attendant` — names resolved against ctx.knownQueues/ctx.knownUsers respectively, each rendered as
+// its own XML block in the description exactly like route_to_queue's own resolution. Both routing
+// paths are best-effort and run AFTER deactivateAgent (queue always was; attendant agent_choice
+// follows the same rule for the same reason — the model's choice isn't known until the tool call
+// arrives, so it can't be folded into that first request the way a PINNED id can): a routing/pinning
+// failure must never block the handoff itself — getting SOME human on the line matters more than
+// getting the RIGHT department or the RIGHT person.
+
+function existingAttendantsXml(names: string[]): string {
+  if (names.length === 0) return "";
+  const els = names.map((u) => `  <attendant>${xmlEscape(u)}</attendant>`);
+  return `<available_attendants>\n${els.join("\n")}\n</available_attendants>`;
+}
 
 function handoffTool(ctx: ZproToolCtx) {
   const mode = ctx.handoffCfg?.mode ?? "route";
   const queueChoice = mode === "agent_choice";
-  const known = ctx.knownQueues ?? [];
+  const knownQueues = ctx.knownQueues ?? [];
+  const knownUsers = ctx.knownUsers ?? [];
   const queuesXml = queueChoice
-    ? existingQueuesXml(known.map((q) => q.name))
+    ? existingQueuesXml(knownQueues.map((q) => q.name))
     : "";
+  const attendantsXml = queueChoice
+    ? existingAttendantsXml(knownUsers.map((u) => u.name))
+    : "";
+  const contextXml = [queuesXml, attendantsXml].filter(Boolean).join("\n\n");
   const coreDescription = queueChoice
-    ? queuesXml
-      ? "Escalate the conversation to a human agent. Set `queue` to one of the departments listed in `<available_queues>` below to route there before transferring; omit it to leave the ticket's current queue unchanged."
-      : "Escalate the conversation to a human agent. Optionally set `queue` — the name of the department to route to (use one of the names from your instructions); omit it to leave the ticket's current queue unchanged."
+    ? contextXml
+      ? "Escalate the conversation to a human agent. Optionally set `queue` to one of the departments listed in `<available_queues>` below and/or `attendant` to one of the people listed in `<available_attendants>` below, to route/assign before transferring; omit either to leave it unchanged."
+      : "Escalate the conversation to a human agent. Optionally set `queue` — the name of the department to route to — and/or `attendant` — the name of the person to assign (use names from your instructions); omit either to leave it unchanged."
     : "Escalate the conversation to a human agent.";
   const baseDescription = `${coreDescription} Optionally include a short summary posted as an internal note before the handoff. Use when the customer needs human help or asks for it. Before transferring, set \`customerMessage\` to a brief reply to the customer (e.g. that a human will continue) so they are not left without an answer.`;
   return tool(
@@ -266,10 +297,12 @@ function handoffTool(ctx: ZproToolCtx) {
       reason,
       customerMessage,
       queue,
+      attendant,
     }: {
       reason?: string;
       customerMessage?: string;
       queue?: string;
+      attendant?: string;
     }) => {
       if (customerMessage?.trim()) {
         try {
@@ -321,7 +354,17 @@ function handoffTool(ctx: ZproToolCtx) {
           });
         }
       }
-      await deactivateAgent(ctx.client, ctx.ticketId);
+      // "pinned" attendant targeting folds into THIS same call (see the module header for why, and
+      // for how that differs from queue routing, which stays a separate best-effort request below).
+      // Absent/null ⇒ the call is byte-for-byte what it was before this file gained attendant
+      // targeting (userId simply never appears in the POSTed body).
+      const pinnedUserId =
+        mode === "pinned" ? (ctx.handoffCfg?.targetUserId ?? null) : null;
+      await deactivateAgent(
+        ctx.client,
+        ctx.ticketId,
+        pinnedUserId != null ? { userId: pinnedUserId } : undefined,
+      );
 
       let routed = "";
       try {
@@ -330,21 +373,21 @@ function handoffTool(ctx: ZproToolCtx) {
             ctx.ticketId,
             ctx.handoffCfg.targetQueueId,
           );
-          routed = " Routed to the configured queue.";
+          routed += " Routed to the configured queue.";
         } else if (queueChoice && queue?.trim()) {
           const clean = queue.trim();
-          const match = known.find(
+          const match = knownQueues.find(
             (q) => q.name.toLowerCase() === clean.toLowerCase(),
           );
           if (match) {
             await ctx.client.updateQueue(ctx.ticketId, match.id);
-            routed = ` Routed to the "${match.name}" queue.`;
+            routed += ` Routed to the "${match.name}" queue.`;
           } else {
             await ctx.client.createNote(
               ctx.ticketId,
               `Tentei encaminhar para a fila "${clean}", mas não encontrei nenhuma fila com esse nome. O ticket ficou na fila atual.`,
             );
-            routed = ` No queue named "${clean}" was found; left in the current queue.`;
+            routed += ` No queue named "${clean}" was found; left in the current queue.`;
           }
         }
       } catch (e) {
@@ -358,6 +401,40 @@ function handoffTool(ctx: ZproToolCtx) {
           phase: "route_queue",
           err: e,
         });
+      }
+      // agent_choice attendant resolution — a SEPARATE best-effort call, parallel to the queue
+      // agent_choice arm just above (never folded into deactivateAgent above: the model's choice
+      // isn't known until this tool call arrives, unlike a PINNED id which is known up front).
+      if (queueChoice && attendant?.trim()) {
+        try {
+          const cleanAttendant = attendant.trim();
+          const match = knownUsers.find(
+            (u) => u.name.toLowerCase() === cleanAttendant.toLowerCase(),
+          );
+          if (match) {
+            await ctx.client.updateTicketInfo(ctx.ticketId, {
+              userId: match.id,
+            });
+            routed += ` Assigned to "${match.name}".`;
+          } else {
+            await ctx.client.createNote(
+              ctx.ticketId,
+              `Tentei atribuir a "${cleanAttendant}", mas não encontrei nenhum atendente com esse nome. O ticket ficou sem atendente fixo.`,
+            );
+            routed += ` No attendant named "${cleanAttendant}" was found; left unassigned.`;
+          }
+        } catch (e) {
+          logger.warn(
+            "zpro handoff attendant assign failed (ticket=%s): %s",
+            String(ctx.ticketId),
+            e instanceof Error ? e.message : String(e),
+          );
+          ctx.onSideEffectError?.({
+            tool: "handoff_to_human",
+            phase: "route_attendant",
+            err: e,
+          });
+        }
       }
       // A human closing the ticket afterward from the Z-PRO panel — no message attached — never
       // fires a webhook we'd otherwise learn it from (mirrorZproMessage only runs on
@@ -380,7 +457,7 @@ function handoffTool(ctx: ZproToolCtx) {
         baseDescription,
         ctx,
         "handoff_to_human",
-        queuesXml,
+        contextXml,
       ),
       schema: z.object({
         reason: z
@@ -398,6 +475,12 @@ function handoffTool(ctx: ZproToolCtx) {
           .optional()
           .describe(
             "The target queue/department name to route to before transferring, exactly as listed in `<available_queues>` (agent_choice targeting only; ignored otherwise).",
+          ),
+        attendant: z
+          .string()
+          .optional()
+          .describe(
+            "The target attendant's name to assign before transferring, exactly as listed in `<available_attendants>` (agent_choice targeting only; ignored otherwise).",
           ),
       }),
     },

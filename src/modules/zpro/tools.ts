@@ -42,6 +42,7 @@ import {
   loadZproQueues,
   loadZproStages,
   loadZproTags,
+  loadZproUsers,
   resolveContactTagNames,
   resolveQueueName,
   resolveZproPipelineId,
@@ -340,6 +341,27 @@ export async function loadZproAgentTools(
         })
       : undefined;
 
+    // handoff_to_human's per-ATTENDANT counterpart to knownQueues above: same "agent_choice" mode
+    // gate (there is no separate flag distinguishing a queue-choice from an attendant-choice — the
+    // model may pass either/both `queue`/`attendant` once agent_choice is on), no other tool needs
+    // this catalog (unlike knownQueues, which route_to_queue and get_contact_info also read).
+    const needsUsers = handoffNeedsQueues;
+    const knownUsers = needsUsers
+      ? await loadZproUsers(client, cacheKey).catch((e) => {
+          logger.warn(
+            "zpro handoff_to_human: user list failed (ticket=%s): %s",
+            String(ticketId),
+            e instanceof Error ? e.message : String(e),
+          );
+          onSideEffectError?.({
+            tool: "handoff_to_human",
+            phase: "list_users",
+            err: e,
+          });
+          return [];
+        })
+      : undefined;
+
     const needsKanban =
       !allow ||
       allow.includes("kanban_move_card") ||
@@ -413,6 +435,7 @@ export async function loadZproAgentTools(
         handoffCfg: params.handoffConfig,
         knownTags,
         knownQueues,
+        knownUsers,
         currentQueueName: resolveQueueName(
           conversation.queueId,
           knownQueues ?? [],

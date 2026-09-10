@@ -59,6 +59,10 @@ export interface HandoffUiState {
   // Z-PRO's own pinned target: a queue (department) id. Independent of target/targetInstanceId
   // (Chatwoot-only) — a dual-bound agent can carry both at once, applied per-channel at runtime.
   targetQueueId: number | null;
+  // Z-PRO's own per-ATTENDANT pinned target: a userId, independent of targetQueueId (a department
+  // vs. one specific human within it) — a dual-bound agent can carry a queue AND an attendant at
+  // once, both applied on the Z-PRO side. See src/modules/handoff/settings.ts's targetUserId.
+  targetUserId: number | null;
   // Operator-authored transfer guidance, appended to the handoff_to_human tool description.
   // Persisted in agent.settings.handoff.instructions.
   instructions: string;

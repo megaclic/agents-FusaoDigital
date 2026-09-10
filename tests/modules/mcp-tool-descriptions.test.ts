@@ -249,7 +249,13 @@ const SETTINGS_DESC_CEILING = 2_110;
 // paragraph above this one exists: the fork's 24,396 and upstream's 24,261 are each about a tree the
 // other had not landed on, and summing the two deltas over the shared 22,346 base writes a number
 // measured nowhere.
-const SETTINGS_SCHEMA_CEILING = 26_010; // Measured on the merged tree at 25,994; same small margin as elsewhere in this file.
+//
+// RAISED again for per-attendant handoff targeting: `handoff.targetUserId`, one more field on the
+// SAME existing block `targetQueueId` already lives on (the "still not built" gap that paragraph
+// named), for the same reason it did not compress then — no Chatwoot equivalent (`targetAgentId`/
+// `targetTeamId` are a different id space entirely) to fold into. Measured on the merged tree at
+// 26,196.
+const SETTINGS_SCHEMA_CEILING = 26_212; // Measured on the merged tree at 26,196; same small margin as elsewhere in this file.
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -581,8 +587,12 @@ describe("MCP tool descriptions", () => {
     // REMEASURED on the merged tree, never summed: 30,584 and 58,820 (fork Z-PRO settings additions
     // on top of upstream's monitoring/code-tools/audit-trail sequence). Same margin discipline as the
     // paragraphs above: the ceilings go to 30,600 and 58,840.
+    //
+    // RAISED again for per-attendant handoff targeting (`handoff.targetUserId`, see
+    // SETTINGS_SCHEMA_CEILING's own paragraph): the description total is untouched (the field carries
+    // no prose of its own outside the schema), and the combined schema total moves to 59,022.
     expect(desc).toBeLessThanOrEqual(30_600);
-    expect(schema).toBeLessThanOrEqual(58_840);
+    expect(schema).toBeLessThanOrEqual(59_038);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

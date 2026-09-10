@@ -11,6 +11,7 @@ import {
   loadZproQueues,
   loadZproStages,
   loadZproTags,
+  loadZproUsers,
   matchZproStage,
   readZproCrmConfig,
   resolveContactTagNames,
@@ -84,6 +85,7 @@ function client(overrides: Partial<ZproClient> = {}): ZproClient {
     listStages: async () => [],
     listTags: async () => [],
     listQueues: async () => [],
+    listUsers: async () => [],
     ...overrides,
   } as unknown as ZproClient;
 }
@@ -208,6 +210,40 @@ describe("loadZproStages / loadZproTags (defensive parsing)", () => {
       listQueues: async () => [{ id: 5, name: "Suporte" }],
     });
     expect(await loadZproQueues(c, "t9b")).toEqual([]);
+  });
+
+  test("loadZproUsers reads the (unconfirmed, defaulted) 'name' label field and caches per key", async () => {
+    let calls = 0;
+    const c = client({
+      listUsers: async () => {
+        calls++;
+        return [{ id: 4, name: "Bruno" }];
+      },
+    });
+    expect(await loadZproUsers(c, "t11")).toEqual([{ id: 4, name: "Bruno" }]);
+    expect(await loadZproUsers(c, "t11")).toEqual([{ id: 4, name: "Bruno" }]);
+    expect(calls).toBe(1);
+  });
+
+  test("loadZproUsers accepts a wrapped {data:[]} shape and drops entries missing a valid id/name", async () => {
+    const c = client({
+      listUsers: async () => ({
+        data: [
+          { id: 4, name: "Bruno" },
+          { id: "bad", name: "Ignored" },
+          { id: 6 },
+          null,
+        ],
+      }),
+    });
+    expect(await loadZproUsers(c, "t12")).toEqual([{ id: 4, name: "Bruno" }]);
+  });
+
+  test("loadZproUsers degrades to an empty list on an unrecognized shape, never throws", async () => {
+    const c = client({
+      listUsers: async () => "not a list" as unknown as never,
+    });
+    expect(await loadZproUsers(c, "t13")).toEqual([]);
   });
 
   test("loadZproStages unwraps the real double-nested {data:{data:[],pagination}} envelope", async () => {

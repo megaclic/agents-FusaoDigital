@@ -16,6 +16,9 @@
 //   - pipeline/list, stage/list: {success, data: {data: [...], pagination}} (double-nested), label "name"
 //   - listTags:                  bare array, label "tag" (matches createTag's body field)
 //   - listQueues:                bare array, label "queue" (matches createQueueData's body field)
+// listUsers (loadZproUsers, below) is the one catalog here that is STILL open-validation: no example
+// response at all in the vendor's Postman collection, so its shape and label field stay a guess
+// (defaulting to "name") until a live capture settles them the way it did for queues/tags.
 
 import { readToolInstructions } from "@/modules/handoff/settings";
 import type { ZproClient } from "./client";
@@ -183,6 +186,34 @@ export async function loadZproQueues(
   return value;
 }
 
+// Users (attendants) — candidates for handoff_to_human's per-attendant "pinned"/"agent_choice"
+// targeting (agent.settings.handoff.targetUserId, src/modules/handoff/settings.ts). Same TTL cache
+// pattern as pipelines/stages/tags/queues. OPEN-VALIDATION: unlike listQueues/listTags (whose actual
+// label field, "queue"/"tag", was only confirmed by a live capture on 2026-08-17 — see the module
+// header — listUsers has no captured example response in the vendor's Postman collection at all, so
+// neither its envelope shape NOR its label field is confirmed. parseIdNamePairs is called with its
+// default label field ("name", the one pipeline/list and stage/list actually use) for lack of any
+// evidence pointing to a Z-PRO-specific field the way queues/tags turned out to have — if a live
+// capture later shows otherwise, this is the one line to change. A shape drift still degrades to an
+// empty list (handoff_to_human's agent_choice mode then simply has no <available_attendants> to
+// offer), never a crash — same contract as every other catalog in this file.
+const usersCache = new Map<
+  string,
+  { value: ZproPipeline[]; expires: number }
+>();
+
+export async function loadZproUsers(
+  client: ZproClient,
+  cacheKey: string,
+  now: number = Date.now(),
+): Promise<ZproPipeline[]> {
+  const hit = usersCache.get(cacheKey);
+  if (hit && hit.expires > now) return hit.value;
+  const value = parseIdNamePairs(await client.listUsers());
+  usersCache.set(cacheKey, { value, expires: now + CRM_TTL_MS });
+  return value;
+}
+
 // Resolves which pipeline kanban_move_card/update_kanban_task operate on. An explicit configured id
 // is trusted as-is (no live validation call — an invalid id surfaces as a tool-level error at
 // createOpportunity/updateOpportunity time instead of paying an extra round trip on every turn).
@@ -252,4 +283,5 @@ export function __resetZproCrmCaches(): void {
   stagesCache.clear();
   tagsCache.clear();
   queuesCache.clear();
+  usersCache.clear();
 }

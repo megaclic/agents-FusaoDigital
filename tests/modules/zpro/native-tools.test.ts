@@ -178,6 +178,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
           targetTeamId: null,
           targetInstanceId: null,
           targetQueueId: 18,
+          targetUserId: null,
           instructions: null,
         },
       }),
@@ -186,6 +187,75 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     const out = await tools[0]?.invoke({});
     expect(calls.map((c) => c[0])).toEqual(["updateTicketInfo", "updateQueue"]);
     expect(calls[1]?.[1]).toEqual({ ticketId: 42, queueId: 18 });
+    expect(String(out)).toContain("Routed to the configured queue");
+  });
+
+  test("handoff_to_human: 'pinned' mode folds targetUserId into the SAME updateTicketInfo call as n8nStatus:false (no second request)", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const client = {
+      updateTicketInfo: async (ticketId: number, patch: unknown) => {
+        calls.push(["updateTicketInfo", { ticketId, patch }]);
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({
+        client,
+        handoffCfg: {
+          mode: "pinned",
+          targetAgentId: null,
+          targetTeamId: null,
+          targetInstanceId: null,
+          targetQueueId: null,
+          targetUserId: 5,
+          instructions: null,
+        },
+      }),
+      ["handoff_to_human"],
+    );
+    const out = await tools[0]?.invoke({});
+    expect(calls).toEqual([
+      [
+        "updateTicketInfo",
+        { ticketId: 42, patch: { n8nStatus: false, userId: 5 } },
+      ],
+    ]);
+    expect(String(out)).toContain("Handed off to a human");
+  });
+
+  test("handoff_to_human: 'pinned' mode combines a pinned queue AND a pinned attendant (independent fields, both apply)", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const client = {
+      updateTicketInfo: async (ticketId: number, patch: unknown) => {
+        calls.push(["updateTicketInfo", { ticketId, patch }]);
+        return {};
+      },
+      updateQueue: async (ticketId: number, queueId: number) => {
+        calls.push(["updateQueue", { ticketId, queueId }]);
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({
+        client,
+        handoffCfg: {
+          mode: "pinned",
+          targetAgentId: null,
+          targetTeamId: null,
+          targetInstanceId: null,
+          targetQueueId: 18,
+          targetUserId: 5,
+          instructions: null,
+        },
+      }),
+      ["handoff_to_human"],
+    );
+    const out = await tools[0]?.invoke({});
+    expect(calls[0]).toEqual([
+      "updateTicketInfo",
+      { ticketId: 42, patch: { n8nStatus: false, userId: 5 } },
+    ]);
+    expect(calls[1]).toEqual(["updateQueue", { ticketId: 42, queueId: 18 }]);
     expect(String(out)).toContain("Routed to the configured queue");
   });
 
@@ -214,6 +284,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
           targetTeamId: null,
           targetInstanceId: null,
           targetQueueId: null,
+          targetUserId: null,
           instructions: null,
         },
       }),
@@ -246,6 +317,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
           targetTeamId: null,
           targetInstanceId: null,
           targetQueueId: null,
+          targetUserId: null,
           instructions: null,
         },
       }),
@@ -258,15 +330,86 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     );
   });
 
-  test("handoff_to_human: 'route' mode (default) never touches updateQueue even with knownQueues present", async () => {
-    const calls: string[] = [];
+  test("handoff_to_human: 'agent_choice' mode resolves the model's `attendant` name against knownUsers", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const client = {
+      updateTicketInfo: async (ticketId: number, patch: unknown) => {
+        calls.push(["updateTicketInfo", { ticketId, patch }]);
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({
+        client,
+        knownUsers: [
+          { id: 3, name: "Ana" },
+          { id: 5, name: "Bruno" },
+        ],
+        handoffCfg: {
+          mode: "agent_choice",
+          targetAgentId: null,
+          targetTeamId: null,
+          targetInstanceId: null,
+          targetQueueId: null,
+          targetUserId: null,
+          instructions: null,
+        },
+      }),
+      ["handoff_to_human"],
+    );
+    const out = await tools[0]?.invoke({ attendant: "bruno" });
+    // First call is deactivateAgent's own updateTicketInfo (no userId: agent_choice attendant
+    // resolution is a SEPARATE call, unlike a PINNED userId which folds into that first one).
+    expect(calls[1]).toEqual([
+      "updateTicketInfo",
+      { ticketId: 42, patch: { userId: 5 } },
+    ]);
+    expect(String(out)).toContain('Assigned to "Bruno"');
+  });
+
+  test("handoff_to_human: 'agent_choice' mode with an unknown attendant name posts a note and still hands off (no crash)", async () => {
+    const calls: Array<[string, unknown]> = [];
     const client = {
       updateTicketInfo: async () => {
-        calls.push("updateTicketInfo");
+        calls.push(["updateTicketInfo", null]);
+        return {};
+      },
+      createNote: async (ticketId: number, notes: string) => {
+        calls.push(["createNote", { ticketId, notes }]);
+        return {};
+      },
+    } as unknown as ZproClient;
+    const tools = buildZproNativeTools(
+      baseCtx({
+        client,
+        knownUsers: [{ id: 3, name: "Ana" }],
+        handoffCfg: {
+          mode: "agent_choice",
+          targetAgentId: null,
+          targetTeamId: null,
+          targetInstanceId: null,
+          targetQueueId: null,
+          targetUserId: null,
+          instructions: null,
+        },
+      }),
+      ["handoff_to_human"],
+    );
+    const out = await tools[0]?.invoke({ attendant: "Ninguém" });
+    expect(calls.map((c) => c[0])).toEqual(["updateTicketInfo", "createNote"]);
+    expect(String(out)).toContain('No attendant named "Ninguém" was found');
+    expect(String(out)).toContain("Handed off to a human");
+  });
+
+  test("handoff_to_human: 'route' mode (default) never touches updateQueue or userId even with knownQueues/knownUsers present", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const client = {
+      updateTicketInfo: async (ticketId: number, patch: unknown) => {
+        calls.push(["updateTicketInfo", { ticketId, patch }]);
         return {};
       },
       updateQueue: async () => {
-        calls.push("updateQueue");
+        calls.push(["updateQueue", null]);
         return {};
       },
     } as unknown as ZproClient;
@@ -274,12 +417,18 @@ describe("buildZproNativeTools (no client/DB access)", () => {
       baseCtx({
         client,
         knownQueues: [{ id: 18, name: "Atendimento Humano" }],
+        knownUsers: [{ id: 3, name: "Ana" }],
       }),
       ["handoff_to_human"],
     );
-    const out = await tools[0]?.invoke({ queue: "Atendimento Humano" });
-    expect(calls).toEqual(["updateTicketInfo"]);
+    const out = await tools[0]?.invoke({
+      queue: "Atendimento Humano",
+      attendant: "Ana",
+    });
+    expect(calls.map((c) => c[0])).toEqual(["updateTicketInfo"]);
+    expect(calls[0]?.[1]).toMatchObject({ patch: { n8nStatus: false } });
     expect(String(out)).not.toContain("Routed to");
+    expect(String(out)).not.toContain("Assigned to");
   });
 
   test("resolve_conversation: immediate mode (no turnState) calls deactivateAgent with closeTicket", async () => {

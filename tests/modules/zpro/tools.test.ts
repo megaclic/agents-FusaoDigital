@@ -729,12 +729,74 @@ describe.skipIf(!dbUp)("loadZproAgentTools", () => {
         targetTeamId: null,
         targetInstanceId: null,
         targetQueueId: null,
+        targetUserId: null,
         instructions: null,
       },
     });
     const handoffTool = result.tools.find((t) => t.name === "handoff_to_human");
     expect(handoffTool?.description).toContain("Financeiro");
     expect(queuesCalled).toBe(1);
+  });
+
+  test("NATIVE: handoff_to_human in 'agent_choice' mode also resolves the known-users list (per-attendant targeting)", async () => {
+    __resetZproCrmCaches();
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Native handoff attendant-choice agent",
+        systemPrompt: "You are a helpful assistant.",
+      },
+    });
+    await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "NATIVE",
+        enabledTools: ["handoff_to_human"],
+        knowledgeBaseIds: [],
+      },
+    });
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 2009,
+        status: "open",
+        contactId: 50,
+        contactNumber: "5511900000050",
+        contactName: "Cliente Atendente",
+        agentActive: true,
+      },
+    });
+    let usersCalled = 0;
+    const client = {
+      listUsers: async () => {
+        usersCalled++;
+        return [{ id: 4, name: "Bruno" }];
+      },
+    } as unknown as ZproClient;
+
+    const result = await loadZproAgentTools({
+      base: appDb,
+      tenantId,
+      agentId: agent.id,
+      zproInstanceId,
+      ticketId: 2009,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:2009`,
+      client,
+      handoffConfig: {
+        mode: "agent_choice",
+        targetAgentId: null,
+        targetTeamId: null,
+        targetInstanceId: null,
+        targetQueueId: null,
+        targetUserId: null,
+        instructions: null,
+      },
+    });
+    const handoffTool = result.tools.find((t) => t.name === "handoff_to_human");
+    expect(handoffTool?.description).toContain("Bruno");
+    expect(usersCalled).toBe(1);
   });
 
   test("NATIVE: handoff_to_human in 'route' mode does NOT trigger a queue-list call", async () => {

@@ -297,6 +297,12 @@ const handoff = z.looseObject({
   targetQueueId: chatwootId().describe(
     "Z-PRO queue id; only matters for mode=pinned, Z-PRO-bound agents",
   ),
+  // Z-PRO's own per-ATTENDANT target: a `userId`, independent of targetQueueId (a department vs one
+  // specific human within it — the vendor's API accepts both on the same updateticketinfo call). See
+  // src/modules/handoff/settings.ts's targetUserId for the full id-space-isolation reasoning.
+  targetUserId: chatwootId().describe(
+    "Z-PRO attendant (user) id; only matters for mode=pinned, Z-PRO-bound agents",
+  ),
   instructions: toolNote()
     .nullable()
     .optional()

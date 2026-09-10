@@ -583,7 +583,15 @@ describe("the command the refusal names", () => {
   const appUrl = process.env.TEST_APP_DATABASE_URL;
   const live =
     process.env[DB_GATE_OPT_OUT] !== "1" && Boolean(suUrl) && Boolean(appUrl);
-  const BASE = "fzsetup417_test";
+  // Each test below gets its OWN base, distinct from its sibling: both run in the same file, and
+  // Bun does not guarantee they cannot overlap — they used to share one BASE and race each other's
+  // DROP/CREATE DATABASE on the exact same name, surfacing as an intermittent
+  // pg_database_datname_index violation under full-suite load (never reproduced running either test
+  // alone). A distinct name per test removes the possibility of the race entirely rather than
+  // relying on scheduling. Must still end in "_test" — test-db-setup.ts refuses to provision
+  // anything that does not.
+  const BASE_A = "fzsetup417a_test";
+  const BASE_B = "fzsetup417b_test";
   const FOREIGN = "20260828000000_left_by_another_branch";
   const repoRoot = ROOT;
 
@@ -591,7 +599,7 @@ describe("the command the refusal names", () => {
     "reprovisions a database that carries a migration this tree does not have",
     async () => {
       const { Client } = await import("pg");
-      const scratch = testDbNameFor(BASE, repoRoot);
+      const scratch = testDbNameFor(BASE_A, repoRoot);
       const maintUrl = new URL(suUrl as string);
       maintUrl.pathname = "/postgres";
       const maint = new Client({ connectionString: maintUrl.toString() });
@@ -629,8 +637,8 @@ describe("the command the refusal names", () => {
           cwd: repoRoot,
           env: {
             ...process.env,
-            TEST_MIGRATION_DATABASE_URL: at(suUrl as string, BASE),
-            TEST_APP_DATABASE_URL: at(appUrl as string, BASE),
+            TEST_MIGRATION_DATABASE_URL: at(suUrl as string, BASE_A),
+            TEST_APP_DATABASE_URL: at(appUrl as string, BASE_A),
           },
           stdout: "pipe",
           stderr: "pipe",
@@ -686,7 +694,7 @@ describe("the command the refusal names", () => {
     "reprovisions even with a connection still open on the database",
     async () => {
       const { Client } = await import("pg");
-      const scratch = testDbNameFor(BASE, repoRoot);
+      const scratch = testDbNameFor(BASE_B, repoRoot);
       const at = (url: string, db: string) => {
         const u = new URL(url);
         u.pathname = `/${db}`;
@@ -736,8 +744,8 @@ describe("the command the refusal names", () => {
           cwd: repoRoot,
           env: {
             ...process.env,
-            TEST_MIGRATION_DATABASE_URL: at(suUrl as string, BASE),
-            TEST_APP_DATABASE_URL: at(appUrl as string, BASE),
+            TEST_MIGRATION_DATABASE_URL: at(suUrl as string, BASE_B),
+            TEST_APP_DATABASE_URL: at(appUrl as string, BASE_B),
           },
           stdout: "pipe",
           stderr: "pipe",

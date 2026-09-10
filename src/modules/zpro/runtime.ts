@@ -249,9 +249,9 @@ export interface LoadedZproAgent {
   toolGuidance: Partial<Record<NativeToolName, string>>;
   crmConfig: ZproCrmConfig;
   // Handoff targeting (route | pinned | agent_choice) — shared config with Chatwoot
-  // (src/modules/handoff/settings.ts), but "pinned"/"agent_choice" target a QUEUE here
-  // (targetQueueId) instead of a Chatwoot agent/team (targetAgentId/targetTeamId, ignored on this
-  // channel). See src/modules/zpro/native-tools.ts's handoffTool.
+  // (src/modules/handoff/settings.ts), but "pinned"/"agent_choice" target a QUEUE (targetQueueId)
+  // and/or an ATTENDANT (targetUserId) here instead of a Chatwoot agent/team (targetAgentId/
+  // targetTeamId, ignored on this channel). See src/modules/zpro/native-tools.ts's handoffTool.
   handoffConfig: HandoffConfig;
   // send_image's host allowlist (agent.settings.sendImage — upstream #76 parity, channel-agnostic,
   // same config Chatwoot's version reads). See docs/zpro.md's "send_image" section.

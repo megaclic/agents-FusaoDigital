@@ -121,6 +121,7 @@ function renderEditor() {
                 target: "",
                 targetInstanceId: null,
                 targetQueueId: null,
+                targetUserId: null,
                 instructions: "",
               }}
               setHandoff={noop}

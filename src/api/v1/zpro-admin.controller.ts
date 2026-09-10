@@ -27,7 +27,11 @@ import {
 } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { ZproClient } from "@/modules/zpro/client";
-import { loadZproQueues, loadZproTags } from "@/modules/zpro/crm";
+import {
+  loadZproQueues,
+  loadZproTags,
+  loadZproUsers,
+} from "@/modules/zpro/crm";
 import { zproWebhookUrl } from "@/modules/zpro/zpro-webhook-mount";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -575,6 +579,62 @@ export const zproAdminController = new Elysia({
       detail: doc(
         "List Z-PRO tags",
         "Read live tags from the Z-PRO instance an agent is bound to (for the follow-up label picker).",
+      ),
+      response: errors(400, 401, 403, 404),
+    },
+  )
+  // Live users (attendants) for the "pinned"/"agent_choice" handoff target picker — Z-PRO's
+  // per-ATTENDANT counterpart to /queues above (a department vs. one specific human within it). Same
+  // single-instance-only contract as /queues and /tags: degrades to an empty list + instanceCount
+  // when the agent is bound to zero or 2+ instances (ambiguous). OPEN-VALIDATION: listUsers has no
+  // captured example response in the vendor's Postman collection (unlike listQueues/listTags, whose
+  // label field was only settled by a 2026-08-17 live capture — see crm.ts's loadZproUsers), so this
+  // degrades to an empty list on any unrecognized shape rather than guessing further.
+  .get(
+    "/users/:agentId",
+    async ({ tenantContext, params }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const agentId = requireDbId(params.agentId, "agentId");
+      return runScopedOn(basePrisma, ctx, async (db) => {
+        const bindings = await db.zproAgentBinding.findMany({
+          where: { agentId },
+          select: {
+            zproInstance: {
+              select: {
+                id: true,
+                baseUrl: true,
+                apiId: true,
+                bearerToken: true,
+              },
+            },
+          },
+        });
+        if (bindings.length !== 1) {
+          return { users: [], instanceCount: bindings.length };
+        }
+        const instance = bindings[0]?.zproInstance;
+        if (!instance) return { users: [], instanceCount: 0 };
+        const client = new ZproClient(
+          instance.baseUrl,
+          instance.apiId,
+          decryptJson<string>(instance.bearerToken),
+        );
+        try {
+          const users = await loadZproUsers(client, String(instance.id));
+          return { users, instanceCount: 1 };
+        } catch {
+          return { users: [], instanceCount: 1 };
+        }
+      });
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        agentId: t.String({ description: "Agent id (BigInt string)." }),
+      }),
+      detail: doc(
+        "List Z-PRO users",
+        "Read live users (attendants) from the Z-PRO instance an agent is bound to (for per-attendant handoff targeting).",
       ),
       response: errors(400, 401, 403, 404),
     },

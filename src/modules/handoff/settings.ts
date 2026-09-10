@@ -31,6 +31,14 @@ export interface HandoffConfig {
   // queue by name at call time instead (see src/modules/zpro/native-tools.ts's handoffTool) — this
   // field only matters for "pinned". null ⇒ unset.
   targetQueueId: number | null;
+  // Z-PRO's per-ATTENDANT target: a `userId` on the same updateticketinfo call deactivateAgent already
+  // makes (ZproClient.updateTicketInfo), independent of targetQueueId — a queue is a department, this
+  // is one specific human within it, and the vendor's own API accepts both on the same request (the
+  // Postman example body sends userId/n8nStatus/queueId together). Same id-space-isolation reasoning
+  // as targetQueueId (never conflated with Chatwoot's targetAgentId, a DIFFERENT system's user id).
+  // "pinned" applies this id directly; "agent_choice" lets the model pass an `attendant` name instead,
+  // resolved against a live user list (see native-tools.ts's handoffTool). null ⇒ unset.
+  targetUserId: number | null;
   // Optional operator-authored guidance, appended to the handoff_to_human tool description so the
   // transfer logic ("when / to whom to escalate") lives in one place instead of buried in the prompt.
   // null ⇒ no extra guidance. Trimmed + length-capped on read.
@@ -43,6 +51,7 @@ export const HANDOFF_DEFAULTS: HandoffConfig = {
   targetTeamId: null,
   targetInstanceId: null,
   targetQueueId: null,
+  targetUserId: null,
   instructions: null,
 };
 
@@ -85,6 +94,7 @@ export function readHandoffConfig(settings: unknown): HandoffConfig {
     targetTeamId: posInt(bag.targetTeamId),
     targetInstanceId: posInt(bag.targetInstanceId),
     targetQueueId: posInt(bag.targetQueueId),
+    targetUserId: posInt(bag.targetUserId),
     instructions: readToolInstructions(bag.instructions),
   };
 }
