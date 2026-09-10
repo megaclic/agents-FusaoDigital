@@ -48,6 +48,10 @@ import {
   startOutboundWorker,
   stopOutboundWorker,
 } from "@/modules/webhooks/outbound/worker";
+import {
+  ensureAllZproDeliverySweeps,
+  registerZproDeliverySweepHandler,
+} from "@/modules/zpro/delivery-sweep";
 import { registerZproStatusCheckHandler } from "@/modules/zpro/status-reconcile";
 
 const MAX_PORT_ATTEMPTS = 10;
@@ -185,6 +189,7 @@ if (config.schedulerWorker.enabled) {
   registerMemoryHandlers();
   registerObserveHandler();
   registerDeliverySweepHandler();
+  registerZproDeliverySweepHandler();
   registerDeliveryRecoveryHandler();
   registerTakeoverRecoveryHandler();
   registerSpendPollHandler();
@@ -204,6 +209,11 @@ if (config.schedulerWorker.enabled) {
   // what makes the recovery reach the rows the restart itself created.
   void ensureAllDeliverySweeps().catch((error) =>
     logger.warn({ error }, "Failed to arm Chatwoot delivery sweeps"),
+  );
+  // Arm the per-tenant recovery sweep for Z-PRO deliveries stranded on PENDING/PROCESSING (issue
+  // #228, ported to Z-PRO) — same reasoning as the Chatwoot arm above.
+  void ensureAllZproDeliverySweeps().catch((error) =>
+    logger.warn({ error }, "Failed to arm Z-PRO delivery sweeps"),
   );
   // Arm the per-tenant spend ceiling poll for every tenant whose ceiling is on (issue #426), so a
   // row lost to a reset is not a ceiling deciding on a figure frozen at its last poll.

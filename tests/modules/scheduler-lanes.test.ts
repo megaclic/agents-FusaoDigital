@@ -98,6 +98,9 @@ const EXPECTED_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   TAKEOVER_RECOVERY: "shared",
   SPEND_CEILING_POLL: "shared",
   OBSERVE: "shared",
+  // Shared, same reasoning as DELIVERY_SWEEP: a sweep with a cadence of minutes and one indexed
+  // query per tenant (issue #228, ported to Z-PRO).
+  ZPRO_DELIVERY_SWEEP: "shared",
 };
 
 // Same discipline as EXPECTED_LANE, and for a sharper reason: the bound test below can only
@@ -131,6 +134,9 @@ const EXPECTED_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   TAKEOVER_RECOVERY: false,
   SPEND_CEILING_POLL: false,
   OBSERVE: true,
+  // Reads and writes rows, emits log lines, invokes nothing — and unlike DELIVERY_SWEEP it arms no
+  // recovery of any kind, so there is no downstream kind that could carry the spend either.
+  ZPRO_DELIVERY_SWEEP: false,
 };
 
 // Same discipline again, and both of these maps were added by the change that introduced
@@ -166,6 +172,9 @@ const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   // lane of its own, so its rows never share a batch with a reminder. OBSERVE is on `shared`, where
   // it is the only kind whose count follows how much contacts write (issue #477 review, round 8).
   OBSERVE: true,
+  // One row per tenant, re-armed forever, same shape as DELIVERY_SWEEP: bounded by the install's
+  // tenant count, not by traffic.
+  ZPRO_DELIVERY_SWEEP: false,
 };
 
 const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
@@ -191,6 +200,9 @@ const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   TAKEOVER_RECOVERY: true,
   SPEND_CEILING_POLL: false,
   OBSERVE: false,
+  // One perpetual row per tenant, same shape as DELIVERY_SWEEP: a completed pass re-arms the same
+  // row rather than being a new unit of work.
+  ZPRO_DELIVERY_SWEEP: false,
 };
 
 // Written out ON PURPOSE, like the tables above: derived, it would mirror whatever the source says.
@@ -219,6 +231,9 @@ const EXPECTED_DEATH_LEVEL: Record<
   TAKEOVER_RECOVERY: "warn",
   SPEND_CEILING_POLL: "error",
   OBSERVE: "warn",
+  // Self-rescheduling, same reasoning as DELIVERY_SWEEP: its death is stranded Z-PRO deliveries
+  // going unreported from then on.
+  ZPRO_DELIVERY_SWEEP: "error",
 };
 
 const ALL_KINDS = Object.keys(EXPECTED_LANE) as SchedulerJobKind[];

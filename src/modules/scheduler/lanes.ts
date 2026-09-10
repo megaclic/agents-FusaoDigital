@@ -81,6 +81,9 @@ export const JOB_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // the cap it wants — the same pool a customer's turn queues on, so a busy inbox's observers cannot
   // starve the replies on it.
   OBSERVE: "shared",
+  // Shared, same reasoning as DELIVERY_SWEEP beside it: a sweep, minutes-by-design cadence, one
+  // indexed query per tenant.
+  ZPRO_DELIVERY_SWEEP: "shared",
 };
 
 // Whether ONE job of this kind spends capacity at an external provider that the rest of the product
@@ -136,6 +139,9 @@ export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   TAKEOVER_RECOVERY: false,
   // One model call per tick, on the agent's own model.
   OBSERVE: true,
+  // It reads and writes rows and emits log lines, same as DELIVERY_SWEEP — and unlike that kind it
+  // arms no recovery of any kind, so there is no second job downstream that could carry the spend.
+  ZPRO_DELIVERY_SWEEP: false,
 };
 
 // How many provider-spending jobs the shared lane may run at once, out of the model budget. NEVER
@@ -183,6 +189,9 @@ export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   // The key names ONE CONVERSATION (`observe:<thread>`), like DEBOUNCE's, and the row is re-armed by
   // every burst on it; a DONE row is the record of the last verdict.
   OBSERVE: false,
+  // One perpetual row per tenant, same shape as DELIVERY_SWEEP/FLOWLOG_SWEEP/HEARTBEAT: a completed
+  // pass re-arms the same row rather than being a new unit of work.
+  ZPRO_DELIVERY_SWEEP: false,
 };
 
 // Whether the NUMBER of rows of this kind follows inbound traffic, rather than a population the
@@ -253,6 +262,9 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   // observation and under load that is exactly the starvation the separate traffic claim exists to
   // prevent, and the kind it would starve is the one that has to arrive BEFORE something.
   OBSERVE: true,
+  // One row per tenant, re-armed forever — same shape as DELIVERY_SWEEP, bounded by the install's
+  // tenant count, not by traffic.
+  ZPRO_DELIVERY_SWEEP: false,
 };
 
 // WHAT ONE KIND'S DEATH MEANS TO THE OPERATOR, at the only moment the scheduler can state it
@@ -344,6 +356,9 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // is already reading and can label by hand, and the next burst on it arms the same row again. No
   // customer message was lost and nothing they wait on stopped.
   OBSERVE: "warn",
+  // Self-rescheduling, same reasoning as DELIVERY_SWEEP: its death is stranded Z-PRO deliveries
+  // going unreported from then on.
+  ZPRO_DELIVERY_SWEEP: "error",
 };
 
 export function kindsInLane(

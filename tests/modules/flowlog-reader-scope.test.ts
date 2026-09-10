@@ -240,6 +240,7 @@ const FLOWLOG_READERS: Record<string, number> = {
   "tests/modules/vision-retry.test.ts": 1,
   "tests/modules/webhooks-outbound-dead-alert.test.ts": 1,
   "tests/modules/webhooks-outbound-deliveries.test.ts": 1,
+  "tests/modules/zpro/delivery-sweep.test.ts": 1,
   "tests/modules/zpro/runtime-turn-failure.test.ts": 2,
 };
 

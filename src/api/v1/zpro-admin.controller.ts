@@ -13,6 +13,7 @@
 import { Elysia, t } from "elysia";
 import { Prisma } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
+import logger from "@/api/lib/logger";
 import { doc, errors } from "@/api/lib/openapi";
 import basePrisma from "@/api/lib/prisma";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
@@ -32,6 +33,7 @@ import {
   loadZproTags,
   loadZproUsers,
 } from "@/modules/zpro/crm";
+import { ensureZproDeliverySweep } from "@/modules/zpro/delivery-sweep";
 import { zproWebhookUrl } from "@/modules/zpro/zpro-webhook-mount";
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -205,6 +207,19 @@ export const zproAdminController = new Elysia({
             })
           : db.zproInstance.create({ data, select: INSTANCE_SELECT });
       });
+      // Arm the stranded-delivery sweep for this tenant (issue #228, ported to Z-PRO). Here and not
+      // only at boot: a first-run install has no tenants when the boot arm runs, and adding an
+      // instance is the moment a tenant acquires the only thing that can produce a delivery to
+      // strand. Idempotent and best-effort, same discipline as the Chatwoot connect wiring
+      // (management.ts) — a failure here must not fail the connection the operator asked for.
+      try {
+        await ensureZproDeliverySweep(tenantId, basePrisma);
+      } catch (err) {
+        logger.warn(
+          { tenantId: String(tenantId), err },
+          "zpro delivery sweep arm failed on instance connect; continuing",
+        );
+      }
       return { instance: instanceToDto(row) };
     },
     {

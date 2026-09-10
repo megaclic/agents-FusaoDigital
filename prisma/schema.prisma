@@ -73,6 +73,7 @@ enum SchedulerJobKind {
   TAKEOVER_RECOVERY
   SPEND_CEILING_POLL
   OBSERVE
+  ZPRO_DELIVERY_SWEEP
 }
 
 enum SchedulerJobStatus {

@@ -73,7 +73,8 @@ export type SchedulerJobKind =
   | "DELIVERY_RECOVERY"
   | "TAKEOVER_RECOVERY"
   | "SPEND_CEILING_POLL"
-  | "OBSERVE";
+  | "OBSERVE"
+  | "ZPRO_DELIVERY_SWEEP";
 
 export interface ClaimedJob {
   id: bigint;
