@@ -10,6 +10,7 @@ import {
   extractQuotedText,
   parseContactTags,
   parseMediaKey,
+  renderZproEventText,
   resolveZproInstanceCandidate,
   withMediaFallback,
   withQuotedPrefix,
@@ -392,6 +393,62 @@ describe("withMediaFallback", () => {
   test("empty plain text (conversation, or an unmapped type) → still empty, correctly", () => {
     expect(withMediaFallback("", "conversation")).toBe("");
     expect(withMediaFallback("", "somethingUnknown")).toBe("");
+  });
+});
+
+// The exact composition runZproAgentTurn (runtime.ts) hands to the model — lifted out (issue
+// #390/#491) so the spend-ceiling gate's empty-render short-circuit asks the SAME question the
+// turn itself does. These pin that it is EXACTLY withQuotedPrefix(withMediaFallback(...), ...), the
+// same two-step composition runtime.ts used to spell out inline.
+describe("renderZproEventText", () => {
+  test("plain text passes through", () => {
+    expect(
+      renderZproEventText({ body: "oi", messageType: "conversation" }),
+    ).toBe("oi");
+  });
+
+  test("body wins over mediaCaption when both are present", () => {
+    expect(
+      renderZproEventText({
+        body: "legenda ignorada",
+        mediaCaption: "legenda",
+        messageType: "imageMessage",
+      }),
+    ).toBe("legenda ignorada");
+  });
+
+  test("falls back to mediaCaption when body is empty", () => {
+    expect(
+      renderZproEventText({
+        body: "",
+        mediaCaption: "uma legenda",
+        messageType: "imageMessage",
+      }),
+    ).toBe("uma legenda");
+  });
+
+  test("an uncaptioned media message degrades to withMediaFallback's marker, not silence", () => {
+    expect(renderZproEventText({ body: "", messageType: "audioMessage" })).toBe(
+      "<mensagem de áudio não audível; peça que o cliente reenvie por texto>",
+    );
+  });
+
+  test("a genuinely empty plain-text message renders to empty — nothing to answer, not a failed extraction", () => {
+    expect(renderZproEventText({ body: "", messageType: "conversation" })).toBe(
+      "",
+    );
+  });
+
+  test("a WhatsApp reply prefixes the quoted marker ahead of the fallback-applied body", () => {
+    expect(
+      renderZproEventText({
+        body: "",
+        messageType: "audioMessage",
+        quotedText: "pergunta original",
+      }),
+    ).toBe(
+      '<em resposta a: "pergunta original">\n<mensagem de áudio não audível; peça que o cliente reenvie por texto>',
+    );
   });
 });
 

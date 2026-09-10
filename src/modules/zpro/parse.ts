@@ -238,6 +238,22 @@ export function withMediaFallback(body: string, messageType: string): string {
   }
 }
 
+// The exact text a turn answers to, lifted out of runZproAgentTurn (runtime.ts) so a caller that
+// only needs to know "will this turn have anything to answer" — the spend-ceiling gate's empty-
+// render short-circuit (docs/spend-ceiling.md), asked before a turn that is not going to run — asks
+// the SAME question the turn itself does, rather than a second copy that could drift from it.
+export function renderZproEventText(ev: {
+  body: string;
+  mediaCaption?: string;
+  messageType: string;
+  quotedText?: string | null;
+}): string {
+  return withQuotedPrefix(
+    withMediaFallback(ev.body || ev.mediaCaption || "", ev.messageType),
+    ev.quotedText,
+  );
+}
+
 // Nem todo canal do Z-PRO manda `whatsapp` na raiz do payload (confirmado: o canal "evo" manda;
 // o webhook global atual, para outros canais, só traz `ticket.whatsappId`). Tenta as fontes em
 // ordem de confiabilidade antes de desistir.

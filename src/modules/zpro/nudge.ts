@@ -23,10 +23,15 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
-import type { AgentNudge } from "@/graph/nudge";
+import { type AgentNudge, nudgeOccasionKey } from "@/graph/nudge";
+import { NUDGE_RETRY_BACKOFF_MS, NUDGE_RETRY_LIMIT } from "@/graph/nudge-retry";
 import { runScopedOn } from "@/lib/tenancy";
 import { contactAuthFlowEvent } from "@/modules/contact-auth/service";
-import { emitFlowEvent } from "@/modules/flowlog/service";
+import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import {
+  announceSpendCeiling,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
 import { authorizeZproContact } from "./contact-auth";
 import { sysCtx } from "./ctx";
 import { parseZproThreadId } from "./debounce";
@@ -43,7 +48,12 @@ export type RunZproAgentNudgeOutcome =
   | "silent"
   | "human-owned"
   | "no-conversation"
-  | "no-agent";
+  | "no-agent"
+  // The tenant's monthly budget is spent (docs/spend-ceiling.md, issue #390/#491). Silent like
+  // every other refusal here — a nudge has nobody waiting on the other end — but a REPAIRABLE one:
+  // isRepairableNudgeRefusal (src/graph/nudge-retry.ts) already treats this literal string as
+  // repairable, the same ladder an "agent-unavailable"/"live-unavailable" Chatwoot nudge rides.
+  | "over-ceiling";
 
 export interface RunZproAgentNudgeParams {
   tenantId: bigint;
@@ -86,6 +96,46 @@ export async function runZproAgentNudge(
 
   const loaded = await loadZproAgent(base, tenantId, zproInstanceId);
   if (!loaded) return "no-agent";
+
+  // The tenant's own spend ceiling (docs/spend-ceiling.md, issue #390/#491), asked here — before
+  // any model spend and before the contact-authorization round trip — for the same reason
+  // src/graph/nudge.ts's own runAgentNudge gives: a proactive nudge has nobody waiting on the other
+  // end, so a refusal is SILENT ONLY (no customer copy, no handoff, no note — those exist to answer
+  // a message the customer just sent, and a nudge is not one). It simply does not go out, and the
+  // caller reschedules it (isRepairableNudgeRefusal treats "over-ceiling" as repairable) rather than
+  // burning the occasion, because a month that turns over repairs this by itself.
+  const ceilingFlow: FlowContext = {
+    tenantId,
+    turnId: crypto.randomUUID(),
+    source: "inbox",
+    conversationId: conv.id,
+    agentId: loaded.agentId,
+    threadId: params.threadId,
+    base,
+    fullDetail: loaded.fullDetail,
+  };
+  const ceiling = await spendCeilingVerdict({
+    tenantId,
+    source: "inbox",
+    base,
+  });
+  // ONE LINE PER OCCASION, not per attempt: a refused nudge is repairable and the caller
+  // reschedules it every 15 minutes for 2 hours (nudge-retry.ts) — windowed to that same ladder and
+  // keyed by the occasion itself (nudgeOccasionKey, already channel-agnostic) rather than by the
+  // conversation, which independent jobs share.
+  announceSpendCeiling(ceilingFlow, ceiling, "inbox", tenantId, {
+    key: nudgeOccasionKey(zproInstanceId, ticketId, params.nudge),
+    windowMs: NUDGE_RETRY_BACKOFF_MS * NUDGE_RETRY_LIMIT,
+  });
+  if (ceiling.state === "over") {
+    logger.info(
+      "zpro nudge: spend ceiling reached (ticket=%s used=%s ceiling=%s) — nothing was sent",
+      String(ticketId),
+      String(ceiling.usedUsd),
+      String(ceiling.ceilingUsd),
+    );
+    return "over-ceiling";
+  }
 
   // The contact-authorization gate applies to proactive sends too (docs/contact-auth.md): a
   // follow-up is a turn the agent starts, and a contact the reactive gate would refuse must not be

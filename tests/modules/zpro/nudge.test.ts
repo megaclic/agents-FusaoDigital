@@ -185,4 +185,150 @@ describe.skipIf(!dbUp)("runZproAgentNudge (DB-backed)", () => {
       `DELETE FROM zpro_instances WHERE id = ${otherInst.id}`,
     );
   });
+
+  // Spend ceiling (docs/spend-ceiling.md, issue #390/#491): silent ONLY — no customer copy, no
+  // handoff, no note. A nudge has nobody waiting on the other end, so the refusal never touches
+  // ZproClient at all, unlike the webhook/debounce gates; there is nothing here to stub fetch for.
+  test("an over-ceiling tenant: over-ceiling outcome, nothing sent, the ticket is untouched", async () => {
+    const conv = await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 3003,
+        status: "open",
+        contactId: 3,
+        contactNumber: "5511900000013",
+        contactName: "Cliente Teto",
+        agentActive: true,
+      },
+    });
+    await suDb.tenant.update({
+      where: { id: tenantId },
+      data: {
+        settings: { spendCeiling: { enabled: true, monthlyInboxUsd: 1 } },
+      },
+    });
+    const monthStart = new Date(
+      Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1),
+    );
+    await suDb.spendCostSnapshot.upsert({
+      where: {
+        tenantId_source_monthStart: { tenantId, source: "inbox", monthStart },
+      },
+      create: {
+        tenantId,
+        source: "inbox",
+        monthStart,
+        costUsd: 999,
+        polledAt: new Date(),
+      },
+      update: { costUsd: 999, polledAt: new Date() },
+    });
+
+    const outcome = await runZproAgentNudge({
+      tenantId,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:3003`,
+      nudge: { source: "appointment_reminder", summary: "lembrete" },
+      base: appDb,
+    });
+    expect(outcome).toBe("over-ceiling");
+
+    // Silent means silent: no handoff (agentActive untouched), the same invariant the
+    // human-owned-conversation test above pins for a different refusal.
+    const row = await suDb.zproConversation.findUniqueOrThrow({
+      where: { id: conv.id },
+      select: { agentActive: true },
+    });
+    expect(row.agentActive).toBe(true);
+
+    await suDb.spendCostSnapshot.deleteMany({ where: { tenantId } });
+    await suDb.tenant.update({
+      where: { id: tenantId },
+      data: { settings: {} },
+    });
+  });
+
+  // The control: under the ceiling nothing about this gate fires, and the nudge proceeds to the
+  // real turn (which this file's own boundary does not exercise — see the module header). Proven
+  // the same way debounce.test.ts proves it: by watching whether the snapshot table is read at all,
+  // rather than by letting the turn actually reach a model.
+  test("under the ceiling the gate reads the snapshot and does not refuse", async () => {
+    await suDb.zproConversation.create({
+      data: {
+        tenantId,
+        zproInstanceId,
+        ticketId: 3004,
+        status: "open",
+        contactId: 4,
+        contactNumber: "5511900000014",
+        contactName: "Cliente Sob Teto",
+        agentActive: true,
+      },
+    });
+    // contactAuth enabled with no URL ⇒ an immediate, network-free "error" outcome (the same
+    // fail-closed refusal contact-auth already takes on its own), used only to stop the nudge
+    // cleanly right after the ceiling gate lets it through — before it would otherwise build a
+    // real model and invoke the graph, out of this file's testing boundary (see the module header).
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { settings: { contactAuth: { enabled: true } } },
+    });
+    await suDb.tenant.update({
+      where: { id: tenantId },
+      data: {
+        settings: {
+          spendCeiling: { enabled: true, monthlyInboxUsd: 1_000_000 },
+        },
+      },
+    });
+    const monthStart = new Date(
+      Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1),
+    );
+    await suDb.spendCostSnapshot.upsert({
+      where: {
+        tenantId_source_monthStart: { tenantId, source: "inbox", monthStart },
+      },
+      create: {
+        tenantId,
+        source: "inbox",
+        monthStart,
+        costUsd: 10,
+        polledAt: new Date(),
+      },
+      update: { costUsd: 10, polledAt: new Date() },
+    });
+
+    let snapshotReads = 0;
+    const watchedDb = appDb.$extends({
+      query: {
+        spendCostSnapshot: {
+          async findUnique({ args, query }) {
+            snapshotReads += 1;
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+
+    const outcome = await runZproAgentNudge({
+      tenantId,
+      threadId: `zpro:${tenantId}:${zproInstanceId}:3004`,
+      nudge: { source: "appointment_reminder", summary: "lembrete" },
+      base: watchedDb,
+    });
+    // The read ran (the gate asked) and it did not refuse — contact-auth's own network-free
+    // "error" outcome is what actually stopped this nudge before a real turn.
+    expect(outcome).toBe("silent");
+    expect(snapshotReads).toBe(1);
+
+    await suDb.spendCostSnapshot.deleteMany({ where: { tenantId } });
+    await suDb.tenant.update({
+      where: { id: tenantId },
+      data: { settings: {} },
+    });
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { settings: {} },
+    });
+  });
 });

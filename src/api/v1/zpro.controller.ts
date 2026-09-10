@@ -41,6 +41,13 @@ import {
 } from "@/modules/contact-auth/state";
 import { armDebounce } from "@/modules/debounce/service";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import { announceSpendCeilingOnConversation } from "@/modules/spend-ceiling/notice";
+import {
+  announceSpendCeiling,
+  SPEND_CEILING_MESSAGE_WINDOW_MS,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
+import { markAgentSending } from "@/modules/zpro/agent-echo";
 import {
   claimZproAwayMessage,
   releaseZproAwayMessage,
@@ -62,9 +69,15 @@ import {
   extractMedia,
   extractWhatsappId,
   parseContactExtraInfo,
+  renderZproEventText,
   resolveZproInstanceCandidate,
 } from "@/modules/zpro/parse";
-import { runZproAgentTurn, zproThreadId } from "@/modules/zpro/runtime";
+import {
+  type LoadedZproAgent,
+  loadZproAgent,
+  runZproAgentTurn,
+  zproThreadId,
+} from "@/modules/zpro/runtime";
 import { resolveZproSttConfig, transcribeZproAudio } from "@/modules/zpro/stt";
 import type {
   ResolvedZproInstance,
@@ -623,7 +636,193 @@ export const zproController = new Elysia({
           }
         }
 
-        // 1g. Contact authorization gate: some agents only serve contacts an operator-configured
+        // 1g. Spend ceiling: the tenant's own budget for the calendar month (docs/spend-ceiling.md,
+        // issue #390/#491) — same feature Chatwoot has (src/modules/chatwoot/webhook.ts), now wired
+        // for Z-PRO. Before contact-authorization for the same reason Chatwoot's own gate goes
+        // first: a cheap local read beats a stranger's network round trip for a turn that is not
+        // going to run.
+        //
+        // Deliberately does NOT port Chatwoot's watermark "already answered" re-check
+        // (readAnsweredFloor): that exists there only because ONE customer message fans out to TWO
+        // independent ChatwootWebhookDelivery rows (the conversation's assigned bot AND the
+        // inbox's), so two concurrent deliveries can race each other. Z-PRO has ONE global webhook
+        // and a UNIQUE (zproInstanceId, messageId) delivery row (see the upsert above) — there is no
+        // second delivery of this same message to race against, so there is no equivalent hole here.
+        if (mirrored) {
+          const renderedText = renderZproEventText(event);
+          // NOTHING TO ANSWER ⇒ NOTHING TO REFUSE (mirrors the webhook's own render check in
+          // src/modules/chatwoot/webhook.ts): a message that renders to nothing never reaches a
+          // billed call, so a customer under a ceiling with room is already unanswered — refusing
+          // here would report a budget refusal that never happened.
+          if (renderedText) {
+            const ceiling = await spendCeilingVerdict({
+              tenantId: instance.tenantId,
+              source: "inbox",
+              base: basePrisma,
+            });
+            // WARNING is announced regardless of whether the agent could have run — it is a
+            // statement about the tenant's MONTH, not about this particular message
+            // (docs/spend-ceiling.md), so it fires even on a path no other gate would ever reach
+            // (mirrors vision's own warning-only announcement). Only the REFUSAL below needs the
+            // agent-runnable escape hatch, so only it pays for the probe.
+            if (ceiling.state === "warning") {
+              announceSpendCeiling(
+                {
+                  tenantId: instance.tenantId,
+                  turnId: crypto.randomUUID(),
+                  source: "inbox",
+                  conversationId: mirrored.conversationId,
+                  agentId: null,
+                  threadId: zproThreadId(
+                    instance.tenantId,
+                    instance.id,
+                    event.threadId,
+                  ),
+                  base: basePrisma,
+                },
+                ceiling,
+                "inbox",
+                instance.tenantId,
+              );
+            } else if (ceiling.state === "over") {
+              // "Is this agent even runnable at all" — an agent with no binding, disabled, or an
+              // unresolvable model credential was never going to answer either, so a refusal here
+              // would blame the budget for a silence that was already coming. A probe READ failure
+              // must NOT silence this gate (fail-open, the same direction the ceiling's own read
+              // takes) — only a CLEAN "not runnable" answer opens this escape hatch.
+              let probed: LoadedZproAgent | null = null;
+              let probeFailed = false;
+              try {
+                probed = await loadZproAgent(
+                  basePrisma,
+                  instance.tenantId,
+                  instance.id,
+                );
+              } catch (err) {
+                probeFailed = true;
+                logger.warn(
+                  { err, deliveryId: String(delivery.id) },
+                  "zpro:dispatch spend-ceiling: could not probe whether the agent is runnable — the ceiling stands",
+                );
+              }
+              if (!probed && !probeFailed) {
+                logger.info(
+                  "zpro:dispatch spend ceiling reached (delivery=%s) — but the agent is not runnable, so the silence is not the budget's",
+                  String(delivery.id),
+                );
+              } else {
+                announceSpendCeiling(
+                  {
+                    tenantId: instance.tenantId,
+                    turnId: crypto.randomUUID(),
+                    source: "inbox",
+                    conversationId: mirrored.conversationId,
+                    agentId: probed?.agentId ?? null,
+                    threadId: zproThreadId(
+                      instance.tenantId,
+                      instance.id,
+                      event.threadId,
+                    ),
+                    base: basePrisma,
+                    fullDetail: probed?.fullDetail ?? false,
+                  },
+                  ceiling,
+                  "inbox",
+                  instance.tenantId,
+                  // ONE REFUSED MESSAGE, ONE LINE: keyed by the instance + this message's own id,
+                  // the Z-PRO analog of Chatwoot's account-scoped message-id key (mirrors
+                  // chatwoot/webhook.ts's SPEND_CEILING_MESSAGE_WINDOW_MS usage exactly).
+                  {
+                    key: `message:${instance.id}:${event.messageId}`,
+                    windowMs: SPEND_CEILING_MESSAGE_WINDOW_MS,
+                  },
+                );
+                const zproClient = new ZproClient(
+                  instance.baseUrl,
+                  instance.apiId,
+                  decryptJson<string>(instance.bearerToken),
+                );
+                await announceSpendCeilingOnConversation({
+                  tenantId: instance.tenantId,
+                  conversationRowId: mirrored.conversationId,
+                  occasion: `message:${event.messageId}`,
+                  cfg: ceiling.cfg,
+                  verdict: ceiling,
+                  postPublicMessage: async (text) => {
+                    try {
+                      // BEFORE the send, not after: the fromMe echo of this very message reaches
+                      // the webhook within seconds, and without this mark mirror.ts's
+                      // resolveSenderType misclassifies it HUMAN and the auto-handoff gate
+                      // deactivates the agent a second, redundant time (docs/zpro.md's "Native
+                      // conversation tools" documents the identical bug for handoff_to_human's
+                      // customerMessage).
+                      await markAgentSending(
+                        instance.tenantId,
+                        instance.id,
+                        Number(event.threadId),
+                        basePrisma,
+                      );
+                      await zproClient.sendText(event.contactNumber, text, {
+                        validateNumber: false,
+                      });
+                      return true;
+                    } catch (err) {
+                      logger.warn(
+                        { err },
+                        "zpro:dispatch spend-ceiling message not sent (conv=%s)",
+                        String(mirrored.conversationId),
+                      );
+                      return false;
+                    }
+                  },
+                  postPrivateNote: async (text) => {
+                    try {
+                      await zproClient.createNote(Number(event.threadId), text);
+                      return true;
+                    } catch (err) {
+                      logger.warn(
+                        { err },
+                        "zpro:dispatch spend-ceiling note not sent (conv=%s)",
+                        String(mirrored.conversationId),
+                      );
+                      return false;
+                    }
+                  },
+                  handoff: async () => {
+                    try {
+                      // NOT {closeTicket: true} — this opens the ticket for a human, it does not
+                      // resolve it (mirrors how contact-auth's own Z-PRO handoff works, below).
+                      await deactivateAgent(zproClient, Number(event.threadId));
+                      return true;
+                    } catch (err) {
+                      logger.warn(
+                        { err },
+                        "zpro:dispatch spend-ceiling handoff failed (conv=%s)",
+                        String(mirrored.conversationId),
+                      );
+                      return false;
+                    }
+                  },
+                });
+                await runScopedOn(basePrisma, sysCtx(instance.tenantId), (db) =>
+                  db.zproWebhookDelivery.update({
+                    where: { id: delivery.id },
+                    data: { status: "PROCESSED", processedAt: new Date() },
+                  }),
+                );
+                logger.info(
+                  "zpro:dispatch spend ceiling reached (conv=%s used=%s ceiling=%s) — the turn did not run",
+                  String(mirrored.conversationId),
+                  String(ceiling.usedUsd),
+                  String(ceiling.ceilingUsd),
+                );
+                return;
+              }
+            }
+          }
+        }
+
+        // 1h. Contact authorization gate: some agents only serve contacts an operator-configured
         // endpoint recognizes (docs/contact-auth.md) — same feature Chatwoot has, now wired for
         // Z-PRO. Runs on every new incoming message, after availability and before debounce/the
         // direct turn — the same gate order Chatwoot's webhook uses (redirect → availability →

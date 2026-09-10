@@ -164,7 +164,7 @@ import {
   startTypingHeartbeat,
 } from "./messages";
 import type { TurnState } from "./native-tools";
-import { withMediaFallback, withQuotedPrefix } from "./parse";
+import { renderZproEventText } from "./parse";
 import { deliverZproReply } from "./split";
 import { ZproAgentStatusReporter } from "./status";
 import { scheduleZproStatusCheck } from "./status-reconcile";
@@ -1506,10 +1506,7 @@ export async function runZproAgentTurn(
   // não recebia resposta nem erro visível (KNOWN GAP, ver docs/zpro.md). Uma resposta a uma
   // mensagem específica (WhatsApp reply) ganha o prefixo "<em resposta a: ...>" — sem isso o
   // agente vê só o texto novo e perde de vista a pergunta original sendo retomada.
-  const text = withQuotedPrefix(
-    withMediaFallback(ev.body || ev.mediaCaption || "", ev.messageType),
-    ev.quotedText,
-  );
+  const text = renderZproEventText(ev);
   if (!text) {
     await markDelivery("PROCESSED");
     return "skipped";

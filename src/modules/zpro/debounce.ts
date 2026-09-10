@@ -15,6 +15,7 @@
 // id externo), avançado por um CAS monotônico idêntico ao advanceHandledWatermark do Chatwoot.
 
 import type { PrismaClient } from "@/../generated/prisma/client";
+import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { runScopedOn } from "@/lib/tenancy";
@@ -28,6 +29,14 @@ import {
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import type { JobResult } from "@/modules/scheduler/worker";
+import { announceSpendCeilingOnConversation } from "@/modules/spend-ceiling/notice";
+import {
+  announceSpendCeiling,
+  SPEND_CEILING_BURST_WINDOW_MS,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
+import { markAgentSending } from "./agent-echo";
+import { ZproClient } from "./client";
 import { authorizeZproContact } from "./contact-auth";
 import { sysCtx } from "./ctx";
 import {
@@ -35,6 +44,7 @@ import {
   clearZproConversationError,
   recordZproConversationError,
 } from "./failure";
+import { deactivateAgent } from "./handoff";
 import {
   parseContactExtraInfo,
   withMediaFallback,
@@ -174,64 +184,11 @@ export async function flushZproDebounceJob(
   const loaded = await loadZproAgent(base, tenantId, zproInstanceId);
   if (!loaded) return { outcome: "done" };
 
-  // The contact-authorization gate, again, at the point the turn happens (docs/contact-auth.md,
-  // mirrors src/modules/debounce/handler.ts's flushDebounceJob exactly): the webhook checks every
-  // incoming message, but a turn is not a message — one allowed message can arm a flush that a
-  // later, refused message rides into (the refused delivery arms nothing, but the pending flush
-  // re-fetches everything past the watermark), and a revocation landing inside the coalescing
-  // window is the same hole from the other side. A refusal ends the flush like a human takeover:
-  // the burst counts as handled off the ARM-TIME payload's own last id (no re-fetch), nothing is
-  // posted, no customer copy and no handoff — those answer a message the customer just sent, and
-  // the webhook path already gave them to the delivery it refused. The flow line is what tells the
-  // operator the burst was dropped.
-  if (loaded.contactAuthConfig.enabled) {
-    const identifier =
-      parseContactExtraInfo(ctx.contactExtraInfo).identifier?.trim() || null;
-    const auth = await authorizeZproContact({
-      tenantId,
-      agentId: loaded.agentId,
-      contactNumber: ctx.contactNumber,
-      contactName: ctx.contactName,
-      identifier,
-      ticketId,
-      // Unavailable outside a live webhook payload (ZproConversation doesn't store it) — same
-      // degradation the synthetic event below already accepts for {{canal}}.
-      channelType: null,
-      // The burst is many messages, not one: there is no single text to forward, and an unlock
-      // code is something the customer sends on a message of their own, which the webhook path
-      // already checked.
-      messageText: null,
-      // Its own asking, like the nudge's: it carries no message text and must never join (or be
-      // joined by) the flight of an incoming message that does.
-      requestKey: "debounce",
-      cfg: loaded.contactAuthConfig,
-      base,
-    });
-    emitFlowEvent(
-      {
-        tenantId,
-        turnId: crypto.randomUUID(),
-        source: "inbox",
-        agentId: loaded.agentId,
-        threadId: zproThreadId(tenantId, zproInstanceId, String(ticketId)),
-        base,
-        fullDetail: loaded.fullDetail,
-      },
-      contactAuthFlowEvent(auth),
-    );
-    if (auth.outcome !== "allowed") {
-      logger.info(
-        "zpro debounce flush: contact not authorized (conv=%s outcome=%s), dropping the burst",
-        String(ctx.convDbId),
-        auth.outcome,
-      );
-      await advanceZproWatermarkFromArm(base, tenantId, ctx.convDbId, job);
-      return { outcome: "done" };
-    }
-  }
-
   // 2. Coalesce the burst PAST THE WATERMARK, straight from our own mirror (no re-fetch — see the
-  // module header). Cap at maxMessagesPerBurst, keeping the most recent.
+  // module header). Cap at maxMessagesPerBurst, keeping the most recent. Hoisted ahead of the
+  // spend-ceiling and contact-authorization gates below so each can ask "is there anything in this
+  // burst to refuse" by reusing the SAME text/empty-check computed here, rather than a second copy
+  // that could drift from it (docs/spend-ceiling.md: "it refuses a burst, never an empty one").
   const watermark = ctx.watermark;
   const pendingAll = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.zproMessage.findMany({
@@ -315,6 +272,187 @@ export async function flushZproDebounceJob(
     // so future flushes don't keep re-stopping on the same messages.
     await shouldPost();
     return { outcome: "done" };
+  }
+
+  // 4. Spend ceiling: the tenant's own budget for the calendar month (docs/spend-ceiling.md, issue
+  // #390/#491) — same feature Chatwoot's own debounce flush has (src/modules/debounce/handler.ts),
+  // now wired for Z-PRO. Before contact-authorization for the same reason: a cheap local read beats
+  // a stranger's network round trip for a turn that is not going to run. Past the empty-text check
+  // above, so a burst with nothing to answer is never mistaken for one the ceiling refused.
+  //
+  // ALREADY ANSWERED ⇒ skip the READ, not just the refusal: a retried attempt at this exact job can
+  // have posted and advanced the watermark past the arm-time payload's own last id before dying
+  // (mirrors handler.ts's `alreadyAnswered`, computed the same way there — this file already
+  // imports readLastMessageId for the gate-closed branch above). Compared on the Number side (not
+  // BigInt(armedLast)) — the same direction zpro.controller.ts already converts a message id in
+  // (`Number(mirrored.messageDbId)`) — so this stays a plain numeric compare rather than a second
+  // non-literal BigInt cast for tests/lib/caller-id-spelling.test.ts to carry a waiver for.
+  const armedLast = readLastMessageId(job.payload);
+  const alreadyAnswered =
+    armedLast !== null &&
+    ctx.watermark !== null &&
+    Number(ctx.watermark) >= armedLast;
+  const ceiling = alreadyAnswered
+    ? null
+    : await spendCeilingVerdict({ tenantId, source: "inbox", base });
+  if (ceiling && ceiling.state !== "allowed") {
+    announceSpendCeiling(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        conversationId: ctx.convDbId,
+        agentId: loaded.agentId,
+        threadId,
+        base,
+        fullDetail: loaded.fullDetail,
+      },
+      ceiling,
+      "inbox",
+      tenantId,
+      // ONE LINE PER REFUSED BURST, not one per attempt — keyed by the burst's own target
+      // watermark, which a retry of this same job repeats and the next burst does not (mirrors
+      // handler.ts's SPEND_CEILING_BURST_WINDOW_MS key exactly).
+      ceiling.state === "over"
+        ? {
+            key: `burst:${ctx.convDbId}:${targetWatermark}`,
+            windowMs: SPEND_CEILING_BURST_WINDOW_MS,
+          }
+        : undefined,
+    );
+  }
+  if (ceiling?.state === "over") {
+    logger.info(
+      "zpro debounce flush: spend ceiling reached (conv=%s used=%s ceiling=%s), dropping the burst",
+      String(ctx.convDbId),
+      String(ceiling.usedUsd),
+      String(ceiling.ceilingUsd),
+    );
+    const ceilingClient = () =>
+      new ZproClient(
+        loaded.instance.baseUrl,
+        loaded.instance.apiId,
+        decryptJson<string>(loaded.instance.bearerToken),
+      );
+    await announceSpendCeilingOnConversation({
+      tenantId,
+      conversationRowId: ctx.convDbId,
+      // The burst is the refusal here, and its target watermark names it — a retry of this same
+      // job refuses the same burst, and the next burst carries a later id.
+      occasion: `burst:${targetWatermark}`,
+      cfg: ceiling.cfg,
+      verdict: ceiling,
+      postPublicMessage: async (msg) => {
+        try {
+          // BEFORE the send, not after: the fromMe echo of this very message reaches the webhook
+          // within seconds, and without this mark mirror.ts's resolveSenderType misclassifies it
+          // HUMAN and the auto-handoff gate deactivates the agent a second, redundant time (see
+          // docs/zpro.md's "Native conversation tools" — the same bug handoff_to_human's
+          // customerMessage hit before markAgentSending was added to its send site).
+          await markAgentSending(tenantId, zproInstanceId, ticketId, base);
+          await ceilingClient().sendText(ctx.contactNumber, msg, {
+            validateNumber: false,
+          });
+          return true;
+        } catch (err) {
+          logger.warn(
+            "zpro debounce flush: spend-ceiling message not sent (conv=%s): %s",
+            String(ctx.convDbId),
+            err instanceof Error ? err.message : String(err),
+          );
+          return false;
+        }
+      },
+      postPrivateNote: async (msg) => {
+        try {
+          await ceilingClient().createNote(ticketId, msg);
+          return true;
+        } catch (err) {
+          logger.warn(
+            "zpro debounce flush: spend-ceiling note not sent (conv=%s): %s",
+            String(ctx.convDbId),
+            err instanceof Error ? err.message : String(err),
+          );
+          return false;
+        }
+      },
+      handoff: async () => {
+        try {
+          // NOT {closeTicket: true} — the same distinction contact-auth's own Z-PRO handoff makes:
+          // this opens the ticket for a human, it does not resolve it.
+          await deactivateAgent(ceilingClient(), ticketId);
+          return true;
+        } catch (err) {
+          logger.warn(
+            "zpro debounce flush: spend-ceiling handoff failed (conv=%s): %s",
+            String(ctx.convDbId),
+            err instanceof Error ? err.message : String(err),
+          );
+          return false;
+        }
+      },
+    });
+    // The burst is handled either way: advance the watermark to what this flush actually saw,
+    // unless a newer message arrived during the announcement above (shouldPost's own supersede
+    // check) — the same CAS every other posting exit in this file goes through.
+    await shouldPost();
+    return { outcome: "done" };
+  }
+
+  // 5. The contact-authorization gate, again, at the point the turn happens (docs/contact-auth.md,
+  // mirrors src/modules/debounce/handler.ts's flushDebounceJob exactly): the webhook checks every
+  // incoming message, but a turn is not a message — one allowed message can arm a flush that a
+  // later, refused message rides into (the refused delivery arms nothing, but the pending flush
+  // re-fetches everything past the watermark), and a revocation landing inside the coalescing
+  // window is the same hole from the other side. A refusal ends the flush like a human takeover:
+  // the burst counts as handled off the ARM-TIME payload's own last id (no re-fetch), nothing is
+  // posted, no customer copy and no handoff — those answer a message the customer just sent, and
+  // the webhook path already gave them to the delivery it refused. The flow line is what tells the
+  // operator the burst was dropped.
+  if (loaded.contactAuthConfig.enabled) {
+    const identifier =
+      parseContactExtraInfo(ctx.contactExtraInfo).identifier?.trim() || null;
+    const auth = await authorizeZproContact({
+      tenantId,
+      agentId: loaded.agentId,
+      contactNumber: ctx.contactNumber,
+      contactName: ctx.contactName,
+      identifier,
+      ticketId,
+      // Unavailable outside a live webhook payload (ZproConversation doesn't store it) — same
+      // degradation the synthetic event below already accepts for {{canal}}.
+      channelType: null,
+      // The burst is many messages, not one: there is no single text to forward, and an unlock
+      // code is something the customer sends on a message of their own, which the webhook path
+      // already checked.
+      messageText: null,
+      // Its own asking, like the nudge's: it carries no message text and must never join (or be
+      // joined by) the flight of an incoming message that does.
+      requestKey: "debounce",
+      cfg: loaded.contactAuthConfig,
+      base,
+    });
+    emitFlowEvent(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        agentId: loaded.agentId,
+        threadId: zproThreadId(tenantId, zproInstanceId, String(ticketId)),
+        base,
+        fullDetail: loaded.fullDetail,
+      },
+      contactAuthFlowEvent(auth),
+    );
+    if (auth.outcome !== "allowed") {
+      logger.info(
+        "zpro debounce flush: contact not authorized (conv=%s outcome=%s), dropping the burst",
+        String(ctx.convDbId),
+        auth.outcome,
+      );
+      await advanceZproWatermarkFromArm(base, tenantId, ctx.convDbId, job);
+      return { outcome: "done" };
+    }
   }
 
   // Synthetic event for the coalesced burst: contactName/contactNumber feed prompt vars; the last
