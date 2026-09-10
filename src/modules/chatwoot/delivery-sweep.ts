@@ -92,10 +92,19 @@ function sysCtx(tenantId: bigint): TenantContext {
 //   handled; it is a statement that WE are not handling it. Keyed by conversation and message, that
 //   exit retires the other route's row, and if that route's process then dies the loss is invisible.
 //   `deliveryRowId` is the caller saying "only the delivery I am".
+//
+// AND `covered` RIDES THE SHAPE, for the same reason and stated by the same union (issue #576, PR
+// review round 4). Whether a turn folded the message into the thread is a fact about the MESSAGE,
+// so only a caller speaking for the message may state it; a route saying "I am not handling this"
+// says nothing about whether the route that IS handling it will. Recorded as a message-wide `false`,
+// that stand-down was read as evidence while the owner's own row sat unsettled, and the owner's late
+// transcription was folded in a second time on the strength of it. Spelled `?: never` on the
+// single-row shape, so there is no such call to write.
 type CoveredMessages =
   // The burst a turn ran over, known exactly because the thread was re-fetched.
   | {
       messageIds: number[];
+      covered: boolean;
       afterMessageId?: never;
       upToMessageId?: never;
       deliveryRowId?: never;
@@ -115,16 +124,95 @@ type CoveredMessages =
   // the bound is inclusive because that message is the one most in need of retiring.
   | {
       messageIds?: never;
+      covered: boolean;
       afterMessageId: number | null;
       upToMessageId: number;
       deliveryRowId?: never;
     }
   | {
       deliveryRowId: bigint;
+      covered?: never;
       messageIds?: never;
       afterMessageId?: never;
       upToMessageId?: never;
     };
+
+// WHETHER A TURN FOLDED THESE MESSAGES INTO THE THREAD, written on its own and WITHOUT SETTLING
+// ANYTHING (issue #576).
+//
+// Separate from the settlement because the two are decided at different moments and a turn cannot
+// wait for the second to record the first: `graph.invoke` persists the channel long before anybody
+// knows whether a reply will reach the customer, and a TTS or a send that fails in between jumps
+// past the settlement entirely while tx2 closes the row all the same. Settling from there instead
+// would be far worse than losing the fact — a row closed mid-turn is a delivery the sweep can no
+// longer see, which is the silent loss this whole subsystem exists to prevent.
+//
+// MONOTONIC. `false` is the ABSENCE of a turn, not a claim that none can ever run: a message
+// consumed with no turn records `false`, and an operator's manual re-engagement then runs a turn over
+// that same tail and checkpoints it. Only `false -> true` moves, so a later settlement carrying
+// `false` — the burst's own word for the messages its cap dropped — cannot take back a coverage that
+// really happened.
+//
+// ASYMMETRIC ON A PENDING ROW, which is where this stops following the settlement's rule (PR review,
+// round 7). The settlement skips PENDING because moving that row's STATUS preempts a delivery whose
+// CAS has not run yet; this write touches only the column, so it preempts nothing.
+//
+//   `true` is written there. A flush that re-fetched the thread from Chatwoot legitimately covers a
+//   message whose own row was inserted and not yet claimed, and nothing later repairs that null: the
+//   delivery, when it does run, only re-arms a flush whose watermark has already moved past it.
+//   Left out, the commonest recovery shape in a debounced deployment records nothing.
+//
+//   `false` is not. That row's owner has not arrived, and "no turn covered this" is exactly what its
+//   own delivery is about to decide — writing the absence first would answer for it.
+export async function recordTurnCoverage(params: {
+  tenantId: bigint;
+  instanceId: bigint;
+  conversationId: number;
+  covered: boolean;
+  // The rows this speaks for. Callers outside this module name their messages; the settlement passes
+  // the filter it already built.
+  where?: Record<string, unknown>;
+  messageIds?: number[];
+  base: PrismaClient;
+}): Promise<void> {
+  const scope = params.where ?? {
+    chatwootInstanceId: params.instanceId,
+    conversationId: params.conversationId,
+    ...(params.messageIds === undefined
+      ? {}
+      : { inboundMessageId: { in: params.messageIds } }),
+  };
+  const covered = params.covered;
+  await runScopedOn(params.base, sysCtx(params.tenantId), (db) =>
+    db.chatwootWebhookDelivery.updateMany({
+      // `AND` rather than a spread, because the settlement's filter carries an `OR` of its own on the
+      // wide scope and a second one at the same level would replace it.
+      //
+      // And the coverage clause is an explicit LIST rather than `not: true`: the column is nullable,
+      // and `NOT (col = true)` is NULL for a NULL row — which is every row that has not yet said
+      // anything, i.e. exactly the ones this exists to write. Measured: with `not: true` it settled
+      // nothing at all. Same trap the observer exclusion below spells out.
+      where: {
+        AND: [
+          scope,
+          ...(covered ? [] : [{ status: { not: "PENDING" as const } }]),
+          covered
+            ? { OR: [{ turnCovered: null }, { turnCovered: false }] }
+            : { turnCovered: null },
+        ],
+      },
+      data: { turnCovered: covered },
+    }),
+  ).catch((e) => {
+    // Best-effort, like every other write on this path: a miss leaves the null the reader falls back
+    // on, never a wrong answer.
+    logger.warn(
+      "chatwoot: could not record whether a turn folded the message in on conversation %d: %s",
+      params.conversationId,
+      e instanceof Error ? e.message : String(e),
+    );
+  });
+}
 
 export async function retireCoveredDeliveries(
   params: CoveredMessages & {
@@ -233,6 +321,12 @@ export async function retireCoveredDeliveries(
   // it preempts nothing: its own tx2 writes PROCESSED over this a moment later. What it leaves out
   // is a delivery that died in the sliver between its insert and its CAS, reported as a loss even
   // though a later burst answered it — two statements wide, against a whole turn for PROCESSING.
+  // WHETHER A TURN FOLDED THE MESSAGE IN is the fact continuous ingestion needs and could not ask
+  // for (issue #576): its gate reads who owns the conversation NOW, which on a `message_updated` is a
+  // reading taken after the decision it is asking about. This call is where every settlement passes,
+  // so it is where the fact is written down. Best-effort like everything else here: a write that does
+  // not land leaves the null the reader falls back on.
+  const answered = params.settlement === "answered";
   const { count } = await runScopedOn(
     params.base,
     sysCtx(params.tenantId),
@@ -265,6 +359,21 @@ export async function retireCoveredDeliveries(
       }),
   );
 
+  // AND, IN A STATEMENT OF ITS OWN, WHETHER A TURN FOLDED THESE MESSAGES INTO THE THREAD — only
+  // where the scope speaks for the message, which the union above is what says: a single-row
+  // settlement is a route reporting about ITSELF, and "I am not handling this" is not evidence about
+  // the route that is.
+  if (params.covered !== undefined) {
+    await recordTurnCoverage({
+      tenantId: params.tenantId,
+      instanceId: params.instanceId,
+      conversationId: params.conversationId,
+      covered: params.covered,
+      where,
+      base: params.base,
+    });
+  }
+
   // AND THE ROWS THAT NEED A CLOSING LINE, which are the ones that were DEAD.
   //
   // READING them first would race the sweep in both directions: a row turning DEAD between the read
@@ -287,7 +396,6 @@ export async function retireCoveredDeliveries(
       }),
   );
 
-  const answered = params.settlement === "answered";
   const total = count + corrected.length;
   if (total > 0) {
     logger.info(
@@ -391,6 +499,12 @@ export interface SweepCounts {
   // ever coming. Counted apart from `owed` because the recovery is the ordinary delivery replay
   // rather than a side effect of its own.
   owedTranscription: number;
+  // Terminal, a colleague's reply, and a route NOTHING EVER NAMED: the process died between the
+  // INSERT and the claim, so no build stated the role (issue #540, window 2). Counted apart from
+  // `owed` because the takeover is armed on a guess that may not have been owed, and apart from
+  // `observerStrands` because the gap reported may not exist — what is certain is only that one of
+  // the two stories happened and this pass cannot say which.
+  roleUnstated: number;
   // The row moved under the sweep (a redelivery claimed it) between the scan and the write.
   raced: number;
 }
@@ -510,6 +624,7 @@ export async function sweepStrandedDeliveries(
     owed: 0,
     observerStrands: 0,
     owedTranscription: 0,
+    roleUnstated: 0,
     raced: 0,
   };
 
@@ -578,12 +693,14 @@ export async function sweepStrandedDeliveries(
     // of its gap, and `record` marks the row terminal before it could be written. Null here is
     // "could not tell", which the line says out loud rather than resolving one way (round 31).
     const mirror =
-      verdict === "lost" || verdict === "observer-strand"
+      verdict === "lost" ||
+      verdict === "observer-strand" ||
+      verdict === "role-unstated"
         ? await mirrorOf(
             row,
             tenantId,
             base,
-            verdict === "observer-strand",
+            verdict === "observer-strand" || verdict === "role-unstated",
           ).catch((err) => {
             logger.warn(
               { err, deliveryId: row.deliveryId },
@@ -685,6 +802,52 @@ async function record(
           ? "could not be read"
           : mirror.responderHasRoute === true
             ? "has a responder with a route (so that responder's own delivery of the same reply probably owns it)"
+            : "has no responder with a route",
+      );
+      return;
+    }
+    if (verdict === "role-unstated") {
+      counts.roleUnstated += 1;
+      // NOTE: BOTH HONEST THINGS, because this pass cannot tell the two stories apart and each of them
+      // costs something different when guessed wrong (issue #540, window 2).
+      //
+      // The takeover is ARMED, which is free where it was not owed: `recover-takeover.ts` re-asks
+      // every gate — the shape, the provider, the mode, the config, the ownership — and answers
+      // `not-owed` without touching the conversation. On the far commoner responder's route it is
+      // the handover the delivery died owing, and refusing it here would leave the conversation with
+      // the bot until the next human reply.
+      //
+      // And the gap is REPORTED, which is what reading the row as the responder's silently skipped:
+      // on a WATCHER's route the takeover was never owed and what WAS owed — the colleague's reply
+      // folded into the observer's memory — cannot be replayed from here (see `observer-strand`), so
+      // without this line it leaves no trace anywhere at all.
+      // WHETHER IT WAS ACTUALLY ARMED, because the line below is the only record this row leaves and
+      // the row is already PROCESSED — nothing revisits it (PR review, round 6). Stated
+      // unconditionally, that line told an operator a takeover was armed on the exact reading where
+      // it was not, which is the one case they would have had to act on themselves.
+      let armed = true;
+      try {
+        await armTakeoverRecovery(tenantId, row.id, base);
+      } catch (error) {
+        armed = false;
+        logger.warn(
+          { error },
+          `chatwoot delivery sweep: ${label} stranded before its route was named and its takeover could not be armed; if it was the responder's, the conversation stays with the bot until the next human reply`,
+        );
+      }
+      logger.warn(
+        "chatwoot delivery sweep: %s stranded on %s carrying a colleague's reply (%s) on conversation %s BEFORE anything named its route — the claim that states the role never ran. %s; if it was a watcher's, that watcher never folded the reply into its memory and nothing can replay it. The inbox %s NOW, which is not necessarily what it had when the event arrived",
+        label,
+        row.status,
+        String(row.humanReplyShape),
+        String(row.conversationId),
+        armed
+          ? "A takeover is armed in case it was the responder's"
+          : "A takeover COULD NOT BE ARMED, so if it was the responder's the conversation stays with the bot until the next human reply",
+        mirror === null
+          ? "could not be read"
+          : mirror.responderHasRoute === true
+            ? "has a responder with a route"
             : "has no responder with a route",
       );
       return;

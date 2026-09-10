@@ -643,14 +643,29 @@ export function ToolGrantsEditor({
       }
     })();
   }, [handoffEnabled, handoffData, agentId]);
-  // Pinned is available only when the agent serves exactly one account (0 ⇒ no inbox bound, ≥2 ⇒
-  // ambiguous). `pinnedHint` explains why it is disabled; `pinnedInstanceId` is stored with the target.
+  // PICKING a pinned target needs exactly one account (0 ⇒ no inbox bound, ≥2 ⇒ the listing comes
+  // back empty, because agent and team ids are account-scoped). `pinnedHint` explains why it is
+  // disabled; `pinnedInstanceId` is stored with the target.
   const handoffAccounts = handoffData?.accounts ?? [];
-  const pinnedAvailable = !!handoffData && handoffAccounts.length === 1;
+  const pinnedOfferable = !!handoffData && handoffAccounts.length === 1;
   const pinnedInstanceId =
-    pinnedAvailable && handoffAccounts[0]
+    pinnedOfferable && handoffAccounts[0]
       ? Number(handoffAccounts[0].instanceId)
       : null;
+  // KEEPING one is a different question, and the answer is the account recorded next to the target,
+  // which is what the runtime reads (`prepare.ts`: a pinned target falls back to agent_choice only in
+  // the accounts it does not belong to). Counting accounts is the fallback for a target stored before
+  // that field existed.
+  const storedPinnedAccount = handoffAccounts.find(
+    (a) => Number(a.instanceId) === handoff.targetInstanceId,
+  );
+  const pinnedStoredUsable =
+    handoff.targetInstanceId != null
+      ? !!storedPinnedAccount
+      : handoffAccounts.length === 1;
+  // A pinned target that stands even though this editor cannot offer the list: shown read-only.
+  const pinnedKept =
+    handoff.mode === "pinned" && pinnedStoredUsable && !!storedPinnedAccount;
   const pinnedHint = !handoffData
     ? t("common.loading", "Loading…")
     : handoffAccounts.length === 0
@@ -666,7 +681,7 @@ export function ToolGrantsEditor({
         : undefined;
 
   // Z-PRO's own pinned target: a queue (department), the closest Z-PRO concept to "who receives the
-  // handoff" (no Chatwoot-style agent/team there). Same single-instance-scoping rule as pinnedAvailable
+  // handoff" (no Chatwoot-style agent/team there). Same single-instance-scoping rule as pinnedOfferable
   // above, mirrored against Z-PRO instances instead of Chatwoot accounts. Fetched only for a
   // Z-PRO-bound agent — pointless network call otherwise.
   const [zproQueueData, setZproQueueData] = useState<{
@@ -733,33 +748,53 @@ export function ToolGrantsEditor({
   const userPinnedAvailable =
     !!zproUserData && zproUserData.instanceCount === 1;
 
-  // "Pinned" is offered whenever ANY of the three sources can supply a live list to pin from — the
-  // targets are independent (see HandoffConfig's targetInstanceId/targetQueueId/targetUserId), so a
-  // dual-bound agent can configure any combination. Chatwoot-only relies solely on pinnedAvailable
-  // (unchanged); Z-PRO-bound also checks queuePinnedAvailable and userPinnedAvailable.
+  // "Pinned" is offered whenever ANY of the three sources can supply a live list to pin from, OR the
+  // Chatwoot side is a stored target the runtime still honors even though this editor cannot relist it
+  // (pinnedKept, the multi-account case) — never disable the mode the config is ALREADY in and working,
+  // that reads as "this is broken, fix it" about a setting that works. The targets are independent (see
+  // HandoffConfig's targetInstanceId/targetQueueId/targetUserId), so a dual-bound agent can configure
+  // any combination. Chatwoot-only relies solely on pinnedOfferable/pinnedKept (unchanged); Z-PRO-bound
+  // also checks queuePinnedAvailable and userPinnedAvailable.
   const pinnedDisabled = channelBinding.zpro
-    ? !pinnedAvailable && !queuePinnedAvailable && !userPinnedAvailable
-    : !pinnedAvailable;
+    ? !pinnedOfferable &&
+      !pinnedKept &&
+      !queuePinnedAvailable &&
+      !userPinnedAvailable
+    : !pinnedOfferable && !pinnedKept;
   const pinnedDisabledHint = !pinnedDisabled
     ? undefined
     : zproOnly
       ? queuePinnedHint
       : pinnedHint;
 
-  // Auto-switch a stale "pinned" target to "agent_choice" once the fetched data shows NEITHER channel
-  // can offer a picker anymore (bindings changed in the Channels tab, or inboxes/instances dropped).
-  // Keeps the SAVED config consistent with what the UI shows and the runtime does; marks the Tools
-  // section unsaved so the operator confirms the change. No loop: after the switch mode !== "pinned".
+  // Auto-switch a stale "pinned" target to "agent_choice" once NEITHER bound channel can still support
+  // it (bindings changed in the Channels tab, a target's account/instance dropped, or a legacy target
+  // with no account recorded on an agent that now serves several). Keeps the SAVED config consistent
+  // with what the UI shows and the runtime does; marks the Tools section unsaved so the operator
+  // confirms the change. No loop: after the switch mode !== "pinned".
   const chatwootHandoffReady = !channelBinding.chatwoot || !!handoffData;
   const zproHandoffReady =
     !channelBinding.zpro || (!!zproQueueData && !!zproUserData);
+  // The CHATWOOT half is judged by pinnedStoredUsable, not pinnedOfferable: a target the runtime WOULD
+  // still use is left alone even when this editor cannot offer the picker (the multi-account "kept"
+  // case, pinnedKept below). Switching on account count alone dropped a valid pinned target — and lit
+  // the tab's unsaved dot — the moment a second account's inbox was bound, with nobody having touched
+  // the form. Zero accounts is treated as INCONCLUSIVE rather than a reason to switch away: it means no
+  // inbox is bound yet, or the read failed, and neither is evidence about the target. Not bound at all
+  // ⇒ Chatwoot never vetoes the switch, leaving the decision entirely to Z-PRO.
+  const chatwootStillSupportsPinning =
+    channelBinding.chatwoot &&
+    (handoffAccounts.length === 0 || pinnedStoredUsable);
+  // The Z-PRO half is unchanged: a queue OR a user picker still resolvable. Not bound at all ⇒ never
+  // vetoes the switch either, leaving the decision to Chatwoot.
+  const zproStillSupportsPinning =
+    channelBinding.zpro && (queuePinnedAvailable || userPinnedAvailable);
   useEffect(() => {
     if (
       chatwootHandoffReady &&
       zproHandoffReady &&
-      !pinnedAvailable &&
-      !queuePinnedAvailable &&
-      !userPinnedAvailable &&
+      !chatwootStillSupportsPinning &&
+      !zproStillSupportsPinning &&
       handoff.mode === "pinned"
     ) {
       setHandoff((h) => ({
@@ -774,9 +809,8 @@ export function ToolGrantsEditor({
   }, [
     chatwootHandoffReady,
     zproHandoffReady,
-    pinnedAvailable,
-    queuePinnedAvailable,
-    userPinnedAvailable,
+    chatwootStillSupportsPinning,
+    zproStillSupportsPinning,
     handoff.mode,
     setHandoff,
   ]);
@@ -1617,19 +1651,32 @@ export function ToolGrantsEditor({
                   "editor.handoffTarget",
                   "Who receives the handoff",
                 )}
-                onChange={(value) =>
+                onChange={(value) => {
+                  // Picking the mode already in force changes nothing, and must WRITE nothing.
+                  // `Dropdown` fires onChange for the current value like any other, and now that
+                  // `pinned` stays reachable while it is the mode in force, that click used to
+                  // rewrite `targetInstanceId` to `pinnedInstanceId` — null wherever the picker
+                  // cannot offer targets — which then failed the check that keeps the target and
+                  // erased the very setting the operator was looking at.
+                  if (value === handoff.mode) return;
                   setHandoff({
                     ...handoff,
                     mode: value,
                     target: value === "pinned" ? handoff.target : "",
+                    // Safe without a fallback to the recorded account precisely BECAUSE of the guard
+                    // above: reaching here with `pinned` means the mode was something else, and the
+                    // item is only selectable then when the agent serves exactly one account — which
+                    // is the case where `pinnedInstanceId` is filled. A `?? handoff.targetInstanceId`
+                    // here reads as prudence and is dead code: no test can tell it apart, and a line
+                    // no test can pin is a line nobody can maintain.
                     targetInstanceId:
                       value === "pinned" ? pinnedInstanceId : null,
                     targetQueueId:
                       value === "pinned" ? handoff.targetQueueId : null,
                     targetUserId:
                       value === "pinned" ? handoff.targetUserId : null,
-                  })
-                }
+                  });
+                }}
                 items={[
                   {
                     value: "route",
@@ -1653,6 +1700,10 @@ export function ToolGrantsEditor({
                             "A specific agent/team, queue and/or attendant",
                           )
                         : t("editor.handoffPinned", "A specific agent or team"),
+                    // Never disable the mode the config is ALREADY in and the runtime still honors:
+                    // a disabled current value reads as "this is broken, fix it" about a setting
+                    // that works. `pinnedKept` folds that Chatwoot-side exception into pinnedDisabled
+                    // itself (see its definition above), so this reads the combined verdict directly.
                     disabled: pinnedDisabled,
                     disabledHint: pinnedDisabledHint,
                   },
@@ -1663,15 +1714,31 @@ export function ToolGrantsEditor({
                 ]}
               />
             </FormField>
-            {channelBinding.chatwoot && handoffData && !pinnedAvailable && (
-              <p className="text-text-muted text-xs">{pinnedHint}</p>
+            {channelBinding.chatwoot &&
+              handoffData &&
+              !pinnedOfferable &&
+              !pinnedKept && (
+                <p className="text-text-muted text-xs">{pinnedHint}</p>
+              )}
+            {channelBinding.chatwoot && pinnedKept && !pinnedOfferable && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "editor.handoffPinnedKept",
+                  "This agent serves inboxes in more than one Chatwoot account, so targets cannot be listed here. The saved target belongs to {{account}} and is used only in that account; elsewhere the AI picks.",
+                  {
+                    account:
+                      storedPinnedAccount?.accountName ??
+                      `#${storedPinnedAccount?.accountId}`,
+                  },
+                )}
+              </p>
             )}
             {channelBinding.zpro && zproQueueData && !queuePinnedAvailable && (
               <p className="text-text-muted text-xs">{queuePinnedHint}</p>
             )}
             {handoff.mode === "pinned" &&
               channelBinding.chatwoot &&
-              pinnedAvailable && (
+              pinnedOfferable && (
                 <FormField
                   label={t("editor.handoffPick", "Agent or team")}
                   group
