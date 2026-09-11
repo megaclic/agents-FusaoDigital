@@ -153,7 +153,7 @@ export async function mirrorZproMessage(
   const lastInboundAt = senderType === "CLIENT" ? lastMessageAt : undefined;
   // ticket.queueId + ticket.contact.tags arrive on EVERY message webhook (confirmed on real
   // captured payloads, see types.ts's header) — previously received and discarded. Mirrored here so
-  // route_to_queue/assign_label's "what does this ticket/contact already have" question is
+  // route_to_queue/set_labels's "what does this ticket/contact already have" question is
   // answerable without a live API call (get_contact_info, the conversation detail page).
   const contactTags = parseContactTags(
     ticket.contact.tags,
@@ -221,7 +221,7 @@ export async function mirrorZproMessage(
           status: ticket.status,
           // contactId is refreshed here too (not just on create) — a contact merge/dedup in the
           // Z-PRO panel changes ticket.contact.id going forward, and without this the mirrored id
-          // would go stale forever (set_custom_attribute/assign_label contact-scope writes, and
+          // would go stale forever (set_custom_attribute/set_labels contact-scope writes, and
           // mirrorZproContact's updateMany match, would all silently keep targeting the old id).
           contactId: ticket.contact.id,
           contactNumber: ticket.contact.number,

@@ -281,7 +281,7 @@ export async function loadZproAgentTools(
 
   // Conversation-scoped NATIVE tools (handoff/note/attribute/label/resolve/funnel/skip), built ONLY
   // when the caller supplied a live client (runtime.ts always does; tests exercising just RAG/HTTP/
-  // MCP/INTEGRATION may omit it). Grounds assign_label with the account's known tags and
+  // MCP/INTEGRATION may omit it). Grounds set_labels with the account's known tags and
   // kanban_move_card/update_kanban_task with the resolved CRM pipeline — each ONLY when the
   // respective tool is actually granted (undefined allowlist ⇒ all ⇒ resolve both), so the common
   // case (neither tool granted) pays zero extra network calls.
@@ -292,21 +292,21 @@ export async function loadZproAgentTools(
     const cacheKey = `${tenantId}:${zproInstanceId}`;
 
     // get_contact_info also needs both catalogs (to resolve the CURRENT queue/tag names, not just
-    // list the possible values) — sharing the same cached load as assign_label/route_to_queue rather
+    // list the possible values) — sharing the same cached load as set_labels/route_to_queue rather
     // than paying a second round trip.
     const needsTags =
       !allow ||
-      allow.includes("assign_label") ||
+      allow.includes("set_labels") ||
       allow.includes("get_contact_info");
     const knownTags = needsTags
       ? await loadZproTags(client, cacheKey).catch((e) => {
           logger.warn(
-            "zpro assign_label: tag list failed (ticket=%s): %s",
+            "zpro set_labels: tag list failed (ticket=%s): %s",
             String(ticketId),
             e instanceof Error ? e.message : String(e),
           );
           onSideEffectError?.({
-            tool: "assign_label",
+            tool: "set_labels",
             phase: "list_tags",
             err: e,
           });

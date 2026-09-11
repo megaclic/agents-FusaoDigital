@@ -43,7 +43,6 @@ describe("buildZproNativeTools (no client/DB access)", () => {
   test("returns all 12 tools when unfiltered, and NEVER react_to_message", () => {
     const tools = buildZproNativeTools(baseCtx());
     expect(tools.map((t) => t.name).sort()).toEqual([
-      "assign_label",
       "get_contact_info",
       "handoff_to_human",
       "kanban_move_card",
@@ -53,6 +52,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
       "schedule_message",
       "send_image",
       "set_custom_attribute",
+      "set_labels",
       "skip_reply",
       "update_kanban_task",
     ]);
@@ -559,7 +559,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     expect(out).toContain("Saved memory: (none)");
   });
 
-  test("assign_label: reuses a known tag id (no createTag call)", async () => {
+  test("set_labels: reuses a known tag id (no createTag call)", async () => {
     const calls: Array<[string, unknown]> = [];
     const client = {
       createTag: async () => {
@@ -577,14 +577,14 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     } as unknown as ZproClient;
     const tools = buildZproNativeTools(
       baseCtx({ client, knownTags: [{ id: 3, name: "vip" }] }),
-      ["assign_label"],
+      ["set_labels"],
     );
     const out = await tools[0]?.invoke({ label: "VIP" });
     expect(calls).toEqual([["addTag", { ticketId: 42, tagId: 3 }]]);
     expect(String(out)).toContain("added to the conversation");
   });
 
-  test("assign_label: an unknown label auto-creates the tag, then applies it", async () => {
+  test("set_labels: an unknown label auto-creates the tag, then applies it", async () => {
     const calls: Array<[string, unknown]> = [];
     const client = {
       createTag: async (tag: string, color: string, isActive: boolean) => {
@@ -597,14 +597,14 @@ describe("buildZproNativeTools (no client/DB access)", () => {
       },
     } as unknown as ZproClient;
     const tools = buildZproNativeTools(baseCtx({ client, knownTags: [] }), [
-      "assign_label",
+      "set_labels",
     ]);
     await tools[0]?.invoke({ label: "urgente" });
     expect(calls[0]?.[0]).toBe("createTag");
     expect(calls[1]).toEqual(["addTag", { ticketId: 42, tagId: 77 }]);
   });
 
-  test("assign_label: scope='contact' calls addTagContact instead of addTag", async () => {
+  test("set_labels: scope='contact' calls addTagContact instead of addTag", async () => {
     const calls: Array<[string, unknown]> = [];
     const client = {
       addTagContact: async (contactId: number, tagId: number) => {
@@ -614,7 +614,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     } as unknown as ZproClient;
     const tools = buildZproNativeTools(
       baseCtx({ client, knownTags: [{ id: 5, name: "lead" }] }),
-      ["assign_label"],
+      ["set_labels"],
     );
     const out = await tools[0]?.invoke({ label: "lead", scope: "contact" });
     expect(calls).toEqual([["addTagContact", { contactId: 7, tagId: 5 }]]);
@@ -638,7 +638,7 @@ describe("buildZproNativeTools (no client/DB access)", () => {
     expect(String(out)).toContain('Routed to the "Suporte" queue');
   });
 
-  test("route_to_queue: fails CLOSED on an unknown queue name — no auto-create, unlike assign_label", async () => {
+  test("route_to_queue: fails CLOSED on an unknown queue name — no auto-create, unlike set_labels", async () => {
     let called = false;
     const client = {
       updateQueue: async () => {

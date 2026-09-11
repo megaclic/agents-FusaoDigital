@@ -28,7 +28,7 @@ export const NATIVE_TOOL_ICONS: Record<string, LucideIcon> = {
   private_note: StickyNote,
   set_custom_attribute: Tag,
   get_contact_info: IdCard,
-  assign_label: Tags,
+  set_labels: Tags,
   resolve_conversation: CheckCircle2,
   kanban_move_card: LayoutGrid,
   update_kanban_task: SquarePen,
@@ -88,13 +88,13 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
           "Look up the contact's current queue, tags, and saved memory before asking the customer for information that might already be on file.",
         ),
       };
-    case "assign_label":
+    case "set_labels":
       return {
         icon,
-        label: t("nativeTools.assign_label.label", "Add label"),
+        label: t("nativeTools.set_labels.label", "Set labels"),
         description: t(
-          "nativeTools.assign_label.desc",
-          "Add a label (tag) to the conversation to categorize it (vip, urgent, lead…).",
+          "nativeTools.set_labels.desc",
+          "Set which labels (tags) the conversation carries, adding and removing in one write (vip, urgent, lead…).",
         ),
       };
     case "resolve_conversation":

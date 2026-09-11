@@ -199,7 +199,7 @@ const ZPRO_ACTIVITY_STUCK_MS = 30_000;
 // The friendly label for the native tools Z-PRO actually builds (native-tools.ts's
 // buildZproNativeTools — same tool names Chatwoot's ToolFlowLogger/UI use, so the SAME translated
 // strings apply). Only the tools ConversationDetailPage.tsx already maps get a dedicated label;
-// everything else (assign_label, kanban_move_card, update_kanban_task, set_voice_preference) falls
+// everything else (set_labels, kanban_move_card, update_kanban_task, set_voice_preference) falls
 // back to prettyToolName, exactly like Chatwoot's own unmapped tools do.
 function prettyToolName(name: string): string {
   const words = name.replace(/_+/g, " ").trim();

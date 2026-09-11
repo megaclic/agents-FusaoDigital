@@ -25,14 +25,14 @@
 //                         in the vendor's Postman collection), so we always read first and resend the
 //                         full array, never trusting a server-side merge.
 //   get_contact_info      → PURE read from ctx, no network call at tool-call time. The counterpart
-//                         to set_custom_attribute/assign_label's writes, which had no way to be read
+//                         to set_custom_attribute/set_labels's writes, which had no way to be read
 //                         back before this: currentQueueName/contactTagNames are resolved once at
 //                         turn prep (tools.ts) against the SAME cached catalogs route_to_queue/
-//                         assign_label already load; contactExtraInfo is threaded straight from
+//                         set_labels already load; contactExtraInfo is threaded straight from
 //                         NormalizedZproEvent.extraInfo (normalize.ts already extracted it from
 //                         ticket.contact.extraInfo on every webhook — previously extracted and never
 //                         read by anything).
-//   assign_label         → Z-PRO tags (addTag/addTagContact), which are id-based unlike Chatwoot's
+//   set_labels           → Z-PRO tags (addTag/addTagContact), which are id-based unlike Chatwoot's
 //                         free-string labels — resolved by name against listTags at turn prep
 //                         (src/modules/zpro/tools.ts), auto-CREATING a new tag on a miss so the
 //                         model can tag freely (mirrors Chatwoot's effective behavior, where posting
@@ -57,7 +57,7 @@
 //                         Z-PRO-ONLY, the inverse asymmetry of react_to_message below: no Chatwoot
 //                         concept of "fila" exists (the closest analog, handoff_to_human's
 //                         targetTeamId, already covers routing on that channel), so this is never
-//                         built in src/graph/tools/native.ts. Unlike assign_label, resolution is
+//                         built in src/graph/tools/native.ts. Unlike set_labels, resolution is
 //                         FAIL-CLOSED (no auto-create): a queue is operator-managed structure, not a
 //                         free-form tag, so an unrecognized name is reported back to the model
 //                         instead of silently creating a new department.
@@ -174,7 +174,7 @@ export interface ZproToolCtx {
   // Handoff targeting (route | pinned | agent_choice) — see handoffTool below. Absent ⇒ "route" (no
   // queue routing on handoff, current/legacy behavior).
   handoffCfg?: HandoffConfig;
-  // Known tags (id+name), resolved once at turn prep — lets assign_label suggest existing tags AND
+  // Known tags (id+name), resolved once at turn prep — lets set_labels suggest existing tags AND
   // resolve a name to an id without a network call inside the tool body.
   knownTags?: ZproPipeline[];
   // Known queues (id+name), same resolve-once pattern as knownTags — lets route_to_queue suggest
@@ -191,7 +191,7 @@ export interface ZproToolCtx {
   // were not granted this turn (their resolve is skipped to avoid the extra network calls).
   kanban?: ZproKanbanContext;
   // get_contact_info's read-only snapshot, resolved once at turn prep (tools.ts) against the SAME
-  // knownQueues/knownTags catalogs route_to_queue/assign_label already load — no extra network call
+  // knownQueues/knownTags catalogs route_to_queue/set_labels already load — no extra network call
   // for this tool specifically. currentQueueName is null when the ticket has no queue (or it isn't
   // in the catalog); contactTagNames/contactExtraInfo are [] when the mirror/webhook had none.
   currentQueueName?: string | null;
@@ -549,7 +549,7 @@ function setCustomAttributeTool(ctx: ZproToolCtx) {
   );
 }
 
-// ── get_contact_info (read-only — the counterpart to set_custom_attribute/assign_label's writes,
+// ── get_contact_info (read-only — the counterpart to set_custom_attribute/set_labels's writes,
 // which had no way to be read back before this) ────────────────────────────
 
 function getContactInfoTool(ctx: ZproToolCtx) {
@@ -577,7 +577,7 @@ function getContactInfoTool(ctx: ZproToolCtx) {
   );
 }
 
-// ── assign_label (Z-PRO tags) ───────────────────────────────────────────────
+// ── set_labels (Z-PRO tags) ───────────────────────────────────────────────
 
 function existingLabelsXml(names: string[]): string {
   if (names.length === 0) return "";
@@ -617,7 +617,7 @@ export async function resolveOrCreateZproTagId(
   }
 }
 
-function assignLabelTool(ctx: ZproToolCtx) {
+function setLabelsTool(ctx: ZproToolCtx) {
   const known = ctx.knownTags ?? [];
   const labelsXml = existingLabelsXml(known.map((t) => t.name));
   const baseDescription = `Add a label (tag) to categorize the conversation or the contact. Use scope to choose (default 'conversation'). ${
@@ -647,11 +647,11 @@ function assignLabelTool(ctx: ZproToolCtx) {
       return `Label "${clean}" added to the conversation.`;
     },
     {
-      name: "assign_label",
+      name: "set_labels",
       description: withOperatorNote(
         baseDescription,
         ctx,
-        "assign_label",
+        "set_labels",
         labelsXml,
       ),
       schema: z.object({
@@ -688,7 +688,7 @@ function routeToQueueTool(ctx: ZproToolCtx) {
     async ({ queue }: { queue: string }) => {
       const clean = queue.trim();
       if (!clean) return "No queue provided.";
-      // Fail closed, unlike assign_label: a queue is operator-managed structure (a department), not a
+      // Fail closed, unlike set_labels: a queue is operator-managed structure (a department), not a
       // free-form tag, so an unrecognized name must not silently create one.
       const match = known.find(
         (q) => q.name.toLowerCase() === clean.toLowerCase(),
@@ -1211,7 +1211,7 @@ export function buildZproNativeTools(
     privateNoteTool(ctx),
     setCustomAttributeTool(ctx),
     getContactInfoTool(ctx),
-    assignLabelTool(ctx),
+    setLabelsTool(ctx),
     resolveConversationTool(ctx),
     kanbanMoveTool(ctx),
     updateKanbanTaskTool(ctx),

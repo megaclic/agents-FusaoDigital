@@ -397,7 +397,7 @@ describe.skipIf(!dbUp)("mirrorZproMessage lastInboundAt watermark", () => {
 });
 
 // DB-backed: ticket.queueId and ticket.contact.tags arrive on EVERY message webhook (confirmed on
-// real captured payloads) but were received and discarded — route_to_queue/assign_label could WRITE
+// real captured payloads) but were received and discarded — route_to_queue/set_labels could WRITE
 // but nothing could read back what a ticket/contact already had. get_contact_info (native-tools.ts)
 // and the conversation detail page both depend on these actually being mirrored.
 describe.skipIf(!dbUp)("mirrorZproMessage queue + contact tags", () => {
